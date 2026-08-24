@@ -875,10 +875,21 @@ dependencies = [
 name = "exocortex-reasoning"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crepe",
+ "exocortex-cache",
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
+ "exocortex-storage",
+ "futures",
+ "lasso",
+ "metrics",
+ "serde_json",
+ "smallvec",
+ "smol_str",
  "steel-core",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1691,6 +1702,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "metrics"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3045b4193fbdc5b5681f32f11070da9be3609f189a79f3390706d42587f46bb5"
+dependencies = [
+ "ahash",
+ "portable-atomic",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1921,6 +1942,12 @@ dependencies = [
  "rustix",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "ppv-lite86"

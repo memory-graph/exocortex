@@ -7,6 +7,24 @@ license.workspace = true
 
 [dependencies]
 exocortex-kernel = { workspace = true }
+exocortex-storage = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
 crepe = { workspace = true }
 steel-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+futures = { workspace = true }
+smol_str = { workspace = true }
+chrono = { workspace = true }
+lasso = { workspace = true }
+smallvec = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+exocortex-cache = { workspace = true }
+futures = { workspace = true }
+
+[[bench]]
+name = "khop"
+harness = false
