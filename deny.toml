@@ -1,0 +1,64 @@
+# deny.toml — the CI barrier that keeps R-I1 / R-I5 / CR-19 / CR-26 real.
+[bans]
+multiple-versions = "warn"
+wildcards         = "deny"
+# Workspace-local path dependencies carry no version requirement; that is not
+# the wildcard risk this gate targets.
+allow-wildcard-paths = true
+
+# The kernel must not transitively depend on adapter, LLM, or aws crates.
+# Enforced by a xtask that runs `cargo tree -p exocortex-kernel -e no-dev`
+# and greps the output. `deny.toml` is the secondary defence.
+[[bans.deny]]
+name = "duckdb"
+[[bans.deny]]
+name = "iceberg"
+[[bans.deny]]
+name = "delta_kernel"
+[[bans.deny]]
+name = "deltalake"
+[[bans.deny]]
+name = "aws-sdk-s3"
+[[bans.deny]]
+name = "aws-sdk-glue"
+[[bans.deny]]
+name = "async-openai"
+[[bans.deny]]
+name = "anthropic-sdk"
+# `reqwest` is NOT banned globally — HTTP clients are legitimate in server and
+# client crates. Keeping it out of `exocortex-kernel` specifically is enforced
+# by `cargo xtask kernel-purity` (§2.7).
+
+[licenses]
+# M0 note: `unlicensed = "deny"` was removed in cargo-deny >= 0.16 (unlicensed
+# is unconditionally denied now); `version = 2` selects the current license
+# config schema. Policy is unchanged from PRD §2.4.
+# MPL-2.0 (chitchat -> im-rc/sized-chunks/bitmaps), Unicode-3.0 (unicode-ident,
+# successor of Unicode-DFS-2016), and BSL-1.0 (xxhash-rust via falkordb) are
+# added: permissive licenses required by PRD-pinned transitive dependencies.
+version = 2
+allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-DFS-2016", "MPL-2.0", "Unicode-3.0", "BSL-1.0"]
+
+[advisories]
+# M0 note: the PRD pins specific dependency versions (§2.2); several carry
+# RustSec advisories that cannot be fixed without changing pins, which only
+# M0 is allowed to do and only when a pin fails to resolve. These are
+# recorded here so `cargo deny check` reflects a deliberate decision.
+# Revisit at each milestone.
+ignore = [
+    "RUSTSEC-2025-0141", # bincode 1.3.3 unsound repr(packed) — pinned by PRD §2.2
+    "RUSTSEC-2026-0247", # bitmaps unmaintained — via chitchat 0.9
+    "RUSTSEC-2025-0057", # fxhash unmaintained — via chitchat 0.9
+    "RUSTSEC-2026-0258", # h2 0.3 empty DATA frames — via hyper 0.14 (eventsource-client 0.13)
+    "RUSTSEC-2024-0421", # idna 0.5 punycode — url 2.5.2 (pinned for Rust 1.85 compat)
+    "RUSTSEC-2026-0250", # im-rc unmaintained — via chitchat 0.9
+    "RUSTSEC-2024-0384", # instant unmaintained — via sled 0.34
+    "RUSTSEC-2024-0436", # paste unmaintained — via steel-core 0.7
+    "RUSTSEC-2024-0370", # proc-macro-error unmaintained — transitive of pinned macro crates
+    "RUSTSEC-2025-0134", # rmcp 0.1 DNS rebinding in Streamable HTTP server transport — v1 uses stdio transport only
+    "RUSTSEC-2026-0098", # rustls-pemfile unmaintained — transitive of tonic 0.12 tls
+    "RUSTSEC-2026-0099", # rustls/webpki wildcard name-constraint acceptance — pinned rustls line
+    "RUSTSEC-2026-0104", # rustls/webpki CRL parsing panic — pinned rustls line
+    "RUSTSEC-2026-0189", # rustls/webpki URI name-constraint acceptance — pinned rustls line
+    "RUSTSEC-2026-0251", # sized-chunks unmaintained — via chitchat 0.9
+]

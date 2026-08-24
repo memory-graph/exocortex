@@ -1,0 +1,18 @@
+# crates/exocortex-wire/Cargo.toml
+[package]
+name    = "exocortex-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build   = "build.rs"
+
+[dependencies]
+prost       = { workspace = true }
+prost-types = { workspace = true }
+tonic       = { workspace = true }
+bytes       = { workspace = true }
+serde       = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+prost-build = "0.13"

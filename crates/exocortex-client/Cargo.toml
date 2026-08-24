@@ -1,0 +1,17 @@
+# crates/exocortex-client/Cargo.toml
+[package]
+name    = "exocortex-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exocortex-kernel = { workspace = true }
+exocortex-wire = { workspace = true }
+tonic = { workspace = true }
+exocortex-cache = { workspace = true }
+exocortex-reasoning = { workspace = true }
+exocortex-ops = { workspace = true }
+rmcp = { workspace = true }
+sled = { workspace = true }
+eventsource-client = { workspace = true }

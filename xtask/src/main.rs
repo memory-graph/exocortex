@@ -1,0 +1,98 @@
+// xtask/src/main.rs
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Compute + print the effective OntologyFingerprint of the pack set
+    /// that would be linked into `exocortex-server`. Used in CI to detect
+    /// unintended ontology drift between commits.
+    Fingerprint,
+    /// Generate MCP + OpenAPI schemas from the operation registry.
+    /// Fails if generated schemas are out of date (CI gate).
+    GenSchemas,
+    /// Run the R-I1/R-I5 kernel purity check: shells out to
+    /// `cargo tree -p exocortex-kernel -e no-dev` and greps for banned crates.
+    KernelPurity,
+    /// Run the interactive-read latency benchmark (R-Lat1 SLO gate).
+    Bench,
+}
+
+fn main() -> Result<()> {
+    match Cli::parse().cmd {
+        Cmd::Fingerprint => fingerprint(),
+        Cmd::GenSchemas => todo!(),
+        Cmd::KernelPurity => kernel_purity(),
+        Cmd::Bench => todo!(),
+    }
+}
+
+/// `cargo xtask fingerprint` — compute and print the effective
+/// `OntologyFingerprint` of the linked pack set. Must be byte-stable across
+/// runs on the same commit (M1 acceptance).
+fn fingerprint() -> Result<()> {
+    let onto = exocortex_kernel::pack::load_registered_packs()?;
+    let fp = onto.fingerprint.0;
+    let mut hex = String::with_capacity(fp.len() * 2);
+    for b in fp {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    println!("{hex}");
+    Ok(())
+}
+
+/// `cargo xtask kernel-purity` — R-I1/R-I5/CR-19/CR-26 defence. Runs
+/// `cargo tree -p exocortex-kernel -e no-dev` and fails if any banned crate
+/// appears in the kernel's dependency graph. HTTP clients (`reqwest`) are
+/// legitimate in server/client crates but must never reach the kernel.
+fn kernel_purity() -> Result<()> {
+    const BANNED: &[&str] = &[
+        "duckdb",
+        "iceberg",
+        "delta_kernel",
+        "deltalake",
+        "aws-sdk-s3",
+        "aws-sdk-glue",
+        "async-openai",
+        "anthropic-sdk",
+        "reqwest",
+    ];
+
+    let out = std::process::Command::new(std::env::var("CARGO")?.trim())
+        .args(["tree", "-p", "exocortex-kernel", "-e", "no-dev"])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "cargo tree failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let tree = String::from_utf8_lossy(&out.stdout);
+    let mut found: Vec<&str> = Vec::new();
+    for line in tree.lines() {
+        for banned in BANNED {
+            let hit = line
+                .split([' ', '\t'])
+                .any(|tok| tok.starts_with(&format!("{banned} v")));
+            if hit && !found.contains(banned) {
+                found.push(banned);
+            }
+        }
+    }
+    if found.is_empty() {
+        println!("kernel-purity ok: no banned crate in exocortex-kernel dependency tree");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "kernel-purity FAILED: banned crates reachable from exocortex-kernel: {}",
+            found.join(", ")
+        )
+    }
+}

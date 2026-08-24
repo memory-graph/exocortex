@@ -1,0 +1,14 @@
+# crates/exocortex-cache/Cargo.toml
+[package]
+name    = "exocortex-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exocortex-kernel = { workspace = true }
+arc-swap = { workspace = true }
+dashmap = { workspace = true }
+petgraph = { workspace = true }
+roaring = { workspace = true }
+lasso = { workspace = true }

@@ -1,0 +1,135 @@
+# Cargo.toml (workspace root)
+[workspace]
+resolver = "2"
+members = [
+    "crates/exocortex-kernel",
+    "crates/exocortex-pack-dev-v1",
+    "crates/exocortex-wire",
+    "crates/exocortex-storage",
+    "crates/exocortex-cache",
+    "crates/exocortex-reasoning",
+    "crates/exocortex-cluster",
+    "crates/exocortex-ingest",
+    "crates/exocortex-worker",
+    "crates/exocortex-server",
+    "crates/exocortex-client",
+    "crates/exocortex-ops",
+    "crates/exocortex-dreams",
+    "xtask",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.85"   # M0 deviation: rmcp requires edition 2024 (Rust >= 1.85); see rust-toolchain.toml
+license      = "Apache-2.0"
+repository   = "https://github.com/memorygraph/exocortex"
+
+[workspace.dependencies]
+# --- runtime & primitives ---
+tokio          = { version = "1.40", features = ["full"] }
+tokio-stream   = { version = "0.1" }
+futures        = "0.3"
+async-trait    = "0.1"
+bytes          = "1"
+thiserror      = "1"
+anyhow         = "1"
+tracing        = "0.1"
+tracing-subscriber        = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry     = "0.24"
+opentelemetry             = "0.23"
+opentelemetry-otlp        = { version = "0.16", features = ["tonic"] }
+
+# --- data structures ---
+arc-swap  = "1.7"
+dashmap   = "6"
+petgraph  = "0.6"
+smallvec  = { version = "1", features = ["serde"] }  # serde needed: kernel serde types carry SmallVec (PRD §2.2 gap)
+smol_str  = { version = "0.3", features = ["serde"] }  # serde needed: kernel serde types carry SmolStr (PRD §2.2 gap)
+lasso     = { version = "0.7", features = ["multi-threaded"] }
+roaring   = "0.10"
+indexmap  = "2"
+
+# --- serde & wire ---
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+schemars    = { version = "0.8", features = ["derive"] }
+bincode     = "1.3"
+prost       = "0.13"
+prost-types = "0.13"
+tonic       = { version = "0.12", features = ["tls", "gzip"] }
+tonic-build = "0.12"
+
+# --- hashing / crypto ---
+blake3      = "1.5"
+sha2        = "0.10"
+hmac        = "0.12"
+
+# --- storage / http ---
+falkordb    = "0.3"          # M0 pin check: 0.1.x unconditionally enables parking_lot/deadlock_detection, which is mutually exclusive with steel-core's send_guard (compile_error in every parking_lot 0.12.x). 0.3.0 is the first release without it.
+redis       = { version = "0.27", features = ["tokio-comp", "aio"] }
+sled        = "0.34"
+axum        = { version = "0.7", features = ["macros", "http2"] }
+tower       = "0.5"
+tower-http  = { version = "0.6", features = ["trace", "cors", "compression-full"] }
+eventsource-client = "0.13"
+
+# --- reasoning ---
+crepe       = "0.1"
+steel-core  = "0.7"          # M0 pin check: no 0.6.x exists on crates.io; 0.7.0 is the nearest release above
+
+# --- MCP / ops ---
+rmcp        = "0.1"
+inventory   = "0.3"
+
+# --- embedding runtime (backend default) ---
+fastembed   = "3"
+
+# --- time / rand ---
+chrono      = { version = "0.4", features = ["serde"] }
+chrono-tz   = "0.9"
+uuid        = { version = "1", features = ["v4", "v7", "serde"] }
+rand        = "0.8"
+
+# --- cluster / gossip ---
+chitchat    = "0.9"
+
+# --- misc runtime ---
+once_cell   = "1"
+parking_lot = "0.12"
+lru         = "0.12"
+async-stream = "0.3"
+http        = "1"
+subtle      = "2"
+
+# --- observability ---
+metrics                     = "0.23"
+metrics-exporter-prometheus = "0.15"
+
+# --- testing ---
+proptest    = "1"
+
+# --- internal ---
+exocortex-kernel = { path = "crates/exocortex-kernel", version = "0.1.0" }
+exocortex-pack-dev-v1 = { path = "crates/exocortex-pack-dev-v1", version = "0.1.0" }
+exocortex-wire = { path = "crates/exocortex-wire", version = "0.1.0" }
+exocortex-storage = { path = "crates/exocortex-storage", version = "0.1.0" }
+exocortex-cache = { path = "crates/exocortex-cache", version = "0.1.0" }
+exocortex-reasoning = { path = "crates/exocortex-reasoning", version = "0.1.0" }
+exocortex-cluster = { path = "crates/exocortex-cluster", version = "0.1.0" }
+exocortex-ingest = { path = "crates/exocortex-ingest", version = "0.1.0" }
+exocortex-ops = { path = "crates/exocortex-ops", version = "0.1.0" }
+exocortex-dreams = { path = "crates/exocortex-dreams", version = "0.1.0" }
+exocortex-worker = { path = "crates/exocortex-worker", version = "0.1.0" }
+exocortex-server = { path = "crates/exocortex-server", version = "0.1.0" }
+exocortex-client = { path = "crates/exocortex-client", version = "0.1.0" }
+
+[profile.release]
+lto            = "fat"
+codegen-units  = 1
+panic          = "abort"
+debug          = 1
+
+[profile.bench]
+inherits = "release"
+debug    = 2

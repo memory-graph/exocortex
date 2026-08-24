@@ -1,0 +1,14 @@
+# crates/exocortex-ingest/Cargo.toml
+[package]
+name    = "exocortex-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exocortex-kernel = { workspace = true }
+exocortex-wire = { workspace = true }
+exocortex-storage = { workspace = true }
+exocortex-cache = { workspace = true }
+exocortex-reasoning = { workspace = true }
+tonic = { workspace = true }

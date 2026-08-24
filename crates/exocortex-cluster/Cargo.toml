@@ -1,0 +1,20 @@
+# crates/exocortex-cluster/Cargo.toml
+[package]
+name    = "exocortex-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exocortex-kernel = { workspace = true }
+exocortex-wire = { workspace = true }
+exocortex-storage = { workspace = true }
+redis = { workspace = true }
+chitchat = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+axum = { workspace = true }
+eventsource-client = { workspace = true }
+
+[features]
+integration = []

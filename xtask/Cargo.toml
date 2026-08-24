@@ -1,0 +1,13 @@
+# xtask/Cargo.toml
+[package]
+name    = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow      = { workspace = true }
+clap        = { version = "4", features = ["derive"] }
+serde_json  = { workspace = true }
+exocortex-kernel      = { workspace = true }
+exocortex-pack-dev-v1 = { workspace = true }

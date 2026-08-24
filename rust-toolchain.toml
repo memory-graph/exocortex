@@ -1,0 +1,9 @@
+# rust-toolchain.toml
+# M0 deviation (recorded): PRD §2.3 pins 1.83.0, but every published release
+# of `rmcp` (§2.2 pin, "0.1") is edition-2024 and requires Rust >= 1.85. The
+# two pins cannot both hold; 1.85.0 is the minimum that satisfies the
+# dependency set. Cargo 1.85's MSRV-aware resolver also unblocks transitive deps.
+[toolchain]
+channel = "1.85.0"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "minimal"

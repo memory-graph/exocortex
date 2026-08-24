@@ -1,0 +1,21 @@
+# crates/exocortex-storage/Cargo.toml
+[package]
+name    = "exocortex-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exocortex-kernel = { workspace = true }
+async-trait = { workspace = true }
+falkordb = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+smol_str = { workspace = true }
+futures = { workspace = true }
+
+[features]
+integration = []

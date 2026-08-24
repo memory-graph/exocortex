@@ -1,0 +1,15 @@
+# crates/exocortex-ops/Cargo.toml
+[package]
+name    = "exocortex-ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exocortex-kernel = { workspace = true }
+exocortex-storage = { workspace = true }
+exocortex-cache = { workspace = true }
+exocortex-reasoning = { workspace = true }
+schemars = { workspace = true }
+inventory = { workspace = true }
+rmcp = { workspace = true }
