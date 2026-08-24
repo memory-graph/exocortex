@@ -32,7 +32,10 @@ impl Ontology {
     /// Assemble the effective ontology from every pack registered (via
     /// `inventory::submit!`) into the linked binary.
     pub(crate) fn from_registered_packs() -> KernelResult<Self> {
-        let packs: Vec<PackDef> = inventory::iter::<PackDef>.into_iter().cloned().collect();
+        let packs: Vec<PackDef> = inventory::iter::<crate::pack::PackRegistration>
+            .into_iter()
+            .map(|r| (r.build)())
+            .collect();
         Self::from_packs(packs)
     }
 
@@ -46,7 +49,35 @@ impl Ontology {
                 return Err(KernelError::DuplicatePack(p.name.clone()));
             }
         }
-        // R-Pk2: kernel-constant coverage.
+
+        // Deterministic order and pack-id assignment: packs are sorted by
+        // name; pack i receives PackId(i). Pack-space kind ids are then
+        // canonicalized from their provisional `0x8000_0000 | local` form to
+        // `RelKindId::from_pack(PackId(i), local)` (kernel-space ids are
+        // untouched). With a single pack (v1) this is the identity mapping.
+        let mut packs = packs;
+        packs.sort_by(|a, b| a.name.cmp(&b.name));
+        for (i, p) in packs.iter_mut().enumerate() {
+            let slot = (i as u32) << 16;
+            for k in p.kinds.iter_mut() {
+                if !k.id.is_kernel() {
+                    k.id = RelKindId(0x8000_0000 | slot | k.id.local_part());
+                }
+                if let Some(inv) = k.inverse {
+                    if !inv.is_kernel() {
+                        k.inverse = Some(RelKindId(0x8000_0000 | slot | inv.local_part()));
+                    }
+                }
+            }
+            for t in p.type_triples.iter_mut() {
+                if !t.kind.is_kernel() {
+                    t.kind = RelKindId(0x8000_0000 | slot | t.kind.local_part());
+                }
+            }
+        }
+
+        // R-Pk2 groundwork: duplicate kind detection, then kernel-constant
+        // coverage.
         let mut kinds_by_id: HashMap<RelKindId, RelMeta> = HashMap::new();
         for p in &packs {
             for k in &p.kinds {
@@ -99,5 +130,19 @@ impl Ontology {
             entity_type_names,
             fingerprint,
         })
+    }
+
+    /// Look up a relationship kind's id by display name (the stable identity
+    /// surface used by wire formats and rule sources).
+    pub fn kind_id(&self, name: &str) -> Option<RelKindId> {
+        self.kinds_by_id
+            .values()
+            .find(|k| k.display_name == name)
+            .map(|k| k.id)
+    }
+
+    /// Look up a memory type's u8 id by name.
+    pub fn memory_type_id(&self, name: &str) -> Option<u8> {
+        self.memory_type_by_name.get(name).copied()
     }
 }

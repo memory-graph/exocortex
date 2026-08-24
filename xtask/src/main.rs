@@ -37,6 +37,9 @@ fn main() -> Result<()> {
 /// `OntologyFingerprint` of the linked pack set. Must be byte-stable across
 /// runs on the same commit (M1 acceptance).
 fn fingerprint() -> Result<()> {
+    // Force-link the pack crate so its inventory ctor (`.init_array`) runs in
+    // this binary; an unreferenced dependency is not linked.
+    let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
     let onto = exocortex_kernel::pack::load_registered_packs()?;
     let fp = onto.fingerprint.0;
     let mut hex = String::with_capacity(fp.len() * 2);

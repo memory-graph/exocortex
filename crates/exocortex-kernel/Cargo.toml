@@ -25,3 +25,9 @@ crepe       = { workspace = true }
 [features]
 default = []
 # no default features; the kernel does zero I/O
+
+[dev-dependencies]
+smallvec   = { workspace = true }
+smol_str   = { workspace = true }
+serde_json = { workspace = true }
+chrono     = { workspace = true }

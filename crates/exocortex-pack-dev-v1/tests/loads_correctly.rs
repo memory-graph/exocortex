@@ -1,0 +1,113 @@
+//! M1 acceptance: the dev-v1 pack loads through the real registration path
+//! with 13/12/48 present, kernel constants bound, and a deterministic
+//! fingerprint.
+
+use exocortex_kernel::{kinds, pack::load_registered_packs, OntologyFingerprint};
+use exocortex_pack_dev_v1::{pack_def, EntityType, MemoryType, KIND_TABLE};
+
+#[test]
+fn loads_correctly() {
+    let onto = load_registered_packs().expect("dev-v1 pack loads");
+
+    // 13 memory types, 12 entity types (§7.18).
+    assert_eq!(onto.memory_type_names.len(), 13);
+    assert_eq!(onto.entity_type_names.len(), 12);
+    assert_eq!(MemoryType::ALL.len(), 13);
+    assert_eq!(EntityType::ALL.len(), 12);
+
+    // 48 authored kinds (+ auto-registered inverse companions, R-T4).
+    let authored = KIND_TABLE.iter().filter(|r| !r.companion).count();
+    assert_eq!(
+        authored, 48,
+        "dev-v1 must register exactly 48 authored kinds"
+    );
+    assert!(onto.kinds_by_id.len() > 48, "inverse companions registered");
+
+    // Bucket sizes: Solution 5, Causal 7, Context 9, Learning 6, Similarity 4,
+    // Workflow 6, Quality 5, Integration 6.
+    let bucket_counts = |b: exocortex_kernel::RelBucket| {
+        KIND_TABLE
+            .iter()
+            .filter(|r| !r.companion && r.bucket == b)
+            .count()
+    };
+    use exocortex_kernel::RelBucket::*;
+    assert_eq!(bucket_counts(Solution), 5);
+    assert_eq!(bucket_counts(Causal), 7);
+    assert_eq!(bucket_counts(Context), 9);
+    assert_eq!(bucket_counts(Learning), 6);
+    assert_eq!(bucket_counts(Similarity), 4);
+    assert_eq!(bucket_counts(Workflow), 6);
+    assert_eq!(bucket_counts(Quality), 5);
+    assert_eq!(bucket_counts(Integration), 6);
+
+    // All four kernel constants bound (R-Pk2).
+    for k in [
+        kinds::SOLVES,
+        kinds::FIXES,
+        kinds::CAUSES,
+        kinds::IN_SESSION,
+    ] {
+        assert!(
+            onto.kinds_by_id.contains_key(&k),
+            "kernel constant {k:?} bound"
+        );
+    }
+    assert_eq!(onto.kind_id("Solves"), Some(kinds::SOLVES));
+    assert_eq!(onto.kind_id("Fixes"), Some(kinds::FIXES));
+    assert_eq!(onto.kind_id("Causes"), Some(kinds::CAUSES));
+    assert_eq!(onto.kind_id("InSession"), Some(kinds::IN_SESSION));
+
+    // Every authored kind has a type triple entry (companions never do).
+    for row in KIND_TABLE.iter().filter(|r| !r.companion) {
+        let id = onto.kind_id(row.name).expect(row.name);
+        assert!(
+            onto.triples_by_kind.contains_key(&id),
+            "kind {} must have at least one type triple",
+            row.name
+        );
+    }
+
+    // Pack rules D1-D6 harvested for fingerprinting.
+    assert_eq!(onto.packs[0].rule_ids.len(), 6);
+
+    // Fingerprint deterministic across two loads.
+    let again = load_registered_packs().expect("second load");
+    assert_eq!(onto.fingerprint, again.fingerprint);
+    // And matches a fresh compute over the same def.
+    let d = pack_def();
+    assert_eq!(onto.fingerprint, OntologyFingerprint::compute(&[d]));
+}
+
+#[test]
+fn inverse_materialization_pairs_are_symmetric() {
+    let onto = load_registered_packs().unwrap();
+    for k in onto.kinds_by_id.values() {
+        if let Some(inv) = k.inverse {
+            let partner = &onto.kinds_by_id[&inv];
+            assert_eq!(
+                partner.inverse,
+                Some(k.id),
+                "{} <-> {} must be symmetric (R-T4)",
+                k.display_name,
+                partner.display_name
+            );
+        }
+    }
+}
+
+#[test]
+fn golden_fingerprint_is_pinned() {
+    let onto = load_registered_packs().unwrap();
+    let hex: String = onto
+        .fingerprint
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let golden = include_str!("dev_v1_fingerprint.txt").trim();
+    assert_eq!(
+        hex, golden,
+        "ontology drift: regenerate the golden file deliberately"
+    );
+}

@@ -51,7 +51,97 @@ pub struct TypeTriple {
     pub to_types: Option<Vec<u8>>,
 }
 
-inventory::collect!(PackDef);
+inventory::collect!(PackRegistration);
+
+/// Registration hook emitted by the `pack!` macro. `inventory` only accepts
+/// const-constructible values and `PackDef` carries heap data (`Vec`, heap
+/// `SmolStr`), so packs register a builder function instead; the ontology
+/// assembly invokes each builder once at load time.
+#[derive(Clone, Copy)]
+pub struct PackRegistration {
+    /// Builds the pack's `PackDef`. Must be deterministic.
+    pub build: fn() -> PackDef,
+}
+
+/// One row of the const kind table the `pack!` macro emits. Authored kinds
+/// carry `companion: false`; auto-registered inverse companions (R-T4) carry
+/// `companion: true`. Companions get no type triples and therefore cannot be
+/// authored directly (the R-T17 lookup fails for them).
+pub struct KindRow {
+    /// Display name of the kind (also its stable Cypher label, R-T2).
+    pub name: &'static str,
+    /// Bucket the kind belongs to.
+    pub bucket: crate::RelBucket,
+    /// Name of the inverse kind (`None` when the kind has no inverse).
+    /// Self-inverse kinds point at their own name.
+    pub inverse_name: Option<&'static str>,
+    /// Whether the kind is symmetric/bidirectional.
+    pub bidirectional: bool,
+    /// Default strength applied when an `EdgeHint` omits strength.
+    pub default_strength: f32,
+    /// Name of the kernel constant this kind binds ("" for none / companions).
+    pub kernel_const_name: &'static str,
+    /// `true` for auto-registered inverse companion rows.
+    pub companion: bool,
+}
+
+/// Resolve a kernel-constant name (as written in a `kernel_const:` DSL field)
+/// to its `RelKindId`. The closed kernel-constant list from `kinds.rs`.
+pub fn kernel_const_by_name(name: &str) -> Option<crate::RelKindId> {
+    match name {
+        "SOLVES" => Some(crate::kinds::SOLVES),
+        "FIXES" => Some(crate::kinds::FIXES),
+        "CAUSES" => Some(crate::kinds::CAUSES),
+        "IN_SESSION" => Some(crate::kinds::IN_SESSION),
+        _ => None,
+    }
+}
+
+/// Extract rule ids from a `crepe_rules!` block source. Rules are
+/// `pred(args) <- body;` — the id is the leading identifier of each
+/// `;`-terminated rule. Deterministic; used by the `pack!` builder.
+pub fn rule_ids_from_source(src: &'static str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for chunk in src.split(';') {
+        let chunk = chunk.trim_start();
+        if chunk.is_empty() {
+            continue;
+        }
+        match chunk.split('(').next() {
+            Some(pred) if !pred.trim().is_empty() && !pred.contains('<') => {
+                out.push(pred.trim());
+            }
+            _ => continue,
+        }
+    }
+    out
+}
+
+impl PackVersion {
+    /// Parse a `"major.minor.patch"` literal. Used by `pack!` at expansion
+    /// time; the input is always a literal, so parsing cannot fail in
+    /// practice — malformed input yields zeros.
+    pub const fn parse(s: &'static str) -> Self {
+        let bytes = s.as_bytes();
+        let mut field: usize = 0;
+        let mut idx: usize = 0;
+        let mut values: [u16; 3] = [0, 0, 0];
+        while idx < bytes.len() {
+            let b = bytes[idx];
+            if b >= b'0' && b <= b'9' {
+                values[field] = values[field] * 10 + (b - b'0') as u16;
+            } else if b == b'.' && field < 2 {
+                field += 1;
+            }
+            idx += 1;
+        }
+        Self {
+            major: values[0],
+            minor: values[1],
+            patch: values[2],
+        }
+    }
+}
 
 /// Called once at process startup. Consumes every `inventory::submit!` in the
 /// linked binary and produces the effective ontology. Fails if:
