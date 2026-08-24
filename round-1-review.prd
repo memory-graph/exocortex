@@ -1,0 +1,288 @@
+# Exocortex v1 — Master Plan (Post-Review)
+
+**Status:** Open work items from the 2026-08-24 deep review of the M0–M8
+implementation against `exocortex-core-prd.md`.
+
+**Context:** All nine milestones are committed (11 commits, `M0`…`M8` +
+report + lint sweep), 88 tests pass, and every gate runs green. The review
+found two correctness bugs and a set of runtime gaps where a promised
+capability exists as schema/struct but is not wired into a running system.
+This file is the worklist; each item cites the PRD obligation it closes.
+
+**Baseline (verified fresh at review time):**
+
+- `cargo test --workspace` — 88 passed, 0 failed
+- `cargo clippy --workspace --all-targets -- -D warnings` — green
+- `cargo fmt --all -- --check` — green
+- `cargo deny check` — green (recorded ignores)
+- `cargo xtask kernel-purity` / `fingerprint` / `gen-schemas` — green
+- SLO benches: search p50 29µs / p99 680µs (budget 500µs/3ms);
+  k-hop p50 272µs / p99 539µs (budget 300µs/2ms)
+- Live FalkorDB suites (storage 7/7, cluster+SSE) — green
+
+---
+
+## Phase 1 — Correctness bugs (do first; small, self-contained)
+
+### B1. MCR² alpha is off by a factor of 1/n
+
+- **Where:** `crates/exocortex-dreams/src/mcr2.rs:100` (`log_det_cov`)
+- **Bug:** PRD §11.2 pins `R(Z) = ½ log det(I + (d/(n·ε²))·ZZᵀ)`. The code
+  computes `alpha = d as f32 / (n * epsilon * epsilon) / n.max(1.0)`, i.e.
+  `d/(n²ε²)`, so it evaluates `det(I + d/(n²ε²)·XᵀX)`.
+- **Impact:** ΔR is distorted, and because `n` changes across a
+  consolidation cycle, the distortion is not even a constant offset — it
+  biases exactly the R-Mcr3 before/after regression check that gates
+  rollback.
+- **Fix:** `let alpha = d as f32 / (n * epsilon * epsilon);`
+- **Verify:** a unit test with a known closed-form case (e.g. orthogonal
+  unit vectors: per-class log-dets collapse to 0; total-rate computes the
+  analytic value); assert ΔR sign/magnitude on a hand-checkable matrix.
+
+### B2. 2Q `admit` pushes duplicate A1in entries
+
+- **Where:** `crates/exocortex-cache/src/lib.rs:418` (`LocalCache::admit`)
+- **Bug:** A1in membership is never checked before `push_back`, so repeated
+  `publish()` calls for the same org stack duplicate entries, corrupting
+  eviction order and the byte accounting.
+- **Impact:** 2Q semantics are wrong under repeated admission; worse, the
+  scan-pollution acceptance test is currently **vacuous** — its 16 MiB
+  budget never evicts the 65 tiny org graphs, so "recently-accessed
+  survives" asserts nothing.
+- **Fix:** skip `push_back` when already in A1in (A1in is a `VecDeque`; add
+  a membership set or scan — entry counts are small).
+- **Verify:** rewrite `two_q_resists_scan_pollution` with a budget small
+  enough to force eviction (assert the warm org survives AND that some cold
+  org was actually evicted); assert no duplicate A1in entries under
+  repeated publishes.
+
+---
+
+## Phase 2 — Write-path integrity
+
+### W1. `end_session` is not dispatched from the MCP server
+
+- **Where:** `crates/exocortex-client/src/mcp.rs` (dispatch lists 4 tools;
+  `tools/end_session.rs` exists but nothing calls it)
+- **PRD:** §13.6.2 — register the tool with the MCP server; M6 AC
+  ("harness calls end_session") cannot be exercised over stdio today.
+- **Fix:** add `exocortex.end_session` to `list_tools` + `call_tool`
+  dispatch. The tool needs a gRPC channel to the backend: add an
+  `Option<EndSessionTool>` to `ExocortexMcp` (None → structured
+  not-connected error), constructed from `--backend` in `main.rs`. For
+  offline mode (M3 WAL path), accept the batch, append to the WAL, return
+  `{ local_lsns, sync_pending: true }` per §5.2.
+- **Verify:** extend `stdio_smoke.rs` — initialize, call
+  `exocortex.end_session` with 3 memories + 2 edges against an in-process
+  test IngestService (or the offline WAL path), assert the ack.
+
+### W2. Inverse materialization never happens on write
+
+- **Where:** no `inverse` handling in `exocortex-storage`,
+  `exocortex-ingest`, or `exocortex-client` write paths
+- **PRD:** R-T4 — "writing `k(a,b)` writes `k'(b,a)` in the same
+  transaction"; also Success Criteria #6.
+- **Fix:** in the ingest commit path (and `FalkorStorage::upsert_batch`),
+  after validating a relationship, look up `RelMeta.inverse`; when present,
+  materialize the companion row (`k'(b,a)`, same provenance context,
+  companion visibility) in the same batch. InMemoryStorage too. R6
+  (`reverse_solves`) should call the same helper.
+- **Verify:** test — write `Solves(A,B)`; assert `SolvedBy(B,A)` exists in
+  storage with mirrored validity; assert a second write is idempotent;
+  assert companions are rejected when authored directly (validator's
+  triples-by-kind lookup already blocks them — add the explicit test).
+
+---
+
+## Phase 3 — Make Dreams work on real data
+
+### W3. Embeddings are never computed (fastembed linked, unused)
+
+- **Where:** zero `fastembed` references in any `src/`
+- **PRD:** §7.5 (`embedding` backend-assigned), §12 Dreams step 1 fetches
+  "memories + embeddings"; today ingest stores `embedding: None`, so on
+  real data `select_anchors` returns empty and MCR² errors `TooFew`. M8
+  passes only because tests hand-craft vectors.
+- **Fix:**
+  1. Add an embedding step to the ingest commit path (backend-only, off the
+     interactive path per R-Lat3): embed `title + content` after entity
+     extraction, store on the memory row. Gate behind a backend config
+     flag; the client never computes embeddings (§24 q1).
+  2. Provide a deterministic test double for the embedder so unit tests
+     don't download a model.
+- **Verify:** end-to-end test — submit a batch through IngestService on
+  InMemoryStorage with the fake embedder; run a Dreams cycle; assert
+  anchors > 0 and a ConsolidationResult stamps both MCR² values.
+
+### W4. Dreams never creates SimilarTo edges
+
+- **Where:** `crates/exocortex-dreams/src/lib.rs` — merge/strengthen/prune
+  only
+- **PRD:** §12.1 step 5 — create SimilarTo @ threshold 0.85 with
+  `Provenance::Computed { producer: SimilarityHnsw, threshold: 0.85 }`;
+  R-T14 — every SimilarTo edge carries Computed provenance.
+- **Fix:** in the cycle, after merge, write SimilarTo edges for surviving
+  same-class anchor pairs above 0.85 similarity (post-merge set), stamped
+  as above; exclude SimilarTo from sparsity out-degrees (already the
+  diagnostic's contract — verify with a test).
+- **Verify:** test — run a cycle on a dataset with 0.9-similar non-duplicate
+  pairs; assert SimilarTo edges exist, all with Computed provenance, and
+  that they did not count toward hairball_fraction.
+
+---
+
+## Phase 4 — Client/backend coherence parity
+
+### W5. SSE client is absent (eventsource-client linked, never used)
+
+- **Where:** no reconnecting subscriber anywhere in `src/`
+- **PRD:** M5.4 — reconnecting subscriber via `eventsource-client`; applies
+  deltas in backend-LSN order; buffers ahead-of-order; R-C6 `?since_lsn=N`
+  replay, `409 Resync Required` → targeted rehydration.
+- **Fix:** `exocortex-client/src/sync.rs` — spawn the SSE subscriber task:
+  connect `$backend/v1/changes?since_lsn=<last>`, decode base64 protobuf
+  envelopes (verify envelope HMAC, check fingerprint), feed
+  `CacheWrite::Apply` into the cache writer in LSN order (hold-back buffer
+  keyed on `backend_lsn`; gap → resubscribe with the earlier LSN).
+  Handle R-C5 heartbeats (stall detection → reconnect).
+- **Verify:** integration test — live server + SSE, commit an upsert,
+  assert the client cache observes the memory via the feed within 500ms
+  (Success Criteria #18's shape); unit test the LSN hold-back with
+  out-of-order envelopes.
+
+### W6. HTTP parity is schema-only (no routes installed)
+
+- **Where:** no `install_all_routes`/http_bind in `exocortex-server`
+- **PRD:** M7 AC — "Every operation the client can call is also callable
+  via HTTP" (CR-9); §21.1's `http_bind.rs`.
+- **Fix:** implement `http_bind` in `exocortex-server`: walk
+  `exocortex_ops::entries()`, mount each handler at `(method, http_path)`
+  with a shared `Arc<OpContext>`, plus bearer-token auth middleware
+  (R-Sec1/7). Add `/metrics` and the §19 health endpoints while the router
+  is open (R-O2, R-O4).
+- **Verify:** integration test — for each registered operation, POST/GET
+  via HTTP against a bootstrapped server and compare output to the typed
+  handler's result (the §21.3.6 parity test, but over the wire).
+
+### W7. Backend-node mode + gossip wiring
+
+- **Where:** `exocortex-node --mode backend-node` still bails ("arrives
+  with M5"); `chitchat` linked, unused
+- **PRD:** M5 AC — 3-node compose cluster, leader election converges <2s
+  after leader-kill, epoch fencing (the storage-side fencing is already
+  live-tested; the node-level loop is missing).
+- **Fix:** backend-node main: connect FalkorStorage, build ClusterNode +
+  SSE router + IngestService on one tonic/axum listener, start the lease
+  re-election loop (retry acquire on loss with epoch check), and wire
+  `chitchat` for member discovery with fingerprint+wire-version in the
+  chitchat state so admission composes with failure detection.
+- **Verify:** docker-compose-cluster test — kill the lease holder mid-cycle
+  (or between cycles), assert a new holder within 2s and no post-fence
+  write from the old holder lands.
+
+### W8. Wire session-wrapup → reasoning enqueue
+
+- **Where:** `ReasoningWork::SessionWrapup` is produced by no caller
+- **PRD:** §10.7 step 8 — "on every session-wrapup submit, enqueue
+  SessionWrapup { memories } after storage commit."
+- **Fix:** in the ingest server (or the end_session completion path), after
+  a successful commit, call `engine.enqueue(SessionWrapup{..})`. The ingest
+  crate already depends on exocortex-reasoning.
+- **Verify:** test — submit a wrapup batch, assert a derived edge appears
+  within a bounded wait (spawn the engine loop on a tokio runtime).
+
+---
+
+## Phase 5 — Hardening and PRD leftovers
+
+### H1. `exocortex-worker --adapter noop` must start without a live backend
+
+- **PRD:** M6 AC — "compiles and runs `--adapter noop` cleanly."
+- **Fix:** connect lazily / tolerate connection failure in noop mode (log
+  and idle), keep `--backend` for v2 adapters.
+
+### H2. Persist source ceilings; bound the idempotency store
+
+- **PRD:** §18.8.5 — last-1000 LRU of `(producer_id, batch_id)` → ack;
+  M6.5 — ceilings persisted in server config via RegisterSource.
+- **Fix:** swap the HashMaps for `lru::LruCache` (cap 1000); persist
+  ceilings (server config file or storage meta node), loaded at boot.
+
+### H3. `xtask bench` + CR-19 grep gate
+
+- **PRD:** §2.7 `Bench` runs the R-Lat1 SLO gate; CR-19 LLM-absence is a CI
+  grep (R-D6).
+- **Fix:** implement `Bench` to invoke the two bench binaries and fail on
+  SLO breach; add `xtask no-llm` (or fold into kernel-purity) grepping for
+  banned LLM client crates/strings across the workspace.
+
+### H4. Observability endpoints
+
+- **PRD:** R-O2 `/metrics`; R-O4 `/health/ready`; R-O5 `/health/cluster`;
+  R-O6 `/health/sync`; R-M5 hydration progress.
+- **Fix:** mount in the W6 router pass; wire the `metrics` recorder to a
+  Prometheus exporter; emit the §19 metric names from cache/cluster/dreams
+  call sites (several counters exist; audit the list).
+
+### H5. Security surface
+
+- **PRD:** R-Sec5 per-client SSE HMAC; R-Sec7 bearer/mTLS; R-Sec1 no
+  `--insecure`.
+- **Fix:** per-client secret derivation at SSE connect (query-param token →
+  HMAC per event); bearer middleware from W6; assert no insecure flag.
+
+### H6. Kernel/ingest small-fry
+
+- Tag normalization: enforce lowercase/trim/dedupe at draft→memory
+  (§2.6.1 memory.rs comment; never implemented).
+- `k_hop_reason`: use bounded `Storage::traverse` for neighborhood harvest
+  instead of full-relationship scans per hop (§10.6; currently
+  O(hops·E)).
+- Caller-visibility on storage point reads: `get_memory` hardcodes `Org`
+  ceiling; add a visibility-checked variant used by ops (cache path is
+  already correct) and a `PermissionDenied` error class (R-MT4).
+- `IngestServer::Clone` uses `blocking_lock()` — deadlock hazard under
+  async contention; restructure streaming to hold `Arc<Self>` instead.
+- §14.3 `effective_strength`: replace Dreams' flat +0.05 strengthen with
+  the formula (base, evidence, success_rate, age).
+- §12.2: move the Dreams fire channel to Redis RPUSH/BLPOP (R-Dr13 Lua
+  reset) and add the quiet-hours preference ordering (R-Dr14) — both are
+  config-shaped but PRD-named.
+
+### H7. Audit ledger onto storage
+
+- **PRD:** §21.4 — Storage-backed append-only log via the registered
+  `audit_append`/`audit_range` templates; R-A1 same-transaction.
+- **Fix:** route `append_audit`/`audit_range` through `query_cypher` when
+  the backend is FalkorDB (keep the in-memory ledger for the double);
+  include the audit write in the action's `upsert_batch` where the
+  transaction shape allows.
+
+### H8. Report hygiene
+
+- Update `MILESTONE_REPORT.md`: move W1/W3/W5/W7/W9 (this file's
+  W1/W6/W3/W4-class items) from "configuration-level" phrasing to explicit
+  runtime-gap disclosure, or simply reference this master plan as the
+  authoritative residual-work list.
+
+---
+
+## Success criteria for this plan
+
+1. Both bug fixes land with the new unit tests described above.
+2. A harness can call `end_session` over stdio end-to-end and observe the
+   memories via `search_memories` (Success Criteria #18 shape, modulo SSE).
+3. A Dreams cycle run against IngestService-ingested data (with the fake
+   embedder) produces anchors, MCR² stamps, merged ids, and SimilarTo
+   edges with Computed provenance.
+4. Every registered operation answers over HTTP on a running
+   `exocortex-node`, with auth.
+5. The 3-node compose harness demonstrates lease handover <2s after kill
+   with no zombie writes.
+6. All original gates stay green throughout; new tests raise the suite
+   count monotonically.
+
+## Explicitly deferred (PRD v2, not this plan)
+
+Iceberg/Delta/parquet adapters, second-pack demo, federation, embedding
+fine-tuning (§24 items) — unchanged from the PRD's own deferrals.
