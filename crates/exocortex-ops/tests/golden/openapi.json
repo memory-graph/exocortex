@@ -1,0 +1,229 @@
+{
+  "info": {
+    "title": "exocortex",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v1/accept_discovery": {
+      "post": {
+        "operationId": "accept_discovery",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "description": "Input for `accept_discovery`.",
+                "properties": {
+                  "discovery_id": {
+                    "description": "Discovery id (UUID).",
+                    "type": "string"
+                  },
+                  "from": {
+                    "description": "Hex from-memory id.",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "description": "Kind display name.",
+                    "type": "string"
+                  },
+                  "to": {
+                    "description": "Hex to-memory id.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "discovery_id",
+                  "from",
+                  "kind",
+                  "to"
+                ],
+                "title": "AcceptDiscoveryInput",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/v1/audit": {
+      "get": {
+        "operationId": "list_audit_records",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "description": "Input for `list_audit_records`.",
+                "properties": {
+                  "since_lsn": {
+                    "default": 0,
+                    "description": "Only records after this LSN.",
+                    "format": "uint64",
+                    "minimum": 0.0,
+                    "type": "integer"
+                  }
+                },
+                "title": "ListAuditInput",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/v1/find_related": {
+      "post": {
+        "operationId": "find_related",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "description": "Input for `find_related`.",
+                "properties": {
+                  "anchor": {
+                    "description": "Anchor memory (hex id).",
+                    "type": "string"
+                  },
+                  "k": {
+                    "default": 2,
+                    "description": "Hop bound (hard-capped at 4).",
+                    "format": "uint8",
+                    "minimum": 0.0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "anchor"
+                ],
+                "title": "FindRelatedInput",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/v1/get_memory": {
+      "post": {
+        "operationId": "get_memory",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "description": "Input for `get_memory`.",
+                "properties": {
+                  "id": {
+                    "description": "Hex memory id.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id"
+                ],
+                "title": "GetMemoryInput",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/v1/promote_visibility": {
+      "post": {
+        "operationId": "promote_visibility",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "description": "Input for `promote_visibility`.",
+                "properties": {
+                  "memory_id": {
+                    "description": "Hex memory id.",
+                    "type": "string"
+                  },
+                  "to": {
+                    "description": "Target visibility: \"project\"|\"team\"|\"org\".",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "memory_id",
+                  "to"
+                ],
+                "title": "PromoteVisibilityInput",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/v1/search_memories": {
+      "post": {
+        "operationId": "search_memories",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "description": "Input for `search_memories`.",
+                "properties": {
+                  "limit": {
+                    "default": 20,
+                    "description": "Result cap.",
+                    "format": "uint32",
+                    "minimum": 0.0,
+                    "type": "integer"
+                  },
+                  "query": {
+                    "description": "Free-text query.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "query"
+                ],
+                "title": "SearchInput",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    }
+  }
+}

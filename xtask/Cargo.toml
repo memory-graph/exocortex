@@ -11,3 +11,5 @@ clap        = { version = "4", features = ["derive"] }
 serde_json  = { workspace = true }
 exocortex-kernel      = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
+exocortex-ops = { workspace = true }
+schemars = { workspace = true }

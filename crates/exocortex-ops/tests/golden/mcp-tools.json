@@ -1,0 +1,150 @@
+[
+  {
+    "description": "accept_discovery",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `accept_discovery`.",
+      "properties": {
+        "discovery_id": {
+          "description": "Discovery id (UUID).",
+          "type": "string"
+        },
+        "from": {
+          "description": "Hex from-memory id.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Kind display name.",
+          "type": "string"
+        },
+        "to": {
+          "description": "Hex to-memory id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "discovery_id",
+        "from",
+        "kind",
+        "to"
+      ],
+      "title": "AcceptDiscoveryInput",
+      "type": "object"
+    },
+    "name": "exocortex.accept_discovery"
+  },
+  {
+    "description": "find_related",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `find_related`.",
+      "properties": {
+        "anchor": {
+          "description": "Anchor memory (hex id).",
+          "type": "string"
+        },
+        "k": {
+          "default": 2,
+          "description": "Hop bound (hard-capped at 4).",
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "anchor"
+      ],
+      "title": "FindRelatedInput",
+      "type": "object"
+    },
+    "name": "exocortex.find_related"
+  },
+  {
+    "description": "get_memory",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `get_memory`.",
+      "properties": {
+        "id": {
+          "description": "Hex memory id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "GetMemoryInput",
+      "type": "object"
+    },
+    "name": "exocortex.get_memory"
+  },
+  {
+    "description": "list_audit_records",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `list_audit_records`.",
+      "properties": {
+        "since_lsn": {
+          "default": 0,
+          "description": "Only records after this LSN.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "title": "ListAuditInput",
+      "type": "object"
+    },
+    "name": "exocortex.list_audit_records"
+  },
+  {
+    "description": "promote_visibility",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `promote_visibility`.",
+      "properties": {
+        "memory_id": {
+          "description": "Hex memory id.",
+          "type": "string"
+        },
+        "to": {
+          "description": "Target visibility: \"project\"|\"team\"|\"org\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "memory_id",
+        "to"
+      ],
+      "title": "PromoteVisibilityInput",
+      "type": "object"
+    },
+    "name": "exocortex.promote_visibility"
+  },
+  {
+    "description": "search_memories",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `search_memories`.",
+      "properties": {
+        "limit": {
+          "default": 20,
+          "description": "Result cap.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "query": {
+          "description": "Free-text query.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "SearchInput",
+      "type": "object"
+    },
+    "name": "exocortex.search_memories"
+  }
+]

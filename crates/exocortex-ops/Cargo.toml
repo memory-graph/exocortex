@@ -6,6 +6,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+smol_str = { workspace = true }
+smallvec = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+http = { workspace = true }
+serde_json = { workspace = true }
 exocortex-kernel = { workspace = true }
 exocortex-storage = { workspace = true }
 exocortex-cache = { workspace = true }
@@ -13,3 +24,7 @@ exocortex-reasoning = { workspace = true }
 schemars = { workspace = true }
 inventory = { workspace = true }
 rmcp = { workspace = true }
+
+[dev-dependencies]
+exocortex-pack-dev-v1 = { workspace = true }
+tokio = { workspace = true }

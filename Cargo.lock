@@ -956,13 +956,26 @@ dependencies = [
 name = "exocortex-ops"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "chrono",
  "exocortex-cache",
  "exocortex-kernel",
+ "exocortex-pack-dev-v1",
  "exocortex-reasoning",
  "exocortex-storage",
+ "futures",
+ "http 1.5.0",
  "inventory",
  "rmcp",
  "schemars",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "smol_str",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -3783,7 +3796,9 @@ dependencies = [
  "anyhow",
  "clap",
  "exocortex-kernel",
+ "exocortex-ops",
  "exocortex-pack-dev-v1",
+ "schemars",
  "serde_json",
 ]
 

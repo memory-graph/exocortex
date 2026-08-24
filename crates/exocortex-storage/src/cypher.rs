@@ -259,6 +259,40 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         "#,
     });
 
+    reg!(Template {
+        id: "audit_append",
+        read_only: false,
+        required_params: &[
+            "action",
+            "actor",
+            "org_id",
+            "input_digest",
+            "output_ids",
+            "fingerprint",
+            "lease_epoch",
+            "recorded_at",
+            "lsn"
+        ],
+        cypher: r#"
+            CREATE (a:_AuditRecord {
+                action: $action, actor: $actor, org_id: $org_id,
+                input_digest: $input_digest, output_ids: $output_ids,
+                fingerprint: $fingerprint, lease_epoch: $lease_epoch,
+                recorded_at: $recorded_at, lsn: $lsn})
+            RETURN id(a) AS node_id
+        "#,
+    });
+
+    reg!(Template {
+        id: "audit_range",
+        read_only: true,
+        required_params: &["since_lsn", "limit"],
+        cypher: r#"
+            MATCH (a:_AuditRecord) WHERE a.lsn > $since_lsn
+            RETURN a ORDER BY a.lsn ASC LIMIT $limit
+        "#,
+    });
+
     m
 });
 

@@ -15,8 +15,13 @@ enum Cmd {
     /// unintended ontology drift between commits.
     Fingerprint,
     /// Generate MCP + OpenAPI schemas from the operation registry.
-    /// Fails if generated schemas are out of date (CI gate).
-    GenSchemas,
+    /// Fails if generated schemas are out of date (CI gate). Pass --write to
+    /// regenerate and commit the goldens.
+    GenSchemas {
+        /// Regenerate the golden files instead of verifying.
+        #[arg(long)]
+        write: bool,
+    },
     /// Run the R-I1/R-I5 kernel purity check: shells out to
     /// `cargo tree -p exocortex-kernel -e no-dev` and greps for banned crates.
     KernelPurity,
@@ -27,7 +32,7 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Fingerprint => fingerprint(),
-        Cmd::GenSchemas => todo!(),
+        Cmd::GenSchemas { write } => gen_schemas(write),
         Cmd::KernelPurity => kernel_purity(),
         Cmd::Bench => todo!(),
     }
@@ -48,6 +53,71 @@ fn fingerprint() -> Result<()> {
         let _ = write!(hex, "{b:02x}");
     }
     println!("{hex}");
+    Ok(())
+}
+
+/// `cargo xtask gen-schemas` — emit MCP tool + OpenAPI catalogues from the
+/// operation registry and verify the checked-in goldens match (schema-drift
+/// CI gate, §21.2). Regenerate with --write.
+fn gen_schemas(write: bool) -> Result<()> {
+    let mut openapi = serde_json::json!({
+        "openapi": "3.1.0",
+        "info": { "title": "exocortex", "version": env!("CARGO_PKG_VERSION") },
+        "paths": {},
+    });
+    let mut mcp_tools = serde_json::json!([]);
+    let mut seen = std::collections::HashSet::new();
+    for e in exocortex_ops::entries() {
+        anyhow::ensure!(seen.insert(e.name), "duplicate op name {}", e.name);
+        let input_schema = (e.input_schema)();
+        anyhow::ensure!(
+            input_schema
+                .schema
+                .metadata
+                .as_ref()
+                .and_then(|m| m.title.clone())
+                .is_some(),
+            "{}: input schema missing title",
+            e.name
+        );
+        openapi["paths"][e.http_path] = serde_json::json!({
+            format!("{:?}", (e.http_method)()).to_lowercase(): {
+                "operationId": e.name,
+                "requestBody": { "content": { "application/json": { "schema": input_schema } } },
+                "responses": { "200": { "description": "OK" } },
+            }
+        });
+        mcp_tools.as_array_mut().unwrap().push(serde_json::json!({
+            "name": e.mcp_tool_name,
+            "description": e.name,
+            "inputSchema": (e.input_schema)(),
+        }));
+    }
+    for (name, doc) in [("openapi.json", &openapi), ("mcp-tools.json", &mcp_tools)] {
+        let path = format!("crates/exocortex-ops/tests/golden/{name}");
+        let serialized = serde_json::to_string_pretty(doc)?;
+        if write {
+            std::fs::create_dir_all("crates/exocortex-ops/tests/golden")?;
+            std::fs::write(
+                &path,
+                serialized
+                    + "
+",
+            )?;
+            println!("wrote {path}");
+        } else {
+            let golden = std::fs::read_to_string(&path).map_err(|_| {
+                anyhow::anyhow!(
+                    "golden {path} missing; run `cargo xtask gen-schemas --write` and commit it"
+                )
+            })?;
+            anyhow::ensure!(
+                golden.trim() == serialized.trim(),
+                "schema drift in {name}; run `cargo xtask gen-schemas --write` and commit the diff"
+            );
+        }
+    }
+    println!("parity ok: {} operations", exocortex_ops::entries().len());
     Ok(())
 }
 
