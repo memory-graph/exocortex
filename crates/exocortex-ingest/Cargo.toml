@@ -5,10 +5,40 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "exocortex_ingest"
+path = "src/lib.rs"
+
 [dependencies]
+
 exocortex-kernel = { workspace = true }
 exocortex-wire = { workspace = true }
 exocortex-storage = { workspace = true }
 exocortex-cache = { workspace = true }
 exocortex-reasoning = { workspace = true }
 tonic = { workspace = true }
+tokio-stream = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+blake3 = { workspace = true }
+serde_json = { workspace = true }
+smol_str = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+once_cell = { workspace = true }
+regex = { workspace = true }
+lasso = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+exocortex-pack-dev-v1 = { workspace = true }
+
+[dev-dependencies]
+exocortex-client = { workspace = true }
+blake3 = { workspace = true }
+prost = { workspace = true }
+exocortex-pack-dev-v1 = { workspace = true }
+futures = { workspace = true }

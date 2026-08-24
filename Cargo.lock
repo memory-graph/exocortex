@@ -844,10 +844,14 @@ dependencies = [
  "exocortex-reasoning",
  "exocortex-storage",
  "exocortex-wire",
+ "hmac",
+ "prost",
+ "prost-types",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "sled",
  "smol_str",
  "thiserror 1.0.69",
@@ -900,12 +904,31 @@ dependencies = [
 name = "exocortex-ingest"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "blake3",
+ "chrono",
  "exocortex-cache",
+ "exocortex-client",
  "exocortex-kernel",
+ "exocortex-pack-dev-v1",
  "exocortex-reasoning",
  "exocortex-storage",
  "exocortex-wire",
+ "futures",
+ "hmac",
+ "lasso",
+ "once_cell",
+ "prost",
+ "regex",
+ "serde_json",
+ "sha2",
+ "smol_str",
+ "subtle",
+ "tokio",
+ "tokio-stream",
  "tonic",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1042,9 +1065,13 @@ dependencies = [
 name = "exocortex-worker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
  "exocortex-wire",
  "tokio",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

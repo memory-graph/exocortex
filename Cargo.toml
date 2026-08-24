@@ -108,6 +108,7 @@ metrics-exporter-prometheus = "0.15"
 
 # --- testing ---
 proptest    = "1"
+regex       = "1"
 
 # --- internal ---
 exocortex-kernel = { path = "crates/exocortex-kernel", version = "0.1.0" }

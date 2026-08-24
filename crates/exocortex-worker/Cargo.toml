@@ -5,7 +5,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "exocortex-worker"
+path = "src/main.rs"
+
 [dependencies]
 exocortex-wire = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

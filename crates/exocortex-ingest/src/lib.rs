@@ -1,10 +1,15 @@
-//! The Ingestion Protocol server (IngestService) — the single validated write path for external data.
-//!
-//! See PRD §18; populated at M6.
+// crates/exocortex-ingest/src/lib.rs
+//! The Ingestion Protocol server (§7.13, §18): the single validated write
+//! path. `IngestService.Submit` runs the kernel validation pipeline
+//! (fingerprint, source admission + ceiling, R-T11a no-widening, R-T17
+//! triples, idempotency by (producer_id, batch_id), HMAC authentication
+//! before anything else — R-I8) and commits atomically.
+
 #![deny(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
 
-// Modules populated by the milestone that owns this crate.
-// Empty compilable scaffold at M0:
-/// Compile-time placeholder; replaced when the owning milestone lands.
-pub fn __placeholder() {}
+pub mod entities;
+pub mod service;
+
+pub use entities::EntityExtractor;
+pub use service::IngestServer;
