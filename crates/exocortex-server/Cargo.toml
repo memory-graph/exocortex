@@ -5,14 +5,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "exocortex_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "exocortex-node"
+path = "src/main.rs"
+
 [dependencies]
-anyhow = { workspace = true }
-clap = { version = "4", features = ["derive"] }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-chrono = { workspace = true }
-tokio = { workspace = true }
-exocortex-pack-dev-v1 = { workspace = true }
 exocortex-kernel = { workspace = true }
 exocortex-storage = { workspace = true }
 exocortex-cache = { workspace = true }
@@ -21,9 +22,20 @@ exocortex-cluster = { workspace = true }
 exocortex-ingest = { workspace = true }
 exocortex-ops = { workspace = true }
 exocortex-dreams = { workspace = true }
+exocortex-wire = { workspace = true }
+exocortex-pack-dev-v1 = { workspace = true }
 axum = { workspace = true }
 rmcp = { workspace = true }
-
-[[bin]]
-name = "exocortex-node"
-path = "src/main.rs"
+prost = { workspace = true }
+async-stream = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }

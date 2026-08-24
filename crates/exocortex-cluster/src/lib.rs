@@ -1,10 +1,13 @@
-//! Backend-only cluster machinery: gossip membership, Redis coherence, Chubby-style leases, HMAC-signed invalidation transport.
-//!
-//! See PRD §9; populated at M5.
+// crates/exocortex-cluster/src/lib.rs
+//! Backend-only cluster machinery (§9): Chubby-style Redis leases with
+//! fencing epochs, HMAC-signed invalidation envelopes, peer admission gated
+//! on wire version + ontology fingerprint (§9.1), and the SSE surface used
+//! by subscribed clients.
+
 #![deny(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
 
-// Modules populated by the milestone that owns this crate.
-// Empty compilable scaffold at M0:
-/// Compile-time placeholder; replaced when the owning milestone lands.
-pub fn __placeholder() {}
+pub mod node;
+pub mod sse;
+
+pub use node::{ClusterError, ClusterNode};

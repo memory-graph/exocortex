@@ -1,0 +1,40 @@
+version: "3.8"
+# M5 harness: a FalkorDB instance shared by the three exocortex-node
+# replicas (falkordb IS the redis coherence layer, §9.1 principle 6).
+# CI starts the nodes with:
+#   docker compose -f docker-compose-cluster.yml up -d falkordb
+#   FALKOR_URL=falkor://127.0.0.1:16379 cargo test -p exocortex-cluster --features integration
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+  node1:
+    image: exocortex-node:local
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    command: ["--mode", "backend-node", "--bind", ":8081", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node2:8082,node3:8083"]
+    ports:
+      - "8081:8081"
+  node2:
+    image: exocortex-node:local
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    command: ["--mode", "backend-node", "--bind", ":8082", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node3:8083"]
+    ports:
+      - "8082:8082"
+  node3:
+    image: exocortex-node:local
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    command: ["--mode", "backend-node", "--bind", ":8083", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node2:8082"]
+    ports:
+      - "8083:8083"
