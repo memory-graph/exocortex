@@ -13,23 +13,42 @@ use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId,
 
 /// The deterministic test double (§6.6): HashMaps and Vecs, no Cypher, no
 /// I/O. Ships as a v1 deliverable — every unit test above the storage seam
-/// depends on it.
+/// depends on it. Clones share the same underlying state.
 pub struct InMemoryStorage {
+    inner: std::sync::Arc<InMemoryInner>,
+    lsn: std::sync::Arc<AtomicU64>,
+}
+
+struct InMemoryInner {
     memories: Mutex<HashMap<MemoryId, Vec<Memory>>>, // history stack per id
     rels: Mutex<HashMap<RelationshipId, Vec<Relationship>>>,
-    lsn: AtomicU64,
     ontology: std::sync::Arc<exocortex_kernel::Ontology>,
+}
+
+impl Clone for InMemoryStorage {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            lsn: self.lsn.clone(),
+        }
+    }
 }
 
 impl InMemoryStorage {
     /// Build a double over an assembled ontology.
     pub fn new(ontology: std::sync::Arc<exocortex_kernel::Ontology>) -> Self {
         Self {
-            memories: Default::default(),
-            rels: Default::default(),
-            lsn: AtomicU64::new(0),
-            ontology,
+            inner: std::sync::Arc::new(InMemoryInner {
+                memories: Default::default(),
+                rels: Default::default(),
+                ontology,
+            }),
+            lsn: std::sync::Arc::new(AtomicU64::new(0)),
         }
+    }
+    /// A clone handle sharing the same underlying state (tests and caches).
+    pub fn clone_dyn(&self) -> Self {
+        self.clone()
     }
     fn next_lsn(&self) -> u64 {
         self.lsn.fetch_add(1, Ordering::SeqCst) + 1
@@ -37,7 +56,8 @@ impl InMemoryStorage {
 
     /// Current (last) version of a memory row, if any.
     pub fn memory_history(&self, id: &MemoryId) -> Vec<Memory> {
-        self.memories
+        self.inner
+            .memories
             .lock()
             .unwrap()
             .get(id)
@@ -47,7 +67,8 @@ impl InMemoryStorage {
 
     /// Current (last) version of a relationship row, if any.
     pub fn relationship_history(&self, id: &RelationshipId) -> Vec<Relationship> {
-        self.rels
+        self.inner
+            .rels
             .lock()
             .unwrap()
             .get(id)
@@ -65,7 +86,7 @@ impl InMemoryStorage {
 impl Storage for InMemoryStorage {
     async fn upsert_memory(&self, m: &Memory) -> Result<CommitRecord, StorageError> {
         let lsn = self.next_lsn();
-        let mut store = self.memories.lock().unwrap();
+        let mut store = self.inner.memories.lock().unwrap();
         let mut m = m.clone();
         m.lsn = exocortex_kernel::LSN::new_backend(lsn);
         store.entry(m.id).or_default().push(m);
@@ -92,7 +113,7 @@ impl Storage for InMemoryStorage {
     }
     async fn delete_memory(&self, id: &MemoryId) -> Result<CommitRecord, StorageError> {
         let lsn = self.next_lsn();
-        let mut store = self.memories.lock().unwrap();
+        let mut store = self.inner.memories.lock().unwrap();
         if let Some(h) = store.get_mut(id) {
             if let Some(last) = h.last_mut() {
                 last.valid_until = Some(Utc::now());
@@ -108,7 +129,7 @@ impl Storage for InMemoryStorage {
     }
     async fn upsert_relationship(&self, r: &Relationship) -> Result<CommitRecord, StorageError> {
         let lsn = self.next_lsn();
-        let mut store = self.rels.lock().unwrap();
+        let mut store = self.inner.rels.lock().unwrap();
         let mut r = r.clone();
         r.lsn = exocortex_kernel::LSN::new_backend(lsn);
         store.entry(r.id).or_default().push(r);
@@ -121,7 +142,7 @@ impl Storage for InMemoryStorage {
     }
     async fn delete_relationship(&self, id: &RelationshipId) -> Result<CommitRecord, StorageError> {
         let lsn = self.next_lsn();
-        let mut store = self.rels.lock().unwrap();
+        let mut store = self.inner.rels.lock().unwrap();
         if let Some(h) = store.get_mut(id) {
             if let Some(last) = h.last_mut() {
                 last.valid_until = Some(Utc::now());
@@ -137,6 +158,7 @@ impl Storage for InMemoryStorage {
     }
     async fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>, StorageError> {
         Ok(self
+            .inner
             .memories
             .lock()
             .unwrap()
@@ -144,7 +166,7 @@ impl Storage for InMemoryStorage {
             .and_then(|h| h.last().cloned()))
     }
     async fn get_memories(&self, ids: &[MemoryId]) -> Result<Vec<Memory>, StorageError> {
-        let store = self.memories.lock().unwrap();
+        let store = self.inner.memories.lock().unwrap();
         Ok(ids
             .iter()
             .filter_map(|id| store.get(id).and_then(|h| h.last().cloned()))
@@ -165,8 +187,8 @@ impl Storage for InMemoryStorage {
         Ok(vec![])
     }
     async fn get_state_at(&self, t: DateTime<Utc>) -> Result<GraphSnapshot, StorageError> {
-        let store = self.memories.lock().unwrap();
-        let rels = self.rels.lock().unwrap();
+        let store = self.inner.memories.lock().unwrap();
+        let rels = self.inner.rels.lock().unwrap();
         let valid =
             |vf: DateTime<Utc>, vu: &Option<DateTime<Utc>>| vf <= t && vu.map_or(true, |v| v > t);
         Ok(GraphSnapshot {
@@ -187,7 +209,7 @@ impl Storage for InMemoryStorage {
         id: &MemoryId,
         at: DateTime<Utc>,
     ) -> Result<Option<Memory>, StorageError> {
-        let store = self.memories.lock().unwrap();
+        let store = self.inner.memories.lock().unwrap();
         Ok(store.get(id).and_then(|h| {
             h.iter()
                 .rev()
@@ -202,6 +224,7 @@ impl Storage for InMemoryStorage {
     }
     async fn stream_all_memories(&self) -> BoxStream<'_, Result<Memory, StorageError>> {
         let all: Vec<_> = self
+            .inner
             .memories
             .lock()
             .unwrap()
@@ -212,6 +235,7 @@ impl Storage for InMemoryStorage {
     }
     async fn stream_all_relationships(&self) -> BoxStream<'_, Result<Relationship, StorageError>> {
         let all: Vec<_> = self
+            .inner
             .rels
             .lock()
             .unwrap()
@@ -269,7 +293,7 @@ impl Storage for InMemoryStorage {
         StorageBackendId::InMemory
     }
     fn ontology_fingerprint(&self) -> [u8; 32] {
-        self.ontology.fingerprint.0
+        self.inner.ontology.fingerprint.0
     }
 }
 

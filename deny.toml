@@ -61,4 +61,6 @@ ignore = [
     "RUSTSEC-2026-0104", # rustls/webpki CRL parsing panic — pinned rustls line
     "RUSTSEC-2026-0189", # rustls/webpki URI name-constraint acceptance — pinned rustls line
     "RUSTSEC-2026-0251", # sized-chunks unmaintained — via chitchat 0.9
+    "RUSTSEC-2026-0002", # lru 0.12 unsound — PRD-pinned lru 0.12 (§2.2); no fixed release on that line
+    "RUSTSEC-2026-0253", # lru 0.12 unsound (second advisory) — same pin, same reason
 ]

@@ -6,6 +6,22 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+blake3 = { workspace = true }
+bincode = { workspace = true}
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+exocortex-storage = { workspace = true }
+smol_str = { workspace = true }
+tokio = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+exocortex-pack-dev-v1 = { workspace = true }
 exocortex-kernel = { workspace = true }
 exocortex-wire = { workspace = true }
 tonic = { workspace = true }
@@ -15,3 +31,7 @@ exocortex-ops = { workspace = true }
 rmcp = { workspace = true }
 sled = { workspace = true }
 eventsource-client = { workspace = true }
+
+[[bin]]
+name = "exocortex-mcp-client"
+path = "src/main.rs"

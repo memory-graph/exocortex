@@ -7,8 +7,26 @@ license.workspace = true
 
 [dependencies]
 exocortex-kernel = { workspace = true }
+exocortex-storage = { workspace = true }
 arc-swap = { workspace = true }
 dashmap = { workspace = true }
 petgraph = { workspace = true }
 roaring = { workspace = true }
 lasso = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+lru = { workspace = true }
+smallvec = { workspace = true }
+smol_str = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+exocortex-pack-dev-v1 = { workspace = true }
+stats_alloc = "0.1"  # §8.5 step 1: no-allocation assertion on the read hot path
+
+[[bench]]
+name = "search"
+harness = false
