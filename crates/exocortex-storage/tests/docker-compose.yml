@@ -1,0 +1,18 @@
+version: "3.8"
+# M2 integration harness: FalkorDB (a Redis server with the FalkorDB module).
+# Per §9.1/principle 6 the coherence Redis is the same instance as FalkorDB;
+# the plain `redis` service exists for auxiliary tooling only.
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"

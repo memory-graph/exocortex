@@ -16,6 +16,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 smol_str = { workspace = true }
 futures = { workspace = true }
+once_cell = { workspace = true }
+chrono = { workspace = true }
+smallvec = { workspace = true }
+redis = { workspace = true }
 
 [features]
 integration = []
+
+[dev-dependencies]
+exocortex-kernel = { workspace = true }
+exocortex-pack-dev-v1 = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+smol_str = { workspace = true }

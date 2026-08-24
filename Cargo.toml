@@ -44,7 +44,7 @@ opentelemetry-otlp        = { version = "0.16", features = ["tonic"] }
 arc-swap  = "1.7"
 dashmap   = "6"
 petgraph  = "0.6"
-smallvec  = { version = "1", features = ["serde"] }  # serde needed: kernel serde types carry SmallVec (PRD §2.2 gap)
+smallvec  = { version = "1", features = ["serde", "const_generics"] }  # serde needed: kernel serde types carry SmallVec (PRD §2.2 gap)
 smol_str  = { version = "0.3", features = ["serde"] }  # serde needed: kernel serde types carry SmolStr (PRD §2.2 gap)
 lasso     = { version = "0.7", features = ["multi-threaded"] }
 roaring   = "0.10"
@@ -66,7 +66,7 @@ sha2        = "0.10"
 hmac        = "0.12"
 
 # --- storage / http ---
-falkordb    = "0.3"          # M0 pin check: 0.1.x unconditionally enables parking_lot/deadlock_detection, which is mutually exclusive with steel-core's send_guard (compile_error in every parking_lot 0.12.x). 0.3.0 is the first release without it.
+falkordb    = { version = "0.3", features = ["tokio"] }          # M0 pin check: 0.1.x unconditionally enables parking_lot/deadlock_detection, which is mutually exclusive with steel-core's send_guard (compile_error in every parking_lot 0.12.x). 0.3.0 is the first release without it.
 redis       = { version = "0.27", features = ["tokio-comp", "aio"] }
 sled        = "0.34"
 axum        = { version = "0.7", features = ["macros", "http2"] }

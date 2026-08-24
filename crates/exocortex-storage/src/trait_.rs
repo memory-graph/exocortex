@@ -1,0 +1,134 @@
+// trait_.rs — the storage seam. Full signature in §6.1; support types in §6.3.
+use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
+use futures::stream::BoxStream;
+
+use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId};
+
+use crate::types::{
+    CommitRecord, CypherQuery, Embedding, GraphSnapshot, Invalidation, LeaseKey, MemoryFilter,
+    OwnerLease, RegionKey, ResultSet, StorageBackendId, StorageCapabilities, TraversalSpec,
+};
+
+/// Errors surfaced by every `Storage` implementation.
+#[derive(Debug, thiserror::Error)]
+pub enum StorageError {
+    /// Backend/driver failure, with detail.
+    #[error("backend error: {0}")]
+    Backend(String),
+    /// The runtime ontology fingerprint does not match the one pinned in
+    /// storage (R-D5). Startup must fail fast.
+    #[error("ontology fingerprint mismatch: storage={storage:?} runtime={runtime:?}")]
+    FingerprintMismatch {
+        /// Fingerprint persisted in the backend.
+        storage: [u8; 32],
+        /// Fingerprint of the running process.
+        runtime: [u8; 32],
+    },
+}
+
+/// The one deliberate seam (§6.0): every subsystem above storage depends on
+/// this trait, never on FalkorDB. Cypher stays inside implementations (CR-10).
+#[async_trait]
+pub trait Storage: Send + Sync + 'static {
+    // ---- Memory + relationship writes ----
+
+    /// Upsert one memory row; returns the commit record with a monotonic
+    /// backend LSN (R-S3).
+    async fn upsert_memory(&self, m: &Memory) -> crate::Result<CommitRecord>;
+    /// Atomically upsert a batch of memories and relationships; on any
+    /// per-row failure the whole batch fails (R-T17).
+    async fn upsert_batch(
+        &self,
+        ms: &[Memory],
+        rs: &[Relationship],
+    ) -> crate::Result<Vec<CommitRecord>>;
+    /// Soft-delete a memory: close `valid_until`, never remove the node.
+    async fn delete_memory(&self, id: &MemoryId) -> crate::Result<CommitRecord>;
+    /// Upsert one relationship row (DELETE-then-CREATE, R-S2).
+    async fn upsert_relationship(&self, r: &Relationship) -> crate::Result<CommitRecord>;
+    /// Soft-delete a relationship: close `valid_until`.
+    async fn delete_relationship(&self, id: &RelationshipId) -> crate::Result<CommitRecord>;
+
+    // ---- Reads (interactive path) ----
+
+    /// Point read, visibility-filtered at the storage boundary (CR-22).
+    async fn get_memory(&self, id: &MemoryId) -> crate::Result<Option<Memory>>;
+    /// Point read of several memories; missing ids are omitted.
+    async fn get_memories(&self, ids: &[MemoryId]) -> crate::Result<Vec<Memory>>;
+    /// Bounded k-hop traversal (CR-6 hard caps).
+    async fn traverse(&self, from: &MemoryId, spec: &TraversalSpec) -> crate::Result<Vec<Memory>>;
+    /// Memories about an entity, filtered and bounded.
+    async fn find_by_entity(
+        &self,
+        entity: &EntityId,
+        filter: &MemoryFilter,
+    ) -> crate::Result<Vec<Memory>>;
+
+    // ---- Bi-temporal ----
+
+    /// Count summary of the graph state valid at `t` (CR-4).
+    async fn get_state_at(&self, t: DateTime<Utc>) -> crate::Result<GraphSnapshot>;
+    /// Bi-temporal point read: the memory row valid at `at`.
+    async fn valid_at(&self, id: &MemoryId, at: DateTime<Utc>) -> crate::Result<Option<Memory>>;
+
+    // ---- Bulk / streaming (Dreams, backfill) ----
+
+    /// Execute a registered Cypher template (§6.4); unregistered templates
+    /// are refused. Cypher never leaks to callers (CR-10).
+    async fn query_cypher(&self, q: &CypherQuery) -> crate::Result<ResultSet>;
+    /// Stream every memory row (current versions).
+    async fn stream_all_memories(&self) -> BoxStream<'_, crate::Result<Memory>>;
+    /// Stream every relationship row (current versions).
+    async fn stream_all_relationships(&self) -> BoxStream<'_, crate::Result<Relationship>>;
+
+    // ---- Offline similarity (Dreams / ingest enrichment ONLY) ----
+    // Never called on the interactive path. See principle 6 (§0.4).
+
+    /// Offline k-NN over stored embeddings (Dreams-only, R-Mcr4).
+    async fn find_similar_offline(
+        &self,
+        query: &Embedding,
+        k: usize,
+        filter: &MemoryFilter,
+    ) -> crate::Result<Vec<(MemoryId, f32)>>;
+
+    // ---- Leases + fencing (called from cluster code; §9.2) ----
+
+    /// Acquire a Chubby-style owner lease: `SET NX EX` plus a monotonic
+    /// fencing epoch (R-C1, R-C3).
+    async fn acquire_lease(
+        &self,
+        key: &LeaseKey,
+        ttl: std::time::Duration,
+    ) -> crate::Result<OwnerLease>;
+    /// Renew a held lease; errors if the lease was lost.
+    async fn renew_lease(&self, lease: &OwnerLease) -> crate::Result<OwnerLease>;
+    /// Release a held lease; safe to call after expiry.
+    async fn release_lease(&self, lease: OwnerLease) -> crate::Result<()>;
+
+    // ---- Change feed (backs SSE clients; §9.1, §9.6) ----
+
+    /// Subscribe to invalidations for a region (or `"*"` wildcards).
+    async fn subscribe_invalidations(
+        &self,
+        region: &RegionKey,
+    ) -> crate::Result<BoxStream<'_, crate::Result<Invalidation>>>;
+
+    // ---- Metadata ----
+
+    /// Backend capability set.
+    fn capabilities(&self) -> StorageCapabilities;
+    /// Backend identity: `"falkordb" | "in-memory"`.
+    fn backend_id(&self) -> StorageBackendId;
+    /// The pinned `OntologyFingerprint` (R-T21).
+    fn ontology_fingerprint(&self) -> [u8; 32];
+}
+
+/// The Chubby-style grace window applied to leases (§9.2).
+pub const LEASE_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// `owner_grace_period_seconds` default from §16.
+pub fn grace_duration() -> Duration {
+    Duration::from_std(LEASE_GRACE_PERIOD).expect("15s fits in chrono::Duration")
+}
