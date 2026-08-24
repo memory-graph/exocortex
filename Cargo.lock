@@ -893,11 +893,24 @@ dependencies = [
 name = "exocortex-dreams"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
+ "dashmap",
  "exocortex-cache",
  "exocortex-cluster",
  "exocortex-kernel",
+ "exocortex-pack-dev-v1",
  "exocortex-reasoning",
  "exocortex-storage",
+ "futures",
+ "metrics",
+ "serde",
+ "serde_json",
+ "smol_str",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

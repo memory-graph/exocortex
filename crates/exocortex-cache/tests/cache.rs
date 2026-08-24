@@ -85,7 +85,7 @@ async fn reseed_matches_storage_after_every_write() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let ctx = vc(Visibility::Org, "u");
         let hits = cache.search("org", "m", 100, &ctx);
-        assert_eq!(hits.len() as u64 + 0, i + 1, "reseed reflects write {}", i);
+        assert_eq!(hits.len(), i + 1, "reseed reflects write {}", i);
     }
     writer.abort();
 }
@@ -153,7 +153,7 @@ async fn two_q_resists_scan_pollution() {
         let _ = cache.search("org-a", "warm", 5, &ctx);
         cache.touch_admission("org-a");
     }
-    assert_eq!(cache.resident_orgs() > 0, true);
+    assert!(cache.resident_orgs() > 0);
     let found = cache.search("org-a", "warm-a", 5, &ctx);
     assert!(
         !found.is_empty(),

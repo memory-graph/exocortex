@@ -5,12 +5,33 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "exocortex_dreams"
+path = "src/lib.rs"
+
 [dependencies]
+
 exocortex-kernel = { workspace = true }
 exocortex-storage = { workspace = true }
 exocortex-cache = { workspace = true }
 exocortex-reasoning = { workspace = true }
 exocortex-cluster = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+smol_str = { workspace = true }
+uuid = { workspace = true }
+metrics = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
 
 [features]
 integration = []
+
+[dev-dependencies]
+serde_json = { workspace = true }
+exocortex-pack-dev-v1 = { workspace = true }
+futures = { workspace = true }
