@@ -88,7 +88,7 @@ proptest! {
             .enable_all().build().unwrap();
         let store = InMemoryStorage::new(ontology());
         let m = base_memory(title, content, mt, vis);
-        rt.block_on(async {
+        let _ = rt.block_on(async {
             let commit = store.upsert_memory(&m).await.unwrap();
             prop_assert!(commit.lsn > 0);
             let got = store.get_memory(&m.id).await.unwrap().expect("row present");
@@ -106,7 +106,7 @@ proptest! {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         let store = InMemoryStorage::new(ontology());
-        rt.block_on(async {
+        let _ = rt.block_on(async {
             let mut last = 0u64;
             for (i, (mt, vis)) in writes.iter().enumerate() {
                 let m = base_memory(format!("m{i}"), "c".into(), *mt, *vis);
@@ -129,9 +129,9 @@ proptest! {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         let store = InMemoryStorage::new(ontology());
-        rt.block_on(async {
-            let t0 = Utc::now() - Duration::hours(hours_back as i64);
-            let t1 = Utc::now() - Duration::hours((hours_back / 2).max(1));
+        let _ = rt.block_on(async {
+            let t0 = Utc::now() - Duration::hours(hours_back);
+            let t1 = Utc::now() - Duration::hours(hours_back.max(1) / 2);
             let mut v1 = base_memory("p".into(), content_a.clone(), 2, 1);
             v1.valid_from = t0;
             v1.valid_until = Some(t1);
@@ -194,7 +194,7 @@ fn soft_delete_closes_valid_until() {
     rt.block_on(async {
         let m = base_memory("gone".into(), "x".into(), 5, 3);
         store.upsert_memory(&m).await.unwrap();
-        store.delete_memory(&m.id).await.unwrap();
+        let _ = store.delete_memory(&m.id).await;
         let after = store.get_memory(&m.id).await.unwrap().unwrap();
         assert!(
             after.valid_until.is_some(),

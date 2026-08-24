@@ -99,12 +99,11 @@ fn inverse_materialization_pairs_are_symmetric() {
 #[test]
 fn golden_fingerprint_is_pinned() {
     let onto = load_registered_packs().unwrap();
-    let hex: String = onto
-        .fingerprint
-        .0
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let mut hex = String::with_capacity(64);
+    for b in onto.fingerprint.0 {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
     let golden = include_str!("dev_v1_fingerprint.txt").trim();
     assert_eq!(
         hex, golden,

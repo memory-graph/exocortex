@@ -8,7 +8,7 @@ use exocortex_cache::{GraphSnapshot, LocalCache};
 use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
 use exocortex_ops::operations::{ops_vc, GetMemoryInput, PromoteVisibilityInput};
 use exocortex_ops::{entries, OpContext, Operation};
-use exocortex_storage::{InMemoryStorage, Storage};
+use exocortex_storage::InMemoryStorage;
 
 fn ontology() -> Arc<exocortex_kernel::Ontology> {
     Arc::new(
@@ -59,7 +59,12 @@ fn mem(title: &str) -> Memory {
 }
 
 fn hex(id: &MemoryId) -> String {
-    id.0.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(32);
+    for b in id.0 {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 #[test]
@@ -116,7 +121,7 @@ async fn both_surfaces_identical_outputs() {
         .expect("registry surface");
 
     let typed: GetMemoryInput = serde_json::from_value(input).unwrap();
-    let direct = exocortex_ops::operations::GetMemory::default()
+    let direct = exocortex_ops::operations::GetMemory
         .handle(&ctx, typed)
         .await
         .expect("typed surface");
@@ -146,7 +151,7 @@ fn ctx_sync() -> (OpContext, Memory) {
 async fn promote_visibility_writes_audit_record() {
     let (ctx, m) = ctx_sync();
     ctx.storage.upsert_memory(&m).await.unwrap();
-    let out = exocortex_ops::operations::PromoteVisibilityOp::default()
+    let out = exocortex_ops::operations::PromoteVisibilityOp
         .handle(
             &ctx,
             PromoteVisibilityInput {
@@ -158,7 +163,7 @@ async fn promote_visibility_writes_audit_record() {
         .expect("promotion");
     assert!(out.audit_lsn > 0, "R-A2: promotion is audited");
 
-    let audit = exocortex_ops::operations::ListAuditRecordsOp::default()
+    let audit = exocortex_ops::operations::ListAuditRecordsOp
         .handle(
             &ctx,
             exocortex_ops::operations::ListAuditInput { since_lsn: 0 },
@@ -178,7 +183,7 @@ async fn accept_discovery_writes_audit_record_and_edge() {
     let b = mem("b");
     ctx.storage.upsert_memory(&a).await.unwrap();
     ctx.storage.upsert_memory(&b).await.unwrap();
-    let out = exocortex_ops::operations::AcceptDiscoveryOp::default()
+    let out = exocortex_ops::operations::AcceptDiscoveryOp
         .handle(
             &ctx,
             exocortex_ops::operations::AcceptDiscoveryInput {

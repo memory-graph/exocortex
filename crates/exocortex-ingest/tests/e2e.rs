@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use exocortex_ingest::IngestServer;
 use exocortex_pack_dev_v1::pack_def;
-use exocortex_storage::{InMemoryStorage, Storage};
+use exocortex_storage::InMemoryStorage;
 use exocortex_wire::ingest::v1::{
     ingest_service_server::IngestService, MemoryDraft, ProducerIdentity, RegisterSourceRequest,
 };

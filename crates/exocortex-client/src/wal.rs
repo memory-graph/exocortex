@@ -269,14 +269,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("exocortex-wal-full-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let wal = Wal::open_with_budget(&dir, 4096).unwrap();
-        assert!(matches!(
-            wal.append_batch(
+        assert!(wal
+            .append_batch(
                 "s",
                 vec![draft("big")],
                 vec![exocortex_kernel::MemoryId::new_v7()]
-            ),
-            Ok(_)
-        ));
+            )
+            .is_ok());
         let mut last = Ok(0);
         for i in 0..64 {
             last = wal.append_batch(

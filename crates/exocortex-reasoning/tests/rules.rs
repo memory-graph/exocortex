@@ -90,7 +90,7 @@ fn rules_r1_through_r3_derive_types() {
     );
     assert!(d.type_from_solves.contains(&(sol, solution_type)), "R1");
     assert!(d.type_from_fixes.contains(&(fixer, fix_type)), "R2");
-    assert!(d.type_from_causes.contains(&(problem, problem_type)) == false);
+    assert!(!d.type_from_causes.contains(&(problem, problem_type)));
     // R3: the Caused target is a Problem.
     let cause = MemoryId::new_v7();
     let d3 = rules::evaluate(

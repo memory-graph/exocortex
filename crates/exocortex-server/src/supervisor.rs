@@ -155,7 +155,7 @@ mod tests {
         let pid = child.id();
         child.kill().unwrap();
         let _ = child.wait();
-        assert!(!child.try_wait().unwrap().is_none(), "child is dead");
+        assert!(child.try_wait().unwrap().is_some(), "child is dead");
 
         // Restart loop honoring max_restarts.
         let mut restarts = 0;

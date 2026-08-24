@@ -259,7 +259,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         drop(ms);
         let now = chrono::Utc::now();
         rows.sort_by(|a, b| {
-            let score = |t: chrono::DateTime<chrono::Utc>| -(now - t).num_days() as i64;
+            let score = |t: chrono::DateTime<chrono::Utc>| -(now - t).num_days();
             score(b.0).cmp(&score(a.0)).then(b.1.id.cmp(&a.1.id))
         });
         Ok(rows.into_iter().take(32).map(|(_, m)| m).collect())

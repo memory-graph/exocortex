@@ -5,7 +5,6 @@
 use std::sync::Arc;
 
 use exocortex_ingest::IngestServer;
-use exocortex_kernel::Visibility;
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{InMemoryStorage, Storage};
 use exocortex_wire::ingest::v1::{
@@ -30,7 +29,7 @@ fn draft(key: &str, mt: &str, vis: i32) -> MemoryDraft {
         id: String::new(),
         memory_type: mt.into(),
         title: format!("title {key}"),
-        content: format!("Fixed in src/auth.rs with cargo build"),
+        content: "Fixed in src/auth.rs with cargo build".to_string(),
         tags: vec!["auth".into()],
         visibility: vis,
         valid_from: None,

@@ -1,7 +1,7 @@
 //! M3 acceptance: the `exocortex-mcp-client` binary runs, speaks MCP over
 //! stdio, and returns synthetic data for `search_memories`.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
 struct Client {
@@ -31,7 +31,6 @@ impl Client {
     }
 
     fn read_line(&mut self) -> serde_json::Value {
-        use std::io::BufRead;
         let stdout = self.child.stdout.as_mut().expect("stdout");
         let mut line = String::new();
         let mut byte = [0u8; 1];
