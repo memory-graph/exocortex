@@ -13,14 +13,15 @@ items are promoted into this file, tracked to done, and never silently
 dropped. Anything not listed here is either shipped or explicitly deferred
 to v2 in the PRD's own terms.
 
-**Current baseline (re-verified 2026-08-23, round 2):** 106 tests,
-0 failed; clippy/fmt/deny green; kernel-purity, fingerprint
-(`d8bcd004…4e8c`, stable), no-llm, and both SLO bench gates green
-(search p99 drifted 680→731µs, still inside the 3ms budget). Full detail:
-`round-2-review.prd`.
-
-**Known caveat:** no CI pipeline exists — all gates are manual `cargo xtask`
-invocations (round-2 item W10).
+**Current baseline (2026-08-25, live + CI verified):** 132 tests /
+0 failed in 58 suites; the full gate pipeline (fmt, clippy, deny,
+tests, kernel-purity, fingerprint, gen-schemas, no-llm, SLO benches)
+is GREEN on GitHub's runner (13m42s). Live Falkor suites green
+(storage 7/7, cypher 6/6, fencing 3/3, cluster 6/6, SSE 1/1, cross-node
+2/2); the 3-node compose cluster converges after leader-kill in
+1290-1448ms across four observed runs (M5 AC < 2s). Full detail:
+`round-2-review.prd`, the MILESTONE_REPORT round-2 addendum, and the
+live-harness + CI first-run sections.
 
 ## Initial build (M0–M8, shipped 2026-08)
 
