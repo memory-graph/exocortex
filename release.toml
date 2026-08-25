@@ -1,0 +1,12 @@
+[workspace]
+# All crates share one version (workspace = true); one tag per release.
+# Publish order is dependency order — cargo-release derives it from the graph.
+
+# cargo-release configuration
+#   cargo release 0.1.0 --execute
+# or from a dry run first:
+#   cargo release 0.1.0 --dry-run
+[[package]]
+name = "xtask"
+# xtask is build tooling: versioned with the repo, never published.
+release = false

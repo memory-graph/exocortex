@@ -4,6 +4,7 @@ name    = "exocortex-reasoning"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Exocortex reasoning layer: Crepe (Datalog) rules R1-R9 plus Steel (Scheme) belief evolution, with idempotent derived-edge writeback."
 
 [dependencies]
 exocortex-kernel = { workspace = true }

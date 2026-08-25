@@ -35,7 +35,9 @@ next session ◀── MCP query (sub-ms local cache) ◀── SSE change feed 
 | `exocortex-ingest` | The Ingestion Protocol server: HMAC → fingerprint → ceiling → triples → embeddings. |
 | `exocortex-ops` | Operation registry: every action registered once, served over MCP *and* HTTP identically. |
 | `exocortex-dreams` | Event-driven consolidation: MCR² rate reduction, sparsity guardrails, discovery proposals. |
-| `exocortex-server` / `exocortex-client` / `exocortex-worker` | The node binary, the MCP client binary, and the adapter host. |
+| `exocortex-server` | The node binary (`exocortex-node`): MCP standalone or backend cluster mode. |
+| `exocortex-client` | The MCP client binary (`exocortex-mcp-client`): local cache, WAL, sync. |
+| `exocortex-worker` | The adapter host: runs out-of-process adapters against `IngestService`. |
 
 `xtask` carries the quality gates (`kernel-purity`, `fingerprint`, `gen-schemas`, `no-llm`, `bench`).
 
@@ -45,8 +47,17 @@ Requires Rust 1.85 (pinned in `rust-toolchain.toml`) and `protoc`.
 
 ```sh
 cargo build --release
-cargo test --workspace        # 132 tests, no backend needed
+cargo test --workspace        # no backend needed, all green
 cargo xtask bench             # SLO gates: search p50<500µs/p99<3ms, k-hop p50<300µs/p99<2ms
+cargo fmt --check             # enforced in CI
+cargo clippy --workspace      # enforced in CI
+```
+
+Or install the binaries straight from git (needs `protoc` on PATH):
+
+```sh
+cargo install --git https://github.com/memory-graph/exocortex --bin exocortex-node
+cargo install --git https://github.com/memory-graph/exocortex --bin exocortex-mcp-client
 ```
 
 ### Personal mode (solo developer)
@@ -61,13 +72,13 @@ Boots a local node with supervised embedded storage. Point your MCP harness at t
 cargo run --release -p exocortex-client --bin exocortex-mcp-client -- --org my-org --user me
 ```
 
-The harness calls `exocortex.search_memories`, `exocortex.get_memory`, `exocortex.find_related`, and `exocortex.end_session` (the session-wrapup write; offline it buffers to a local WAL and reports `{local_lsns, sync_pending}`).
+The harness calls `exocortex.search_memories`, `exocortex.get_memory`, `exocortex.find_related`, `exocortex.end_session` (the session-wrapup write; offline it buffers to a local WAL and reports `{local_lsns, sync_pending}`), `exocortex.promote_visibility`, `exocortex.accept_discovery`, and `exocortex.list_audit_records`.
 
 ### Org mode (backend cluster)
 
 ```sh
 docker build -t exocortex-node:local .
-docker compose -f crates/exocortex-cluster/tests/docker-compose-cluster.yml up -d
+docker compose -f crates/exocortex-cluster/tests/docker-compose-cluster.yml up -d --build
 ```
 
 Three nodes + one FalkorDB. Every operation is available over authenticated HTTP with identical outputs to the MCP surface; the SSE change feed (`/v1/changes?since_lsn=N&token=…`) keeps client caches current, with a bounded replay window and `409 Resync Required` past it. Release builds refuse to start without `--bearer-token`.
@@ -101,4 +112,4 @@ v1 complete: milestones M0–M8 shipped, two review rounds closed, all gates gre
 
 ## License
 
-See the license field in the workspace manifest.
+AGPL-3.0-or-later. See [LICENSE](LICENSE).

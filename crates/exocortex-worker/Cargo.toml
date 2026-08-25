@@ -4,6 +4,7 @@ name    = "exocortex-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Exocortex adapter host: runs external-source adapters (v1: noop) and forwards batches to the ingest service over gRPC. Never links the kernel."
 
 [[bin]]
 name = "exocortex-worker"

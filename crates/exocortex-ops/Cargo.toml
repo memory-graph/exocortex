@@ -4,6 +4,7 @@ name    = "exocortex-ops"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Exocortex operation registry: typed actions registered once and served identically over MCP and HTTP, with schema goldens and the audit ledger."
 
 [dependencies]
 metrics = { workspace = true }

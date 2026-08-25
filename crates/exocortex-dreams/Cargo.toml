@@ -4,6 +4,7 @@ name    = "exocortex-dreams"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Exocortex consolidation engine: MCR-squared rate reduction, graph-sparsity guardrails, rollback, and structured discovery proposals."
 
 [lib]
 name = "exocortex_dreams"

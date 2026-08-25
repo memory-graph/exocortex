@@ -4,6 +4,7 @@ name    = "exocortex-cache"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Exocortex local read path: ArcSwap lock-free snapshots, 2Q admission, and zero-allocation search/traverse over the org graph."
 
 [dependencies]
 exocortex-kernel = { workspace = true }

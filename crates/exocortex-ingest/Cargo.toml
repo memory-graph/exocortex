@@ -4,6 +4,7 @@ name    = "exocortex-ingest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Exocortex ingestion service: HMAC-authenticated batches through fingerprint, ceiling, and triple validation, with server-side entity extraction and embeddings."
 
 [lib]
 name = "exocortex_ingest"

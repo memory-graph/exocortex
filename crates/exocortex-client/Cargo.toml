@@ -4,6 +4,7 @@ name    = "exocortex-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "The Exocortex MCP client: local cache, WAL offline capture, the session-wrapup tool, and the reconnecting SSE subscriber."
 
 [dependencies]
 serde = { workspace = true }

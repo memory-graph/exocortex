@@ -22,8 +22,8 @@ members = [
 version      = "0.1.0"
 edition      = "2021"
 rust-version = "1.85"   # M0 deviation: rmcp requires edition 2024 (Rust >= 1.85); see rust-toolchain.toml
-license      = "Apache-2.0"
-repository   = "https://github.com/memorygraph/exocortex"
+license      = "AGPL-3.0-or-later"
+repository   = "https://github.com/memory-graph/exocortex"
 
 [workspace.dependencies]
 # --- runtime & primitives ---

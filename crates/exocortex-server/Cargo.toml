@@ -4,6 +4,7 @@ name    = "exocortex-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "The Exocortex node binary: mcp-standalone and backend-node modes over one listener (gRPC + HTTP + SSE) with gossip and lease re-election."
 
 [features]
 fastembed = ["exocortex-ingest/fastembed"]
