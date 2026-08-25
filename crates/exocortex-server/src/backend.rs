@@ -33,6 +33,12 @@ pub struct BackendNodeArgs {
     pub gossip_listen: SocketAddr,
     /// Chitchat seed nodes (`host:port`).
     pub seed_nodes: Vec<String>,
+    /// Redis URL for the Dreams fire queue (§12.2). When set, the node
+    /// drains the Redis queue (RPUSH/BLPOP, R-Dr13 counter reset, R-Dr14
+    /// quiet-hours reordering) instead of only the in-process channel.
+    pub redis_url: Option<String>,
+    /// Quiet-hours window for the fire drainer (R-Dr14; default: none).
+    pub quiet_hours: exocortex_dreams::fire::QuietHours,
 }
 
 /// The Dreams lease every backend node re-elects for (§9.2).
@@ -108,6 +114,39 @@ pub async fn run_backend_node<S: Storage + 'static>(
     {
         let engine = dreams.clone();
         tokio::spawn(async move { engine.run().await });
+    }
+
+    // Fire transport (§12.2): when a Redis URL is configured, drain the
+    // shared fire queue — reset the region's Redis write counters
+    // atomically (R-Dr13, at consumption) and notify the engine. Quiet
+    // hours reorder a short backlog rather than blocking it (R-Dr14).
+    if let Some(redis_url) = args.redis_url.clone() {
+        let dreams = dreams.clone();
+        let quiet = args.quiet_hours;
+        tokio::spawn(async move {
+            match redis::Client::open(redis_url.as_str()) {
+                Ok(client) => match client.get_multiplexed_async_connection().await {
+                    Ok(conn) => {
+                        let mut queue = exocortex_dreams::fire::RedisFireQueue::new(conn, quiet);
+                        loop {
+                            match queue.drain(Duration::from_secs(5)).await {
+                                Ok(Some(region)) => {
+                                    let _ = queue.reset_counters(&region).await;
+                                    dreams.notify(region);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!(%e, "fire drain error; retrying");
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(%e, "fire queue connect failed"),
+                },
+                Err(e) => tracing::warn!(%e, "fire queue client open failed"),
+            }
+        });
     }
 
     // Ingest: gRPC IngestService, embedding-enabled, reasoning-wired.

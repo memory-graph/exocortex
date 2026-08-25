@@ -14,7 +14,7 @@ use rmcp::ServiceExt;
 
 use exocortex_cache::LocalCache;
 use exocortex_kernel::{Ontology, Visibility};
-use exocortex_storage::VisibilityContext;
+use exocortex_ops::VisibilityContext;
 
 /// Local MCP server options (§4.2).
 #[derive(Debug, Parser)]

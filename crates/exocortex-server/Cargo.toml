@@ -51,6 +51,7 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 tonic = { workspace = true }
 http = { workspace = true }
+redis = { workspace = true }
 
 [dev-dependencies]
 chitchat = { workspace = true }

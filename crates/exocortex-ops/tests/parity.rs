@@ -260,3 +260,57 @@ async fn audit_ledger_is_org_scoped() {
         assert!(!rows.records.is_empty(), "{org} sees its own record");
     }
 }
+
+/// CR-22 / R-MT4 through the op surface: a caller without visibility for an
+/// existing memory gets `Unauthorized` (PermissionDenied), never a silent
+/// empty result; a caller with visibility gets the row even on a cold cache.
+#[tokio::test]
+async fn get_memory_surfaces_permission_denied_not_silent_none() {
+    use exocortex_storage::Storage;
+    let onto = ontology();
+    let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
+    let storage = InMemoryStorage::new(onto.clone());
+
+    // A Private memory authored by someone else.
+    let mut m = mem("private-target");
+    m.visibility = Visibility::Private;
+    let author = "someone-else";
+    m.provenance = Provenance::Asserted { author: author.into() };
+    storage.upsert_memory(&m).await.unwrap();
+
+    let ctx = OpContext {
+        visibility_ctx: ops_vc("org", "alice", Visibility::Project),
+        storage: Arc::new(storage),
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+    };
+    let err = exocortex_ops::operations::GetMemory
+        .handle(&ctx, exocortex_ops::operations::GetMemoryInput { id: hex(&m.id) })
+        .await
+        .expect_err("invisible row must error");
+    assert!(
+        matches!(err, exocortex_ops::OpError::Unauthorized(_)),
+        "PermissionDenied surfaces as Unauthorized, got {err}"
+    );
+
+    // A caller with visibility reads through the same op (cold cache →
+    // the storage fallthrough fills the miss, R-C8). The memory stays
+    // Private but is authored BY alice, so it resolves for her.
+    let (cache2, _rx2) = LocalCache::new(16 * 1024 * 1024);
+    let storage2 = InMemoryStorage::new(ontology());
+    let mut own = mem("own-private");
+    own.visibility = Visibility::Private;
+    own.context.user_id = Some("alice".into());
+    storage2.upsert_memory(&own).await.unwrap();
+    let ctx2 = OpContext {
+        visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        storage: Arc::new(storage2),
+        cache: Arc::new(cache2),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+    };
+    let out = exocortex_ops::operations::GetMemory
+        .handle(&ctx2, exocortex_ops::operations::GetMemoryInput { id: hex(&own.id) })
+        .await
+        .expect("author reads own private memory");
+    assert!(out.memory.is_some(), "cold-cache miss fills from storage");
+}

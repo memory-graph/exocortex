@@ -19,7 +19,6 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-exocortex-storage = { workspace = true }
 smol_str = { workspace = true }
 tokio = { workspace = true }
 clap = { version = "4", features = ["derive"] }
@@ -44,6 +43,7 @@ name = "exocortex-mcp-client"
 path = "src/main.rs"
 
 [dev-dependencies]
+exocortex-storage = { workspace = true }
 exocortex-cluster = { workspace = true }
 exocortex-server = { workspace = true }
 axum = { workspace = true }

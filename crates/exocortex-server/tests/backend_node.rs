@@ -18,6 +18,8 @@ fn args(bind: &str, gossip: u16, seeds: Vec<String>) -> BackendNodeArgs {
         bearer_token: "test-bearer".into(),
         gossip_listen: format!("127.0.0.1:{gossip}").parse().unwrap(),
         seed_nodes: seeds,
+        redis_url: None,
+        quiet_hours: exocortex_dreams::fire::QuietHours::none(),
     }
 }
 

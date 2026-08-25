@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use exocortex_cache::LocalCache;
-use exocortex_storage::VisibilityContext;
+use exocortex_ops::VisibilityContext;
 
 use crate::tools::end_session::{EdgeHintInput, EndSessionArgs, EndSessionTool, MemoryDraftInput};
 use crate::wal;

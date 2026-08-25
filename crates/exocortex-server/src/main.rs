@@ -38,6 +38,13 @@ struct Args {
     /// Cluster seed endpoints (backend-node).
     #[arg(long)]
     cluster_endpoints: Option<String>,
+    /// Redis URL for the Dreams fire queue (backend-node; §12.2). Without
+    /// it the node runs Dreams on the in-process fire channel only.
+    #[arg(long)]
+    redis_url: Option<String>,
+    /// Quiet hours for Dreams firing (backend-node; R-Dr14, e.g. 23-7).
+    #[arg(long)]
+    quiet_hours: Option<u8>,
     /// Chitchat gossip listen address (backend-node).
     #[arg(long, default_value = "0.0.0.0:8100")]
     gossip_addr: String,
@@ -146,6 +153,12 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
                 .cluster_endpoints
                 .map(|eps| eps.split(',').map(str::to_string).collect())
                 .unwrap_or_default(),
+            redis_url: args.redis_url.clone(),
+            quiet_hours: match args.quiet_hours {
+                // "--quiet-hours 23" → the nightly 23..7 window.
+                Some(_) => exocortex_dreams::fire::QuietHours::nightly(),
+                None => exocortex_dreams::fire::QuietHours::none(),
+            },
         };
         let node = backend::run_backend_node(storage, ontology, node_args).await?;
         tracing::info!(addr = %node.local_addr, "backend-node up; serving until interrupted");

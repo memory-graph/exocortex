@@ -38,7 +38,7 @@ pub struct FindRelatedOutput {
 }
 
 /// JSON projection of a memory (kernel Memory is not JsonSchema-derived).
-#[derive(Serialize, JsonSchema)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct MemoryJson {
     /// Hex id.
     pub id: String,
@@ -144,7 +144,7 @@ pub struct GetMemoryInput {
 }
 
 /// Output for `get_memory`.
-#[derive(Serialize, JsonSchema)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct GetMemoryOutput {
     /// The memory, when visible.
     pub memory: Option<MemoryJson>,
@@ -169,13 +169,26 @@ impl Operation for GetMemory {
     async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
         let id = unhex(&input.id)?;
         let org = ctx.visibility_ctx.org_id.to_string();
-        Ok(GetMemoryOutput {
-            memory: ctx
-                .cache
-                .get_memory(&org, &id, &ctx.visibility_ctx)
-                .as_ref()
-                .map(mem_json),
-        })
+        // Cache first (zero-cost hit). On a miss, distinguish the three
+        // cases through the caller-visibility storage read (R-MT4 /
+        // CR-22): a row the caller may not see is `PermissionDenied`,
+        // never a silent None — and a real hit also fills the cache-miss
+        // case (R-C8).
+        if let Some(m) = ctx.cache.get_memory(&org, &id, &ctx.visibility_ctx) {
+            return Ok(GetMemoryOutput {
+                memory: Some(mem_json(&m)),
+            });
+        }
+        match ctx.storage.get_memory_for(&id, &ctx.visibility_ctx).await {
+            Ok(Some(m)) => Ok(GetMemoryOutput {
+                memory: Some(mem_json(&m)),
+            }),
+            Ok(None) => Ok(GetMemoryOutput { memory: None }),
+            Err(exocortex_storage::StorageError::PermissionDenied) => {
+                Err(OpError::Unauthorized("memory outside caller visibility".into()))
+            }
+            Err(e) => Err(OpError::Storage(e.to_string())),
+        }
     }
 }
 

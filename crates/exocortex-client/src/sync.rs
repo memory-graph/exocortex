@@ -19,7 +19,7 @@ use prost::Message;
 
 use exocortex_cache::{CacheWrite, LocalCache};
 use exocortex_kernel::{MemoryId, RelationshipId};
-use exocortex_storage::Invalidation;
+use exocortex_ops::Invalidation;
 use exocortex_wire::cluster::v1::InvalidationEnvelope;
 use exocortex_wire::WIRE_VERSION;
 use hmac::{Hmac, Mac};

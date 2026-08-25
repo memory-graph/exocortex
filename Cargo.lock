@@ -1244,6 +1244,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "prost",
+ "redis 0.27.6",
  "rmcp",
  "serde",
  "serde_json",
