@@ -1,3 +1,6 @@
 /target
 /.bootstrap
 .env.local
+/.codegraph
+/.crush
+/.pickle-rick

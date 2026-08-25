@@ -246,7 +246,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         // consolidation structure. Inventing memory rows or kinds here
         // would violate the "no silent design" rule; the row-writing
         // variant lands with the second-pack ontology work (open
-        // question, MILESTONE_REPORT).
+        // question, docs/MILESTONE_REPORT.md).
         {
             let mut by_class: std::collections::BTreeMap<u32, Vec<MemoryId>> = Default::default();
             for a in anchors.iter().filter(|a| !res.merged.contains(&a.id)) {

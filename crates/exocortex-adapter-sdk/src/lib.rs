@@ -1,7 +1,7 @@
 // crates/exocortex-adapter-sdk/src/lib.rs
 //! The Exocortex adapter protocol core (Layer A).
 //!
-//! `exocortex-core-prd.md` §18.2 defines seven normative adapter
+//! `docs/prd/exocortex-core-prd.md` §18.2 defines seven normative adapter
 //! obligations. Six are identical protocol concerns for every adapter —
 //! registration, snapshot stamping, identity, idempotency, rate handling,
 //! process isolation — and this crate makes them executable so an adapter

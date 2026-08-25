@@ -108,7 +108,7 @@ Chaos-check leader re-election (PRD bound: < 2s):
 
 ## Status
 
-v1 complete: milestones M0–M8 shipped, two review rounds closed, all gates green in CI, live FalkorDB suites and the multi-node chaos harness verified against Docker. The [PRD](exocortex-core-prd.md) is the source of truth; [master-plan.prd](master-plan.prd) tracks state and v2 deferrals (Iceberg/Delta adapters, federation, second pack, OTel).
+v1 complete: milestones M0–M8 shipped, two review rounds closed, all gates green in CI, live FalkorDB suites and the multi-node chaos harness verified against Docker. The [PRD](docs/prd/exocortex-core-prd.md) is the source of truth; [master plan](docs/master-plan.prd) tracks state and v2 deferrals (Iceberg/Delta adapters, federation, second pack, OTel). Agents and contributors: start with [AGENTS.md](AGENTS.md); specs, reviews, and publishing live in [docs/](docs/).
 
 ## License
 
