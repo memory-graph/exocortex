@@ -5,6 +5,10 @@
 
 mod supervisor;
 
+use exocortex_server::backend;
+
+use std::net::SocketAddr;
+
 use clap::Parser;
 
 /// Node deployment mode.
@@ -34,6 +38,15 @@ struct Args {
     /// Cluster seed endpoints (backend-node).
     #[arg(long)]
     cluster_endpoints: Option<String>,
+    /// Chitchat gossip listen address (backend-node).
+    #[arg(long, default_value = "0.0.0.0:8100")]
+    gossip_addr: String,
+    /// Bearer token guarding the HTTP op surface (R-Sec7).
+    #[arg(long, default_value = "exocortex-dev-bearer")]
+    bearer_token: String,
+    /// Cluster-shared HMAC secret (64 hex chars; defaults to a dev key).
+    #[arg(long)]
+    cluster_secret: Option<String>,
     /// redis-server binary for the embedded supervisor.
     #[arg(long)]
     redis_server_bin: Option<std::path::PathBuf>,
@@ -77,10 +90,73 @@ fn main() -> anyhow::Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
-        Mode::BackendNode | Mode::Embedded => {
-            anyhow::bail!("--mode {:?} arrives with M5 (cluster)", args.mode);
+        Mode::BackendNode => backend_node_main(args),
+        Mode::Embedded => {
+            anyhow::bail!("--mode embedded is the in-process path used by tests");
         }
     }
+}
+
+/// `--mode backend-node` (M5): storage + cluster + ingest + HTTP + SSE +
+/// gossip + lease re-election on one process.
+fn backend_node_main(args: Args) -> anyhow::Result<()> {
+    use std::str::FromStr;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let ontology =
+            std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
+        let storage = if let Some(url) = args.storage.strip_prefix("falkor://") {
+            std::sync::Arc::new(
+                exocortex_storage::FalkorStorage::connect(
+                    exocortex_storage::FalkorConfig {
+                        falkor_url: format!("falkor://{url}"),
+                        redis_url: format!("redis://{url}"),
+                        graph_name: format!("exocortex-node-{}", std::process::id()),
+                        org_id: "org".into(),
+                        node_id: format!("node-{}", std::process::id()).into(),
+                    },
+                    ontology.clone(),
+                )
+                .await?,
+            )
+        } else {
+            anyhow::bail!(
+                "backend-node needs --storage=falkor://host:port (embedded storage is mcp-standalone)"
+            );
+        };
+        let cluster_secret = args
+            .cluster_secret
+            .as_deref()
+            .and_then(|hex| decode_hex32(hex).ok())
+            .unwrap_or([0x42u8; 32]);
+        let node_args = backend::BackendNodeArgs {
+            bind: args.bind.clone(),
+            node_id: format!("node-{}", std::process::id()),
+            cluster_secret,
+            bearer_token: args.bearer_token.clone(),
+            gossip_listen: SocketAddr::from_str(&args.gossip_addr)
+                .map_err(|e| anyhow::anyhow!("bad --gossip-addr: {e}"))?,
+            seed_nodes: args
+                .cluster_endpoints
+                .map(|eps| eps.split(',').map(str::to_string).collect())
+                .unwrap_or_default(),
+        };
+        let node = backend::run_backend_node(storage, ontology, node_args).await?;
+        tracing::info!(addr = %node.local_addr, "backend-node up; serving until interrupted");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    })
+}
+
+/// Decode 64 hex chars into a 32-byte key.
+fn decode_hex32(hex: &str) -> Result<[u8; 32], anyhow::Error> {
+    let bytes = (0..32)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
+        .collect::<Result<Vec<_>, _>>()?;
+    bytes.try_into().map_err(|_| anyhow::anyhow!("bad hex"))
 }
 
 /// Data dir under the user's data home (§4.3).

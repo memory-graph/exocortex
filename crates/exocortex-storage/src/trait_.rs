@@ -16,6 +16,10 @@ pub enum StorageError {
     /// Backend/driver failure, with detail.
     #[error("backend error: {0}")]
     Backend(String),
+    /// The caller may not read this row (R-MT4: distinct from NotFound —
+    /// the row exists but is outside the caller's visibility).
+    #[error("permission denied")]
+    PermissionDenied,
     /// The runtime ontology fingerprint does not match the one pinned in
     /// storage (R-D5). Startup must fail fast.
     #[error("ontology fingerprint mismatch: storage={storage:?} runtime={runtime:?}")]
@@ -52,8 +56,18 @@ pub trait Storage: Send + Sync + 'static {
 
     // ---- Reads (interactive path) ----
 
-    /// Point read, visibility-filtered at the storage boundary (CR-22).
+    /// Point read at the historical `Visibility::Org` ceiling (kept for
+    /// internal paths that re-check visibility above the seam).
     async fn get_memory(&self, id: &MemoryId) -> crate::Result<Option<Memory>>;
+    /// Caller-visibility point read (R-MT4): filters at the caller's
+    /// ceiling AND resolves `Private` against `vc.user_id`; a row the
+    /// caller may not see yields `Err(StorageError::PermissionDenied)`
+    /// (distinguishable from a missing row's `Ok(None)`).
+    async fn get_memory_for(
+        &self,
+        id: &MemoryId,
+        vc: &crate::VisibilityContext,
+    ) -> crate::Result<Option<Memory>>;
     /// Point read of several memories; missing ids are omitted.
     async fn get_memories(&self, ids: &[MemoryId]) -> crate::Result<Vec<Memory>>;
     /// Bounded k-hop traversal (CR-6 hard caps).

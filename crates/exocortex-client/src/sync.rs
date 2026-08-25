@@ -1,0 +1,376 @@
+// crates/exocortex-client/src/sync.rs
+//! The reconnecting SSE subscriber (M5.4, §9.3): connects to
+//! `$backend/v1/changes?since_lsn=<last>`, decodes base64 protobuf
+//! invalidation envelopes, verifies the envelope HMAC and ontology
+//! fingerprint (R-W4/R-W3), and feeds `CacheWrite::Apply` into the cache
+//! writer strictly in backend-LSN order. Out-of-order envelopes buffer in a
+//! hold-back gate; a gap past `gap_timeout` resubscribes from the earlier
+//! LSN (R-C6). Heartbeats arrive as SSE comments (R-C5); silence past
+//! `stall_timeout` forces a reconnect.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use eventsource_client as es;
+use eventsource_client::Client as _;
+use futures::StreamExt;
+use prost::Message;
+
+use exocortex_cache::{CacheWrite, LocalCache};
+use exocortex_kernel::{MemoryId, RelationshipId};
+use exocortex_storage::Invalidation;
+use exocortex_wire::cluster::v1::InvalidationEnvelope;
+use exocortex_wire::WIRE_VERSION;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+/// Errors surfaced by the subscriber.
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    /// Bad base64 or protobuf payload.
+    #[error("bad envelope payload: {0}")]
+    BadPayload(String),
+    /// Envelope failed admission (wire version / fingerprint / HMAC).
+    #[error("envelope rejected: {0}")]
+    Rejected(String),
+}
+
+/// Configuration for the SSE subscriber.
+#[derive(Clone)]
+pub struct SseSyncConfig {
+    /// Backend base URL (`http://host:port`).
+    pub backend: String,
+    /// Cluster-shared HMAC key (R-Sec4).
+    pub hmac_key: [u8; 32],
+    /// Per-client SSE token + provisioned derived key (R-Sec5). When set,
+    /// the subscribe URL carries `?token=` and envelope verification uses
+    /// the derived key instead of the cluster key.
+    pub client_token: Option<String>,
+    pub client_key: Option<[u8; 32]>,
+    /// Expected ontology fingerprint (R-W3 peer admission).
+    pub fingerprint: [u8; 32],
+    /// Silence window before a reconnect (R-C5; heartbeats every 5s).
+    pub stall_timeout: Duration,
+    /// How long a missing LSN may gap before resubscribing from the earlier
+    /// LSN (R-C6).
+    pub gap_timeout: Duration,
+    /// Reconnect backoff (capped at 10s).
+    pub backoff: Duration,
+}
+
+impl SseSyncConfig {
+    /// Defaults: 15s stall, 2s gap, 1s backoff, cluster-key verification.
+    pub fn new(backend: impl Into<String>, hmac_key: [u8; 32], fingerprint: [u8; 32]) -> Self {
+        Self {
+            backend: backend.into(),
+            hmac_key,
+            client_token: None,
+            client_key: None,
+            fingerprint,
+            stall_timeout: Duration::from_secs(15),
+            gap_timeout: Duration::from_secs(2),
+            backoff: Duration::from_secs(1),
+        }
+    }
+}
+
+/// Optional targeted-rehydration hook (R-C6 `409 Resync Required` /
+/// unrecoverable gap): invoked before a resubscribe so the caller can
+/// reseed the cache from storage.
+pub type ResyncFn = Box<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send>;
+
+/// Verify an envelope: wire version, fingerprint, HMAC-SHA256 over fields
+/// 1..4 (R-W4). Same scheme as `ClusterNode::admit`, inlined so the client
+/// crate needs no cluster dependency.
+pub fn verify_envelope(
+    hmac_key: &[u8; 32],
+    fingerprint: &[u8; 32],
+    env: &InvalidationEnvelope,
+) -> Result<(), SyncError> {
+    if env.wire_version != WIRE_VERSION {
+        return Err(SyncError::Rejected("wire version mismatch".into()));
+    }
+    if env.ontology_fingerprint.as_slice() != fingerprint {
+        return Err(SyncError::Rejected("ontology fingerprint mismatch".into()));
+    }
+    let mut unsigned = env.clone();
+    unsigned.hmac = vec![];
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(hmac_key).expect("HMAC accepts any key length");
+    mac.update(&unsigned.encode_to_vec());
+    let expected = mac.finalize().into_bytes();
+    if expected.len() != env.hmac.len()
+        || !bool::from(subtle::ConstantTimeEq::ct_eq(
+            expected.as_slice(),
+            env.hmac.as_slice(),
+        ))
+    {
+        return Err(SyncError::Rejected("hmac verification failed".into()));
+    }
+    Ok(())
+}
+
+/// Decode one SSE `inv` payload (base64 protobuf envelope) into the storage
+/// invalidation plus its backend LSN.
+pub fn decode_envelope(
+    hmac_key: &[u8; 32],
+    fingerprint: &[u8; 32],
+    payload: &str,
+) -> Result<(Invalidation, u64), SyncError> {
+    let raw = b64_decode(payload).ok_or_else(|| SyncError::BadPayload("base64".into()))?;
+    let env = InvalidationEnvelope::decode(raw.as_slice())
+        .map_err(|e| SyncError::BadPayload(e.to_string()))?;
+    verify_envelope(hmac_key, fingerprint, &env)?;
+    let inv_pb = env
+        .inv
+        .ok_or_else(|| SyncError::BadPayload("no inv".into()))?;
+    let lsn = inv_pb.backend_lsn;
+    let id16 = |b: &[u8]| -> Result<[u8; 16], SyncError> {
+        if b.len() == 16 {
+            return Ok(b.try_into().expect("len checked"));
+        }
+        if b.len() == 32 {
+            let mut out = [0u8; 16];
+            for (i, byte) in out.iter_mut().enumerate() {
+                let hi = (b[i * 2] as char).to_digit(16);
+                let lo = (b[i * 2 + 1] as char).to_digit(16);
+                match (hi, lo) {
+                    (Some(h), Some(l)) => *byte = ((h << 4) | l) as u8,
+                    _ => return Err(SyncError::BadPayload("bad hex id".into())),
+                }
+            }
+            return Ok(out);
+        }
+        Err(SyncError::BadPayload("id not 16/32 bytes".into()))
+    };
+    let inv = match inv_pb.kind {
+        Some(exocortex_wire::sse::v1::invalidation::Kind::MemoryUpserted(m)) => {
+            Invalidation::MemoryUpserted {
+                id: MemoryId(id16(&m.id)?),
+                lsn,
+            }
+        }
+        Some(exocortex_wire::sse::v1::invalidation::Kind::MemoryDeleted(m)) => {
+            Invalidation::MemoryDeleted {
+                id: MemoryId(id16(&m.id)?),
+                lsn,
+            }
+        }
+        Some(exocortex_wire::sse::v1::invalidation::Kind::RelationshipUpserted(r)) => {
+            Invalidation::RelationshipUpserted {
+                id: RelationshipId(id16(&r.id)?),
+                from: MemoryId(id16(&r.from)?),
+                to: MemoryId(id16(&r.to)?),
+                kind: exocortex_kernel::RelKindId(r.kind),
+                lsn,
+            }
+        }
+        Some(exocortex_wire::sse::v1::invalidation::Kind::RelationshipDeleted(r)) => {
+            Invalidation::RelationshipDeleted {
+                id: RelationshipId(id16(&r.id)?),
+                lsn,
+            }
+        }
+        None => return Err(SyncError::BadPayload("no kind".into())),
+    };
+    Ok((inv, lsn))
+}
+
+/// The LSN hold-back gate: releases invalidations strictly in
+/// `next..next+1..` order; buffers ahead-of-order envelopes; reports the
+/// oldest missing LSN once `gap_timeout` elapses (caller resubscribes from
+/// there, R-C6).
+#[derive(Debug, Default)]
+pub struct LsnGate {
+    next: u64,
+    anchored: bool,
+    held: BTreeMap<u64, Invalidation>,
+    gap_since: Option<Instant>,
+}
+
+impl LsnGate {
+    /// New gate expecting `next` as the next LSN to apply.
+    pub fn new(next: u64) -> Self {
+        Self {
+            next,
+            anchored: false,
+            held: BTreeMap::new(),
+            gap_since: None,
+        }
+    }
+
+    /// The next LSN the gate awaits.
+    pub fn next_lsn(&self) -> u64 {
+        self.next
+    }
+
+    /// Push one envelope; returns the invalidations now releasable in order.
+    pub fn push(&mut self, lsn: u64, inv: Invalidation) -> Vec<Invalidation> {
+        if !self.anchored {
+            // Servers do not replay below `since_lsn`; the first envelope at
+            // or beyond `next` anchors the sequence. Ordering and gap
+            // detection then apply strictly within the stream.
+            if lsn < self.next {
+                return vec![];
+            }
+            self.next = lsn;
+            self.anchored = true;
+        }
+        if lsn < self.next {
+            // Stale replay from a resubscribe: already applied.
+            return vec![];
+        }
+        if self.held.is_empty() {
+            self.gap_since = Some(Instant::now());
+        }
+        self.held.insert(lsn, inv);
+        self.release()
+    }
+
+    fn release(&mut self) -> Vec<Invalidation> {
+        let mut out = Vec::new();
+        while let Some(inv) = self.held.remove(&self.next) {
+            out.push(inv);
+            self.next += 1;
+        }
+        if self.held.is_empty() {
+            self.gap_since = None;
+        } else {
+            self.gap_since.get_or_insert_with(Instant::now);
+        }
+        out
+    }
+
+    /// True when a gap has persisted past `timeout`; `next` is the missing
+    /// LSN to resubscribe from.
+    pub fn gap_expired(&self, timeout: Duration) -> Option<u64> {
+        match (self.held.is_empty(), self.gap_since) {
+            (false, Some(t)) if t.elapsed() > timeout => Some(self.next),
+            _ => None,
+        }
+    }
+}
+
+/// Run the reconnecting subscriber until the process exits. Each connection
+/// applies envelopes through the gate; gaps and stalls both trigger a
+/// resubscribe from the last applied LSN (R-C6), invoking `resync` first
+/// when provided (targeted rehydration).
+pub async fn run_sse_sync(
+    cfg: SseSyncConfig,
+    cache: Arc<LocalCache>,
+    mut next_lsn: u64,
+    resync: Option<ResyncFn>,
+) {
+    let mut backoff = cfg.backoff;
+    loop {
+        let since = next_lsn.saturating_sub(1);
+        let mut url = format!(
+            "{}/v1/changes?since_lsn={since}",
+            cfg.backend.trim_end_matches('/')
+        );
+        if let Some(token) = &cfg.client_token {
+            url.push_str("&token=");
+            url.push_str(token);
+        }
+        tracing::info!(%url, "sse subscribe");
+        let mut gate = LsnGate::new(next_lsn);
+        let mut reconnect_reason = "stream ended";
+        {
+            let client = match es::ClientBuilder::for_url(&url).map_err(|e| e.to_string()) {
+                Ok(b) => b.read_timeout(cfg.stall_timeout).build(),
+                Err(e) => {
+                    tracing::warn!(%e, "sse client build failed; backing off");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                    continue;
+                }
+            };
+            let mut stream = client.stream();
+            while let Some(item) = stream.next().await {
+                match item {
+                    // R-C5: heartbeats/connect anchors arrive as comments;
+                    // transport-level silence trips `read_timeout` below.
+                    Ok(es::SSE::Connected(_)) | Ok(es::SSE::Comment(_)) => {}
+                    Ok(es::SSE::Event(ev)) => {
+                        if ev.event_type == "inv" {
+                            let verify_key = cfg.client_key.unwrap_or(cfg.hmac_key);
+                            match decode_envelope(&verify_key, &cfg.fingerprint, &ev.data) {
+                                Ok((inv, lsn)) => {
+                                    for released in gate.push(lsn, inv) {
+                                        next_lsn = next_lsn.max(lsn + 1);
+                                        metrics::counter!("exocortex_sync_envelopes_applied_total")
+                                            .increment(1);
+                                        cache.submit(CacheWrite::Apply(released)).await;
+                                    }
+                                    next_lsn = next_lsn.max(gate.next_lsn());
+                                }
+                                Err(e) => tracing::warn!(%e, "envelope dropped"),
+                            }
+                        }
+                        if let Some(missing) = gate.gap_expired(cfg.gap_timeout) {
+                            tracing::warn!(missing, "lsn gap; resubscribing");
+                            next_lsn = missing;
+                            reconnect_reason = "lsn gap";
+                            break;
+                        }
+                    }
+                    Err(es::Error::UnexpectedResponse(resp, _)) if resp.status() == 409 => {
+                        // R-C6: Resync Required -> targeted rehydration.
+                        tracing::warn!("409 resync required");
+                        reconnect_reason = "409 resync";
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "sse stream error");
+                        reconnect_reason = "stream error";
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(resync) = &resync {
+            (resync)().await;
+        }
+        tracing::info!(reason = reconnect_reason, next_lsn, "sse reconnecting");
+        metrics::counter!("exocortex_sync_reconnects_total").increment(1);
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(10));
+    }
+}
+
+/// Base64 (standard alphabet) decode; rejects padding errors.
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let _ = T;
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let unpadded: Vec<u8> = bytes.iter().copied().take_while(|b| *b != b'=').collect();
+    if bytes.len() % 4 != 0 || bytes.len() - unpadded.len() > 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(unpadded.len() * 3 / 4);
+    for chunk in unpadded.chunks(4) {
+        let mut n: u32 = 0;
+        for (i, c) in chunk.iter().enumerate() {
+            n |= (val(*c)? as u32) << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}

@@ -95,9 +95,9 @@ fn log_det_cov(rows: &[&[f32]], epsilon: f32) -> f32 {
         return 0.0;
     }
     let n = rows.len() as f32;
-    // Σ = (1/n) XᵀX, so I + (d/(n ε²)) Σ = I + (1/(n ε²)) XᵀX —
-    // accumulate the Gram matrix and run a plain Cholesky.
-    let alpha = d as f32 / (n * epsilon * epsilon) / n.max(1.0);
+    // PRD §11.2: R(Z) = ½ log det(I + (d/(n ε²))·ZZᵀ). Accumulate the Gram
+    // matrix XᵀX directly, so alpha = d/(n ε²) — no extra 1/n.
+    let alpha = d as f32 / (n * epsilon * epsilon);
     let mut a = vec![vec![0.0f64; d]; d];
     for r in rows {
         for (i, row) in a.iter_mut().enumerate().take(d) {
@@ -278,18 +278,24 @@ pub struct GraphSparsity {
 }
 
 /// Compute sparsity from an edge list: (from, to, kind, similarity-class).
-/// `similar_kind` edges are excluded from out-degrees (§11.6.1).
+/// `similar_kind` edges are excluded from out-degrees (§11.6.1: the
+/// similarity bucket must not inflate hairball detection).
 pub fn compute_sparsity(
     nodes: &[(MemoryId, u8)],
     edges: &[(MemoryId, MemoryId, u32, ClusterId, f32)],
     hairball_threshold: u32,
+    similar_kind: Option<exocortex_kernel::RelKindId>,
 ) -> GraphSparsity {
     let mut out_deg: HashMap<MemoryId, u32> = HashMap::new();
     let mut densities: HashMap<ClusterId, (f32, usize)> = HashMap::new();
-    let mut n_counted = 0usize;
-    for (from, _to, _kind, cluster, confidence) in edges {
+    let n_counted = 0usize;
+    for (from, _to, kind, cluster, confidence) in edges {
+        // Similarity edges ride the graph but never count toward
+        // out-degrees/hairballs (§11.6.1).
+        if similar_kind.is_some_and(|sk| sk.0 == *kind) {
+            continue;
+        }
         *out_deg.entry(*from).or_default() += 1;
-        n_counted += 1;
         let e = densities.entry(*cluster).or_default();
         e.0 += *confidence;
         e.1 += 1;
@@ -357,4 +363,15 @@ pub fn compute_sparsity(
         n_edges: edges.len().max(n_counted),
         computed_at: Utc::now(),
     }
+}
+
+/// §14.3 effective relationship strength: evidence boost (capped 0.20),
+/// success scaling, and age decay (floored 0.5), clamped to [0,1]. This is
+/// the single scoring copy — Dreams' strengthen action applies it; there is
+/// no second implementation elsewhere.
+pub fn effective_strength(base: f32, evidence_count: u32, success_rate: f32, age_days: f32) -> f32 {
+    let boost = (0.05 * ((evidence_count as f32 - 1.0).max(0.0)).sqrt()).min(0.20);
+    let success = 0.5 + 0.5 * success_rate;
+    let decay = (1.0 - 0.01 * age_days).max(0.5);
+    ((base + boost) * success * decay).clamp(0.0, 1.0)
 }

@@ -3,12 +3,10 @@
 //! then the §7.13 pipeline; batches are atomic and the ack names the first
 //! offending draft_key with its RejectCode.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use tokio::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status, Streaming};
 
 use exocortex_kernel::{
@@ -22,7 +20,17 @@ use exocortex_wire::ingest::v1::{
     SubmitOne,
 };
 
+use crate::embedding::EmbedderRef;
 use crate::entities::EntityExtractor;
+
+/// §18.8.5: the idempotency + source registries keep their last 1000
+/// entries (LRU), so a churning producer set cannot grow them unboundedly.
+const REGISTRY_LRU_CAP: usize = 1000;
+
+/// The source-ceiling registry: (org, source_uri, producer_id) -> ceiling.
+pub type SourceRegistry = lru::LruCache<(String, String, String), Visibility>;
+/// The idempotency store: (producer_id, batch_id) -> original ack.
+pub type SeenBatchRegistry = lru::LruCache<(String, String), IngestAck>;
 
 /// The Ingestion Protocol server over any Storage backend.
 pub struct IngestServer<S: Storage> {
@@ -33,25 +41,38 @@ pub struct IngestServer<S: Storage> {
     /// Producer authentication key (R-I8).
     pub hmac_key: [u8; 32],
     /// Registered source ceilings: (org, source_uri, producer_id) -> ceiling
-    /// (R-I3 / R-T11a).
-    pub sources: Mutex<HashMap<(String, String, String), Visibility>>,
-    /// Idempotency LRU: (producer_id, batch_id) -> original ack.
-    pub seen_batches: Mutex<HashMap<(String, String), IngestAck>>,
+    /// (R-I3 / R-T11a). LRU-bounded (§18.8.5) and Arc-shared across clones.
+    /// std::Mutex: critical sections are pure map ops, never held across awaits.
+    pub sources: Arc<Mutex<SourceRegistry>>,
+    /// Where the ceiling registry persists (M6.5); `None` = ephemeral.
+    pub sources_file: Option<std::path::PathBuf>,
+    /// Idempotency LRU: (producer_id, batch_id) -> original ack (§18.8.5).
+    pub seen_batches: Arc<Mutex<SeenBatchRegistry>>,
+    /// Backend-assigned embeddings (§7.5); `None` disables the embedding
+    /// step (backend config flag, R-Lat3).
+    pub embedder: Option<EmbedderRef>,
     /// Entity extraction (server-side only, R-T18).
     pub extractor: EntityExtractor,
+    /// Reasoning enrichment: after a successful commit, enqueue
+    /// `SessionWrapup` work (§10.7 step 8).
+    pub reasoning: Option<Arc<exocortex_reasoning::ReasoningEngine<S>>>,
 }
 
 impl<S: Storage> Clone for IngestServer<S> {
     fn clone(&self) -> Self {
-        // The Mutex'd registries are cloned by value: streaming handlers
-        // receive a snapshot view; commits share the Arc'd storage.
+        // Cheap handle clone: storage, registries, and ontology are shared;
+        // commits through any clone hit the same registries (no
+        // `blocking_lock` under async contention).
         Self {
             storage: self.storage.clone(),
             ontology: self.ontology.clone(),
             hmac_key: self.hmac_key,
-            sources: Mutex::new(self.sources.blocking_lock().clone()),
-            seen_batches: Mutex::new(self.seen_batches.blocking_lock().clone()),
-            extractor: EntityExtractor::new("org"),
+            sources: self.sources.clone(),
+            sources_file: self.sources_file.clone(),
+            seen_batches: self.seen_batches.clone(),
+            embedder: self.embedder.clone(),
+            extractor: self.extractor.clone(),
+            reasoning: self.reasoning.clone(),
         }
     }
 }
@@ -69,9 +90,62 @@ impl<S: Storage> IngestServer<S> {
             storage,
             ontology,
             hmac_key,
-            sources: Mutex::new(HashMap::new()),
-            seen_batches: Mutex::new(HashMap::new()),
+            sources: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(REGISTRY_LRU_CAP).unwrap(),
+            ))),
+            sources_file: None,
+            seen_batches: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(REGISTRY_LRU_CAP).unwrap(),
+            ))),
+            embedder: None,
             extractor: EntityExtractor::new(&org),
+            reasoning: None,
+        }
+    }
+
+    /// Backend config flag: enable the embedding step (§7.5).
+    pub fn with_embedder(mut self, embedder: EmbedderRef) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// Wire the reasoning engine for post-commit `SessionWrapup` enrichment
+    /// (§10.7 step 8). The caller owns the engine's `run` loop.
+    pub fn with_reasoning(mut self, engine: Arc<exocortex_reasoning::ReasoningEngine<S>>) -> Self {
+        self.reasoning = Some(engine);
+        self
+    }
+
+    /// Persist the ceiling registry to `path` on every registration, and
+    /// load it now (M6.5). Failures are logged, never fatal: an unreadable
+    /// registry degrades to re-registration, not an outage.
+    pub fn with_sources_file(mut self, path: std::path::PathBuf) -> Self {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            match serde_json::from_str::<Vec<((String, String, String), u8)>>(&raw) {
+                Ok(rows) => {
+                    let mut sources = self.sources.lock().unwrap();
+                    for ((org, uri, producer), vis) in rows {
+                        sources.put((org, uri, producer), Self::vis_from_i32(vis as i32));
+                    }
+                }
+                Err(e) => tracing::warn!(?e, "source registry unreadable; starting empty"),
+            }
+        }
+        self.sources_file = Some(path);
+        self
+    }
+
+    /// Flush the ceiling registry to disk (best effort).
+    fn persist_sources(&self, sources: &SourceRegistry) {
+        let Some(path) = &self.sources_file else {
+            return;
+        };
+        let rows: Vec<((String, String, String), u8)> = sources
+            .iter()
+            .map(|((o, u, p), v)| ((o.clone(), u.clone(), p.clone()), *v as u8))
+            .collect();
+        if let Err(e) = std::fs::write(path, serde_json::to_vec(&rows).unwrap_or_default()) {
+            tracing::warn!(?e, "source registry persist failed");
         }
     }
 
@@ -147,7 +221,8 @@ impl<S: Storage> IngestServer<S> {
             title: m.title.clone().into(),
             content: m.content.clone(),
             summary: None,
-            tags: m.tags.iter().map(|t| t.as_str().into()).collect(),
+            // §2.6.1: tags are lowercased/trimmed/deduped at draft→memory.
+            tags: exocortex_kernel::normalize_tags(m.tags.iter().map(|t| t.as_str())),
             visibility: vis,
             provenance: if snapshot {
                 Provenance::ExternalSnapshot(exocortex_kernel::ExternalSnapshot {
@@ -229,6 +304,18 @@ impl<S: Storage> IngestServer<S> {
         }
         // Server-side entity extraction (R-T18).
         crate::entities::attach_entities(&mut mem, &self.extractor);
+        // Backend-assigned embedding (§7.5): embed `title + content` after
+        // entity extraction, on the commit path only (R-Lat3). Failures
+        // degrade to `embedding: None` — Dreams skips the row, ingest never
+        // rejects on embedder health.
+        if let Some(embedder) = &self.embedder {
+            if let Ok(v) = embedder.embed(&format!("{}\n{}", m.title, m.content)) {
+                metrics::counter!("exocortex_ingest_embeddings_total",
+                    "model" => embedder.model_id())
+                .increment(1);
+                mem.embedding = Some(v);
+            }
+        }
         Ok(mem)
     }
 
@@ -365,7 +452,7 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         }
         // Idempotency: replay returns the original ack.
         {
-            let seen = self.seen_batches.lock().await;
+            let mut seen = self.seen_batches.lock().unwrap();
             if let Some(original) = seen.get(&(batch.producer_id.clone(), batch.batch_id.clone())) {
                 let mut replay = original.clone();
                 replay.rejections = vec![RejectRow {
@@ -378,7 +465,7 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         }
         // Step 2: source admission + ceiling equality (R-I3).
         let registered_ceiling = {
-            let sources = self.sources.lock().await;
+            let mut sources = self.sources.lock().unwrap();
             sources
                 .get(&(
                     batch.org_id.clone(),
@@ -444,6 +531,19 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             return Ok(Response::new(ack));
         }
 
+        // R-T4: writing `k(a,b)` writes `k'(b,a)` in the same batch. The
+        // companion mirrors provenance/visibility; deterministic ids make
+        // re-materialization idempotent.
+        let mut batch_ids: std::collections::HashSet<RelationshipId> =
+            ok_rel.iter().map(|r| r.id).collect();
+        for r in ok_rel.clone() {
+            if let Some(inv) = exocortex_kernel::materialize_inverse(&self.ontology, &r) {
+                if batch_ids.insert(inv.id) {
+                    ok_rel.push(inv);
+                }
+            }
+        }
+
         // Step: persist accepted rows in one transactional batch.
         let commit = self
             .storage
@@ -451,6 +551,19 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             .await
             .map_err(|e| Status::internal(format!("storage: {e}")))?;
         let assigned_lsn = commit.last().map(|c| c.lsn).unwrap_or(0);
+
+        // §10.7 step 8: on every session-wrapup submit, enqueue
+        // `SessionWrapup { memories }` after the storage commit so the
+        // reasoning engine derives edges off the interactive path.
+        if batch.source_uri.starts_with("session://") {
+            if let Some(engine) = &self.reasoning {
+                engine
+                    .enqueue(exocortex_reasoning::ReasoningWork::SessionWrapup {
+                        memories: ok_mem.iter().map(|m| m.id).collect(),
+                    })
+                    .await;
+            }
+        }
         let ack = IngestAck {
             batch_id: batch.batch_id.clone(),
             accepted: (ok_mem.len() + ok_rel.len()) as u32,
@@ -458,7 +571,7 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             rejections: vec![],
             assigned_lsn,
         };
-        self.seen_batches.lock().await.insert(
+        self.seen_batches.lock().unwrap().put(
             (batch.producer_id.clone(), batch.batch_id.clone()),
             ack.clone(),
         );
@@ -517,10 +630,11 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
     ) -> Result<Response<RegisterSourceResponse>, Status> {
         let r = req.into_inner();
         let ceiling = Self::vis_from_i32(r.ceiling);
-        self.sources
-            .lock()
-            .await
-            .insert((r.org_id, r.source_uri, r.producer_id), ceiling);
+        {
+            let mut sources = self.sources.lock().unwrap();
+            sources.put((r.org_id, r.source_uri, r.producer_id), ceiling);
+            self.persist_sources(&sources);
+        }
         Ok(Response::new(RegisterSourceResponse {
             ceiling: ceiling as i32,
         }))

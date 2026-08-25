@@ -80,6 +80,25 @@ impl InMemoryStorage {
     pub fn last_lsn(&self) -> u64 {
         self.lsn.load(Ordering::SeqCst)
     }
+
+    /// Row write without inverse materialization (the companion path's
+    /// terminal, so R-T4 never recurses).
+    async fn upsert_relationship_row(
+        &self,
+        r: &Relationship,
+    ) -> Result<CommitRecord, StorageError> {
+        let lsn = self.next_lsn();
+        let mut store = self.inner.rels.lock().unwrap();
+        let mut r = r.clone();
+        r.lsn = exocortex_kernel::LSN::new_backend(lsn);
+        store.entry(r.id).or_default().push(r);
+        Ok(CommitRecord {
+            lsn,
+            committed_at: Utc::now(),
+            node_id: None,
+            edge_id: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -128,17 +147,23 @@ impl Storage for InMemoryStorage {
         })
     }
     async fn upsert_relationship(&self, r: &Relationship) -> Result<CommitRecord, StorageError> {
-        let lsn = self.next_lsn();
-        let mut store = self.inner.rels.lock().unwrap();
-        let mut r = r.clone();
-        r.lsn = exocortex_kernel::LSN::new_backend(lsn);
-        store.entry(r.id).or_default().push(r);
-        Ok(CommitRecord {
-            lsn,
-            committed_at: Utc::now(),
-            node_id: None,
-            edge_id: None,
-        })
+        let rec = self.upsert_relationship_row(r).await?;
+        // R-T4: write `k'(b,a)` in the same operation. Skipped when the
+        // companion is already current, so repeated writes are idempotent.
+        if let Some(inv) = exocortex_kernel::materialize_inverse(&self.inner.ontology, r) {
+            let already_current = self
+                .inner
+                .rels
+                .lock()
+                .unwrap()
+                .get(&inv.id)
+                .and_then(|h| h.last())
+                .is_some_and(|cur| cur.valid_until.is_none());
+            if !already_current {
+                self.upsert_relationship_row(&inv).await?;
+            }
+        }
+        Ok(rec)
     }
     async fn delete_relationship(&self, id: &RelationshipId) -> Result<CommitRecord, StorageError> {
         let lsn = self.next_lsn();
@@ -164,6 +189,29 @@ impl Storage for InMemoryStorage {
             .unwrap()
             .get(id)
             .and_then(|h| h.last().cloned()))
+    }
+    async fn get_memory_for(
+        &self,
+        id: &MemoryId,
+        vc: &crate::VisibilityContext,
+    ) -> Result<Option<Memory>, StorageError> {
+        let Some(m) = self
+            .inner
+            .memories
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|h| h.last().cloned())
+        else {
+            return Ok(None);
+        };
+        if m.visibility as u8 > vc.max_visibility as u8
+            || (m.visibility == Visibility::Private
+                && m.context.user_id.as_deref() != Some(vc.user_id.as_str()))
+        {
+            return Err(StorageError::PermissionDenied);
+        }
+        Ok(Some(m))
     }
     async fn get_memories(&self, ids: &[MemoryId]) -> Result<Vec<Memory>, StorageError> {
         let store = self.inner.memories.lock().unwrap();

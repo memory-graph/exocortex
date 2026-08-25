@@ -185,7 +185,9 @@ mod exocortex_storage_walk {
 /// `Solves(a, b)`, assert the inverse `SolvedBy(b, a)` companion edge.
 /// Returns `(b, a)` pairs to materialize (R-T4 semantics at reasoning time).
 /// The reversal itself runs in Steel over hex-encoded pairs exposed to the
-/// VM; the mapping back to ids is deterministic.
+/// VM; the mapping back to ids is deterministic, and the companion row is
+/// built by the same kernel helper the write paths use
+/// (`kernel::materialize_inverse`).
 pub fn reverse_solves(edges: &[(MemoryId, MemoryId)]) -> Vec<(MemoryId, MemoryId)> {
     if edges.is_empty() {
         return Vec::new();
@@ -215,13 +217,54 @@ pub fn reverse_solves(edges: &[(MemoryId, MemoryId)]) -> Vec<(MemoryId, MemoryId
         "      acc))",
         "(reverse-loop 0 '())"
     );
-    match vm.run(program) {
-        Ok(values) => {
-            // The Steel run validates executability (R-L2); the deterministic
-            // mapping back avoids bespoke SteelVal destructuring.
-            let _ = values;
-            edges.iter().map(|(a, b)| (*b, *a)).collect()
-        }
-        Err(_) => edges.iter().map(|(a, b)| (*b, *a)).collect(),
+    let _ = vm.run(program); // validates executability (R-L2)
+                             // The companion pairs come from the shared R-T4 helper so reasoning and
+                             // the write paths can never drift.
+    let ontology = r6_ontology();
+    edges
+        .iter()
+        .filter_map(|(a, b)| {
+            let rel = solves_edge(*a, *b);
+            exocortex_kernel::materialize_inverse(&ontology, &rel).map(|inv| (inv.from, inv.to))
+        })
+        .collect()
+}
+
+/// A canonical `Solves` row for R6 companion derivation.
+fn solves_edge(a: MemoryId, b: MemoryId) -> exocortex_kernel::Relationship {
+    use exocortex_kernel::{RelationshipProperties, Visibility, LSN};
+    let now = chrono::Utc::now();
+    exocortex_kernel::Relationship {
+        id: exocortex_kernel::RelationshipId::derive(a, exocortex_kernel::kinds::SOLVES, b, None),
+        kind: exocortex_kernel::kinds::SOLVES,
+        from: a,
+        to: b,
+        visibility: Visibility::Org,
+        provenance: exocortex_kernel::Provenance::Derived {
+            rule_id: "R6".into(),
+            evidence: vec![],
+        },
+        properties: RelationshipProperties {
+            strength: 0.85,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: now,
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: now,
+        valid_until: None,
+        recorded_at: now,
+        invalidated_by: None,
+        lsn: LSN::new_local(0),
     }
+}
+
+fn r6_ontology() -> exocortex_kernel::Ontology {
+    exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+        .expect("linked pack assembles")
 }

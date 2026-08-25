@@ -72,33 +72,68 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
     /// Bounded k-hop reasoning (§10.7 step 4): gather the neighborhood,
     /// load facts into Crepe, run the fixpoint, write new relationships back
     /// with `Provenance::Derived { rule_id, evidence }`.
+    ///
+    /// §10.6: the neighborhood harvest is ONE relationship scan (O(E)),
+    /// not one scan per hop — adjacency is built once, then BFS over it is
+    /// bounded by `k` and the CR-6 node caps. Previously O(hops·E).
     #[instrument(skip(self))]
     pub async fn k_hop_reason(&self, seed: MemoryId, k: u8) {
         let k = k.clamp(1, self.k_hop.max(1));
         let mut edges: Vec<Edge> = Vec::new();
         let mut entities: Vec<EntityFact> = Vec::new();
         let mut tags: Vec<TagFact> = Vec::new();
-        let mut seeds = vec![seed];
-        let mut seen = std::collections::HashSet::new();
         let mut evidence: Vec<RelationshipId> = Vec::new();
 
-        for _hop in 0..k {
-            let mut next_seeds = Vec::new();
+        // Single scan: build undirected adjacency for the BFS + the edge
+        // rows (directed) for the rule program.
+        let mut adjacency: std::collections::HashMap<MemoryId, Vec<(MemoryId, RelationshipId)>> =
+            std::collections::HashMap::new();
+        {
             use futures::StreamExt;
             let mut rels = self.storage.stream_all_relationships().await;
             while let Some(Ok(r)) = rels.next().await {
-                if (seeds.contains(&r.from) || seeds.contains(&r.to)) && seen.insert(r.id) {
-                    evidence.push(r.id);
-                    edges.push(Edge(r.from, r.to, r.kind));
-                    next_seeds.push(r.from);
-                    next_seeds.push(r.to);
+                adjacency.entry(r.from).or_default().push((r.to, r.id));
+                adjacency.entry(r.to).or_default().push((r.from, r.id));
+            }
+        }
+
+        // Bounded BFS from the seed (CR-6 hard caps).
+        const MAX_NODES: usize = 512;
+        let mut neighborhood: std::collections::HashSet<MemoryId> =
+            std::collections::HashSet::from([seed]);
+        let mut seen_edges: std::collections::HashSet<RelationshipId> =
+            std::collections::HashSet::new();
+        let mut frontier = vec![seed];
+        for _hop in 0..k {
+            let mut next = Vec::new();
+            for node in &frontier {
+                if let Some(neighbors) = adjacency.get(node) {
+                    for (other, edge_id) in neighbors {
+                        if neighborhood.insert(*other) && neighborhood.len() <= MAX_NODES {
+                            next.push(*other);
+                        }
+                        if seen_edges.insert(*edge_id) {
+                            evidence.push(*edge_id);
+                        }
+                    }
                 }
             }
-            drop(rels);
-            if next_seeds.is_empty() {
+            if next.is_empty() || neighborhood.len() > MAX_NODES {
                 break;
             }
-            seeds = next_seeds;
+            frontier = next;
+        }
+
+        // Edge facts: every edge with BOTH endpoints inside the
+        // neighborhood, directed as stored.
+        {
+            use futures::StreamExt;
+            let mut rels = self.storage.stream_all_relationships().await;
+            while let Some(Ok(r)) = rels.next().await {
+                if neighborhood.contains(&r.from) && neighborhood.contains(&r.to) {
+                    edges.push(Edge(r.from, r.to, r.kind));
+                }
+            }
         }
 
         // Attribute facts (tags, entities) come from every memory: affinity

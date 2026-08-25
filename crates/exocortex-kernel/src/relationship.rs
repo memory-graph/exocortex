@@ -59,3 +59,35 @@ pub struct RelationshipProperties {
     /// Last time this edge was validated.
     pub last_validated: DateTime<Utc>,
 }
+
+/// Build the inverse companion row for a relationship (R-T4): writing
+/// `k(a,b)` writes `k'(b,a)` in the same transaction. The companion mirrors
+/// provenance, visibility, properties, and bi-temporal validity; identity is
+/// deterministic (`RelationshipId::derive(b, k', a)`), so re-materializing
+/// an already-present companion is an idempotent upsert. Returns `None`
+/// when the kind has no inverse, when the kind is self-inverse /
+/// bidirectional (the row already is its own companion), or when the kind
+/// is unknown to the ontology.
+pub fn materialize_inverse(ontology: &crate::Ontology, rel: &Relationship) -> Option<Relationship> {
+    let meta = ontology.kinds_by_id.get(&rel.kind)?;
+    let inverse = meta.inverse?;
+    if inverse == rel.kind || meta.bidirectional {
+        return None;
+    }
+    Some(Relationship {
+        id: RelationshipId::derive(rel.to, inverse, rel.from, None),
+        kind: inverse,
+        from: rel.to,
+        to: rel.from,
+        visibility: rel.visibility,
+        provenance: rel.provenance.clone(),
+        properties: rel.properties.clone(),
+        description: rel.description.clone(),
+        bidirectional: false,
+        valid_from: rel.valid_from,
+        valid_until: rel.valid_until,
+        recorded_at: rel.recorded_at,
+        invalidated_by: None,
+        lsn: rel.lsn,
+    })
+}

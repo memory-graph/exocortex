@@ -8,8 +8,10 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
 
+pub mod embedding;
 pub mod entities;
 pub mod service;
 
+pub use embedding::{Embedder, EmbedderRef, FakeEmbedder};
 pub use entities::EntityExtractor;
 pub use service::IngestServer;

@@ -127,33 +127,50 @@ async fn apply_invalidations_cow() {
 
 #[tokio::test]
 async fn two_q_resists_scan_pollution() {
-    // §8.5 step 5: [A B C A] keeps A resident; a long unique scan does not
-    // evict a warm graph (ghost-hit re-promotion).
-    let (cache, _rx) = LocalCache::new(16 * 1024 * 1024); // ~16k entry budget
+    // §8.5 step 5: a long unique scan evicts cold graphs, but a re-referenced
+    // warm graph is promoted out of A1in into Am and survives. The budget is
+    // small enough that the 65 tiny org graphs (~600B each ≈ 39KB total)
+    // overflow it, forcing real evictions.
+    let budget = 8 * 1024;
+    let (cache, _rx) = LocalCache::new(budget);
     let ctx = vc(Visibility::Org, "u");
 
     let mut snap = GraphSnapshot::empty();
     snap.push_test_memory(mem("warm-a", Visibility::Org, None));
     cache.publish("org-a", Arc::new(snap));
-    assert!(
-        cache
-            .get_memory("org-a", &cache_first_id("org-a", &cache), &ctx)
-            .is_some()
-            | true
-    );
+    assert_eq!(cache.a1in_count("org-a"), 1);
 
-    // Fill with enough orgs to overflow A1in; then scan many cold graphs.
-    for i in 0..64 {
+    // Re-reference the warm org: 2Q promotes it from A1in to Am.
+    cache.touch_admission("org-a");
+    assert_eq!(cache.a1in_count("org-a"), 0, "no duplicate A1in entries");
+    assert!(cache.am_contains("org-a"), "re-reference promotes to Am");
+
+    // Fill with cold orgs; each publish overflows the byte budget and evicts
+    // from A1in, so the cold scan cannot displace the warm Am entry.
+    const COLD: usize = 64;
+    for i in 0..COLD {
         let mut s = GraphSnapshot::empty();
         s.push_test_memory(mem(&format!("cold-{i}"), Visibility::Org, None));
         cache.publish(&format!("org-cold-{i}"), Arc::new(s));
     }
-    // Re-touch org-a repeatedly: it must survive the cold scan.
-    for _ in 0..8 {
-        let _ = cache.search("org-a", "warm", 5, &ctx);
-        cache.touch_admission("org-a");
+
+    // Eviction really happened: far fewer residents than published orgs.
+    assert!(
+        cache.resident_orgs() < 1 + COLD,
+        "budget must force eviction: resident={} published={}",
+        cache.resident_orgs(),
+        1 + COLD
+    );
+    // Some cold org was actually evicted.
+    let mut evicted = 0;
+    for i in 0..COLD {
+        if cache.graphs_snapshot(&format!("org-cold-{i}")).is_none() {
+            evicted += 1;
+        }
     }
-    assert!(cache.resident_orgs() > 0);
+    assert!(evicted > 0, "at least one cold org evicted (got {evicted})");
+
+    // The warm org survived the scan load.
     let found = cache.search("org-a", "warm-a", 5, &ctx);
     assert!(
         !found.is_empty(),
@@ -161,8 +178,30 @@ async fn two_q_resists_scan_pollution() {
     );
 }
 
-fn cache_first_id(_org: &str, _cache: &LocalCache) -> MemoryId {
-    MemoryId::new_v7()
+#[tokio::test]
+async fn repeated_publish_never_duplicates_a1in() {
+    let (cache, _rx) = LocalCache::new(64 * 1024 * 1024);
+    for _ in 0..5 {
+        let mut s = GraphSnapshot::empty();
+        s.push_test_memory(mem("x", Visibility::Org, None));
+        cache.publish("org-x", Arc::new(s));
+    }
+    assert_eq!(
+        cache.a1in_count("org-x"),
+        0,
+        "re-publish promotes, never duplicates"
+    );
+    assert!(cache.am_contains("org-x"));
+    for i in 0..10 {
+        let mut s = GraphSnapshot::empty();
+        s.push_test_memory(mem(&format!("y{i}"), Visibility::Org, None));
+        cache.publish(&format!("org-y{i}"), Arc::new(s));
+    }
+    assert_eq!(
+        cache.a1in_len(),
+        10,
+        "A1in holds each distinct org exactly once"
+    );
 }
 
 #[tokio::test]

@@ -35,7 +35,16 @@ exocortex-ops = { workspace = true }
 rmcp = { workspace = true }
 sled = { workspace = true }
 eventsource-client = { workspace = true }
+futures = { workspace = true }
+metrics = { workspace = true }
+subtle = { workspace = true }
 
 [[bin]]
 name = "exocortex-mcp-client"
 path = "src/main.rs"
+
+[dev-dependencies]
+exocortex-cluster = { workspace = true }
+exocortex-server = { workspace = true }
+axum = { workspace = true }
+prost = { workspace = true }

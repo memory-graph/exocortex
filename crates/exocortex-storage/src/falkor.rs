@@ -396,6 +396,53 @@ impl FalkorStorage {
             "lsn": lsn,
         })
     }
+
+    /// Row write without inverse materialization (R-T4 terminal).
+    async fn upsert_relationship_row(
+        &self,
+        r: &Relationship,
+    ) -> Result<CommitRecord, StorageError> {
+        let lsn = self.next_lsn().await?;
+        let now = Utc::now();
+        let kind_label = self.kind_label(r.kind)?;
+        let params = serde_json::json!({
+            "rel_id": hex(&r.id.0),
+            "from": hex(&r.from.0),
+            "to": hex(&r.to.0),
+            "kind_label": kind_label,
+            "props_json": FalkorStorage::props_json(r, lsn),
+            "visibility": r.visibility as u8,
+            "valid_from": r.valid_from.to_rfc3339(),
+            "valid_until": r.valid_until.map(|t| t.to_rfc3339()),
+            "invalidated_by": r.invalidated_by.map(|id| hex(&id.0)),
+            "recorded_at": r.recorded_at.to_rfc3339(),
+            "lsn": lsn,
+        });
+        let rows = self
+            .run_template("upsert_relationship", &params, false)
+            .await?;
+        let edge_id = rows.first().and_then(|r| r.first()).and_then(|v| {
+            if let FalkorValue::I64(i) = v {
+                Some(*i as u64)
+            } else {
+                None
+            }
+        });
+        self.publish(Invalidation::RelationshipUpserted {
+            id: r.id,
+            from: r.from,
+            to: r.to,
+            kind: r.kind,
+            lsn,
+        })
+        .await;
+        Ok(CommitRecord {
+            lsn,
+            committed_at: now,
+            node_id: None,
+            edge_id,
+        })
+    }
 }
 
 #[async_trait]
@@ -465,46 +512,14 @@ impl Storage for FalkorStorage {
     }
 
     async fn upsert_relationship(&self, r: &Relationship) -> Result<CommitRecord, StorageError> {
-        let lsn = self.next_lsn().await?;
-        let now = Utc::now();
-        let kind_label = self.kind_label(r.kind)?;
-        let params = serde_json::json!({
-            "rel_id": hex(&r.id.0),
-            "from": hex(&r.from.0),
-            "to": hex(&r.to.0),
-            "kind_label": kind_label,
-            "props_json": FalkorStorage::props_json(r, lsn),
-            "visibility": r.visibility as u8,
-            "valid_from": r.valid_from.to_rfc3339(),
-            "valid_until": r.valid_until.map(|t| t.to_rfc3339()),
-            "invalidated_by": r.invalidated_by.map(|id| hex(&id.0)),
-            "recorded_at": r.recorded_at.to_rfc3339(),
-            "lsn": lsn,
-        });
-        let rows = self
-            .run_template("upsert_relationship", &params, false)
-            .await?;
-        let edge_id = rows.first().and_then(|r| r.first()).and_then(|v| {
-            if let FalkorValue::I64(i) = v {
-                Some(*i as u64)
-            } else {
-                None
-            }
-        });
-        self.publish(Invalidation::RelationshipUpserted {
-            id: r.id,
-            from: r.from,
-            to: r.to,
-            kind: r.kind,
-            lsn,
-        })
-        .await;
-        Ok(CommitRecord {
-            lsn,
-            committed_at: now,
-            node_id: None,
-            edge_id,
-        })
+        let rec = self.upsert_relationship_row(r).await?;
+        // R-T4: write `k'(b,a)` in the same operation. The companion row
+        // write is terminal (no further materialization) so R-T4 never
+        // recurses; DELETE-then-CREATE makes re-writes idempotent.
+        if let Some(inv) = exocortex_kernel::materialize_inverse(&self.ontology, r) {
+            self.upsert_relationship_row(&inv).await?;
+        }
+        Ok(rec)
     }
 
     async fn delete_relationship(&self, id: &RelationshipId) -> Result<CommitRecord, StorageError> {
@@ -533,6 +548,31 @@ impl Storage for FalkorStorage {
         let rows = self.run_template("get_memory_by_id", &params, true).await?;
         match rows.first().and_then(|r| r.first()) {
             Some(v) if !matches!(v, FalkorValue::None) => Ok(Some(memory_from_value(v)?)),
+            _ => Ok(None),
+        }
+    }
+    async fn get_memory_for(
+        &self,
+        id: &MemoryId,
+        vc: &crate::VisibilityContext,
+    ) -> Result<Option<Memory>, StorageError> {
+        // Template filters at the caller's ceiling; the Private-authorship
+        // resolution (§17.2) re-checks above the seam.
+        let params = serde_json::json!({
+            "id": hex(&id.0),
+            "max_visibility": vc.max_visibility as u8,
+        });
+        let rows = self.run_template("get_memory_by_id", &params, true).await?;
+        match rows.first().and_then(|r| r.first()) {
+            Some(v) if !matches!(v, FalkorValue::None) => {
+                let m = memory_from_value(v)?;
+                if m.visibility == Visibility::Private
+                    && m.context.user_id.as_deref() != Some(vc.user_id.as_str())
+                {
+                    return Err(StorageError::PermissionDenied);
+                }
+                Ok(Some(m))
+            }
             _ => Ok(None),
         }
     }

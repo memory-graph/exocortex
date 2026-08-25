@@ -426,6 +426,14 @@ impl LocalCache {
             tq.a1out.pop(org);
             return;
         }
+        if tq.a1in.contains(org) {
+            // Re-reference while still in A1in: promote to Am (2Q
+            // semantics). This also guarantees repeated publishes never
+            // duplicate the A1in entry.
+            tq.a1in.retain(|o| o != org);
+            tq.am.put(org.clone(), ());
+            return;
+        }
         tq.a1in.push_back(org.clone());
         while tq.bytes > self.budget {
             if let Some(evicted) = tq.a1in.pop_front() {
@@ -593,6 +601,25 @@ impl LocalCache {
     /// Number of resident org graphs (tests).
     pub fn resident_orgs(&self) -> usize {
         self.graphs.len()
+    }
+
+    /// A1in membership count for `org` (tests: duplicate-admission guard).
+    #[doc(hidden)]
+    pub fn a1in_count(&self, org: &str) -> usize {
+        let tq = self.tq.lock();
+        tq.a1in.iter().filter(|o| o.as_str() == org).count()
+    }
+
+    /// Total A1in entries (tests).
+    #[doc(hidden)]
+    pub fn a1in_len(&self) -> usize {
+        self.tq.lock().a1in.len()
+    }
+
+    /// Am membership (tests: promotion semantics).
+    #[doc(hidden)]
+    pub fn am_contains(&self, org: &str) -> bool {
+        self.tq.lock().am.contains(org)
     }
 
     /// Load the current snapshot Arc for an org (read path; refcount bump).

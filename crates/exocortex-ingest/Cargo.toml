@@ -35,6 +35,15 @@ lasso = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
+metrics = { workspace = true }
+lru = { workspace = true }
+fastembed = { workspace = true, optional = true }
+
+[features]
+# Production embedding backend (bge-small via fastembed/ort). Off by default
+# so builds and CI do not fetch the ONNX runtime; backend deployments enable
+# it (§16 embedding backend default).
+fastembed = ["dep:fastembed"]
 
 [dev-dependencies]
 exocortex-client = { workspace = true }
@@ -42,3 +51,5 @@ blake3 = { workspace = true }
 prost = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
 futures = { workspace = true }
+exocortex-dreams = { workspace = true }
+exocortex-reasoning = { workspace = true }

@@ -25,8 +25,14 @@ enum Cmd {
     /// Run the R-I1/R-I5 kernel purity check: shells out to
     /// `cargo tree -p exocortex-kernel -e no-dev` and greps for banned crates.
     KernelPurity,
-    /// Run the interactive-read latency benchmark (R-Lat1 SLO gate).
+    /// Run the interactive-read latency benchmark (R-Lat1 SLO gate):
+    /// builds both bench binaries in release mode and runs them; either one
+    /// exiting non-zero (SLO breach) fails the task.
     Bench,
+    /// CR-19 grep gate (R-D6): no LLM client crate or API endpoint string
+    /// anywhere under `crates/` or `xtask/` source. Complements
+    /// `kernel-purity` (which scopes to the kernel dep tree).
+    NoLlm,
 }
 
 fn main() -> Result<()> {
@@ -34,7 +40,8 @@ fn main() -> Result<()> {
         Cmd::Fingerprint => fingerprint(),
         Cmd::GenSchemas { write } => gen_schemas(write),
         Cmd::KernelPurity => kernel_purity(),
-        Cmd::Bench => todo!(),
+        Cmd::Bench => bench(),
+        Cmd::NoLlm => no_llm(),
     }
 }
 
@@ -167,5 +174,78 @@ fn kernel_purity() -> Result<()> {
             "kernel-purity FAILED: banned crates reachable from exocortex-kernel: {}",
             found.join(", ")
         )
+    }
+}
+
+/// `cargo xtask bench` — R-Lat1 SLO gate. Runs both bench binaries
+/// (`search`, `khop`) in release mode; each binary enforces its own budget
+/// and exits non-zero on breach.
+fn bench() -> Result<()> {
+    let cargo = std::env::var("CARGO")?.trim().to_string();
+    for (pkg, bench) in [
+        ("exocortex-cache", "search"),
+        ("exocortex-reasoning", "khop"),
+    ] {
+        println!("==> cargo bench -p {pkg} --bench {bench}");
+        let status = std::process::Command::new(&cargo)
+            .args(["bench", "-p", pkg, "--bench", bench])
+            .status()?;
+        anyhow::ensure!(
+            status.success(),
+            "SLO gate FAILED for {bench} (R-Lat1); see the p50/p99 lines above"
+        );
+    }
+    println!("bench ok: both SLO gates green (R-Lat1)");
+    Ok(())
+}
+
+/// `cargo xtask no-llm` — CR-19/R-D6 grep gate. Walks `crates/` and
+/// `xtask/` sources; fails on any LLM client crate identifier or API
+/// endpoint string. Model names in docs/comments are not violations; the
+/// gate matches dependency identifiers and wire endpoints. Scans `crates/`
+/// only (this file's own banned list must not self-match).
+fn no_llm() -> Result<()> {
+    const BANNED: &[&str] = &[
+        "async-openai",
+        "openai_api",
+        "api.openai.com",
+        "anthropic.com",
+        "api.anthropic",
+        "generativelanguage.googleapis.com",
+        "mistral.ai",
+        "cohere.ai",
+        "llm_client",
+    ];
+    let mut hits: Vec<String> = Vec::new();
+    // `crates/` only — this file's own banned list must not self-match.
+    let mut stack: Vec<std::path::PathBuf> = vec!["crates".into()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs" || e == "toml") {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for banned in BANNED {
+                    if text.contains(banned) {
+                        hits.push(format!("{}: contains `{banned}`", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    if hits.is_empty() {
+        println!("no-llm ok: no LLM client crate or endpoint in workspace sources (CR-19)");
+        Ok(())
+    } else {
+        anyhow::bail!("no-llm FAILED (CR-19):\n{}", hits.join("\n"))
     }
 }

@@ -106,3 +106,33 @@ pub struct MemoryContext {
     /// <= 8 KiB serialized (R-T10).
     pub additional_metadata: serde_json::Value,
 }
+
+/// Normalize one tag (§7.5 comment: tags are "lowercased, trimmed,
+/// deduped"): trim, lowercase, drop empties. Applied at every
+/// draft→memory conversion so storage never sees raw-cased tags.
+pub fn normalize_tag(tag: &str) -> Option<SmolStr> {
+    let normalized = tag.trim().to_lowercase();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.into())
+    }
+}
+
+/// Normalize a tag list: lowercase/trim each, drop empties, dedupe
+/// preserving first-seen order.
+pub fn normalize_tags<I, S>(tags: I) -> SmallVec<[SmolStr; 4]>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: SmallVec<[SmolStr; 4]> = SmallVec::new();
+    for t in tags {
+        if let Some(n) = normalize_tag(t.as_ref()) {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
+}

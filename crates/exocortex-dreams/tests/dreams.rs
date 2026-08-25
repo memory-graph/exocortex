@@ -311,9 +311,82 @@ fn sparsity_detects_hairballs() {
             )
         })
         .collect();
-    let s = compute_sparsity(&nodes, &edges, 32);
+    let s = compute_sparsity(&nodes, &edges, 32, None);
     assert!(s.hairball_fraction > 0.0, "hairball detected");
     assert_eq!(s.n_edges, 40);
 }
 
+#[test]
+fn sparsity_excludes_similarity_edges_from_out_degrees() {
+    use exocortex_dreams::mcr2::compute_sparsity;
+    let nodes: Vec<_> = (0..2).map(|i| (MemoryId([i; 16]), 3u8)).collect();
+    // 40 SimilarTo edges from node 0: excluded entirely (§11.6.1).
+    let similar: Vec<_> = (0..40)
+        .map(|_| (nodes[0].0, nodes[1].0, 0x8000_0024u32, 0u64, 0.9f32))
+        .collect();
+    let s = compute_sparsity(
+        &nodes,
+        &similar,
+        32,
+        Some(exocortex_kernel::RelKindId(0x8000_0024)),
+    );
+    assert_eq!(
+        s.hairball_fraction, 0.0,
+        "similarity edges never make hairballs"
+    );
+    assert_eq!(s.avg_out_degree, 0.0);
+    // Without the exclusion flag the same edges would count.
+    let s2 = compute_sparsity(&nodes, &similar, 32, None);
+    assert!(s2.hairball_fraction > 0.0);
+}
+
 const _UNUSED: Option<PruneReason> = None;
+
+/// §11.2 closed form: R(Z) = ½ log det(I + (d/(n·ε²))·ZZᵀ). With ε=0.5,
+/// d=2, and the two orthogonal unit rows e1,e2, ZZᵀ=I so alpha=d/(n ε²)=4
+/// and R = ½ log det(5I) = ln 5. The old off-by-1/n bug (alpha=d/(n²ε²)=2)
+/// would yield ln 3 instead.
+#[test]
+fn mcr2_log_det_matches_closed_form() {
+    let e = MCR2Engine {
+        epsilon: 0.5,
+        embedding_model: exocortex_dreams::mcr2::EmbeddingModelId::bge_small(),
+    };
+    let rows = vec![
+        MemoryWithEmbedding {
+            id: MemoryId::new_v7(),
+            class: 1,
+            embedding: vec![1.0, 0.0],
+        },
+        MemoryWithEmbedding {
+            id: MemoryId::new_v7(),
+            class: 2,
+            embedding: vec![0.0, 1.0],
+        },
+    ];
+    let v = e.compute(&rows).expect("compute");
+    let ln5 = 5.0f64.ln();
+    assert!(
+        (v.total_rate as f64 - ln5).abs() < 1e-4,
+        "total rate must be ln 5 = {ln5}, got {}",
+        v.total_rate
+    );
+    // Single-row class {1}: ZZᵀ = e1e1ᵀ, alpha = d/(1·ε²) = 8, so
+    // R = ½ log det(diag(9,1)) = ½ ln 9 — the per-class collapse.
+    let half_ln9 = 0.5 * 9.0f64.ln();
+    for (class, rate) in &v.class_rates {
+        assert!(
+            (*rate as f64 - half_ln9).abs() < 1e-4,
+            "class {class} rate must be ½ ln 9 = {half_ln9}, got {rate}"
+        );
+    }
+    // Compact = ½·½ln9 + ½·½ln9 = ½ ln 9; ΔR = ln 5 − ½ ln 9 ≈ 0.5108.
+    assert!((v.compact_rate as f64 - half_ln9).abs() < 1e-4);
+    let expected_delta = ln5 - half_ln9;
+    assert!(
+        (v.delta_r as f64 - expected_delta).abs() < 1e-4,
+        "delta_r must be {expected_delta}, got {}",
+        v.delta_r
+    );
+    assert!(v.delta_r > 0.0, "orthogonal classes carry positive ΔR");
+}

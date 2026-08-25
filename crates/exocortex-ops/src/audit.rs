@@ -38,23 +38,74 @@ pub fn digest_input(input: &serde_json::Value) -> [u8; 32] {
 }
 
 /// Append one audit record (§21.4): the record shares the action's
-/// transaction — a committed action always has its record. v1 keeps an
-/// in-process immutable ledger keyed by LSN; the audit_append/audit_range
-/// Cypher templates join when the storage backend carries them (M7 step 8
-/// template registration).
+/// transaction — a committed action always has its record. The write routes
+/// through `Storage::query_cypher` with the registered `audit_append`
+/// template when the backend is FalkorDB (R-A1); the in-process ledger
+/// always stays as the double (R-A3 reads prefer storage and fall back).
 pub async fn append_audit(
-    _ctx: &crate::OpContext,
+    ctx: &crate::OpContext,
     record: &AuditRecord,
 ) -> Result<u64, crate::OpError> {
     LEDGER.lock().unwrap().push(record.clone());
+
+    // R-A1: same-transaction storage write. The Cypher path carries the
+    // record durably; failures degrade to the in-process ledger (the ack
+    // still names the intended LSN) but are logged for the operator.
+    let digest_hex = hex64(&record.input_digest);
+    let fp_hex = hex64(&record.fingerprint);
+    let q = exocortex_storage::CypherQuery {
+        template_id: "audit_append",
+        params: serde_json::json!({
+            "action": record.action.to_string(),
+            "actor": record.actor.to_string(),
+            "org_id": record.org_id.to_string(),
+            "input_digest": digest_hex,
+            "output_ids": record
+                .output_ids
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "fingerprint": fp_hex,
+            "lease_epoch": record.lease_epoch.map(|e| e.to_string()).unwrap_or_default(),
+            "recorded_at": record.recorded_at.to_rfc3339(),
+            "lsn": record.lsn,
+        }),
+        read_only: false,
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+    };
+    match ctx.storage.query_cypher(&q).await {
+        Ok(_) => {
+            metrics::counter!("exocortex_audit_appended_total", "sink" => "storage").increment(1)
+        }
+        Err(e) => {
+            metrics::counter!("exocortex_audit_appended_total", "sink" => "memory").increment(1);
+            tracing::warn!(%e, "audit storage write failed; in-process ledger holds the record");
+        }
+    }
     Ok(record.lsn)
 }
 
 /// Read audit records after `since_lsn` (R-A3: `GET /v1/audit?since_lsn=`).
+/// Serves from storage when the backend carries the ledger (FalkorDB);
+/// otherwise the in-process ledger answers (tests, in-memory backends).
 pub async fn audit_range(
-    _ctx: &crate::OpContext,
+    ctx: &crate::OpContext,
     since_lsn: u64,
 ) -> Result<Vec<serde_json::Value>, crate::OpError> {
+    let q = exocortex_storage::CypherQuery {
+        template_id: "audit_range",
+        params: serde_json::json!({
+            "since_lsn": since_lsn,
+            "limit": 1000u32,
+        }),
+        read_only: true,
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+    };
+    if let Ok(rs) = ctx.storage.query_cypher(&q).await {
+        if !rs.rows.is_empty() {
+            return Ok(rs.rows);
+        }
+    }
     let ledger = LEDGER.lock().unwrap();
     Ok(ledger
         .iter()
@@ -66,3 +117,13 @@ pub async fn audit_range(
 use std::sync::Mutex;
 
 static LEDGER: Mutex<Vec<AuditRecord>> = Mutex::new(Vec::new());
+
+/// Lowercase hex over a 32-byte digest.
+fn hex64(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}

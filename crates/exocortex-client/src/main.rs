@@ -35,6 +35,17 @@ struct Args {
     /// Data directory for the WAL (defaults to the user's data home).
     #[arg(long)]
     data_dir: Option<std::path::PathBuf>,
+    /// Producer HMAC key (64 hex chars) for backend submits.
+    #[arg(long)]
+    hmac_key: Option<String>,
+}
+
+/// Decode 64 hex chars into a 32-byte key.
+fn decode_hex32(hex: &str) -> Result<[u8; 32], anyhow::Error> {
+    let bytes = (0..32)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
+        .collect::<Result<Vec<_>, _>>()?;
+    bytes.try_into().map_err(|_| anyhow::anyhow!("bad hex"))
 }
 
 fn org_visibility(org: &str, user: &str) -> VisibilityContext {
@@ -116,7 +127,7 @@ fn main() -> anyhow::Result<()> {
     // black_box reference force-links the pack so its inventory registration
     // runs in this binary.
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
-    let _ontology: Arc<Ontology> = Arc::new(exocortex_kernel::pack::load_registered_packs()?);
+    let ontology: Arc<Ontology> = Arc::new(exocortex_kernel::pack::load_registered_packs()?);
 
     // Cache: v1 seeds synthetic data until backend sync (M5) lands.
     let (cache, _writer_rx) = LocalCache::new(2 * 1024 * 1024 * 1024);
@@ -127,16 +138,41 @@ fn main() -> anyhow::Result<()> {
     let data_dir = args.data_dir.clone().unwrap_or_else(|| {
         dirs_fallback().unwrap_or_else(|_| std::env::temp_dir().join("exocortex"))
     });
-    let wal = wal::Wal::open(&data_dir.join("wal"))?;
+    let wal = Arc::new(wal::Wal::open(&data_dir.join("wal"))?);
     if wal.near_full() {
         tracing::warn!("WAL Near Full (R-Sc8)");
     }
 
-    let server = mcp::ExocortexMcp::new(
+    let mut server = mcp::ExocortexMcp::new(
         args.org.clone().into(),
         cache.clone(),
         org_visibility(&args.org, &args.user),
-    );
+    )
+    .with_offline_wal(wal.clone(), ontology.clone());
+
+    // Online end_session (§13.6.2): a gRPC channel to the backend, plus the
+    // producer HMAC key. Connect lazily at first call when unreachable.
+    if let Some(backend) = args.backend.clone() {
+        let hmac_key = args
+            .hmac_key
+            .as_deref()
+            .and_then(|hex| decode_hex32(hex).ok())
+            .unwrap_or([0u8; 32]);
+        let endpoint = tonic::transport::Endpoint::from_shared(backend.clone())
+            .map_err(|e| anyhow::anyhow!("bad --backend {backend}: {e}"))?;
+        let channel = endpoint.connect_lazy();
+        let tool = exocortex_client::tools::end_session::EndSessionTool {
+            client: exocortex_wire::ingest::v1::ingest_service_client::IngestServiceClient::new(
+                channel,
+            ),
+            org_id: args.org.clone(),
+            fingerprint: ontology.fingerprint.0,
+            hmac_key,
+            node_id: format!("exocortex-mcp-client-{}", std::process::id()),
+            agent_id: args.user.clone(),
+        };
+        server = server.with_end_session(Arc::new(tool));
+    }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

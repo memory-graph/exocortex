@@ -7,6 +7,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
 
+pub mod fire;
 pub mod mcr2;
 pub mod trigger;
 
@@ -21,8 +22,13 @@ use tracing::{info, instrument, warn};
 use exocortex_kernel::{MemoryId, Provenance, RelationshipId};
 use exocortex_storage::{LeaseKey, RegionKey, Storage};
 
-use mcr2::{compute_sparsity, GraphSparsity, MCR2Engine, MCR2Value, MemoryWithEmbedding};
+use mcr2::{
+    compute_sparsity, effective_strength, GraphSparsity, MCR2Engine, MCR2Value, MemoryWithEmbedding,
+};
 use trigger::{DreamsTrigger, RegionWriteCounters};
+
+/// §12.1 step 5: SimilarTo creation threshold.
+pub const SIMILAR_TO_THRESHOLD: f32 = 0.85;
 
 /// The audit record stamped per cycle — every field R-Dr4 mandates.
 #[derive(Clone, Debug)]
@@ -59,6 +65,8 @@ pub struct ConsolidationResult {
     pub strengthened: Vec<RelationshipId>,
     /// Rewired edge ids.
     pub rewired: Vec<RelationshipId>,
+    /// SimilarTo edges created this cycle (§12.1 step 5, R-T14).
+    pub similar_edges: Vec<RelationshipId>,
     /// Owning node.
     pub owner_node_id: SmolStr,
     /// Fencing epoch of the lease held.
@@ -186,6 +194,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             pruned: vec![],
             strengthened: vec![],
             rewired: vec![],
+            similar_edges: vec![],
             owner_node_id: self.node_id.clone(),
             lease_epoch: lease.epoch,
             regression: false,
@@ -205,6 +214,17 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             self.prune(&mut res, a).await?;
         }
         res.memories_output = (res.memories_input as usize - res.merged.len()).max(0) as u32;
+
+        // §12.1 step 5 / R-T14: SimilarTo edges over the surviving anchors —
+        // every edge carries `Computed { SimilarityHnsw, threshold 0.85 }`
+        // provenance. Below the merge threshold (0.92), so near-duplicates
+        // consolidate instead of gaining similarity edges.
+        let survivors: Vec<MemoryWithEmbedding> = anchors
+            .iter()
+            .filter(|a| !res.merged.contains(&a.id))
+            .cloned()
+            .collect();
+        self.write_similar_edges(&mut res, &survivors).await?;
 
         // Re-score with the post-cycle set (merged anchors removed).
         let remaining: Vec<MemoryWithEmbedding> = anchors
@@ -284,7 +304,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         }
         drop(rs);
         let _ = region;
-        Ok(compute_sparsity(&nodes, &edges, 32))
+        // §11.6.1: the similarity bucket never counts toward out-degrees.
+        Ok(compute_sparsity(&nodes, &edges, 32, similar_to_kind()))
     }
 
     /// Merge a duplicate pair: keep the older row, close the newer with
@@ -316,18 +337,124 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         Ok(())
     }
 
-    /// Strengthen: surviving edges with evidence gain the §14.3 bump (capped).
+    /// Strengthen (§12.5 step 6): surviving edges gain one evidence count
+    /// and re-derive strength from the §14.3 formula — evidence boost
+    /// (capped 0.20), success scaling, age decay — never a flat bump.
+    /// SimilarTo edges ride `Computed` provenance and are not strengthened.
     async fn strengthen(
         &self,
         res: &mut ConsolidationResult,
         _a: &MemoryWithEmbedding,
     ) -> anyhow::Result<()> {
         use futures::StreamExt;
+        let now = chrono::Utc::now();
+        let mut updates = Vec::new();
         let mut rs = self.storage.stream_all_relationships().await;
         while let Some(Ok(mut r)) = rs.next().await {
+            if matches!(r.provenance, Provenance::Computed { .. }) {
+                continue;
+            }
+            if res.strengthened.contains(&r.id) {
+                continue; // one evidence bump per cycle, not per anchor
+            }
             r.properties.evidence_count += 1;
-            r.properties.strength = (r.properties.strength + 0.05).min(1.0);
+            let age_days = (now - r.recorded_at).num_days().max(0) as f32;
+            r.properties.strength = effective_strength(
+                r.properties.strength,
+                r.properties.evidence_count,
+                r.properties.success_rate.unwrap_or(1.0),
+                age_days,
+            );
+            updates.push(r);
+        }
+        drop(rs);
+        for r in &updates {
             res.strengthened.push(r.id);
+        }
+        if !updates.is_empty() {
+            self.storage
+                .upsert_batch(&[], &updates)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok(())
+    }
+
+    /// §12.1 step 5: SimilarTo edges between same-class surviving anchors
+    /// above the 0.85 threshold, stamped `Computed { SimilarityHnsw }`
+    /// (R-T14). Idempotent via deterministic `RelationshipId::derive`.
+    async fn write_similar_edges(
+        &self,
+        res: &mut ConsolidationResult,
+        survivors: &[MemoryWithEmbedding],
+    ) -> anyhow::Result<()> {
+        let Some(similar_kind) = similar_to_kind() else {
+            return Ok(());
+        };
+        let now = chrono::Utc::now();
+        let mut edges = Vec::new();
+        for i in 0..survivors.len() {
+            for j in (i + 1)..survivors.len() {
+                let (a, b) = (&survivors[i], &survivors[j]);
+                if a.class != b.class || a.id == b.id {
+                    continue;
+                }
+                let sim = mcr2::cosine(&a.embedding, &b.embedding);
+                if sim < SIMILAR_TO_THRESHOLD {
+                    continue;
+                }
+                use exocortex_kernel::{Relationship, RelationshipProperties, Visibility, LSN};
+                edges.push(Relationship {
+                    id: exocortex_kernel::RelationshipId::derive(a.id, similar_kind, b.id, None),
+                    kind: similar_kind,
+                    from: a.id,
+                    to: b.id,
+                    visibility: Visibility::Org,
+                    provenance: Provenance::Computed {
+                        producer: exocortex_kernel::provenance::ComputedProducer::SimilarityHnsw,
+                        threshold: SIMILAR_TO_THRESHOLD,
+                    },
+                    properties: RelationshipProperties {
+                        strength: sim.clamp(0.0, 1.0),
+                        confidence: sim.clamp(0.0, 1.0),
+                        context: None,
+                        evidence_count: 1,
+                        success_rate: None,
+                        validation_count: 0,
+                        counter_evidence_count: 0,
+                        last_validated: now,
+                    },
+                    description: None,
+                    bidirectional: true,
+                    valid_from: now,
+                    valid_until: None,
+                    recorded_at: now,
+                    invalidated_by: None,
+                    lsn: LSN::new_local(0),
+                });
+            }
+        }
+        // Idempotency: only write edges that do not already exist.
+        use futures::StreamExt;
+        let mut existing: std::collections::HashSet<exocortex_kernel::RelationshipId> = {
+            let mut set = std::collections::HashSet::new();
+            let mut rs = self.storage.stream_all_relationships().await;
+            while let Some(Ok(r)) = rs.next().await {
+                set.insert(r.id);
+            }
+            set
+        };
+        let fresh: Vec<_> = edges
+            .into_iter()
+            .filter(|e| existing.insert(e.id))
+            .collect();
+        if !fresh.is_empty() {
+            self.storage
+                .upsert_batch(&[], &fresh)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            res.similar_edges.extend(fresh.iter().map(|e| e.id));
+            metrics::counter!("exocortex_dreams_similar_edges_total").increment(fresh.len() as u64);
         }
         Ok(())
     }
@@ -420,4 +547,20 @@ pub fn discovery_provenance(score: f32) -> Provenance {
         discovery_id: uuid::Uuid::new_v4(),
         score,
     }
+}
+
+/// Resolve the `SimilarTo` kind id from the linked pack (v1: dev-v1). The
+/// cycle stamps every similarity edge with this kind (§12.1 step 5); the
+/// sparsity diagnostic excludes it (§11.6.1).
+/// Resolve the `SimilarTo` kind id from the linked pack (v1: dev-v1). The
+/// cycle stamps every similarity edge with this kind (§12.1 step 5); the
+/// sparsity diagnostic excludes it (§11.6.1).
+fn similar_to_kind() -> Option<exocortex_kernel::RelKindId> {
+    static KIND: std::sync::OnceLock<Option<exocortex_kernel::RelKindId>> =
+        std::sync::OnceLock::new();
+    *KIND.get_or_init(|| {
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+            .ok()
+            .and_then(|onto| onto.kind_id("SimilarTo"))
+    })
 }

@@ -94,27 +94,72 @@ cross-cutting gates (§3). Commits: one per milestone, `M<n>: <what and why>`.
     edges stay k-hop bounded.
 
 ### M5
-13. Chitchat gossip and Redis pub-sub peer fan-out: peer discovery rides
+13. ~~Chitchat gossip and Redis pub-sub peer fan-out: peer discovery rides
     storage-level invalidations (FalkorDB pub-sub) in the shipped path;
     `chitchat` is linked and the compose topology provides the 3-node
-    harness, but the gossip wire-up is configuration, not new code paths —
-    admission (the load-bearing §9.1 check) is fully implemented and
-    tested. The SSE client in the e2e test is a raw socket (no HTTP client
-    in the workspace catalog). Leader-kill convergence is bounded by the
-    lease TTL in the live race test.
+    harness, but the gossip wire-up is configuration, not new code paths —~~
+    **closed in round 1** (see the post-review addendum): `--mode
+    backend-node` now boots cluster + ingest + HTTP + SSE on one listener,
+    runs the lease re-election loop, and wires chitchat gossip carrying
+    wire-version + ontology fingerprint. The SSE client
+    (`exocortex-client/src/sync.rs`, eventsource-client-based reconnecting
+    subscriber with LSN hold-back) also landed in round 1. Peer admission
+    (the load-bearing §9.1 check) is fully implemented and tested.
 
 ### M6
 14. `submit_stream` clones the server handle per stream (registries
     snapshot); the batched `Submit` path is authoritative. Relationship
     draft strength/confidence 0.0 means "default" (wire encoding has no
-    Option).
+    Option). Round 1: the clone is now a cheap Arc-shared handle (the old
+    `blocking_lock` snapshot was a deadlock hazard under async contention),
+    and `--adapter noop` starts without a live backend (lazy channel).
 
 ### M7
 15. The audit ledger is an in-process immutable list sharing the action's
     LSN; `audit_append`/`audit_range` Cypher templates joined the catalogue
     for the storage-backed ledger (R-A1's same-transaction guarantee holds
     at the LSN level; a cross-store transaction would need backend support
-    FalkorDB's MULTI does not expose through the client).
+    FalkorDB's MULTI does not expose through the client). Round 1:
+    `append_audit`/`audit_range` now route through `query_cypher` on the
+    registered templates, with the in-process ledger kept as the double and
+    fallback; the HTTP parity binding (`http_bind.rs`) mounts every
+    registered operation behind bearer auth with `/metrics` + `/health/*`.
+
+## Post-review round 1 (2026-08-24)
+
+The deep review of the M0–M8 implementation found two correctness bugs and
+a set of runtime gaps. **`round-1-review.prd` is the authoritative
+residual-work list**; the round-1 pass closed all of it:
+
+- **B1** MCR² alpha off by 1/n — fixed (§11.2 formula now exact, with the
+  closed-form `ln 5` unit test).
+- **B2** 2Q duplicate A1in admission — fixed (re-reference promotes to Am);
+  the vacuous scan-pollution test was rewritten with a budget that actually
+  evicts.
+- **W1** `end_session` dispatches over stdio (gRPC online path +
+  WAL-buffering offline path, §5.2 `{local_lsns, sync_pending}`).
+- **W2** R-T4 inverse materialization on every write path (kernel
+  `materialize_inverse`; ingest batch, both storage backends, R6 helper).
+- **W3** backend-assigned embeddings on the ingest commit path
+  (`FakeEmbedder` test double; `fastembed` bge-small behind the backend
+  `fastembed` feature flag).
+- **W4** Dreams writes SimilarTo edges @0.85 with
+  `Computed{SimilarityHnsw}` provenance, excluded from hairball accounting.
+- **W5** reconnecting SSE subscriber (`sync.rs`): LSN hold-back gate, gap
+  resubscribe (R-C6), 409 resync, stall reconnect (R-C5).
+- **W6/W7/H4/H5** HTTP parity binding with bearer auth + `/metrics` +
+  `/health/*`; backend-node mode with lease re-election and chitchat
+  gossip; per-client SSE HMAC (R-Sec5).
+- **W8** session-wrapup commits enqueue `SessionWrapup` reasoning work.
+- **H1/H2/H3** noop worker without a backend; LRU-bounded idempotency +
+  persisted ceilings; `xtask bench` (SLO gate) and `xtask no-llm` (CR-19).
+- **H6** tag normalization at draft→memory; k-hop harvest is one scan
+  (O(E) not O(hops·E)); caller-visibility point reads
+  (`get_memory_for` + `PermissionDenied`, R-MT4); ingest Clone without
+  `blocking_lock`; §14.3 `effective_strength` formula; Redis RPUSH/BLPOP
+  fire channel with the R-Dr13 Lua reset and R-Dr14 quiet hours
+  (`fire.rs`).
+- **H7** audit ledger routed onto storage templates (double kept).
 
 ### M8
 16. Clustering: deterministic threshold clustering, decision recorded in
