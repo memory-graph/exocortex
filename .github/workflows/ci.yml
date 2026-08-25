@@ -14,7 +14,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # No toolchain argument: installs whatever rust-toolchain.toml pins,
+      # so the runner formats with the same rustfmt the repo was written
+      # against (stable's fmt drifts).
+      - uses: dtolnay/rust-toolchain@master
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
