@@ -29,7 +29,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Deny (licenses, advisories, bans)
-        run: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --workspace
       - name: Tests
         run: cargo test --workspace
       - name: Kernel purity (R-I1/CR-26)
