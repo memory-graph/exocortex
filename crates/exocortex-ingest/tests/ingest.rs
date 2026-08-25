@@ -305,6 +305,61 @@ async fn duplicate_batch_is_idempotent_replay() {
     );
 }
 
+/// H2 (§18.8.5): the ceiling registry persists across restarts — a source
+/// registered with ceiling 1 in one process is still ceiling-limited in a
+/// fresh process booted from the same sources file.
+#[tokio::test]
+async fn source_ceilings_persist_across_restart() {
+    use tonic::Request;
+
+    let dir = std::env::temp_dir().join(format!("exo-src-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sources.json");
+
+    let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
+    let mk_server = || {
+        IngestServer::new(
+            Arc::new(InMemoryStorage::new(onto.clone())),
+            onto.clone(),
+            [5u8; 32],
+        )
+        .with_sources_file(path.clone())
+    };
+
+    {
+        let srv = mk_server();
+        srv.register_source(Request::new(RegisterSourceRequest {
+            org_id: "org".into(),
+            source_uri: "session://persist".into(),
+            producer_id: "test-adapter".into(),
+            ceiling: 1, // Private only
+            source_flavor: "custom".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(path.exists(), "ceiling registry written on registration");
+    }
+
+    // Fresh process stand-in: same sources file, no re-registration.
+    let srv2 = mk_server();
+    let mut b = batch(vec![draft("k1", "Fix", 1)]);
+    b.ontology_fingerprint = srv2.ontology.fingerprint.0.to_vec();
+    b.source_uri = "session://persist".into();
+    b.producer_id = "test-adapter".into();
+    b.ceiling = 3; // Org — above the persisted ceiling
+    let b = sign(b, [5u8; 32]);
+    let ack = srv2.submit(Request::new(b)).await.unwrap().into_inner();
+    assert!(
+        ack.rejections
+            .iter()
+            .any(|r| r.code == RejectCode::UnknownSource as i32),
+        "persisted ceiling survives restart: {:?}",
+        ack.rejections
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
 #[tokio::test]
 async fn entities_extracted_server_side() {
     let ex = exocortex_ingest::EntityExtractor::new("org");

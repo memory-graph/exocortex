@@ -286,9 +286,9 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "audit_range",
         read_only: true,
-        required_params: &["since_lsn", "limit"],
+        required_params: &["org_id", "since_lsn", "limit"],
         cypher: r#"
-            MATCH (a:_AuditRecord) WHERE a.lsn > $since_lsn
+            MATCH (a:_AuditRecord) WHERE a.lsn > $since_lsn AND a.org_id = $org_id
             RETURN a ORDER BY a.lsn ASC LIMIT $limit
         "#,
     });

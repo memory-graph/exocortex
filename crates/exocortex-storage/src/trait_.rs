@@ -29,6 +29,14 @@ pub enum StorageError {
         /// Fingerprint of the running process.
         runtime: [u8; 32],
     },
+    /// A write made under a lease that is no longer current (R-C3 fencing
+    /// token): the lease expired or was re-acquired by another owner. The
+    /// write is rejected before any row commits.
+    #[error("fenced write rejected: lease epoch {lease_epoch} is stale")]
+    FencedWriteRejected {
+        /// Epoch of the stale lease presented with the write.
+        lease_epoch: u64,
+    },
 }
 
 /// The one deliberate seam (§6.0): every subsystem above storage depends on
@@ -120,6 +128,27 @@ pub trait Storage: Send + Sync + 'static {
     async fn renew_lease(&self, lease: &OwnerLease) -> crate::Result<OwnerLease>;
     /// Release a held lease; safe to call after expiry.
     async fn release_lease(&self, lease: OwnerLease) -> crate::Result<()>;
+
+    // ---- Fenced writes (R-C3: owner-only writes carry the fencing token) ----
+
+    /// [`Storage::upsert_batch`](Self::upsert_batch), but the batch only
+    /// commits while `lease` is still the current holder of its lease key.
+    /// A stale lease (epoch bumped by re-election, or expiry) rejects with
+    /// [`crate::StorageError::FencedWriteRejected`] before any row lands —
+    /// the storage-side fencing guarantee for consolidation/Dreams writes.
+    async fn upsert_batch_fenced(
+        &self,
+        ms: &[Memory],
+        rs: &[Relationship],
+        lease: &OwnerLease,
+    ) -> crate::Result<Vec<CommitRecord>>;
+    /// [`Storage::delete_memory`](Self::delete_memory) under the same
+    /// fencing check (a rollback must not delete a newer owner's rows).
+    async fn delete_memory_fenced(
+        &self,
+        id: &MemoryId,
+        lease: &OwnerLease,
+    ) -> crate::Result<CommitRecord>;
 
     // ---- Change feed (backs SSE clients; §9.1, §9.6) ----
 

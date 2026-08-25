@@ -104,10 +104,12 @@ pub struct DreamsEngine<S: Storage> {
     pub hairball_tolerance: f32,
     /// Operator rollback flag.
     pub rollback_on_regression: bool,
-    /// Fires to the consolidation loop.
-    pub tx_fire: mpsc::Sender<RegionKey>,
+    /// Fires to the consolidation loop (region + the counters snapshot at
+    /// fire time, so completion can compare-and-reset without losing
+    /// writes that landed mid-cycle, R-Dr13).
+    pub tx_fire: mpsc::Sender<(RegionKey, RegionWriteCounters)>,
     /// The loop's receiver.
-    pub rx_fire: tokio::sync::Mutex<mpsc::Receiver<RegionKey>>,
+    pub rx_fire: tokio::sync::Mutex<mpsc::Receiver<(RegionKey, RegionWriteCounters)>>,
     /// Node identity for lease tokens.
     pub node_id: SmolStr,
 }
@@ -138,28 +140,48 @@ impl<S: Storage + 'static> DreamsEngine<S> {
 
     /// Record a write; fire when the predicate trips (§12.2 transport is
     /// Redis in production; the in-process channel is the same shape).
+    /// R-Dr13: counters are NOT reset here — completion resets them, so a
+    /// failed cycle never loses its write counts.
     pub async fn on_write(&self, region: RegionKey) {
         let mut e = self.counters.entry(region.clone()).or_default();
         e.memories_since_last_cycle += 1;
         if self.dreams_trigger.should_fire(&e) {
-            *e = RegionWriteCounters::default();
+            let snap = *e;
             drop(e);
-            let _ = self.tx_fire.try_send(region);
+            let _ = self.tx_fire.try_send((region, snap));
         }
+    }
+
+    /// Fire a region explicitly (Redis fire-queue drainer side).
+    pub fn notify(&self, region: RegionKey) {
+        let snap = self
+            .counters
+            .get(&region)
+            .map(|e| *e)
+            .unwrap_or_default();
+        let _ = self.tx_fire.try_send((region, snap));
     }
 
     /// The consolidation loop.
     pub async fn run(self: Arc<Self>) {
-        while let Some(region) = { self.rx_fire.lock().await.recv().await } {
+        while let Some((region, fired_at)) = { self.rx_fire.lock().await.recv().await } {
             match self.try_consolidate(&region).await {
                 Ok(res) => info!(?res, "consolidation ok"),
                 Err(e) => warn!(?e, "consolidation failed"),
+            }
+            // R-Dr13: reset only when nothing new landed during the cycle;
+            // otherwise the surviving counts roll into the next fire.
+            if let Some(mut c) = self.counters.get_mut(&region) {
+                if *c == fired_at {
+                    *c = RegionWriteCounters::default();
+                }
             }
         }
     }
 
     /// One full cycle under the region lease (§12.4 skeleton, filled per
-    /// §12.5 steps 3-9).
+    /// §12.5 steps 3-9). The lease is released on every path; all writes
+    /// ride the fenced paths so a stale owner can never commit (R-C3).
     #[instrument(skip(self))]
     pub async fn try_consolidate(&self, region: &RegionKey) -> anyhow::Result<ConsolidationResult> {
         let lease_key = LeaseKey::Dreams {
@@ -172,7 +194,16 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             .acquire_lease(&lease_key, Duration::from_secs(60))
             .await
             .map_err(|e| anyhow::anyhow!("lease: {e}"))?;
+        let outcome = self.consolidate_under(&lease, region).await;
+        let _ = self.storage.release_lease(lease).await;
+        outcome
+    }
 
+    async fn consolidate_under(
+        &self,
+        lease: &exocortex_storage::OwnerLease,
+        region: &RegionKey,
+    ) -> anyhow::Result<ConsolidationResult> {
         let anchors = self.select_anchors(region).await?;
         let mcr2_before = self.score_with(&anchors)?;
         let sparsity_before = self.sparsity(region).await?;
@@ -206,11 +237,11 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let candidates = engine.identify_merge_candidates(&anchors);
         for c in candidates.iter().take(32) {
             if c.cosine_similarity >= 0.92 {
-                self.merge(&mut res, c).await?;
+                self.merge(&mut res, c, lease).await?;
             }
         }
         for a in &anchors {
-            self.strengthen(&mut res, a).await?;
+            self.strengthen(&mut res, a, lease).await?;
             self.prune(&mut res, a).await?;
         }
         res.memories_output = (res.memories_input as usize - res.merged.len()).max(0) as u32;
@@ -224,7 +255,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             .filter(|a| !res.merged.contains(&a.id))
             .cloned()
             .collect();
-        self.write_similar_edges(&mut res, &survivors).await?;
+        self.write_similar_edges(&mut res, &survivors, lease).await?;
 
         // Re-score with the post-cycle set (merged anchors removed).
         let remaining: Vec<MemoryWithEmbedding> = anchors
@@ -242,7 +273,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                     "MCR2 degraded {} -> {} - rolling back",
                     res.mcr2_before.delta_r, res.mcr2_after.delta_r
                 );
-                self.rollback(&res).await?;
+                self.rollback(&res, lease).await?;
             }
         }
         if res.sparsity_after.hairball_fraction
@@ -251,7 +282,6 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             res.hairball_regression = true; // R-Mcr6
         }
         self.write_audit(&res).await?;
-        let _ = self.storage.release_lease(lease).await;
         Ok(res)
     }
 
@@ -314,6 +344,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         &self,
         res: &mut ConsolidationResult,
         c: &mcr2::MergeCandidate,
+        lease: &exocortex_storage::OwnerLease,
     ) -> anyhow::Result<()> {
         use futures::StreamExt;
         let mut newer = None;
@@ -329,7 +360,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             m.valid_until = Some(chrono::Utc::now());
             m.invalidated_by = Some(c.a);
             self.storage
-                .upsert_memory(&m)
+                .upsert_batch_fenced(&[m], &[], lease)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             res.merged.push(c.b);
@@ -345,6 +376,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         &self,
         res: &mut ConsolidationResult,
         _a: &MemoryWithEmbedding,
+        lease: &exocortex_storage::OwnerLease,
     ) -> anyhow::Result<()> {
         use futures::StreamExt;
         let now = chrono::Utc::now();
@@ -373,7 +405,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         }
         if !updates.is_empty() {
             self.storage
-                .upsert_batch(&[], &updates)
+                .upsert_batch_fenced(&[], &updates, lease)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
@@ -387,6 +419,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         &self,
         res: &mut ConsolidationResult,
         survivors: &[MemoryWithEmbedding],
+        lease: &exocortex_storage::OwnerLease,
     ) -> anyhow::Result<()> {
         let Some(similar_kind) = similar_to_kind() else {
             return Ok(());
@@ -450,7 +483,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             .collect();
         if !fresh.is_empty() {
             self.storage
-                .upsert_batch(&[], &fresh)
+                .upsert_batch_fenced(&[], &fresh, lease)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             res.similar_edges.extend(fresh.iter().map(|e| e.id));
@@ -478,9 +511,13 @@ impl<S: Storage + 'static> DreamsEngine<S> {
 
     /// Rollback is bi-temporal, never destructive: close everything the
     /// cycle wrote (§12.5 step 8).
-    async fn rollback(&self, res: &ConsolidationResult) -> anyhow::Result<()> {
+    async fn rollback(
+        &self,
+        res: &ConsolidationResult,
+        lease: &exocortex_storage::OwnerLease,
+    ) -> anyhow::Result<()> {
         for id in &res.merged {
-            let _ = self.storage.delete_memory(id).await;
+            let _ = self.storage.delete_memory_fenced(id, lease).await;
         }
         Ok(())
     }

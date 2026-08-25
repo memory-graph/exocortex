@@ -141,7 +141,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
         exocortex_wire::ingest::v1::ingest_service_server::IngestServiceServer::new(ingest),
     )
     .into_axum_router();
-    let sse = crate::sse::sse_router(cluster.clone());
+    let sse = crate::sse::sse_router(cluster.clone(), crate::sse::SseAuth::RequiredToken);
     let app = bind.router(Some(sse)).merge(grpc);
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;

@@ -209,3 +209,54 @@ fn openapi_and_mcp_json_generate_from_one_registry() {
     assert!(openapi_paths.contains(&"/v1/audit"));
     assert!(mcp_tools.contains(&"exocortex.find_related"));
 }
+
+/// §17.2 tenant isolation on the audit ledger (R-A1/R-A3): two orgs write
+/// audit records; one org's read must never surface the other's records —
+/// on the volatile in-process path just as on storage.
+#[tokio::test]
+async fn audit_ledger_is_org_scoped() {
+    fn ctx_for(org: &str) -> OpContext {
+        let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
+        OpContext {
+            visibility_ctx: ops_vc(org, "alice", Visibility::Org),
+            storage: Arc::new(InMemoryStorage::new(ontology())),
+            cache: Arc::new(cache),
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        }
+    }
+    let ctx_a = ctx_for("org-a");
+    let ctx_b = ctx_for("org-b");
+
+    for (ctx, org) in [(&ctx_a, "org-a"), (&ctx_b, "org-b")] {
+        let m = mem("isolation-probe");
+        ctx.storage.upsert_memory(&m).await.unwrap();
+        let out = exocortex_ops::operations::PromoteVisibilityOp
+            .handle(
+                ctx,
+                PromoteVisibilityInput {
+                    memory_id: hex(&m.id),
+                    to: "org".into(),
+                },
+            )
+            .await
+            .expect("promotion");
+        assert!(out.audit_lsn > 0, "{org}: audited");
+    }
+
+    for (ctx, org, other) in [
+        (&ctx_a, "org-a", "org-b"),
+        (&ctx_b, "org-b", "org-a"),
+    ] {
+        let rows = exocortex_ops::operations::ListAuditRecordsOp
+            .handle(ctx, exocortex_ops::operations::ListAuditInput { since_lsn: 0 })
+            .await
+            .unwrap();
+        assert!(
+            rows.records
+                .iter()
+                .all(|r| r["org_id"] == *org || r.get("org_id").is_none()),
+            "{org} ledger rows must not leak {other}"
+        );
+        assert!(!rows.records.is_empty(), "{org} sees its own record");
+    }
+}

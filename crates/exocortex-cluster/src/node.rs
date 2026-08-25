@@ -4,7 +4,8 @@
 //! pub-sub), and verifies peer admission — wire version, ontology
 //! fingerprint, and HMAC — before accepting inbound envelopes.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use hmac::{Hmac, Mac};
 use tokio::sync::broadcast;
@@ -44,6 +45,27 @@ pub struct ClusterNode<S: Storage> {
     pub hmac_key: [u8; 32],
     /// Local fan-out hub backing the SSE router.
     pub tx: broadcast::Sender<InvalidationEnvelope>,
+    /// Bounded replay buffer for `?since_lsn` reconnects (R-C6): the last
+    /// `replay_cap` envelopes in backend-LSN order. When a reconnect's
+    /// `since_lsn` is older than the buffer floor the server answers
+    /// `409 Resync Required` instead of silently skipping deltas.
+    replay: Mutex<VecDeque<InvalidationEnvelope>>,
+    /// Ring capacity (default [`REPLAY_CAPACITY_DEFAULT`]).
+    replay_cap: usize,
+}
+
+/// Default replay-buffer depth (envelopes). The PRD's "last 15 minutes"
+/// Redis-Streams window is the production backend; the bounded ring is the
+/// embedded default with the same contract.
+pub const REPLAY_CAPACITY_DEFAULT: usize = 1024;
+
+/// R-C6 replay outcome for a reconnecting subscriber.
+#[derive(Debug, Clone)]
+pub enum Replay {
+    /// Envelopes after `since_lsn`, oldest first (possibly empty).
+    Fresh(Vec<InvalidationEnvelope>),
+    /// `since_lsn` precedes the buffer floor: the client must reseed.
+    TooOld,
 }
 
 impl<S: Storage + 'static> ClusterNode<S> {
@@ -61,7 +83,64 @@ impl<S: Storage + 'static> ClusterNode<S> {
             fp,
             hmac_key,
             tx,
+            replay: Mutex::new(VecDeque::with_capacity(REPLAY_CAPACITY_DEFAULT)),
+            replay_cap: REPLAY_CAPACITY_DEFAULT,
         }
+    }
+
+    /// Shrink the replay ring (tests pin a small floor to exercise 409s).
+    pub fn with_replay_capacity(mut self, cap: usize) -> Self {
+        self.replay_cap = cap.max(1);
+        self
+    }
+
+    /// R-C6: envelopes with `backend_lsn > since_lsn`, oldest first.
+    /// `Replay::TooOld` when `since_lsn + 1` precedes the buffer's oldest
+    /// entry — a gap the buffer can no longer bridge.
+    pub fn replay_since(&self, since_lsn: u64) -> Replay {
+        let ring = self.replay.lock().unwrap();
+        let Some(oldest) = ring.front() else {
+            return Replay::Fresh(vec![]);
+        };
+        let floor = envelope_lsn(oldest);
+        if since_lsn + 1 < floor {
+            return Replay::TooOld;
+        }
+        Replay::Fresh(
+            ring.iter()
+                .filter(|e| envelope_lsn(e) > since_lsn)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// The oldest buffered LSN (1 when the ring is empty): the floor a
+    /// `409` tells the client to resume from.
+    pub fn replay_floor(&self) -> u64 {
+        self.replay
+            .lock()
+            .unwrap()
+            .front()
+            .map(envelope_lsn)
+            .unwrap_or(1)
+    }
+
+    /// Track one envelope in the replay ring (LSN-ordered; the ring is
+    /// fed from the same storage stream the hub fans out).
+    fn record_replay(&self, env: InvalidationEnvelope) {
+        let mut ring = self.replay.lock().unwrap();
+        if ring.len() == self.replay_cap {
+            ring.pop_front();
+        }
+        ring.push_back(env);
+    }
+
+    /// Fan one envelope out through the hub AND the replay ring. This is
+    /// the single publish path: whatever the hub serves, `?since_lsn`
+    /// reconnects can replay (R-C6).
+    pub fn publish_envelope(&self, env: InvalidationEnvelope) {
+        self.record_replay(env.clone());
+        let _ = self.tx.send(env);
     }
 
     /// Join the cluster (§9.1): verify our own fingerprint is pinned, then
@@ -79,7 +158,7 @@ impl<S: Storage + 'static> ClusterNode<S> {
         while let Some(inv) = sub.next().await {
             let Ok(inv) = inv else { continue };
             let env = self.envelope(inv);
-            let _ = self.tx.send(env);
+            self.publish_envelope(env);
             // Peer fan-out over Redis pub-sub is wired at M5 server start
             // (same instance as FalkorDB, §9.1); the storage subscribe
             // already crosses nodes through FalkorDB replication in the
@@ -157,3 +236,8 @@ impl<S: Storage + 'static> ClusterNode<S> {
 }
 
 type Sha256Mac = sha2::Sha256;
+
+/// The backend LSN an envelope carries (0 when malformed).
+fn envelope_lsn(env: &InvalidationEnvelope) -> u64 {
+    env.inv.as_ref().map(|i| i.backend_lsn).unwrap_or(0)
+}

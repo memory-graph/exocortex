@@ -508,7 +508,8 @@ impl Operation for ListAuditRecordsOp {
         "/v1/audit"
     }
     async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
-        let rows = crate::audit::audit_range(ctx, input.since_lsn).await?;
+        let org = ctx.visibility_ctx.org_id.to_string();
+        let rows = crate::audit::audit_range(ctx, &org, input.since_lsn).await?;
         Ok(ListAuditOutput { records: rows })
     }
 }

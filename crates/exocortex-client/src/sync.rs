@@ -316,8 +316,19 @@ pub async fn run_sse_sync(
                         }
                     }
                     Err(es::Error::UnexpectedResponse(resp, _)) if resp.status() == 409 => {
-                        // R-C6: Resync Required -> targeted rehydration.
+                        // R-C6: Resync Required -> targeted rehydration via
+                        // the hook, then resume from the server's replay
+                        // floor. Without advancing `next_lsn` the client
+                        // would 409-loop on the same un-bridgeable gap.
                         tracing::warn!("409 resync required");
+                        if let Some(min) = resp
+                            .get_header_value("x-exocortex-min-lsn")
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.parse::<u64>().ok())
+                        {
+                            next_lsn = next_lsn.max(min);
+                        }
                         reconnect_reason = "409 resync";
                         break;
                     }

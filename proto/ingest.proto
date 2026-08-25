@@ -118,6 +118,9 @@ enum RejectCode {
   BAD_CHECKSUM          = 9;
   UNAUTHORIZED          = 10;  // HMAC missing/invalid
   RATE_LIMITED          = 11;
+  // R-T14: computed-only kinds (SimilarTo) are produced exclusively by the
+  // Dreams cycle; a producer asserting one directly is rejected.
+  COMPUTED_KIND_REJECTED = 12;
 }
 message SubmitOne { oneof body { IngestBatch batch = 1; } }
 message SubmitAck { IngestAck ack = 1; }

@@ -92,7 +92,7 @@ async fn sse_client_observes_upsert_within_200ms() {
     let runner = cluster.clone();
     tokio::spawn(async move { runner.run().await });
 
-    let app = sse_router(cluster.clone());
+    let app = sse_router(cluster.clone(), SseAuth::OptionalToken);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();

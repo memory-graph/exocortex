@@ -105,7 +105,7 @@ async fn backend_nodes_serve_http_grpc_and_gossip_converges() {
             .await
             .unwrap();
         let req = format!(
-            "GET /v1/changes HTTP/1.1
+            "GET /v1/changes?token=test-bearer HTTP/1.1
 Host: {}
 Connection: close
 

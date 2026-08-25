@@ -41,9 +41,12 @@ struct Args {
     /// Chitchat gossip listen address (backend-node).
     #[arg(long, default_value = "0.0.0.0:8100")]
     gossip_addr: String,
-    /// Bearer token guarding the HTTP op surface (R-Sec7).
-    #[arg(long, default_value = "exocortex-dev-bearer")]
-    bearer_token: String,
+    /// Bearer token guarding the HTTP op surface (R-Sec7). No default in
+    /// release builds: backend-node refuses to start without it (a shipped
+    /// credential is worse than a startup error). Debug builds keep the
+    /// loopback dev token for local iteration.
+    #[arg(long)]
+    bearer_token: Option<String>,
     /// Cluster-shared HMAC secret (64 hex chars; defaults to a dev key).
     #[arg(long)]
     cluster_secret: Option<String>,
@@ -131,11 +134,12 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
             .as_deref()
             .and_then(|hex| decode_hex32(hex).ok())
             .unwrap_or([0x42u8; 32]);
+        let bearer_token = resolve_bearer(&args)?;
         let node_args = backend::BackendNodeArgs {
             bind: args.bind.clone(),
             node_id: format!("node-{}", std::process::id()),
             cluster_secret,
-            bearer_token: args.bearer_token.clone(),
+            bearer_token,
             gossip_listen: SocketAddr::from_str(&args.gossip_addr)
                 .map_err(|e| anyhow::anyhow!("bad --gossip-addr: {e}"))?,
             seed_nodes: args
@@ -157,6 +161,28 @@ fn decode_hex32(hex: &str) -> Result<[u8; 32], anyhow::Error> {
         .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
         .collect::<Result<Vec<_>, _>>()?;
     bytes.try_into().map_err(|_| anyhow::anyhow!("bad hex"))
+}
+
+/// R-Sec7: the op surface never ships a default credential. Release
+/// builds fail fast when `--bearer-token` is absent; debug builds fall
+/// back to the loopback dev token with a loud warning.
+fn resolve_bearer(args: &Args) -> anyhow::Result<String> {
+    match &args.bearer_token {
+        Some(t) => Ok(t.clone()),
+        None => {
+            #[cfg(debug_assertions)]
+            {
+                tracing::warn!(
+                    "--bearer-token absent; using the DEBUG-ONLY dev token (never in release)"
+                );
+                Ok("exocortex-dev-bearer".to_string())
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                anyhow::bail!("--bearer-token is required in release builds (R-Sec7: no default credential)")
+            }
+        }
+    }
 }
 
 /// Data dir under the user's data home (§4.3).

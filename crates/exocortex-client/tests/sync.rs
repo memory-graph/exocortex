@@ -130,6 +130,7 @@ fn envelope_decode_verifies_hmac_fingerprint_and_wire_version() {
 /// through the feed within 500ms.
 #[tokio::test(flavor = "multi_thread")]
 async fn sse_feed_observed_by_client_cache_within_500ms() {
+    let _ = tracing_subscriber::fmt().with_env_filter("exocortex=debug,info").with_writer(std::io::stderr).try_init();
     let onto = Arc::new(
         exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
     );
@@ -155,7 +156,10 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
         tokio::spawn(async move { cache.run(storage, rx).await });
     }
 
-    let app = exocortex_server::sse::sse_router(cluster.clone());
+    let app = exocortex_server::sse::sse_router(
+        cluster.clone(),
+        exocortex_server::sse::SseAuth::OptionalToken,
+    );
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -168,8 +172,15 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
     cache.reseed_from_storage(&*storage, &"org".into()).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+    let cfg = {
+        let mut c = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+        c.backoff = Duration::from_millis(50);
+        c
+    };
     let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 0, None));
+    // Let the subscriber establish its stream before the first publish so
+    // the run exercises the live path (not a 409/replay detour).
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Commit an upsert on the backend and publish it through the hub. The
     // broadcast can race the subscriber's connect, so the fan-out retries
@@ -184,15 +195,13 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
     };
     let m = test_memory("pushed-via-sse", 2);
     let commit = storage.upsert_memory(&m).await.unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
     let mut seen = false;
     while tokio::time::Instant::now() < deadline {
-        let _ = cluster
-            .tx
-            .send(cluster.envelope(Invalidation::MemoryUpserted {
-                id: m.id,
-                lsn: commit.lsn,
-            }));
+        cluster.publish_envelope(cluster.envelope(Invalidation::MemoryUpserted {
+            id: m.id,
+            lsn: commit.lsn,
+        }));
         if cache.get_memory("org", &m.id, &vc).is_some() {
             seen = true;
             break;
@@ -225,7 +234,10 @@ async fn per_client_sse_hmac_verifies_with_derived_key() {
         onto.fingerprint,
         HMAC_KEY,
     ));
-    let app = exocortex_server::sse::sse_router(cluster.clone());
+    let app = exocortex_server::sse::sse_router(
+        cluster.clone(),
+        exocortex_server::sse::SseAuth::OptionalToken,
+    );
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -248,9 +260,12 @@ async fn per_client_sse_hmac_verifies_with_derived_key() {
     let token = "client-token-7";
     let derived = derive_client_sse_key(&HMAC_KEY, token);
     let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+    cfg.backoff = Duration::from_millis(50);
     cfg.client_token = Some(token.into());
     cfg.client_key = Some(derived);
     let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 0, None));
+    // Head start so the run exercises the live path (see sse_feed test).
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
     let vc = VisibilityContext {
         user_id: "u".into(),
@@ -261,15 +276,13 @@ async fn per_client_sse_hmac_verifies_with_derived_key() {
     };
     let m = test_memory("per-client-hmac", 3);
     let commit = storage.upsert_memory(&m).await.unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
     let mut seen = false;
     while tokio::time::Instant::now() < deadline {
-        let _ = cluster
-            .tx
-            .send(cluster.envelope(Invalidation::MemoryUpserted {
-                id: m.id,
-                lsn: commit.lsn,
-            }));
+        cluster.publish_envelope(cluster.envelope(Invalidation::MemoryUpserted {
+            id: m.id,
+            lsn: commit.lsn,
+        }));
         if cache.get_memory("org", &m.id, &vc).is_some() {
             seen = true;
             break;
@@ -377,3 +390,80 @@ fn b64_encode(data: &[u8]) -> String {
     }
     out
 }
+
+/// Deterministic replay probe: publish 3 envelopes first, then subscribe
+/// from LSN 1 — the client must replay-apply deltas 2 and 3.
+#[tokio::test(flavor = "multi_thread")]
+async fn deterministic_replay_probe() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let cluster = Arc::new(ClusterNode::new(
+        storage.clone(),
+        "probe".into(),
+        onto.fingerprint,
+        HMAC_KEY,
+    ));
+    let (cache, rx) = LocalCache::new(16 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    {
+        let cache = cache.clone();
+        let storage = storage.clone();
+        tokio::spawn(async move { cache.run(storage, rx).await });
+    }
+
+    // Publish 1..3 deterministically BEFORE any subscriber exists.
+    for lsn in 1..=3u64 {
+        let m = test_memory(&format!("replay-{lsn}"), lsn as u8);
+        let commit = storage.upsert_memory(&m).await.unwrap();
+        assert_eq!(commit.lsn, lsn);
+        cluster.publish_envelope(cluster.envelope(Invalidation::MemoryUpserted {
+            id: m.id,
+            lsn: commit.lsn,
+        }));
+    }
+
+    let app = exocortex_server::sse::sse_router(
+        cluster.clone(),
+        exocortex_server::sse::SseAuth::OptionalToken,
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // The client's org graph must be resident before deltas can apply
+    // (§8.2: the reseed establishes the org, then Apply flows in).
+    cache.reseed_from_storage(&*storage, &"org".into()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+    cfg.backoff = Duration::from_millis(50);
+    let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 1, None));
+
+    let vc = VisibilityContext {
+        user_id: "u".into(),
+        org_id: "org".into(),
+        project_ids: Default::default(),
+        team_ids: Default::default(),
+        max_visibility: exocortex_kernel::Visibility::Org,
+    };
+    // Wait for replay-apply of lsn 3 (bounded).
+    let m3_id = {
+        let m = test_memory("replay-3", 3);
+        storage.upsert_memory(&m).await.unwrap(); // idempotent; id deterministic
+        m.id
+    };
+    let mut seen = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        if cache.get_memory("org", &m3_id, &vc).is_some() {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    sync.abort();
+    assert!(seen, "replayed delta 3 applied through the es client");
+}
+

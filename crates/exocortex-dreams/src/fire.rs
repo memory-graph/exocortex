@@ -13,6 +13,10 @@ use smol_str::SmolStr;
 /// The queue key (§12.2).
 pub const DREAMS_QUEUE_KEY: &str = "exocortex:dreams:queue";
 
+/// R-Dr14: quiet hours defer only while the backlog is shorter than this;
+/// at or above it the preference yields and the backlog still runs.
+pub const QUIET_HOURS_BACKLOG_MIN: u64 = 32;
+
 /// R-Dr13: reset the region's write counters atomically when a new lease
 /// holder picks the region up (the previous holder may have died after
 /// firing but before resetting). Counter hashes live under
@@ -141,6 +145,11 @@ impl RedisFireQueue {
 
     /// BLPOP one region (DreamsWorker side). `timeout` bounds the wait.
     /// Returns `None` on timeout.
+    ///
+    /// R-Dr14: quiet hours is a *preference, not a gate* — during the
+    /// window the worker defers (re-queues at the tail) only while the
+    /// backlog is short; a backlog at or above
+    /// [`QUIET_HOURS_BACKLOG_MIN`] runs anyway so cycles never starve.
     pub async fn drain(&mut self, timeout: Duration) -> anyhow::Result<Option<RegionKey>> {
         let (key, payload): (String, String) = match redis::cmd("BLPOP")
             .arg(DREAMS_QUEUE_KEY)
@@ -158,10 +167,9 @@ impl RedisFireQueue {
         };
         let _ = key;
         let msg: FireMessage = serde_json::from_str(&payload)?;
-        // R-Dr14: during quiet hours the worker defers (re-queues at the
-        // tail) instead of consolidating; ordering preserves fairness.
         let local_hour = local_hour_now();
-        if self.quiet_hours.contains(local_hour) {
+        if self.quiet_hours.contains(local_hour) && self.backlog_len().await? < QUIET_HOURS_BACKLOG_MIN
+        {
             let _: () = redis::cmd("RPUSH")
                 .arg(DREAMS_QUEUE_KEY)
                 .arg(payload)
@@ -171,6 +179,15 @@ impl RedisFireQueue {
             return Ok(None);
         }
         Ok(Some(msg.region.into()))
+    }
+
+    /// Current queue depth (LLEN).
+    async fn backlog_len(&mut self) -> anyhow::Result<u64> {
+        let n: u64 = redis::cmd("LLEN")
+            .arg(DREAMS_QUEUE_KEY)
+            .query_async(&mut self.conn)
+            .await?;
+        Ok(n)
     }
 
     /// R-Dr13: atomically read + reset the region's write counters; call

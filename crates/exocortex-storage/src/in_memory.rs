@@ -23,6 +23,18 @@ struct InMemoryInner {
     memories: Mutex<HashMap<MemoryId, Vec<Memory>>>, // history stack per id
     rels: Mutex<HashMap<RelationshipId, Vec<Relationship>>>,
     ontology: std::sync::Arc<exocortex_kernel::Ontology>,
+    /// Chubby-style lease table (§9.2): current holder token per key plus
+    /// the monotonic epoch counter — same semantics as the Redis path, so
+    /// fencing is exercisable without a live backend.
+    leases: Mutex<HashMap<LeaseKey, InMemoryLease>>, 
+    /// Monotonic fencing-epoch counter per lease key (never resets).
+    lease_epochs: Mutex<HashMap<LeaseKey, u64>>,
+}
+
+/// Current lease holder entry for the in-memory lease table.
+struct InMemoryLease {
+    token: String,
+    expires_at: DateTime<Utc>,
 }
 
 impl Clone for InMemoryStorage {
@@ -42,6 +54,8 @@ impl InMemoryStorage {
                 memories: Default::default(),
                 rels: Default::default(),
                 ontology,
+                leases: Default::default(),
+                lease_epochs: Default::default(),
             }),
             lsn: std::sync::Arc::new(AtomicU64::new(0)),
         }
@@ -79,6 +93,23 @@ impl InMemoryStorage {
     /// Highest LSN emitted so far.
     pub fn last_lsn(&self) -> u64 {
         self.lsn.load(Ordering::SeqCst)
+    }
+
+    /// R-C3 fencing check: the lease table must still hold this lease's
+    /// token and it must be unexpired. Mirrors the Redis-side check in
+    /// `FalkorStorage`.
+    fn check_lease_current(&self, lease: &OwnerLease) -> Result<(), StorageError> {
+        let leases = self.inner.leases.lock().unwrap();
+        match leases.get(&lease.key) {
+            Some(held)
+                if held.token == lease.fencing_token.as_str() && held.expires_at > Utc::now() =>
+            {
+                Ok(())
+            }
+            _ => Err(StorageError::FencedWriteRejected {
+                lease_epoch: lease.epoch,
+            }),
+        }
     }
 
     /// Row write without inverse materialization (the companion path's
@@ -306,21 +337,79 @@ impl Storage for InMemoryStorage {
         ttl: std::time::Duration,
     ) -> Result<OwnerLease, StorageError> {
         let now = Utc::now();
+        let mut leases = self.inner.leases.lock().unwrap();
+        if let Some(held) = leases.get(key) {
+            if held.expires_at > now {
+                return Err(StorageError::Backend("lease held by another node".into()));
+            }
+        }
+        // Monotonic epoch bump (R-C3): every acquisition mints a fresh
+        // fencing token, so a prior holder's writes can never pass the check.
+        let mut epochs = self.inner.lease_epochs.lock().unwrap();
+        let epoch = epochs.entry(key.clone()).and_modify(|e| *e += 1).or_insert(1);
+        let epoch = *epoch;
+        drop(epochs);
+        let token = format!("in-memory:{epoch}");
+        let expires_at = now + chrono::Duration::from_std(ttl).unwrap();
+        leases.insert(
+            key.clone(),
+            InMemoryLease {
+                token: token.clone(),
+                expires_at,
+            },
+        );
+        drop(leases);
         Ok(OwnerLease {
             key: key.clone(),
             owner_node_id: "in-memory".into(),
-            epoch: 1,
+            epoch,
             acquired_at: now,
-            expires_at: now + chrono::Duration::from_std(ttl).unwrap(),
-            grace_period: chrono::Duration::from_std(ttl).unwrap(),
-            fencing_token: "in-memory:1".into(),
+            expires_at,
+            grace_period: crate::trait_::grace_duration(),
+            fencing_token: token.into(),
         })
     }
     async fn renew_lease(&self, l: &OwnerLease) -> Result<OwnerLease, StorageError> {
-        Ok(l.clone())
+        let mut leases = self.inner.leases.lock().unwrap();
+        match leases.get_mut(&l.key) {
+            Some(held) if held.token == l.fencing_token.as_str() && held.expires_at > Utc::now() => {
+                let ttl = l.expires_at - l.acquired_at;
+                held.expires_at = Utc::now() + ttl;
+                Ok(OwnerLease {
+                    expires_at: held.expires_at,
+                    ..l.clone()
+                })
+            }
+            _ => Err(StorageError::Backend("lease lost (token mismatch)".into())),
+        }
     }
-    async fn release_lease(&self, _l: OwnerLease) -> Result<(), StorageError> {
+    async fn release_lease(&self, l: OwnerLease) -> Result<(), StorageError> {
+        let mut leases = self.inner.leases.lock().unwrap();
+        if leases
+            .get(&l.key)
+            .map(|h| h.token == l.fencing_token.as_str())
+            .unwrap_or(false)
+        {
+            leases.remove(&l.key);
+        }
         Ok(())
+    }
+    async fn upsert_batch_fenced(
+        &self,
+        ms: &[Memory],
+        rs: &[Relationship],
+        lease: &OwnerLease,
+    ) -> Result<Vec<CommitRecord>, StorageError> {
+        self.check_lease_current(lease)?;
+        self.upsert_batch(ms, rs).await
+    }
+    async fn delete_memory_fenced(
+        &self,
+        id: &MemoryId,
+        lease: &OwnerLease,
+    ) -> Result<CommitRecord, StorageError> {
+        self.check_lease_current(lease)?;
+        self.delete_memory(id).await
     }
     async fn subscribe_invalidations(
         &self,
@@ -332,7 +421,7 @@ impl Storage for InMemoryStorage {
         StorageCapabilities {
             bi_temporal: true,
             streaming: true,
-            leases: false,
+            leases: true,
             change_feed: false,
             max_traversal_depth: 4,
         }

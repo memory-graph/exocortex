@@ -46,7 +46,13 @@ pub async fn append_audit(
     ctx: &crate::OpContext,
     record: &AuditRecord,
 ) -> Result<u64, crate::OpError> {
-    LEDGER.lock().unwrap().push(record.clone());
+    LEDGER
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .entry(record.org_id.clone())
+        .or_default()
+        .push(record.clone());
 
     // R-A1: same-transaction storage write. The Cypher path carries the
     // record durably; failures degrade to the in-process ledger (the ack
@@ -85,16 +91,20 @@ pub async fn append_audit(
     Ok(record.lsn)
 }
 
-/// Read audit records after `since_lsn` (R-A3: `GET /v1/audit?since_lsn=`).
-/// Serves from storage when the backend carries the ledger (FalkorDB);
-/// otherwise the in-process ledger answers (tests, in-memory backends).
+/// Read audit records after `since_lsn` for one org (R-A3: `GET
+/// /v1/audit?since_lsn=`). Serves from storage when the backend carries
+/// the ledger (FalkorDB); otherwise the in-process ledger answers (tests,
+/// in-memory backends). Both paths are org-scoped — one tenant's reads
+/// never surface another's records (§17.2).
 pub async fn audit_range(
     ctx: &crate::OpContext,
+    org: &str,
     since_lsn: u64,
 ) -> Result<Vec<serde_json::Value>, crate::OpError> {
     let q = exocortex_storage::CypherQuery {
         template_id: "audit_range",
         params: serde_json::json!({
+            "org_id": org,
             "since_lsn": since_lsn,
             "limit": 1000u32,
         }),
@@ -108,15 +118,25 @@ pub async fn audit_range(
     }
     let ledger = LEDGER.lock().unwrap();
     Ok(ledger
-        .iter()
-        .filter(|r| r.lsn > since_lsn)
-        .map(|r| serde_json::to_value(r).unwrap_or_default())
-        .collect())
+        .as_ref()
+        .and_then(|m| m.get(org))
+        .map(|rows| {
+            rows.iter()
+                .filter(|r| r.lsn > since_lsn)
+                .map(|r| serde_json::to_value(r).unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
-static LEDGER: Mutex<Vec<AuditRecord>> = Mutex::new(Vec::new());
+/// Per-org in-process ledger: the durability double for non-Falkor
+/// backends (R-A3 fallback). Keyed by org so tenant isolation holds even
+/// when the volatile path answers. `Option` inside the lock because
+/// `HashMap::new` is not const.
+static LEDGER: Mutex<Option<HashMap<SmolStr, Vec<AuditRecord>>>> = Mutex::new(None);
 
 /// Lowercase hex over a 32-byte digest.
 fn hex64(bytes: &[u8; 32]) -> String {

@@ -886,6 +886,25 @@ impl Storage for FalkorStorage {
         Ok(())
     }
 
+    async fn upsert_batch_fenced(
+        &self,
+        ms: &[Memory],
+        rs: &[Relationship],
+        lease: &OwnerLease,
+    ) -> Result<Vec<CommitRecord>, StorageError> {
+        self.check_lease_current(lease).await?;
+        self.upsert_batch(ms, rs).await
+    }
+
+    async fn delete_memory_fenced(
+        &self,
+        id: &MemoryId,
+        lease: &OwnerLease,
+    ) -> Result<CommitRecord, StorageError> {
+        self.check_lease_current(lease).await?;
+        self.delete_memory(id).await
+    }
+
     async fn subscribe_invalidations(
         &self,
         _region: &RegionKey,
@@ -963,6 +982,28 @@ impl FalkorStorage {
     /// Current backend LSN frontier (Redis GET).
     async fn last_backend_lsn(&self) -> u64 {
         self.redis.clone().get(&self.lsn_key).await.unwrap_or(0)
+    }
+
+    /// R-C3 fencing check: the lease key must still hold this lease's
+    /// token. A missing key (expiry/release) or a different token
+    /// (re-election bumped the epoch) means the caller is a stale owner —
+    /// reject before any row commits.
+    async fn check_lease_current(&self, lease: &OwnerLease) -> Result<(), StorageError> {
+        let key_str = serde_json::to_string(&lease.key).unwrap();
+        let redis_key = format!("exocortex:lease:{key_str}");
+        let held: Option<String> = self
+            .redis
+            .clone()
+            .get(&redis_key)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        if held.as_deref() == Some(lease.fencing_token.as_str()) {
+            Ok(())
+        } else {
+            Err(StorageError::FencedWriteRejected {
+                lease_epoch: lease.epoch,
+            })
+        }
     }
 
     /// Hex helper exposed for tests.

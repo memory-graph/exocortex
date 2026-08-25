@@ -328,6 +328,73 @@ async fn inverse_materialized_on_write() {
     );
 }
 
+/// R-T14 at the ingest boundary: `SimilarTo` has a registered type-triple,
+/// so triple validation alone would admit it — a producer forging one gets
+/// `ComputedKindRejected`; Dreams stays the only legitimate producer.
+#[tokio::test]
+async fn computed_only_kind_rejected_at_ingest() {
+    use exocortex_wire::ingest::v1::RelationshipDraft;
+    use tonic::Request;
+
+    let srv = server();
+    srv.register_source(Request::new(RegisterSourceRequest {
+        org_id: "org".into(),
+        source_uri: "session://sim".into(),
+        producer_id: "test-adapter".into(),
+        ceiling: 3,
+        source_flavor: "custom".into(),
+    }))
+    .await
+    .unwrap();
+
+    let rows = vec![row("a", "Solution", 3), row("b", "Solution", 3)];
+    let mut b = exocortex_wire::ingest::v1::IngestBatch {
+        org_id: "org".into(),
+        source_uri: "session://sim".into(),
+        producer_id: "test-adapter".into(),
+        batch_id: "sim-forged".into(),
+        mapping_version: "1".into(),
+        ontology_fingerprint: srv.ontology.fingerprint.0.to_vec(),
+        ceiling: 3,
+        checksum: String::new(),
+        observed_at: None,
+        recorded_at: None,
+        snapshot: None,
+        memories: rows,
+        relationships: vec![RelationshipDraft {
+            from_draft_key: "a".into(),
+            to_draft_key: "b".into(),
+            kind: "SimilarTo".into(),
+            strength: 0.95,
+            confidence: 0.9,
+            context: String::new(),
+            visibility: 3,
+        }],
+        producer: Some(ProducerIdentity {
+            node_id: "n".into(),
+            agent_id: String::new(),
+            adapter_id: String::new(),
+            hmac_signature: vec![],
+        }),
+    };
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&[5u8; 32]).unwrap();
+    mac.update(&prost::Message::encode_to_vec(&b));
+    if let Some(p) = b.producer.as_mut() {
+        p.hmac_signature = mac.finalize().into_bytes().to_vec();
+    }
+    let ack = srv.submit(Request::new(b)).await.unwrap().into_inner();
+    // Endpoint drafts ride their relationship's rejection (same per-row
+    // semantics as the companion-rejection case above).
+    assert_eq!(ack.accepted, 0, "nothing from the forged batch commits");
+    assert!(
+        ack.rejections
+            .iter()
+            .any(|r| r.code == exocortex_wire::ingest::v1::RejectCode::ComputedKindRejected as i32),
+        "forged SimilarTo must be rejected with ComputedKindRejected: {:?}",
+        ack.rejections
+    );
+}
+
 /// R-T4 at the storage seam: writing the same `Solves` row twice never
 /// duplicates the companion (deterministic ids + current-row guard).
 #[tokio::test]

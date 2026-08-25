@@ -1240,6 +1240,7 @@ dependencies = [
  "exocortex-wire",
  "futures",
  "hmac",
+ "http 1.5.0",
  "metrics",
  "metrics-exporter-prometheus",
  "prost",

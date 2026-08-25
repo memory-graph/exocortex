@@ -27,6 +27,10 @@ use crate::entities::EntityExtractor;
 /// entries (LRU), so a churning producer set cannot grow them unboundedly.
 const REGISTRY_LRU_CAP: usize = 1000;
 
+/// Kinds produced exclusively by backend computation (R-T14): Dreams is
+/// the only legitimate producer, so the ingest boundary refuses them.
+const COMPUTED_ONLY_KIND: &str = "SimilarTo";
+
 /// The source-ceiling registry: (org, source_uri, producer_id) -> ceiling.
 pub type SourceRegistry = lru::LruCache<(String, String, String), Visibility>;
 /// The idempotency store: (producer_id, batch_id) -> original ack.
@@ -334,6 +338,13 @@ impl<S: Storage> IngestServer<S> {
         let Some(kind) = self.ontology.kind_id(&r.kind) else {
             return Err(RejectCode::UnknownKind);
         };
+        // R-T14: computed-only kinds land exclusively via the Dreams cycle
+        // (Computed/SimilarityHnsw provenance, §12.1 step 5). A producer
+        // asserting one through the batch path would forge the invariant,
+        // so the boundary rejects it outright.
+        if r.kind == COMPUTED_ONLY_KIND {
+            return Err(RejectCode::ComputedKindRejected);
+        }
         let vis = Self::vis_from_i32(r.visibility);
         if !vis.within(ceiling) {
             return Err(RejectCode::VisibilityWidening);
