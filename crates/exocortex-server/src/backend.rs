@@ -41,6 +41,13 @@ pub struct BackendNodeArgs {
     pub quiet_hours: exocortex_dreams::fire::QuietHours,
 }
 
+/// Dreams-lease TTL for the backend re-election loop. 1.5s + a 400ms
+/// retry cadence bounds worst-case takeover after a leader-kill at
+/// ~1.9s — inside the M5 acceptance bound (§3: converge within 2s).
+const LEASE_TTL: Duration = Duration::from_millis(1500);
+/// Renewal cadence: a healthy holder extends well before expiry.
+const LEASE_RENEW: Duration = Duration::from_millis(400);
+
 /// The Dreams lease every backend node re-elects for (§9.2).
 fn dreams_lease_key(org: &str) -> LeaseKey {
     LeaseKey::Dreams {
@@ -237,8 +244,12 @@ pub async fn run_backend_node<S: Storage + 'static>(
         let org = org.to_string();
         tokio::spawn(async move {
             let key = dreams_lease_key(&org);
+            // §3 M5 AC: leader election converges within 2s of a
+            // leader-kill — the lease TTL must be <= 2s for a surviving
+            // node to take over inside the bound, with sub-second renewals
+            // keeping a healthy holder stable.
             loop {
-                match storage.acquire_lease(&key, Duration::from_secs(10)).await {
+                match storage.acquire_lease(&key, LEASE_TTL).await {
                     Ok(lease) => {
                         let mut epoch = lease.epoch;
                         metrics::counter!(
@@ -254,7 +265,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
                             Arc::new(next)
                         });
                         loop {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            tokio::time::sleep(LEASE_RENEW).await;
                             match storage.renew_lease(&lease).await {
                                 Ok(l) => {
                                     epoch = l.epoch;
@@ -279,7 +290,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
                             next.last_lease_tick = Some(chrono::Utc::now());
                             Arc::new(next)
                         });
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        tokio::time::sleep(LEASE_RENEW).await;
                     }
                 }
             }

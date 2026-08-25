@@ -1,4 +1,3 @@
-version: "3.8"
 # M5 harness: a FalkorDB instance shared by the three exocortex-node
 # replicas (falkordb IS the redis coherence layer, §9.1 principle 6).
 # CI starts the nodes with:
@@ -19,7 +18,7 @@ services:
     depends_on:
       falkordb:
         condition: service_healthy
-    command: ["--mode", "backend-node", "--bind", ":8081", "--bearer-token", "dev-bearer", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node2:8082,node3:8083"]
+    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8081", "--node-id", "node1", "--gossip-addr", "0.0.0.0:8101", "--bearer-token", "dev-bearer", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node2:8082,node3:8083"]
     ports:
       - "8081:8081"
   node2:
@@ -27,7 +26,7 @@ services:
     depends_on:
       falkordb:
         condition: service_healthy
-    command: ["--mode", "backend-node", "--bind", ":8082", "--bearer-token", "dev-bearer", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node3:8083"]
+    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8082", "--node-id", "node2", "--gossip-addr", "0.0.0.0:8102", "--bearer-token", "dev-bearer", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node3:8083"]
     ports:
       - "8082:8082"
   node3:
@@ -35,6 +34,6 @@ services:
     depends_on:
       falkordb:
         condition: service_healthy
-    command: ["--mode", "backend-node", "--bind", ":8083", "--bearer-token", "dev-bearer", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node2:8082"]
+    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8083", "--node-id", "node3", "--gossip-addr", "0.0.0.0:8103", "--bearer-token", "dev-bearer", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node2:8082"]
     ports:
       - "8083:8083"

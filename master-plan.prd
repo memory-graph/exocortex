@@ -106,4 +106,4 @@ each step (88 tests at completion).
 | D8 | ABSTRACT row-writing variant (ontology shape TBD) | §12.1 step 4, round-2 H9 |
 | D9 | 100-user visibility fuzz + concurrent-region/CrossRegion suites | §23 #21/#22, round-2 H10 |
 | D10 | Wire-protocol throughput fan-out + additive-change rollout tests | §23 #23, round-2 H10 |
-| D11 | Multi-node leader-kill/partition live runs (Dockerfile + chaos script shipped; needs docker in the runner) | §3 M5 AC, round-2 H10 |
+| D11 | Partition-and-heal live run (leader-kill + convergence now OBSERVED: 4/4 in 1290-1448ms; the partition leg remains manual) | §3 M5 AC, round-2 H10 |

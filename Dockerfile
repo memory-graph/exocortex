@@ -3,6 +3,9 @@
 # The cluster compose harness (crates/exocortex-cluster/tests/
 # docker-compose-cluster.yml) references this tag.
 FROM rust:1.85-slim AS build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /repo
 COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml ./
 COPY .cargo .cargo

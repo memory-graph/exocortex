@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use exocortex_cluster::ClusterNode;
 use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
 use exocortex_pack_dev_v1::pack_def;
-use exocortex_server::sse::sse_router;
+use exocortex_server::sse::{sse_router, SseAuth};
 use exocortex_storage::{FalkorConfig, FalkorStorage, Invalidation, Storage};
 
 fn falkor_url() -> Option<String> {
@@ -118,7 +118,7 @@ Connection: close
     )
     .await
     .unwrap();
-    let mut sock = sock;
+    let sock = sock;
     let (mut rx, _) = tokio::io::split(sock);
 
     // Subscribe to storage's own change feed first (it feeds the cluster

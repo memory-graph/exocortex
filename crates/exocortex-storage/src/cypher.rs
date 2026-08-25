@@ -133,7 +133,10 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             CALL {
               WITH a
               MATCH (a)-[rels__KIND_TYPES__*1..$max_depth]->(b:Memory)
-              WHERE b.visibility <= $max_visibility
+              // The seed anchors the neighborhood; with inverse
+              // materialization (R-T4) a round-trip path would otherwise
+              // return the seed itself.
+              WHERE b.visibility <= $max_visibility AND b.id <> $from
               RETURN DISTINCT b LIMIT $max_nodes
             }
             RETURN b

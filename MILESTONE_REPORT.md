@@ -281,3 +281,34 @@ closed all of it. Worklist → code map:
    feature flag in v2.
 4. **Cross-domain/concurrent-region suites** (§23 #21/#22): recorded as
    v2 deferrals in `master-plan.prd` (heavy harness work).
+
+## Live-harness verification (2026-08-25, round 2 closeout)
+
+The two "shipped-but-unobserved" residuals from round 2 are now observed
+against real backends (Docker 29 / compose harness):
+
+- **Image + cluster**: `exocortex-node:local` builds from the repo
+  Dockerfile (builder needed `protobuf-compiler` + `libprotobuf-dev` —
+  Debian splits the well-known-types out of the compiler package). Three
+  nodes serve on one FalkorDB with distinct `--node-id`s (container PIDs
+  all read 1; the new flag replaces `node-{pid}`) and distinct gossip
+  ports. Compose binds use explicit `0.0.0.0:` — a bare `:8081` bind
+  makes the listener do an empty-host getaddrinfo and exit.
+- **M5 chaos AC (observed)**: 4/4 leader-kill runs converge — 1290ms,
+  1448ms, 1415ms, 1388ms — inside the 2s bound. This forced the
+  re-election lease from 10s TTL / 2s renewals to 1.5s TTL / 400ms
+  cadence: a 10s lease cannot converge inside 2s by construction
+  (Chubby takeover waits out the TTL).
+- **Live suites (observed)**: storage 7/7, cypher 6/6, fencing 3/3
+  (stale/expired/held + forged-token renewal rejection against real
+  Redis), cluster 6/6, SSE e2e 1/1. One live-only bug found and fixed:
+  `traverse_bounded` returned the seed itself (inverse materialization
+  makes A→B→A a valid 2-hop path); the template now excludes `$from`.
+- **New docker-backed coverage**: `cross_node.rs` (FALKOR_URL-gated) —
+  node A's commits reach node B's local hub through real Redis pub-sub
+  with peer admission verifying A's signature, and B's replay ring
+  serves a reconnecting SSE subscriber the buffered window in LSN order
+  (§9.1 + R-C6 on the live path, previously proven only in-process).
+- **fencing_live.rs** compiles and passes under the feature gate (it had
+  never been compiled with `--features integration` — the gate now runs
+  in every live pass).

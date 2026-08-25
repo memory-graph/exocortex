@@ -16,24 +16,31 @@ leader_of() { docker compose -f "$COMPOSE" ps --format json \
     | jq -r 'select(.Service|startswith("node")) | .Service + " " + .State' \
     | sort; }
 
-# Find the current lease holder via /health/cluster on each node.
+# Find the current lease holder via /health/cluster on each node. A
+# fresh cluster may still be inside a predecessor's lease TTL — wait up
+# to 15s for the first holder instead of failing instantly.
 leader=""
-for i in 1 2 3; do
-  port=$((8080 + i))
-  holder=$(curl -sf "http://127.0.0.1:${port}/health/cluster" | jq -r '.leader_node_id // empty')
-  if [ -n "$holder" ]; then leader="$holder"; break; fi
+waited=0
+while [ -z "$leader" ] && [ "$waited" -lt 15000 ]; do
+  for i in 1 2 3; do
+    port=$((8080 + i))
+    holder=$(curl -sf "http://127.0.0.1:${port}/health/cluster" 2>/dev/null         | jq -r '.leader_node_id // empty' || true)
+    if [ -n "$holder" ]; then leader="$holder"; break; fi
+  done
+  [ -z "$leader" ] && { sleep 0.5; waited=$((waited + 500)); }
 done
-[ -n "$leader" ] || { echo "FAIL: no lease holder found"; exit 1; }
+[ -n "$leader" ] || { echo "FAIL: no lease holder found within 15s"; exit 1; }
 echo "leader before kill: $leader"
 
-t0=$(date +%s%3N)
+now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+t0=$(now_ms)
 docker compose -f "$COMPOSE" kill "$leader"
 echo "killed $leader at $t0"
 
 # Poll for a new holder; the M5 AC bound is 2s.
 deadline=$((t0 + 2000))
 new_leader=""
-while [ "$(date +%s%3N)" -lt "$deadline" ]; do
+while [ "$(now_ms)" -lt "$deadline" ]; do
   for i in 1 2 3; do
     port=$((8080 + i))
     holder=$(curl -sf "http://127.0.0.1:${port}/health/cluster" 2>/dev/null | jq -r '.leader_node_id // empty' || true)
@@ -41,10 +48,11 @@ while [ "$(date +%s%3N)" -lt "$deadline" ]; do
   done
   sleep 0.1
 done
-t1=$(date +%s%3N)
+t1=$(now_ms)
 
 if [ -z "$new_leader" ]; then
   echo "FAIL: no new lease holder within 2s"
   exit 1
 fi
 echo "PASS: $leader -> $new_leader in $((t1 - t0))ms"
+docker compose -f "$COMPOSE" start "$leader" >/dev/null 2>&1 || true

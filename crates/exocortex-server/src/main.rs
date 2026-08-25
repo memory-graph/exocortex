@@ -29,6 +29,10 @@ struct Args {
     /// Deployment mode.
     #[arg(long, value_enum, default_value = "mcp-standalone")]
     mode: Mode,
+    /// Node identity (lease tokens, envelopes, gossip). Defaults to
+    /// `node-{pid}`; containers pass an explicit id (PIDs collide at 1).
+    #[arg(long)]
+    node_id: Option<String>,
     /// Storage selection: embedded falkordb or a networked URL.
     #[arg(long, default_value = "falkordb-embedded")]
     storage: String,
@@ -142,9 +146,13 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
             .and_then(|hex| decode_hex32(hex).ok())
             .unwrap_or([0x42u8; 32]);
         let bearer_token = resolve_bearer(&args)?;
+        let node_id = args
+            .node_id
+            .clone()
+            .unwrap_or_else(|| format!("node-{}", std::process::id()));
         let node_args = backend::BackendNodeArgs {
             bind: args.bind.clone(),
-            node_id: format!("node-{}", std::process::id()),
+            node_id,
             cluster_secret,
             bearer_token,
             gossip_listen: SocketAddr::from_str(&args.gossip_addr)
