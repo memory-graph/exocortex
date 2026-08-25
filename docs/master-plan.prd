@@ -1,11 +1,11 @@
 # Exocortex — Master Plan
 
-**Status:** Round 2 review open. `round-2-review.prd` is the current
-worklist (B3-B7, W9-W14, H9-H14, P1). Round-1 closure verified by audit:
-14/19 items fully closed with tests; W7/H1/H2/H6 carry residue (H12).
-
-**Process blocker (P1):** the round-1 closure exists only as uncommitted
-working-tree changes — commit it before round-2 work starts.
+**Status:** Round 3 review open. `docs/reviews/round-3-review.prd` is the
+current worklist (C1-C5, G1-G4, D1-D6, M1-M15). Rounds 1-2 are closed
+with tests; B8/B9 and the adapter-SDK (A1) landed since — the round-3
+audit covered that delta and found the SDK's integration tests
+CI-dead (C1), two protocol bugs (C3, C5), a tenancy hole (C4), and a
+worker key mismatch (C2).
 
 **Purpose:** The authoritative, phased worklist for this repository. Each
 round of review findings gets its own `round-<n>-review.prd`; accepted
@@ -47,6 +47,14 @@ each step (88 tests at completion).
 | B8 | `ExternalKey.table_uuid` lossy-UTF8 identity collision (`service.rs:246,304`, `ids.rs:15`) | `docs/bug-prd-external-key-identity.md` | Closed |
 | B9 | `ExternalSnapshotInfo.schema_hash` discarded at commit (`service.rs:240`) | `docs/bug-prd-external-key-identity.md` | Closed |
 | A1 | `exocortex-adapter-sdk` — Layer A protocol core + fixture adapter (unblocks D1) | adapter-SDK PRD (session `2026-08-25-4b715f6a`); closed `adoption`-grade: R1-R20 shipped | Closed |
+| C1 | SDK integration tests CI-dead (`testing` feature never enabled) — vacuous R7/R8/R12/R14/R19 | round-3 | Open |
+| C2 | Worker fixture HMAC key `[5u8;32]` never matches server; `--config` dead | round-3 | Open |
+| C3 | R-I2 split measures pre-stamp/pre-sign; post-check dead code; near-limit batches overshoot | round-3 | Open |
+| C4 | Cross-tenant cache pollution: ingest accepts any org; bridge applies to first graph | round-3 | Open |
+| C5 | `Status::internal` (transient storage) classified Fatal — blip kills session | round-3 | Open |
+| G1-G4 | Purity assertion absent (commit msg overclaims); grep gates miscalibrated; 0.1.0 hardcode; PRD table drift | round-3 | Open |
+| D1-D6 | release.toml inert in docs/; repository link missing on crates; stale docs | round-3 | Open |
+| M1-M15 | Mixed-ack double-count; secret-parse panic; bridge loss windows; minors | round-3 | Open |
 
 ## In progress
 

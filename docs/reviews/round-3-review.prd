@@ -1,0 +1,242 @@
+# Exocortex v1 — Round 3 Review (Deep audit of the post-round-2 delta)
+
+**Status:** Open work items from the 2026-08-25 audit. Scope: everything
+landed since round 2 — B8/B9 identity fixes, the `wire::signing`
+migration + server checksum verification, `exocortex-adapter-sdk` (A1),
+the backend cache-feed bridge, `--storage memory`, publish tooling, and
+the docs/ reorganization.
+
+**Method:** fresh deterministic baseline + four orthogonal reviewers
+(PRD-acceptance, regression/invariants, adversarial correctness,
+repo/CI/release). Every finding below was independently re-verified
+against the code before inclusion.
+
+**Baseline (verified fresh):** 68 test suites green, clippy/fmt clean,
+deny green, all seven xtask gates pass, fingerprint
+`d8bcd004…4e8c` stable. **Note the trap: "green" includes test binaries
+that compile to zero tests (C1 below) — the baseline overstates.**
+
+## What held up (verified sound)
+
+- The signing migration core: `unsigned_bytes` symmetry means
+  `sign_batch`/`verify_signature` hash identical preimages; all three
+  producer paths (end_session, SDK, tests) produce signatures the
+  server accepts; HMAC → checksum → fingerprint ordering prevents
+  forged-replay ack harvesting.
+- B8/B9: raw-byte identity end-to-end; hex is display-only; no caller
+  hashes hex into `from_external`.
+- Lease timing: backend re-election lease (`*:*`, 1.5s) and Dreams
+  per-region leases (60s) are distinct keys; `/health/ready` freshness
+  holds with ~37× margin.
+- Publish order in `scripts/publish.sh` matches the dependency graph;
+  the strip set covers every forward dev-cycle.
+- SSE replay/409/auth paths intact after all changes.
+
+---
+
+## Phase 1 — Critical (correctness/security)
+
+### C1. The SDK's integration tests never run in CI (vacuous green)
+
+- **Where:** every integration test is `#![cfg(feature = "testing")]`
+  (`tests/{handshake,cursor,rejects,backoff,golden}.rs`); the `testing`
+  feature is non-default and nothing enables it for test builds — CI
+  runs bare `cargo test --workspace`. Verified: bare `cargo test -p
+  exocortex-adapter-sdk` runs only the 10 lib unit tests; the five
+  integration binaries compile to `running 0 tests`.
+- **Impact:** R7/R8/R12/R14/R19 verification passes vacuously — the
+  exact "skipped test that reports green" failure mode the adapter-SDK
+  PRD's own risk table forbids.
+- **Fix:** enable the feature for the SDK's own test builds (self
+  dev-dependency with `features = ["testing"]`, the standard pattern)
+  and/or add a CI step. Then re-count the baseline.
+
+### C2. The worker's fixture adapter can never authenticate
+
+- **Where:** `crates/exocortex-worker/src/main.rs:147` hardcodes
+  `hmac_key: [5u8; 32]`; the server's ingest key is the cluster secret
+  (default `[0x42; 32]`, `crates/exocortex-server/src/main.rs:132`). The
+  worker has no way to receive it; `--config` is parsed and never read.
+- **Impact:** every real `exocortex-worker --adapter fixture` run gets
+  `Unauthorized` → session-fatal. The R17 test passes only because it
+  builds the config in-process with the matching key — the shipped
+  binary path is untested and broken.
+- **Fix:** key from env/flag/config-file (read the dead `--config`);
+  add a worker-binary-level test (also closes R16's missing second
+  verify clause, M11).
+
+### C3. R-I2 budget is violated: the split-time measure is not the submitted bytes
+
+- **Where:** `split.rs:94,209-214` measures components with empty
+  `org_id`/`source_uri`, no `mapping_version`, and no signature;
+  `lib.rs:323-328` stamps identity fields and signs AFTER splitting.
+  The post-hoc check (`split.rs:156`) runs pre-stamp/pre-signature and
+  is provably unreachable for multi-component packs (the flush
+  invariant already bounds those below the estimate).
+- **Impact:** a batch within `len(org_id)+len(source_uri)+~38` bytes of
+  the limit ships OVER `max_batch_bytes` with no check anywhere →
+  server-side decode limit → deterministic `Unavailable` → 8 futile
+  retries → `RetriesExhausted`; the window is stuck forever.
+- **Fix:** measure after full stamping + signing (build, prepare, then
+  verify `encoded_len()`; re-split if over — or reserve headroom).
+
+### C4. Cross-tenant cache pollution via the backend feed bridge
+
+- **Where:** ingest accepts any `batch.org_id` at face value
+  (`service.rs:506`); the bridge subscribes `org: "*"`
+  (`backend.rs:108`); `apply()` targets `org_of_write()` = the FIRST
+  resident graph (`cache/src/lib.rs:420-423`); `storage.get_memory` is
+  org-agnostic.
+- **Impact:** a write committed under any other org id publishes an
+  invalidation that gets fetched and inserted into THIS node's org
+  snapshot — cross-tenant rows on the ops surface. (InMemory + Falkor
+  both; single-org v1 deployments narrow but do not remove the hole —
+  nothing validates the org.)
+- **Fix:** validate `batch.org_id` against the node's org at submit
+  (reject `UnknownSource`-class), and/or carry the org on the
+  invalidation and drop non-matching events in the bridge.
+
+### C5. Transient storage errors are classified Fatal — one blip kills the session
+
+- **Where:** `classify_status` (`adapter-sdk/src/lib.rs:466-474`) maps
+  everything outside {Unavailable, DeadlineExceeded, ResourceExhausted,
+  Aborted} to Fatal — but the ingest server returns
+  `Status::internal("storage: …")` for failed upserts
+  (`service.rs:587`), exactly the transient class.
+- **Impact:** a Falkor/Redis hiccup aborts the adapter session instead
+  of retrying.
+- **Fix:** add `Internal` (and arguably `Unknown`) to the retryable set
+  with the same backoff; keep truly-fatal codes narrow.
+
+---
+
+## Phase 2 — Gates and truth
+
+### G1. The R15 purity assertion does not exist (and a commit message says it does)
+
+- **Where:** zero `adapter-sdk` references in `xtask/src/main.rs`;
+  `kernel_purity` checks only the kernel's banned-crate list. Commit
+  `3ab680c`'s message claims "kernel-purity asserts the SDK's single
+  exocortex dependency" — the insertion script failed (NUL-byte
+  mangling) and was never re-run. AGENTS.md:82 repeats the false claim.
+- **Fix:** implement the assertion (cargo tree over adapter-sdk AND
+  worker: no `exocortex-kernel`, exactly one `exocortex-*` for the
+  SDK); correct AGENTS.md in the same commit; note the commit-message
+  inaccuracy in MILESTONE_REPORT.
+
+### G2. The PRD's grep gates are miscalibrated and unwired
+
+- `checksum: String::new()` matches 15 sites (all benign scaffolding
+  later overwritten by `prepare_batch`) — the gate as written fails on
+  a healthy tree; not in CI.
+- `Hmac<Sha256>` matches `client/src/sync.rs` + `server/src/sse.rs` —
+  those MAC the SSE *envelope* (R-W4), not batches; the single-impl
+  intent holds but the gate text is wrong; not in CI.
+- **Fix:** narrow both gates (e.g. grep for local `sign_batch|fn
+  compute_checksum` outside `exocortex-wire/src/signing.rs`; assert
+  submitted batches' checksums non-empty via the ack path) and wire
+  them into xtask + CI.
+
+### G3. `wire-standalone` hardcodes version 0.1.0
+
+- `xtask/src/main.rs:292-293` maps `version.workspace` to the literal
+  `"0.1.0"`. At 0.2.0 the gate looks for a nonexistent tarball and CI
+  breaks.
+- **Fix:** parse the real version via `cargo metadata`.
+
+### G4. PRD verification-table drift (documentation)
+
+- R5's tests live in `external_key.rs`, not the promised `checksum.rs`;
+  R17's test lives in `exocortex-server/tests/`, not the SDK; R21's
+  span is per window, not per submit; R12's corrupt-cursor test is a
+  negative match only. Record the deltas in MILESTONE_REPORT.
+
+---
+
+## Phase 3 — Release and docs
+
+- **D1.** `docs/release.toml` is inert (cargo-release reads the
+  workspace root). Worse: with it unread, `xtask`'s `release = false`
+  never applies — a resumed `cargo release --execute` could try to
+  publish xtask. Move it back to the root.
+- **D2.** No crate sets `repository.workspace = true` — the 14
+  published manifests carry no repo link, and PUBLISHING.md claims
+  otherwise. Add the inheritance line to every crate.
+- **D3.** `docs/master-plan.prd` header is stale: says "Round 2 review
+  open" + the long-closed P1 blocker (a later edit clobbered the
+  phase-6 status). Rewrite the header (done in this commit).
+- **D4.** PUBLISHING.md: says 13 crates (14 exist); the order graph
+  omits `exocortex-adapter-sdk`.
+- **D5.** The wire tarball `include` omits `LICENSE` — published crate
+  ships no AGPL text alongside an AGPL SPDX field.
+- **D6.** README/MILESTONE_REPORT/AGENTS gate lists omit
+  `proto-sync`/`wire-standalone` which CI runs.
+
+## Phase 4 — Correctness minors and hardening
+
+- **M1.** Mixed acks: permanent rejections re-recorded on every retry
+  (double counting); the duplicate-replay path re-adds the ORIGINAL
+  `ack.accepted` (replayed windows report rows as newly accepted).
+  (`adapter-sdk/src/lib.rs:410-455`)
+- **M2.** `decode_hex32` panics on a short `--cluster-secret`; a
+  non-hex 64-char string silently falls back to the PUBLIC dev key —
+  a typo'd secret yields a working, known-key node.
+  (`server/src/main.rs:198-203,130-132`)
+- **M3.** Cache-bridge loss windows: reseed completes before subscribe
+  (commits in the gap are missed forever), same on every resubscribe;
+  fetch errors drop the event with no retry; the inner resubscribe
+  loop has no sleep (tight flap on instantly-dying streams). Add a
+  periodic reseed/LSN reconcile or an LSN gap check.
+  (`backend.rs:85-129`, `cache/src/lib.rs:395-398`)
+- **M4.** `Fatal.code` is always 0 on the transport path (tonic `Code`
+  displays as a name; `to_string().parse()` fails). Carry the tonic
+  code properly. (`adapter-sdk/src/lib.rs:357`)
+- **M5.** A `draft_key` duplicated within one unit passes validation →
+  two independent rows persisted. Dedupe or reject.
+  (`split.rs:169-179`)
+- **M6.** Cursor tmp path: `with_extension("tmp")` collides for `*.tmp`
+  cursors and across sibling cursors sharing a stem; no fsync before
+  rename. (`adapter-sdk/src/lib.rs:496`)
+- **M7.** The checksum preimage is not injective (field values
+  containing `\x1e`/`{`/`:` can shift section boundaries). Not
+  exploitable today (server recomputes + HMAC covers), but the
+  "collision-safe" doc comment overclaims — length-prefix or escape
+  the separators, or soften the comment.
+- **M8.** SDK batches never stamp `node_id`/`agent_id`/`adapter_id`
+  (config fields exist; split leaves them empty) — measured bytes ≠
+  operator-attributable bytes. Also `mapping_version` is never stamped
+  despite a comment claiming the caller does it.
+- **M9.** After a SERVER restart, `seen_batches` (in-memory LRU) is
+  empty and session-flavor rows have fresh v7 ids — replaying a
+  window duplicates every non-external row. Document, or persist
+  batch-id dedup.
+- **M10.** Golden regen command in docs misses `--features testing`
+  (the test file is feature-gated; the bare command runs nothing).
+- **M11.** No end-to-end test drives the worker BINARY with
+  `--adapter fixture` (R16's second verify clause).
+- **M12.** R9 asked for a property test over generated units;
+  fixed cases only (`proptest` already a workspace dep).
+- **M13.** `/health/cluster` reports the `*:*` re-election lease as
+  "leader" while Dreams ownership is per-region — misleading during
+  partition heal (observation only).
+- **M14.** B8 latent fork: the first future caller that re-derives
+  `MemoryId` from the stored hex `provenance.ExternalKey.table_uuid`
+  silently forks identity. Add a doc note or a hex-decoding helper
+  with a test.
+- **M15.** The WAL replay path, when it lands, must rebuild batches and
+  `prepare_batch` at replay time (WAL stores unsigned kernel drafts);
+  record in the plan so it isn't built naively.
+
+## Deferred-candidates
+
+None new beyond the recorded v2 list (D1 Iceberg, D6-D11 in the master
+plan). M9's server-side dedup persistence is the strongest v2 candidate.
+
+## Sign-off
+
+Baseline green but overstated (C1). Round-3 worklist: 5 critical
+(C1-C5), 4 gate/truth items (G1-G4), 6 release/docs items (D1-D6),
+15 minors (M1-M15). The adapter-SDK PRD itself is implemented to
+letter-of-intent; the gaps are verification wiring (C1, G1-G3), two
+real protocol bugs (C3, C5), one tenancy hole (C4), and one dead
+binary path (C2).
