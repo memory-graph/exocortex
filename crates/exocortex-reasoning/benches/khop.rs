@@ -58,7 +58,20 @@ fn main() {
     let p50 = percentile(samples.clone(), 50.0);
     let p99 = percentile(samples.clone(), 99.0);
     println!("k-hop fixpoint over 128 nodes: p50={p50:?} p99={p99:?}");
-    let ok = p50 < Duration::from_micros(300) && p99 < Duration::from_millis(2);
+    // Shared-CI tolerance (R-Lat1 budgets assume dedicated hardware):
+    // `SLO_MULTIPLIER` relaxes BOTH budgets by the same factor so noisy
+    // public runners gate regressions without tripping on steal time.
+    // Local/dev runs keep the bare budget (multiplier 1.0).
+    let m = std::env::var("SLO_MULTIPLIER")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .clamp(1.0, 3.0);
+    let ok =
+        p50 < Duration::from_micros(300).mul_f64(m) && p99 < Duration::from_millis(2).mul_f64(m);
+    if m != 1.0 {
+        println!("SLO budgets relaxed x{m} (SLO_MULTIPLIER)");
+    }
     println!(
         "SLO gate (§10.7 step 6): {}",
         if ok { "PASS" } else { "FAIL" }

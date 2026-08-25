@@ -122,7 +122,17 @@ fn main() {
     let p99 = percentile(samples.clone(), 99.0);
     println!("search_memories over {N} memories: p50={p50:?} p99={p99:?}");
 
-    let ok = p50 < Duration::from_micros(500) && p99 < Duration::from_millis(3);
+    // Shared-CI tolerance — see the khop bench for rationale.
+    let m = std::env::var("SLO_MULTIPLIER")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0)
+        .clamp(1.0, 3.0);
+    let ok =
+        p50 < Duration::from_micros(500).mul_f64(m) && p99 < Duration::from_millis(3).mul_f64(m);
+    if m != 1.0 {
+        println!("SLO budgets relaxed x{m} (SLO_MULTIPLIER)");
+    }
     println!("SLO gate (R-Lat1): {}", if ok { "PASS" } else { "FAIL" });
     if !ok {
         std::process::exit(1);

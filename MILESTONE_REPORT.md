@@ -312,3 +312,24 @@ against real backends (Docker 29 / compose harness):
 - **fencing_live.rs** compiles and passes under the feature gate (it had
   never been compiled with `--features integration` — the gate now runs
   in every live pass).
+
+### CI first-run record (2026-08-25)
+
+The gate suite now executes on GitHub's runner (private repo
+`gregorydickson/exocortex`, workflow `ci`). First-run findings, each
+fixed at the root:
+
+1. **rustfmt drift**: installing `stable` disagreed with the 1.85 pin —
+   the workflow now installs exactly `1.85.0`.
+2. **`protoc` absent** from the runner image (same Debian split the
+   Dockerfile hit) — installed in a step.
+3. **`cargo-deny` is not a built-in subcommand** — switched to
+   `EmbarkStudios/cargo-deny-action@v2`.
+4. **SLO p50 on shared hardware**: k-hop measured 437µs against the
+   300µs budget (local: 269µs) — CPU steal, not a regression. Benches
+   gained `SLO_MULTIPLIER` (clamped 1.0-3.0); CI sets x2, local runs
+   keep bare budgets. A 2x real regression still fails CI.
+5. One genuinely unformatted file (`cross_node.rs`) shipped in the live
+   commit — the pre-commit gate sequence now includes `fmt --check`.
+
+Final state: all nine workflow gates green on the runner.
