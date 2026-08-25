@@ -184,9 +184,9 @@ impl Operation for GetMemory {
                 memory: Some(mem_json(&m)),
             }),
             Ok(None) => Ok(GetMemoryOutput { memory: None }),
-            Err(exocortex_storage::StorageError::PermissionDenied) => {
-                Err(OpError::Unauthorized("memory outside caller visibility".into()))
-            }
+            Err(exocortex_storage::StorageError::PermissionDenied) => Err(OpError::Unauthorized(
+                "memory outside caller visibility".into(),
+            )),
             Err(e) => Err(OpError::Storage(e.to_string())),
         }
     }

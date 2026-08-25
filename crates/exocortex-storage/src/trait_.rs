@@ -160,6 +160,12 @@ pub trait Storage: Send + Sync + 'static {
 
     // ---- Metadata ----
 
+    /// Liveness probe for R-O4 readiness: a cheap round trip that fails
+    /// when the backend is unreachable. Default `Ok(())` for doubles with
+    /// no network hop.
+    async fn ping(&self) -> crate::Result<()> {
+        Ok(())
+    }
     /// Backend capability set.
     fn capabilities(&self) -> StorageCapabilities;
     /// Backend identity: `"falkordb" | "in-memory"`.

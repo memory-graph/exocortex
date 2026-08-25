@@ -22,7 +22,9 @@ fn mem(seed: u8) -> Memory {
         summary: None,
         tags: Default::default(),
         visibility: Visibility::Org,
-        provenance: Provenance::Asserted { author: "fence".into() },
+        provenance: Provenance::Asserted {
+            author: "fence".into(),
+        },
         context: MemoryContext {
             timestamp: Utc::now(),
             project_id: None,

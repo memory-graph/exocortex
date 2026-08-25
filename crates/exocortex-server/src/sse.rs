@@ -80,8 +80,7 @@ async fn handler<S: Storage + 'static>(
         Some(n) => match cluster.replay_since(n) {
             Replay::Fresh(envs) => envs,
             Replay::TooOld => {
-                let mut resp =
-                    (http::StatusCode::CONFLICT, "Resync Required").into_response();
+                let mut resp = (http::StatusCode::CONFLICT, "Resync Required").into_response();
                 if let Ok(v) = http::HeaderValue::from_str(&cluster.replay_floor().to_string()) {
                     resp.headers_mut().insert("x-exocortex-min-lsn", v);
                 }

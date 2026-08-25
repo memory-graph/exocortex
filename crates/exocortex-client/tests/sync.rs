@@ -130,7 +130,10 @@ fn envelope_decode_verifies_hmac_fingerprint_and_wire_version() {
 /// through the feed within 500ms.
 #[tokio::test(flavor = "multi_thread")]
 async fn sse_feed_observed_by_client_cache_within_500ms() {
-    let _ = tracing_subscriber::fmt().with_env_filter("exocortex=debug,info").with_writer(std::io::stderr).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("exocortex=debug,info")
+        .with_writer(std::io::stderr)
+        .try_init();
     let onto = Arc::new(
         exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
     );
@@ -428,7 +431,9 @@ async fn deterministic_replay_probe() {
         cluster.clone(),
         exocortex_server::sse::SseAuth::OptionalToken,
     );
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
@@ -466,4 +471,3 @@ async fn deterministic_replay_probe() {
     sync.abort();
     assert!(seen, "replayed delta 3 applied through the es client");
 }
-

@@ -19,7 +19,7 @@ services:
     depends_on:
       falkordb:
         condition: service_healthy
-    command: ["--mode", "backend-node", "--bind", ":8081", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node2:8082,node3:8083"]
+    command: ["--mode", "backend-node", "--bind", ":8081", "--bearer-token", "dev-bearer", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node2:8082,node3:8083"]
     ports:
       - "8081:8081"
   node2:
@@ -27,7 +27,7 @@ services:
     depends_on:
       falkordb:
         condition: service_healthy
-    command: ["--mode", "backend-node", "--bind", ":8082", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node3:8083"]
+    command: ["--mode", "backend-node", "--bind", ":8082", "--bearer-token", "dev-bearer", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node3:8083"]
     ports:
       - "8082:8082"
   node3:
@@ -35,6 +35,6 @@ services:
     depends_on:
       falkordb:
         condition: service_healthy
-    command: ["--mode", "backend-node", "--bind", ":8083", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node2:8082"]
+    command: ["--mode", "backend-node", "--bind", ":8083", "--bearer-token", "dev-bearer", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node2:8082"]
     ports:
       - "8083:8083"

@@ -26,7 +26,7 @@ struct InMemoryInner {
     /// Chubby-style lease table (§9.2): current holder token per key plus
     /// the monotonic epoch counter — same semantics as the Redis path, so
     /// fencing is exercisable without a live backend.
-    leases: Mutex<HashMap<LeaseKey, InMemoryLease>>, 
+    leases: Mutex<HashMap<LeaseKey, InMemoryLease>>,
     /// Monotonic fencing-epoch counter per lease key (never resets).
     lease_epochs: Mutex<HashMap<LeaseKey, u64>>,
 }
@@ -346,7 +346,10 @@ impl Storage for InMemoryStorage {
         // Monotonic epoch bump (R-C3): every acquisition mints a fresh
         // fencing token, so a prior holder's writes can never pass the check.
         let mut epochs = self.inner.lease_epochs.lock().unwrap();
-        let epoch = epochs.entry(key.clone()).and_modify(|e| *e += 1).or_insert(1);
+        let epoch = epochs
+            .entry(key.clone())
+            .and_modify(|e| *e += 1)
+            .or_insert(1);
         let epoch = *epoch;
         drop(epochs);
         let token = format!("in-memory:{epoch}");
@@ -372,7 +375,9 @@ impl Storage for InMemoryStorage {
     async fn renew_lease(&self, l: &OwnerLease) -> Result<OwnerLease, StorageError> {
         let mut leases = self.inner.leases.lock().unwrap();
         match leases.get_mut(&l.key) {
-            Some(held) if held.token == l.fencing_token.as_str() && held.expires_at > Utc::now() => {
+            Some(held)
+                if held.token == l.fencing_token.as_str() && held.expires_at > Utc::now() =>
+            {
                 let ttl = l.expires_at - l.acquired_at;
                 held.expires_at = Utc::now() + ttl;
                 Ok(OwnerLease {

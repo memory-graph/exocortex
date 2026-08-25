@@ -243,12 +243,12 @@ async fn audit_ledger_is_org_scoped() {
         assert!(out.audit_lsn > 0, "{org}: audited");
     }
 
-    for (ctx, org, other) in [
-        (&ctx_a, "org-a", "org-b"),
-        (&ctx_b, "org-b", "org-a"),
-    ] {
+    for (ctx, org, other) in [(&ctx_a, "org-a", "org-b"), (&ctx_b, "org-b", "org-a")] {
         let rows = exocortex_ops::operations::ListAuditRecordsOp
-            .handle(ctx, exocortex_ops::operations::ListAuditInput { since_lsn: 0 })
+            .handle(
+                ctx,
+                exocortex_ops::operations::ListAuditInput { since_lsn: 0 },
+            )
             .await
             .unwrap();
         assert!(
@@ -275,7 +275,9 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
     let mut m = mem("private-target");
     m.visibility = Visibility::Private;
     let author = "someone-else";
-    m.provenance = Provenance::Asserted { author: author.into() };
+    m.provenance = Provenance::Asserted {
+        author: author.into(),
+    };
     storage.upsert_memory(&m).await.unwrap();
 
     let ctx = OpContext {
@@ -285,7 +287,10 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
     };
     let err = exocortex_ops::operations::GetMemory
-        .handle(&ctx, exocortex_ops::operations::GetMemoryInput { id: hex(&m.id) })
+        .handle(
+            &ctx,
+            exocortex_ops::operations::GetMemoryInput { id: hex(&m.id) },
+        )
         .await
         .expect_err("invisible row must error");
     assert!(
@@ -309,7 +314,10 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
     };
     let out = exocortex_ops::operations::GetMemory
-        .handle(&ctx2, exocortex_ops::operations::GetMemoryInput { id: hex(&own.id) })
+        .handle(
+            &ctx2,
+            exocortex_ops::operations::GetMemoryInput { id: hex(&own.id) },
+        )
         .await
         .expect("author reads own private memory");
     assert!(out.memory.is_some(), "cold-cache miss fills from storage");

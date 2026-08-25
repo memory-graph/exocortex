@@ -168,7 +168,8 @@ impl RedisFireQueue {
         let _ = key;
         let msg: FireMessage = serde_json::from_str(&payload)?;
         let local_hour = local_hour_now();
-        if self.quiet_hours.contains(local_hour) && self.backlog_len().await? < QUIET_HOURS_BACKLOG_MIN
+        if self.quiet_hours.contains(local_hour)
+            && self.backlog_len().await? < QUIET_HOURS_BACKLOG_MIN
         {
             let _: () = redis::cmd("RPUSH")
                 .arg(DREAMS_QUEUE_KEY)

@@ -66,17 +66,27 @@ pub async fn run_backend_node<S: Storage + 'static>(
 ) -> anyhow::Result<BackendNode> {
     let org: Arc<str> = "org".into();
 
-    // Read path: cache + writer loop over the same storage.
+    // Read path: cache + writer loop over the same storage. The writer
+    // consumes first so the reseed flows through it (§8.2).
     let (cache, writer_rx) = LocalCache::new(2 * 1024 * 1024 * 1024);
     let cache = Arc::new(cache);
-    cache
-        .reseed_from_storage(&*storage, &org.to_string().into())
-        .await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
     {
         let cache = cache.clone();
         let storage = storage.clone();
         tokio::spawn(async move { cache.run(storage, writer_rx).await });
+    }
+    cache
+        .reseed_from_storage(&*storage, &org.to_string().into())
+        .await;
+    // R-O4: hydration completes when the org graph is actually resident
+    // (the reseed flowed through the writer), not at spawn time.
+    let mut hydrated = false;
+    for _ in 0..200 {
+        if cache.resident_orgs() > 0 {
+            hydrated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
     // Cluster: envelope signing + SSE fan-out.
@@ -172,9 +182,32 @@ pub async fn run_backend_node<S: Storage + 'static>(
     let health = bind.health_handle();
     health.store(Arc::new(HealthSnapshot {
         node_id: args.node_id.clone(),
-        hydrated: true,
+        hydrated,
         ..Default::default()
     }));
+
+    // R-O4 maintainers: a storage probe keeps `storage_ok` truthful, and
+    // the reasoning worker reports liveness.
+    {
+        let storage = storage.clone();
+        let health = health.clone();
+        tokio::spawn(async move {
+            loop {
+                let ok = storage.ping().await.is_ok();
+                health.rcu(|h| {
+                    let mut next = (**h).clone();
+                    next.storage_ok = ok;
+                    Arc::new(next)
+                });
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
+    health.rcu(|h| {
+        let mut next = (**h).clone();
+        next.reasoning_alive = true;
+        Arc::new(next)
+    });
 
     let grpc = tonic::service::Routes::new(
         exocortex_wire::ingest::v1::ingest_service_server::IngestServiceServer::new(ingest),
@@ -208,10 +241,16 @@ pub async fn run_backend_node<S: Storage + 'static>(
                 match storage.acquire_lease(&key, Duration::from_secs(10)).await {
                     Ok(lease) => {
                         let mut epoch = lease.epoch;
+                        metrics::counter!(
+                            "exocortex_cluster_owner_lease_transitions_total",
+                            "role" => "dreams"
+                        )
+                        .increment(1);
                         health.rcu(|h| {
                             let mut next = (**h).clone();
                             next.leader_node_id = Some(node_id.clone());
                             next.lease_epoch = epoch;
+                            next.last_lease_tick = Some(chrono::Utc::now());
                             Arc::new(next)
                         });
                         loop {
@@ -222,6 +261,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
                                     health.rcu(|h| {
                                         let mut next = (**h).clone();
                                         next.lease_epoch = epoch;
+                                        next.last_lease_tick = Some(chrono::Utc::now());
                                         Arc::new(next)
                                     });
                                 }
@@ -234,6 +274,11 @@ pub async fn run_backend_node<S: Storage + 'static>(
                     }
                     Err(_) => {
                         // Another node holds it; health keeps observing.
+                        health.rcu(|h| {
+                            let mut next = (**h).clone();
+                            next.last_lease_tick = Some(chrono::Utc::now());
+                            Arc::new(next)
+                        });
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                 }

@@ -154,11 +154,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
 
     /// Fire a region explicitly (Redis fire-queue drainer side).
     pub fn notify(&self, region: RegionKey) {
-        let snap = self
-            .counters
-            .get(&region)
-            .map(|e| *e)
-            .unwrap_or_default();
+        let snap = self.counters.get(&region).map(|e| *e).unwrap_or_default();
         let _ = self.tx_fire.try_send((region, snap));
     }
 
@@ -255,7 +251,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             .filter(|a| !res.merged.contains(&a.id))
             .cloned()
             .collect();
-        self.write_similar_edges(&mut res, &survivors, lease).await?;
+        self.write_similar_edges(&mut res, &survivors, lease)
+            .await?;
 
         // Re-score with the post-cycle set (merged anchors removed).
         let remaining: Vec<MemoryWithEmbedding> = anchors

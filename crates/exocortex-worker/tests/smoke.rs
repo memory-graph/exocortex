@@ -13,10 +13,7 @@ fn noop_adapter_boots_without_backend() {
         .expect("spawn worker");
     std::thread::sleep(std::time::Duration::from_millis(750));
     let exited = child.try_wait().expect("child is alive or exited cleanly");
-    assert!(
-        exited.is_none(),
-        "worker must idle, not exit: {exited:?}"
-    );
+    assert!(exited.is_none(), "worker must idle, not exit: {exited:?}");
     child.kill().expect("kill");
     child.wait().expect("reaped");
 }

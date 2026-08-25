@@ -36,6 +36,14 @@ pub struct HealthSnapshot {
     pub sync_lsn: u64,
     /// True once startup hydration completed.
     pub hydrated: bool,
+    /// True while the storage backend answers pings (R-O4: storage
+    /// reachable). Maintained by a background probe.
+    pub storage_ok: bool,
+    /// When the lease re-election loop last ticked (R-O4: cluster
+    /// membership stable; stale means the owner loop is stuck).
+    pub last_lease_tick: Option<chrono::DateTime<chrono::Utc>>,
+    /// True while the reasoning worker loop is consuming (R-O4).
+    pub reasoning_alive: bool,
 }
 
 /// The HTTP binding: operation routes + auth + observability.
@@ -54,8 +62,15 @@ impl HttpBind {
         Self {
             ctx,
             bearer,
+            // Readiness defaults are optimistic for standalone mounts
+            // (embedded/library use); `run_backend_node` installs the
+            // maintainers that make these fields observational (R-O4).
             health: Arc::new(arc_swap::ArcSwap::from(Arc::new(HealthSnapshot {
                 node_id: "exocortex-node".into(),
+                hydrated: true,
+                storage_ok: true,
+                reasoning_alive: true,
+                last_lease_tick: Some(chrono::Utc::now()),
                 ..Default::default()
             }))),
             prometheus: install_prometheus(),
@@ -86,6 +101,7 @@ impl HttpBind {
         }));
 
         let _health = self.health.clone();
+        let health_ready = self.health.clone();
         let health_cluster = self.health.clone();
         let health_sync = self.health.clone();
         let health_hydration = self.health.clone();
@@ -109,7 +125,33 @@ impl HttpBind {
             )
             .route(
                 "/health/ready",
-                get(|| async { axum::Json(serde_json::json!({ "status": "ready" })) }),
+                get(move || {
+                    let h = health_ready.load_full();
+                    async move {
+                        // R-O4: 200 only when hydration completed, storage
+                        // answers, the reasoning worker is consuming, and
+                        // (backend) the lease loop ticked recently.
+                        let lease_fresh = h
+                            .last_lease_tick
+                            .is_some_and(|t| (chrono::Utc::now() - t).num_seconds() < 15);
+                        let ready = h.hydrated && h.storage_ok && h.reasoning_alive && lease_fresh;
+                        let status = if ready {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        };
+                        (
+                            status,
+                            axum::Json(serde_json::json!({
+                                "status": if ready { "ready" } else { "not-ready" },
+                                "hydrated": h.hydrated,
+                                "storage_ok": h.storage_ok,
+                                "reasoning_alive": h.reasoning_alive,
+                                "lease_fresh": lease_fresh,
+                            })),
+                        )
+                    }
+                }),
             )
             .route(
                 "/health/cluster",
@@ -218,7 +260,11 @@ fn op_route(
                 }
             };
             metrics::counter!("exocortex_http_requests_total", "op" => entry.name).increment(1);
-            match (entry.handler)(&ctx, input).await {
+            let started = std::time::Instant::now();
+            let out = (entry.handler)(&ctx, input).await;
+            metrics::histogram!("exocortex_ops_duration_seconds", "op" => entry.name)
+                .record(started.elapsed().as_secs_f64());
+            match out {
                 Ok(out) => axum::Json(out).into_response(),
                 Err(e) => match e {
                     OpError::BadInput(m) => err_response(StatusCode::BAD_REQUEST, &m),

@@ -37,7 +37,9 @@ async fn serve(
     auth: exocortex_server::sse::SseAuth,
 ) -> std::net::SocketAddr {
     let app = exocortex_server::sse::sse_router(node, auth);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     addr
@@ -60,9 +62,9 @@ async fn get_status_and_body(addr: std::net::SocketAddr, path: &str) -> (String,
     loop {
         let quiet = tokio::time::timeout(Duration::from_millis(400), sock.read(&mut chunk)).await;
         match quiet {
-            Ok(Ok(0)) => break,                        // EOF
+            Ok(Ok(0)) => break, // EOF
             Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
-            Ok(Err(_)) | Err(_) => break,             // error or quiet: done
+            Ok(Err(_)) | Err(_) => break, // error or quiet: done
         }
         if tokio::time::Instant::now() > deadline {
             break;

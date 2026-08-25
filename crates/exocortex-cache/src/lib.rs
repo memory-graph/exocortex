@@ -339,6 +339,13 @@ impl LocalCache {
             match msg {
                 CacheWrite::Apply(inv) => self.apply(&*storage, inv).await,
                 CacheWrite::Reseed { org, snapshot } => {
+                    // R-O2 families: rebuild counts + graph size levels.
+                    metrics::counter!("exocortex_cache_rebuild_total", "reason" => "reseed")
+                        .increment(1);
+                    metrics::gauge!("exocortex_memories_total", "graph" => org.to_string())
+                        .set(snapshot.petgraph.node_count() as f64);
+                    metrics::gauge!("exocortex_relationships_total", "graph" => org.to_string(), "provenance" => "all")
+                        .set(snapshot.petgraph.edge_count() as f64);
                     let bytes = snapshot.est_bytes;
                     {
                         let mut tq = self.tq.lock();
@@ -419,11 +426,17 @@ impl LocalCache {
         let mut tq = self.tq.lock();
         if tq.am.contains(org) {
             tq.am.put(org.clone(), ());
+            drop(tq);
+            metrics::counter!("exocortex_2q_admission_events_total", "decision" => "promote_am")
+                .increment(1);
             return;
         }
         if tq.a1out.contains(org) {
             tq.am.put(org.clone(), ());
             tq.a1out.pop(org);
+            drop(tq);
+            metrics::counter!("exocortex_2q_admission_events_total", "decision" => "ghost_hit")
+                .increment(1);
             return;
         }
         if tq.a1in.contains(org) {
@@ -432,9 +445,14 @@ impl LocalCache {
             // duplicate the A1in entry.
             tq.a1in.retain(|o| o != org);
             tq.am.put(org.clone(), ());
+            drop(tq);
+            metrics::counter!("exocortex_2q_admission_events_total", "decision" => "promote_am")
+                .increment(1);
             return;
         }
         tq.a1in.push_back(org.clone());
+        metrics::counter!("exocortex_2q_admission_events_total", "decision" => "admit_a1in")
+            .increment(1);
         while tq.bytes > self.budget {
             if let Some(evicted) = tq.a1in.pop_front() {
                 tq.a1out.put(evicted.clone(), ());
@@ -442,11 +460,15 @@ impl LocalCache {
                     tq.bytes = tq.bytes.saturating_sub(g.load_full().est_bytes);
                 }
                 self.graphs.remove(&evicted);
+                metrics::counter!("exocortex_2q_admission_events_total", "decision" => "evict_a1in")
+                    .increment(1);
             } else if let Some((evicted, _)) = tq.am.pop_lru() {
                 if let Some(g) = self.graphs.get(&evicted) {
                     tq.bytes = tq.bytes.saturating_sub(g.load_full().est_bytes);
                 }
                 self.graphs.remove(&evicted);
+                metrics::counter!("exocortex_2q_admission_events_total", "decision" => "evict_am")
+                    .increment(1);
             } else {
                 break;
             }

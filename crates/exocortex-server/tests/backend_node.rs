@@ -185,3 +185,43 @@ async fn chitchat_state_carries_wire_version_and_fingerprint() {
     assert_eq!(kv("ontology_fingerprint").len(), 64);
     handle.shutdown().await.ok();
 }
+
+/// R-O4: readiness is observational — when the storage probe fails and the
+/// lease loop goes stale, `/health/ready` answers 503 with the failed
+/// checks named; healthy maintainers restore 200.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_ready_reflects_maintainer_truth() {
+    let onto = std::sync::Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = std::sync::Arc::new(InMemoryStorage::new(onto.clone()));
+    let node = run_backend_node(storage, onto, args("127.0.0.1:0", 0, vec![]))
+        .await
+        .unwrap();
+
+    // Healthy: maintainers (probe + lease loop) report green.
+    let mut ok = false;
+    for _ in 0..50 {
+        let (status, body) = http_get(node.local_addr, "/health/ready", None).await;
+        if status == 200 && body.contains("\"ready\"") {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(ok, "ready turns 200 once maintainers report green");
+
+    // Simulate maintainer failure: storage probe fails + lease tick stale.
+    node.health.rcu(|h| {
+        let mut next = h.as_ref().clone();
+        next.storage_ok = false;
+        next.last_lease_tick = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+        std::sync::Arc::new(next)
+    });
+    let (status, body) = http_get(node.local_addr, "/health/ready", None).await;
+    assert_eq!(status, 503, "unhealthy node must not answer ready");
+    assert!(
+        body.contains("\"storage_ok\":false"),
+        "names the failed check: {body}"
+    );
+}

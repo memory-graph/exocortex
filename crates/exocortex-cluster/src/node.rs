@@ -140,6 +140,7 @@ impl<S: Storage + 'static> ClusterNode<S> {
     /// reconnects can replay (R-C6).
     pub fn publish_envelope(&self, env: InvalidationEnvelope) {
         self.record_replay(env.clone());
+        metrics::counter!("exocortex_cluster_invalidations_published_total").increment(1);
         let _ = self.tx.send(env);
     }
 

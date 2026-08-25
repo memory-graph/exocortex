@@ -905,6 +905,19 @@ impl Storage for FalkorStorage {
         self.delete_memory(id).await
     }
 
+    async fn ping(&self) -> Result<(), StorageError> {
+        // R-O4 liveness: the Redis PING backing LSNs/leases answers.
+        let pong: String = redis::cmd("PING")
+            .query_async(&mut self.redis.clone())
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        if pong == "PONG" {
+            Ok(())
+        } else {
+            Err(StorageError::Backend("unexpected ping reply".into()))
+        }
+    }
+
     async fn subscribe_invalidations(
         &self,
         _region: &RegionKey,

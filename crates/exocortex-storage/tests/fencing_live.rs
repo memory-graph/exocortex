@@ -47,10 +47,16 @@ async fn stale_lease_write_is_fenced() {
         org: "org".into(),
         region: "*".into(),
     };
-    let old = s.acquire_lease(&key, std::time::Duration::from_secs(60)).await.unwrap();
+    let old = s
+        .acquire_lease(&key, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
     // Re-election: release, then a new owner acquires (epoch bumps).
     s.release_lease(old.clone()).await.unwrap();
-    let new = s.acquire_lease(&key, std::time::Duration::from_secs(60)).await.unwrap();
+    let new = s
+        .acquire_lease(&key, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
     assert!(new.epoch > old.epoch, "epoch must be monotonic");
 
     // The stale owner attempts its consolidation write.

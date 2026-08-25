@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Deny (licenses, advisories, bans)
+        run: cargo deny check
+      - name: Tests
+        run: cargo test --workspace
+      - name: Kernel purity (R-I1/CR-26)
+        run: cargo xtask kernel-purity
+      - name: Fingerprint stability (R-T21)
+        run: |
+          a=$(cargo xtask fingerprint)
+          b=$(cargo xtask fingerprint)
+          [ "$a" = "$b" ] && echo "fingerprint stable: $a"
+      - name: Schema drift (M7 goldens)
+        run: cargo xtask gen-schemas
+      - name: No LLM (R-D6/CR-19)
+        run: cargo xtask no-llm
+      - name: SLO benches (R-Lat1; fail on regression)
+        run: cargo xtask bench

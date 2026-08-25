@@ -192,7 +192,9 @@ fn resolve_bearer(args: &Args) -> anyhow::Result<String> {
             }
             #[cfg(not(debug_assertions))]
             {
-                anyhow::bail!("--bearer-token is required in release builds (R-Sec7: no default credential)")
+                anyhow::bail!(
+                    "--bearer-token is required in release builds (R-Sec7: no default credential)"
+                )
             }
         }
     }
