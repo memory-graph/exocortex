@@ -1,0 +1,11 @@
+// proto/cluster.proto
+syntax = "proto3";
+package exocortex.cluster.v1;
+import "sse.proto";
+message InvalidationEnvelope {
+  uint32 wire_version         = 1;  // WIRE_VERSION const (R-W2)
+  bytes  ontology_fingerprint = 2;  // 32 bytes; peer admission gate (R-W3)
+  string emitter_node_id      = 3;
+  exocortex.sse.v1.Invalidation inv = 4;
+  bytes  hmac                 = 5;  // HMAC-SHA256 over fields 1..4 (R-W4)
+}

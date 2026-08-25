@@ -1,0 +1,16 @@
+// proto/sse.proto
+syntax = "proto3";
+package exocortex.sse.v1;
+message Invalidation {
+  oneof kind {
+    MemoryUpserted      memory_upserted      = 1;
+    MemoryDeleted       memory_deleted       = 2;
+    RelationshipUpserted relationship_upserted = 3;
+    RelationshipDeleted  relationship_deleted  = 4;
+  }
+  uint64 backend_lsn = 10;
+}
+message MemoryUpserted      { bytes id = 1; bytes snapshot_json = 2; }
+message MemoryDeleted       { bytes id = 1; }
+message RelationshipUpserted { bytes id = 1; bytes from = 2; bytes to = 3; uint32 kind = 4; }
+message RelationshipDeleted  { bytes id = 1; }

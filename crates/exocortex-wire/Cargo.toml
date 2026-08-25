@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Wire protocols for Exocortex: protobuf schemas for ingestion, cluster envelopes, and the SSE change feed, plus HMAC signing types."
+include = ["/src", "/proto", "/build.rs", "Cargo.toml"]
 build   = "build.rs"
 
 [dependencies]

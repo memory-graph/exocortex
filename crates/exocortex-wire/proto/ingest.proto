@@ -1,0 +1,128 @@
+syntax = "proto3";
+package exocortex.ingest.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service IngestService {
+  // Batched, validated write path. Idempotent by (producer_id, batch_id).
+  rpc Submit(IngestBatch) returns (IngestAck);
+  // Streaming variant for high-volume adapters. Each SubmitOne acks
+  // independently; the server may reject individual batches without tearing
+  // down the stream.
+  rpc SubmitStream(stream SubmitOne) returns (stream SubmitAck);
+  // Register a source and its visibility ceiling before the first Submit (R-I3).
+  rpc RegisterSource(RegisterSourceRequest) returns (RegisterSourceResponse);
+  // Fetch the currently accepted ontology fingerprint before submitting.
+  rpc Fingerprint(FingerprintRequest) returns (FingerprintResponse);
+}
+
+message RegisterSourceRequest {
+  string     org_id        = 1;
+  string     source_uri    = 2;
+  string     producer_id   = 3;
+  Visibility ceiling       = 4;  // org-admin-configured, not adapter-configured (§18.2)
+  string     source_flavor = 5;  // "session" | "iceberg" | "delta" | "parquet-dir" | "custom"
+}
+message RegisterSourceResponse { Visibility ceiling = 1; }
+
+message IngestBatch {
+  string org_id                = 1;   // scopes identity derivation (R-T18a)
+  string source_uri            = 2;   // "session://…" or "iceberg://…"
+  string producer_id           = 3;   // registered producer
+  string batch_id              = 4;   // producer-scoped monotonic id (idempotency key)
+  string mapping_version       = 5;
+  bytes  ontology_fingerprint  = 6;   // 32 bytes; kernel rejects on mismatch
+  Visibility ceiling           = 7;   // MUST equal the registered value (R-I3)
+  string checksum              = 8;   // hex; BLAKE3 over canonical serialization
+  google.protobuf.Timestamp observed_at = 9;
+  google.protobuf.Timestamp recorded_at = 10;
+  ExternalSnapshotInfo snapshot = 11; // present iff producer is external-source (R-T16a)
+
+  repeated MemoryDraft       memories      = 20;
+  repeated RelationshipDraft relationships = 21;
+  ProducerIdentity           producer      = 22;
+}
+
+message MemoryDraft {
+  string draft_key   = 1;   // producer-local id; relationships link via draft keys
+  string id          = 2;   // suggested ULID; final MemoryId assigned by the kernel
+  string memory_type = 3;   // MUST resolve to a registered MemoryType
+  string title       = 4;   // 1..=200 chars (R-T5)
+  string content     = 5;   // free text; single-string payload (§7.5)
+  repeated string tags = 6;
+  Visibility visibility = 7;   // ≤ ceiling (R-T11a); required, no default (R-T6)
+  google.protobuf.Timestamp valid_from  = 8;   // empty = recorded_at (R-T7)
+  google.protobuf.Timestamp valid_until = 9;   // optional
+  ExternalKey external_key = 10;  // required iff batch.snapshot present
+}
+
+message RelationshipDraft {
+  string from_draft_key = 1;
+  string to_draft_key   = 2;
+  string kind           = 3;   // MUST resolve to a registered RelKindId
+  float  strength       = 4;   // 0.0..1.0; 0 = RelMeta default
+  float  confidence     = 5;   // 0.0..1.0
+  string context        = 6;
+  Visibility visibility = 7;   // ≤ ceiling
+}
+
+message ExternalSnapshotInfo {
+  string snapshot_id   = 1;
+  bytes  schema_hash   = 2;   // 32 bytes
+  string source_flavor = 3;   // "iceberg" | "delta" | "parquet-dir" | "custom"
+}
+
+message ExternalKey {
+  bytes  table_uuid      = 1;   // 16 bytes
+  string logical_pk      = 2;
+  uint32 mapping_version = 3;
+}
+
+enum Visibility {
+  PRIVATE = 0;
+  PROJECT = 1;
+  TEAM    = 2;
+  ORG     = 3;
+  PUBLIC  = 4;   // reserved; v1 read paths treat as ORG (R-T11)
+}
+
+message ProducerIdentity {
+  string node_id       = 1;
+  string agent_id      = 2;   // optional; harness only
+  string adapter_id    = 3;   // optional; adapter only
+  bytes  hmac_signature= 4;   // over remainder of batch
+}
+
+message IngestAck {
+  string batch_id      = 1;
+  uint32 accepted      = 2;
+  uint32 rejected      = 3;
+  repeated RejectRow rejections = 4;
+  uint64 assigned_lsn  = 5;
+}
+message RejectRow {
+  string draft_key  = 1;   // producer-local, for triage
+  RejectCode code   = 2;
+  string detail     = 3;
+}
+enum RejectCode {
+  UNKNOWN               = 0;
+  INCOMPATIBLE_ONTOLOGY = 1;   // fingerprint mismatch
+  UNKNOWN_SOURCE        = 2;   // producer_id not registered, or ceiling mismatch (R-I3)
+  UNKNOWN_MEMORY_TYPE   = 3;
+  UNKNOWN_KIND          = 4;
+  INVALID_TYPE_TRIPLE   = 5;   // R-T17
+  VISIBILITY_WIDENING   = 6;   // R-T11a
+  MISSING_EXTERNAL_KEY  = 7;   // external batch without ExternalKey
+  DUPLICATE_BATCH       = 8;   // batch_id already committed (idempotent replay)
+  BAD_CHECKSUM          = 9;
+  UNAUTHORIZED          = 10;  // HMAC missing/invalid
+  RATE_LIMITED          = 11;
+  // R-T14: computed-only kinds (SimilarTo) are produced exclusively by the
+  // Dreams cycle; a producer asserting one directly is rejected.
+  COMPUTED_KIND_REJECTED = 12;
+}
+message SubmitOne { oneof body { IngestBatch batch = 1; } }
+message SubmitAck { IngestAck ack = 1; }
+message FingerprintRequest {}
+message FingerprintResponse { bytes fingerprint = 1; string kernel_version = 2; repeated string packs = 3; }
