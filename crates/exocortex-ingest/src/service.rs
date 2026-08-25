@@ -218,6 +218,20 @@ impl<S: Storage> IngestServer<S> {
         if snapshot && m.external_key.is_none() {
             return Err(RejectCode::MissingExternalKey);
         }
+        // B8/B9: §18.6 fixes the widths — table_uuid is 16 bytes,
+        // snapshot schema_hash is 32. Malformed coordinates are rejected,
+        // never lossy-coerced (a truncated UUID silently forks/collides
+        // identity; a short hash silently zeroes provenance).
+        if let Some(k) = &m.external_key {
+            if k.table_uuid.len() != 16 {
+                return Err(RejectCode::InvalidExternalKey);
+            }
+        }
+        if let Some(s) = &batch.snapshot {
+            if s.schema_hash.len() != 32 {
+                return Err(RejectCode::InvalidExternalKey);
+            }
+        }
         let now = chrono::Utc::now();
         let mut mem = Memory {
             id: MemoryId::new_v7(),
@@ -237,13 +251,25 @@ impl<S: Storage> IngestServer<S> {
                         .map(|s| s.snapshot_id.clone())
                         .unwrap_or_default()
                         .into(),
-                    schema_hash: [0u8; 32],
+                    schema_hash: batch
+                        .snapshot
+                        .as_ref()
+                        .map(|s| {
+                            let mut h = [0u8; 32];
+                            h.copy_from_slice(&s.schema_hash);
+                            h
+                        })
+                        .unwrap_or([0u8; 32]),
                     observed_at: now,
                     external_key: exocortex_kernel::ExternalKey {
+                        // B8: raw UUID bytes are stored as their hex
+                        // rendering — lossless and human-readable — never
+                        // a from_utf8_lossy string (distinct invalid-UTF8
+                        // UUIDs must never normalize together).
                         table_uuid: m
                             .external_key
                             .as_ref()
-                            .map(|k| String::from_utf8_lossy(&k.table_uuid).to_string())
+                            .map(|k| hex32(&k.table_uuid))
                             .unwrap_or_default()
                             .into(),
                         logical_pk: m
@@ -298,10 +324,13 @@ impl<S: Storage> IngestServer<S> {
             lsn: LSN::new_local(0),
         };
         if let Some(k) = &m.external_key {
+            // B8: identity rides the RAW uuid bytes — hex here would
+            // match the stored rendering but hashing bytes keeps one
+            // canonical input shape for R-T18a.
             mem.id = MemoryId::from_external(
                 &batch.org_id,
                 &batch.source_uri,
-                String::from_utf8_lossy(&k.table_uuid).as_ref(),
+                &k.table_uuid,
                 k.logical_pk.as_bytes(),
                 k.mapping_version,
             );
@@ -650,4 +679,15 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             ceiling: ceiling as i32,
         }))
     }
+}
+
+/// Lowercase hex over raw uuid bytes — the lossless rendering stored on
+/// `kernel::ExternalKey.table_uuid` (B8: never a lossy UTF-8 string).
+fn hex32(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }

@@ -121,6 +121,10 @@ enum RejectCode {
   // R-T14: computed-only kinds (SimilarTo) are produced exclusively by the
   // Dreams cycle; a producer asserting one directly is rejected.
   COMPUTED_KIND_REJECTED = 12;
+  // B8/B9: malformed external-source coordinates — table_uuid must be 16
+  // bytes (§18.6), snapshot schema_hash must be 32 (§18.6). Rejected
+  // rather than lossy-coerced.
+  INVALID_EXTERNAL_KEY = 13;
 }
 message SubmitOne { oneof body { IngestBatch batch = 1; } }
 message SubmitAck { IngestAck ack = 1; }

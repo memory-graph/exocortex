@@ -33,6 +33,7 @@ enum Cmd {
     /// anywhere under `crates/` or `xtask/` source. Complements
     /// `kernel-purity` (which scopes to the kernel dep tree).
     NoLlm,
+    ProtoSync,
 }
 
 fn main() -> Result<()> {
@@ -42,6 +43,7 @@ fn main() -> Result<()> {
         Cmd::KernelPurity => kernel_purity(),
         Cmd::Bench => bench(),
         Cmd::NoLlm => no_llm(),
+        Cmd::ProtoSync => proto_sync(),
     }
 }
 
@@ -248,4 +250,18 @@ fn no_llm() -> Result<()> {
     } else {
         anyhow::bail!("no-llm FAILED (CR-19):\n{}", hits.join("\n"))
     }
+}
+
+/// Wire vendors the protos for publishable tarballs (B8-era fix); the
+/// root proto/ stays authoritative. This gate fails when they diverge.
+fn proto_sync() -> anyhow::Result<()> {
+    for name in ["ingest.proto", "cluster.proto", "sse.proto"] {
+        let root = std::fs::read_to_string(format!("proto/{name}"))?;
+        let vendored = std::fs::read_to_string(format!("crates/exocortex-wire/proto/{name}"))?;
+        if root != vendored {
+            anyhow::bail!("proto/{name} and crates/exocortex-wire/proto/{name} diverge — copy the authoritative root file");
+        }
+    }
+    println!("proto-sync ok: vendored wire protos match proto/");
+    Ok(())
 }

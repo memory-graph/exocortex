@@ -9,10 +9,16 @@ impl MemoryId {
     /// Derive a `MemoryId` from external-source coordinates (R-T18a).
     ///
     /// `MemoryId = blake3(org_id || source_uri || table_uuid || logical_pk || mapping_version)[..16]`
+    ///
+    /// `table_uuid` is raw bytes (§18.6: 16 uniformly random bytes —
+    /// overwhelmingly not valid UTF-8). It MUST NOT pass through a lossy
+    /// string conversion first: `String::from_utf8_lossy` normalizes
+    /// distinct invalid UUIDs onto the same replacement-char string,
+    /// silently colliding identities (B8).
     pub fn from_external(
         org_id: &str,
         source_uri: &str,
-        table_uuid: &str,
+        table_uuid: &[u8],
         logical_pk: &[u8],
         mapping_version: u32,
     ) -> Self {
@@ -21,7 +27,7 @@ impl MemoryId {
         hasher.update(b"\x1e"); // record separator
         hasher.update(source_uri.as_bytes());
         hasher.update(b"\x1e");
-        hasher.update(table_uuid.as_bytes());
+        hasher.update(table_uuid);
         hasher.update(b"\x1e");
         hasher.update(logical_pk);
         hasher.update(b"\x1e");

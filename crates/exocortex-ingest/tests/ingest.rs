@@ -255,28 +255,13 @@ async fn external_batch_without_key_rejected_and_with_key_deterministic() {
         .into_inner();
     assert_eq!(ack2.accepted, 1);
 
-    let id_a = exocortex_kernel::MemoryId::from_external(
-        "org",
-        "session://s1",
-        &String::from_utf8_lossy(&[1u8; 16]),
-        b"row-1",
-        3,
-    );
-    let id_b = exocortex_kernel::MemoryId::from_external(
-        "org",
-        "session://s1",
-        &String::from_utf8_lossy(&[1u8; 16]),
-        b"row-1",
-        3,
-    );
+    let id_a =
+        exocortex_kernel::MemoryId::from_external("org", "session://s1", &[1u8; 16], b"row-1", 3);
+    let id_b =
+        exocortex_kernel::MemoryId::from_external("org", "session://s1", &[1u8; 16], b"row-1", 3);
     assert_eq!(id_a, id_b, "deterministic identity");
-    let id_c = exocortex_kernel::MemoryId::from_external(
-        "org",
-        "session://s1",
-        &String::from_utf8_lossy(&[1u8; 16]),
-        b"row-1",
-        4,
-    );
+    let id_c =
+        exocortex_kernel::MemoryId::from_external("org", "session://s1", &[1u8; 16], b"row-1", 4);
     assert_ne!(id_a, id_c, "mapping_version bump forks identity");
 }
 

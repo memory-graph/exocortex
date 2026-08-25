@@ -44,7 +44,9 @@ each step (88 tests at completion).
 
 | ID | Item | Source | Status |
 |----|------|--------|--------|
-| — | — | — | — |
+| B8 | `ExternalKey.table_uuid` lossy-UTF8 identity collision (`service.rs:246,304`, `ids.rs:15`) | `docs/bug-prd-external-key-identity.md` | Closed |
+| B9 | `ExternalSnapshotInfo.schema_hash` discarded at commit (`service.rs:240`) | `docs/bug-prd-external-key-identity.md` | Closed |
+| A1 | `exocortex-adapter-sdk` — Layer A protocol core + fixture adapter (unblocks D1) | adapter-SDK PRD (session `2026-08-25-4b715f6a`) | Open |
 
 ## In progress
 
