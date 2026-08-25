@@ -1,17 +1,8 @@
 # Exocortex — Master Plan
 
-**Status:** Round 3 complete. All five critical items closed with tests:
-the SDK suites now run (workspace `--features exocortex-adapter-sdk/testing`,
-with a canary that fails any dark-suite run), the worker authenticates
-(key from --hmac-key/env/dev-default, hard errors on bad hex, plus a
-worker-binary e2e), R-I2 verifies signed+stamped bytes with a re-split
-loop, ingest pins the node's org (foreign orgs rejected end to end),
-and transient storage errors retry. Gates: kernel-purity asserts the
-SDK/worker seams (repairing a claim a prior commit made falsely),
-signing-hygiene replaces the miscalibrated greps, wire-standalone reads
-the real version. release.toml back at root; every crate inherits the
-repository link; the wire tarball ships LICENSE. Accepted residue:
-M3 (bridge reseed gaps), M6-M15 minors — v2 hardening.
+**Status:** Round 3 complete. No open items. Three review rounds closed
+(`docs/reviews/round-{1,2,3}-review.prd`); every accepted item carries
+a test that fails without it.
 
 **Purpose:** The authoritative, phased worklist for this repository. Each
 round of review findings gets its own `round-<n>-review.prd`; accepted
@@ -19,15 +10,20 @@ items are promoted into this file, tracked to done, and never silently
 dropped. Anything not listed here is either shipped or explicitly deferred
 to v2 in the PRD's own terms.
 
-**Current baseline (2026-08-25, live + CI verified):** 132 tests /
-0 failed in 58 suites; the full gate pipeline (fmt, clippy, deny,
-tests, kernel-purity, fingerprint, gen-schemas, no-llm, SLO benches)
-is GREEN on GitHub's runner (13m42s). Live Falkor suites green
+**Current baseline (2026-08-25, post-round-3):** 138 tests / 0 failed
+across 68 suites (`cargo test --workspace --features
+exocortex-adapter-sdk/testing` — the feature is mandatory: a lib canary
+fails any run that would leave the SDK's mock-driven suites dark). Full
+gate pipeline green on GitHub's runner and locally: fmt, clippy, deny,
+tests, kernel-purity (kernel tree + SDK single-dep + worker kernel-ban),
+fingerprint (`d8bcd004…4e8c`, stable), gen-schemas, no-llm, proto-sync
+(vendored wire protos + LICENSE), signing-hygiene, wire-standalone
+(version from cargo metadata), SLO benches. Live Falkor suites green
 (storage 7/7, cypher 6/6, fencing 3/3, cluster 6/6, SSE 1/1, cross-node
 2/2); the 3-node compose cluster converges after leader-kill in
-1290-1448ms across four observed runs (M5 AC < 2s). Full detail:
-`round-2-review.prd`, the MILESTONE_REPORT round-2 addendum, and the
-live-harness + CI first-run sections.
+1290-1448ms across four observed runs (M5 AC < 2s). All 14 crates
+published at 0.1.0. Full detail: the MILESTONE_REPORT addenda and the
+round reviews.
 
 ## Initial build (M0–M8, shipped 2026-08)
 
@@ -36,13 +32,13 @@ each step (88 tests at completion).
 
 | Milestone | Delivered |
 |---|---|
-| M0 | Workspace scaffolding: kernel, wire, xtask; toolchain/dep pins resolved (deviations recorded in `MILESTONE_REPORT.md`) |
+| M0 | Workspace scaffolding: kernel, wire, xtask; toolchain/dep pins resolved (deviations recorded in `docs/MILESTONE_REPORT.md`) |
 | M1 | Ontology: `pack!` macro engine, dev-v1 pack (13 memory types, 12 entity types, 48 kinds), R-Pk/R-T validators |
 | M2 | Storage: `Storage` trait, registered Cypher catalogue, FalkorDB adapter, InMemory double, bi-temporal reads |
 | M3 | Cache + MCP client: ArcSwap snapshots, 2Q admission, sled WAL, stdio MCP server, search SLO bench (100k) |
 | M4 | Reasoning: Crepe R1–R9 + D1–D6 fixpoints, Steel explain traces + R6, idempotent derived-edge writeback |
 | M5 | Cluster: owner leases with epoch fencing, HMAC-signed envelopes, peer admission, SSE change feed |
-| M6 | Ingestion: IngestService pipeline (HMAC → fingerprint → ceiling → triples), entity extraction, `end_session` tool, worker host |
+| M6 | Ingestion: IngestService pipeline (HMAC → checksum → fingerprint → ceiling → triples), entity extraction, `end_session` tool, worker host |
 | M7 | Operation registry: one entry per operation, MCP+HTTP schema parity, audit ledger, goldens |
 | M8 | Dreams: MCR² + sparsity guardrails, consolidation cycle with rollback, trigger model, discovery proposals |
 
@@ -50,17 +46,8 @@ each step (88 tests at completion).
 
 | ID | Item | Source | Status |
 |----|------|--------|--------|
-| B8 | `ExternalKey.table_uuid` lossy-UTF8 identity collision (`service.rs:246,304`, `ids.rs:15`) | `docs/bug-prd-external-key-identity.md` | Closed |
-| B9 | `ExternalSnapshotInfo.schema_hash` discarded at commit (`service.rs:240`) | `docs/bug-prd-external-key-identity.md` | Closed |
-| A1 | `exocortex-adapter-sdk` — Layer A protocol core + fixture adapter (unblocks D1) | adapter-SDK PRD (session `2026-08-25-4b715f6a`); closed `adoption`-grade: R1-R20 shipped | Closed |
-| ~~{iid}~~ | SDK integration tests CI-dead (`testing` feature never enabled) — vacuous R7/R8/R12/R14/R19 | round-3 | Open |
-| ~~{iid}~~ | Worker fixture HMAC key `[5u8;32]` never matches server; `--config` dead | round-3 | Open |
-| ~~{iid}~~ | R-I2 split measures pre-stamp/pre-sign; post-check dead code; near-limit batches overshoot | round-3 | Open |
-| ~~{iid}~~ | Cross-tenant cache pollution: ingest accepts any org; bridge applies to first graph | round-3 | Open |
-| ~~{iid}~~ | `Status::internal` (transient storage) classified Fatal — blip kills session | round-3 | Open |
-| G1-G4 | Purity assertion absent (commit msg overclaims); grep gates miscalibrated; 0.1.0 hardcode; PRD table drift | round-3 | Closed (G4 recorded in MILESTONE_REPORT) |
-| D1-D6 | release.toml inert in docs/; repository link missing on crates; stale docs | round-3 | Closed |
-| M1-M15 | Mixed-ack double-count; secret-parse panic; bridge loss windows; minors | round-3 | M1/M2/M4/M5 closed; M3+M6-M15 accepted residue |
+| R1 | M3 — backend cache-feed bridge loss windows (reseed/subscribe gap, no retry on fetch error, tight resubscribe flap); needs periodic reseed or LSN reconcile | round-3 review | Accepted v1 residue |
+| R2 | M6-M15 minors: cursor tmp-collision/no-fsync; checksum preimage separators; per-server-restart duplicate replays (in-memory dedup); golden-regen doc flag; `/health/cluster` leader semantics; B8 hex-rederivation guard note; WAL replay must rebuild+sign | round-3 review | Accepted v1 residue |
 
 ## In progress
 
@@ -72,6 +59,25 @@ each step (88 tests at completion).
 
 | ID | Item | Closed by |
 |----|------|-----------|
+| **Round 3** | | |
+| C1 | SDK integration suites live (workspace feature flag + canary failing dark runs) | `b150c0e`; canary test in adapter-sdk lib |
+| C2 | Worker fixture authenticates (key resolution + hard errors) + worker-binary e2e | worker main.rs; smoke.rs fixture test |
+| C3 | R-I2 budget verified against signed+stamped bytes; re-split loop | submit_window; backoff.rs signed-budget test |
+| C4 | Single-org nodes pin the org; foreign orgs rejected end to end | `with_org`; external_key.rs guard test |
+| C5 | Transient storage (`Status::internal`) retries | classify_status; backoff.rs internal-retry test |
+| G1 | Purity gate asserts SDK single-dep + worker kernel-ban (repaired false commit claim) | xtask kernel-purity |
+| G2 | Calibrated signing-hygiene gate (replaces miscalibrated greps), in CI | xtask signing-hygiene |
+| G3 | wire-standalone reads the real version (cargo metadata) | xtask |
+| G4 | PRD verification-table drift recorded | MILESTONE_REPORT round-3 section |
+| D1-D6 | release.toml at root; repository.workspace everywhere; wire tarball ships LICENSE (proto-sync-guarded); docs corrected | `b150c0e` |
+| M1 | Mixed-ack double-count fixed; per-settle recording | rejects.rs mixed-acks test |
+| M2 | `--cluster-secret` length-checked before parse; provided-but-bad is an error | server main.rs |
+| M4 | `Fatal.code` carries the tonic code as i32 | adapter-sdk lib.rs |
+| M5 | Duplicate draft_keys rejected pre-wire | split.rs m5 test |
+| B8 | `ExternalKey.table_uuid` raw-byte identity (lossy-UTF8 collision) | `ca6ede4`; kernel ids tests |
+| B9 | `schema_hash` propagates byte-exact into provenance | `ca6ede4`; external_key.rs |
+| A1 | `exocortex-adapter-sdk` Layer A (R1-R22; C1-C5 hardened it) | `3ab680c` + `b150c0e` |
+| **Round 2** | | |
 | P1 | Round-1 closure committed | `bb87acd` |
 | B3 | Fenced writes (R-C3) end to end | storage seam + both backends + dreams; fencing tests |
 | B4 | `?since_lsn` replay + 409 + client advance (R-C6) | cluster replay ring + sse handler + client sync |
@@ -89,7 +95,8 @@ each step (88 tests at completion).
 | H11 | gRPC→SSE→sibling chain + R-T16a replay | InMemory change feed; `e2e_chain.rs` |
 | H12 | Round-1 residue closed | fire drainer, get_memory_for, ceiling persist, unit tests |
 | H13 | Registry-driven client MCP surface | mcp.rs list/dispatch; stdio parity test |
-| H14 | Transitive finder; quality reconciled; deferrals recorded | `run_discovery` + test; D7/D8 above |
+| H14 | Transitive finder; quality reconciled; deferrals recorded | `run_discovery` + test; D7/D8 below |
+| **Round 1** | | |
 | B1 | MCR² alpha off by 1/n (§11.2) | `dreams/src/mcr2.rs`; closed-form ln 5 test |
 | B2 | 2Q duplicate A1in admission; vacuous scan test | `cache/src/lib.rs`; eviction-forcing rewrite |
 | W1 | `end_session` dispatched over stdio (gRPC + WAL offline, §5.2) | `client/src/mcp.rs`; stdio smoke test |
@@ -98,22 +105,22 @@ each step (88 tests at completion).
 | W4 | Dreams SimilarTo @0.85 with Computed provenance (R-T14) | `dreams/src/lib.rs`; excluded from hairball |
 | W5 | Reconnecting SSE subscriber: LSN hold-back, R-C6 gap/409, R-C5 stall | `client/src/sync.rs` |
 | W6 | HTTP parity binding: every op over HTTP, CR-9 | `server/src/http_bind.rs`; over-the-wire parity test |
-| W7 | backend-node mode: one listener (gRPC+HTTP+SSE), lease re-election, chitchat gossip | `server/src/backend.rs` — **round-2 audit: prescribed kill-holder test absent (H10/H12)** |
+| W7 | backend-node mode: one listener (gRPC+HTTP+SSE), lease re-election, chitchat gossip; leader-kill convergence OBSERVED <2s | `server/src/backend.rs` + live chaos runs |
 | W8 | Session-wrapup → reasoning enqueue (§10.7 step 8) | `ingest/src/service.rs`; bounded-wait test |
 | H1 | `--adapter noop` starts without a live backend | `worker/src/main.rs` (lazy channel) |
 | H2 | LRU(1000) idempotency + persisted source ceilings (§18.8.5) | `ingest/src/service.rs` |
 | H3 | `xtask bench` SLO gate + `xtask no-llm` CR-19 grep | `xtask/src/main.rs` |
 | H4 | `/metrics` + `/health/{ready,cluster,sync,hydration}` | mounted in `http_bind.rs` |
 | H5 | Per-client SSE HMAC (R-Sec5); bearer auth on ops (R-Sec7) | `server/src/sse.rs`, `http_bind.rs` |
-| H6 | Small-fry: tag normalization; O(E) k-hop harvest; `get_memory_for` + `PermissionDenied` (R-MT4); no `blocking_lock` in ingest Clone; §14.3 `effective_strength`; Redis fire channel + R-Dr13/R-Dr14 quiet hours | across kernel/storage/reasoning/dreams — **round-2 audit: get_memory_for unwired, fire queue unwired, two fixes untested (H12)** |
+| H6 | Small-fry bundle (tags, O(E) k-hop, effective_strength, fire channel, quiet hours) | across kernel/storage/reasoning/dreams |
 | H7 | Audit ledger routed onto storage templates (R-A1) | `ops/src/audit.rs` (in-process double kept) |
-| H8 | Milestone report residual-work disclosure | `MILESTONE_REPORT.md` round-1 addendum |
+| H8 | Milestone report residual-work disclosure | `docs/MILESTONE_REPORT.md` round-1 addendum |
 
 ## Deferred to v2 (with PRD citation)
 
 | ID | Item | PRD |
 |----|------|-----|
-| D1 | Iceberg / Delta / parquet-dir adapter workers | §18.4, §24 |
+| D1 | Iceberg / Delta / parquet-dir adapter workers (unblocked: B8+B9+A1 closed) | §18.4, §24 |
 | D2 | Second-pack demo | §23.26, §24 |
 | D3 | Federation | §24 |
 | D4 | Embedding fine-tuning | §24 |
@@ -123,4 +130,5 @@ each step (88 tests at completion).
 | D8 | ABSTRACT row-writing variant (ontology shape TBD) | §12.1 step 4, round-2 H9 |
 | D9 | 100-user visibility fuzz + concurrent-region/CrossRegion suites | §23 #21/#22, round-2 H10 |
 | D10 | Wire-protocol throughput fan-out + additive-change rollout tests | §23 #23, round-2 H10 |
-| D11 | Partition-and-heal live run (leader-kill + convergence now OBSERVED: 4/4 in 1290-1448ms; the partition leg remains manual) | §3 M5 AC, round-2 H10 |
+| D11 | Partition-and-heal live run (leader-kill convergence OBSERVED: 4/4 in 1290-1448ms; the partition leg remains manual) | §3 M5 AC, round-2 H10 |
+| D12 | Round-3 accepted residue (R1/R2 above): bridge reconcile loop, cursor fsync, checksum preimage hardening, persistent batch-dedup, WAL replay rebuild | round-3 review M3/M6-M15 |
