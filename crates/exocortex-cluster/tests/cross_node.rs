@@ -187,7 +187,9 @@ async fn cross_node_replay_window_serves_reconnects() {
 
     // And the router serves the same window over SSE.
     let app = sse_router(cluster_b.clone(), SseAuth::OptionalToken);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
