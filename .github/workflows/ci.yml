@@ -45,6 +45,10 @@ jobs:
         run: cargo xtask gen-schemas
       - name: No LLM (R-D6/CR-19)
         run: cargo xtask no-llm
+      - name: Proto sync (vendored wire protos)
+        run: cargo xtask proto-sync
+      - name: Wire standalone (packaged-tarball consumer)
+        run: cargo xtask wire-standalone
       - name: SLO benches (R-Lat1; fail on regression)
         # Shared runners steal CPU; the budgets assume dedicated hardware.
         # x2 keeps the gate meaningful (a 2x regression still fails) while

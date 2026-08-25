@@ -96,6 +96,38 @@ pub async fn run_backend_node<S: Storage + 'static>(
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
+    // Change-feed bridge (§8.2/§9.1): storage invalidations flow into the
+    // node's own cache writer, so the ops surface serves CURRENT data —
+    // without this the backend's cache would be frozen at boot while
+    // SSE clients stayed live (found by the R17 out-of-process test).
+    {
+        let cache = cache.clone();
+        let storage = storage.clone();
+        tokio::spawn(async move {
+            let region = exocortex_storage::RegionKey {
+                org: "*".into(),
+                project: "*".into(),
+                memory_type: 0,
+            };
+            loop {
+                match storage.subscribe_invalidations(&region).await {
+                    Ok(mut sub) => {
+                        use futures::StreamExt;
+                        while let Some(item) = sub.next().await {
+                            if let Ok(inv) = item {
+                                let _ = cache.submit(exocortex_cache::CacheWrite::Apply(inv)).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "cache change-feed subscribe failed; retrying");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
+    }
+
     // Cluster: envelope signing + SSE fan-out.
     let cluster = Arc::new(ClusterNode::new(
         storage.clone(),

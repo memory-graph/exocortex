@@ -13,8 +13,6 @@ use exocortex_wire::ingest::v1::{
     ingest_service_client::IngestServiceClient, ExternalKey, ExternalSnapshotInfo, IngestBatch,
     MemoryDraft, ProducerIdentity, RegisterSourceRequest,
 };
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 
 use exocortex_cache::LocalCache;
 use exocortex_client::sync::{run_sse_sync, SseSyncConfig};
@@ -50,11 +48,7 @@ async fn boot() -> (
 }
 
 fn signed(mut b: IngestBatch) -> IngestBatch {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&HMAC_KEY).unwrap();
-    mac.update(&prost::Message::encode_to_vec(&b));
-    if let Some(p) = b.producer.as_mut() {
-        p.hmac_signature = mac.finalize().into_bytes().to_vec();
-    }
+    exocortex_wire::signing::prepare_batch(&HMAC_KEY, &mut b);
     b
 }
 

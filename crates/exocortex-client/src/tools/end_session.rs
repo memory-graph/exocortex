@@ -11,8 +11,6 @@ use exocortex_wire::ingest::v1::{
     ingest_service_client::IngestServiceClient, IngestBatch, MemoryDraft as WireMemoryDraft,
     ProducerIdentity, RegisterSourceRequest,
 };
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 
 /// `exocortex.end_session` arguments (§13.5).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -108,37 +106,6 @@ fn parse_visibility(s: &str) -> Result<i32, String> {
     }
 }
 
-/// Canonical checksum over sorted row projections (§13.6 step 3).
-pub fn compute_checksum(m: &[WireMemoryDraft]) -> String {
-    // BLAKE3 over canonical (sorted) serialization — same input => same
-    // checksum; edge order cannot change it (§13.6 step 3).
-    let mut canonical: Vec<String> = m
-        .iter()
-        .map(|d| {
-            serde_json::json!({
-                "content": d.content,
-                "draft_key": d.draft_key,
-                "memory_type": d.memory_type,
-                "title": d.title,
-                "visibility": d.visibility,
-            })
-            .to_string()
-        })
-        .collect();
-    canonical.sort();
-    blake3::hash(canonical.join("\n").as_bytes())
-        .to_hex()
-        .to_string()
-}
-
-fn sign_batch(key: &[u8; 32], b: &mut IngestBatch) {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).unwrap();
-    mac.update(&prost::Message::encode_to_vec(b));
-    if let Some(p) = b.producer.as_mut() {
-        p.hmac_signature = mac.finalize().into_bytes().to_vec();
-    }
-}
-
 impl EndSessionTool {
     /// Handle a call. `call_tool` dispatch from the MCP server feeds the
     /// parsed `EndSessionArgs` here.
@@ -194,8 +161,8 @@ impl EndSessionTool {
             batch_id: uuid::Uuid::now_v7().simple().to_string(),
             mapping_version: "session-wrapup:1.0.0".into(),
             ontology_fingerprint: self.fingerprint.to_vec(),
-            ceiling: 3, // registered ceiling (§18.2)
-            checksum: compute_checksum(&memories),
+            ceiling: 3,              // registered ceiling (§18.2)
+            checksum: String::new(), // set by prepare_batch below
             observed_at: Some(ts),
             recorded_at: Some(ts),
             snapshot: None, // no ExternalSnapshotInfo (§18.3)
@@ -208,7 +175,9 @@ impl EndSessionTool {
                 hmac_signature: vec![],
             }),
         };
-        sign_batch(&self.hmac_key, &mut batch);
+        // Canonical checksum + HMAC from the single wire implementation
+        // (PRD R3/R6 — no local copies).
+        exocortex_wire::signing::prepare_batch(&self.hmac_key, &mut batch);
 
         // RegisterSource before the first Submit (R-I3); idempotent on the
         // server side.

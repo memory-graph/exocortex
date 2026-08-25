@@ -3,8 +3,6 @@
 //! then the §7.13 pipeline; batches are atomic and the ack names the first
 //! offending draft_key with its RejectCode.
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status, Streaming};
@@ -160,20 +158,7 @@ impl<S: Storage> IngestServer<S> {
         if producer.hmac_signature.is_empty() {
             return Err(Status::unauthenticated("missing hmac"));
         }
-        let mut unsigned = b.clone();
-        if let Some(p) = unsigned.producer.as_mut() {
-            p.hmac_signature = vec![];
-        }
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.hmac_key)
-            .expect("HMAC accepts any key length");
-        mac.update(&prost::Message::encode_to_vec(&unsigned));
-        let expected = mac.finalize().into_bytes();
-        if expected.len() != producer.hmac_signature.len()
-            || !bool::from(subtle::ConstantTimeEq::ct_eq(
-                expected.as_slice(),
-                producer.hmac_signature.as_slice(),
-            ))
-        {
+        if !exocortex_wire::signing::verify_signature(&self.hmac_key, b) {
             return Err(Status::unauthenticated("hmac verification failed"));
         }
         Ok(())
@@ -480,6 +465,16 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                 &batch,
                 RejectCode::Unauthorized,
                 e.message(),
+            )));
+        }
+        // Step 1a (R-I8.5 / PRD R5): canonical checksum. An empty or
+        // wrong checksum is a mismatch, never a bypass — the field is a
+        // §18.1 integrity obligation, not decoration.
+        if batch.checksum != exocortex_wire::signing::canonical_checksum(&batch) {
+            return Ok(Response::new(ack_reject_all(
+                &batch,
+                RejectCode::BadChecksum,
+                "checksum mismatch",
             )));
         }
         // Step 1: ontology fingerprint.

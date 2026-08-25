@@ -33,7 +33,9 @@ struct Args {
     /// `node-{pid}`; containers pass an explicit id (PIDs collide at 1).
     #[arg(long)]
     node_id: Option<String>,
-    /// Storage selection: embedded falkordb or a networked URL.
+    /// Storage selection: embedded falkordb, a networked URL
+    /// (`falkor://host:port`), or `memory` — the non-durable in-memory
+    /// backend for tests and throwaway dev topologies.
     #[arg(long, default_value = "falkordb-embedded")]
     storage: String,
     /// Bind address for networked modes.
@@ -121,25 +123,8 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
     runtime.block_on(async move {
         let ontology =
             std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
-        let storage = if let Some(url) = args.storage.strip_prefix("falkor://") {
-            std::sync::Arc::new(
-                exocortex_storage::FalkorStorage::connect(
-                    exocortex_storage::FalkorConfig {
-                        falkor_url: format!("falkor://{url}"),
-                        redis_url: format!("redis://{url}"),
-                        graph_name: format!("exocortex-node-{}", std::process::id()),
-                        org_id: "org".into(),
-                        node_id: format!("node-{}", std::process::id()).into(),
-                    },
-                    ontology.clone(),
-                )
-                .await?,
-            )
-        } else {
-            anyhow::bail!(
-                "backend-node needs --storage=falkor://host:port (embedded storage is mcp-standalone)"
-            );
-        };
+        // Storage arms stay concrete (run_backend_node is generic over the
+        // backend); a shared tail serves whichever arm won.
         let cluster_secret = args
             .cluster_secret
             .as_deref()
@@ -163,17 +148,50 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
                 .unwrap_or_default(),
             redis_url: args.redis_url.clone(),
             quiet_hours: match args.quiet_hours {
-                // "--quiet-hours 23" → the nightly 23..7 window.
                 Some(_) => exocortex_dreams::fire::QuietHours::nightly(),
                 None => exocortex_dreams::fire::QuietHours::none(),
             },
         };
-        let node = backend::run_backend_node(storage, ontology, node_args).await?;
-        tracing::info!(addr = %node.local_addr, "backend-node up; serving until interrupted");
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Some(url) = args.storage.strip_prefix("falkor://") {
+            let storage = std::sync::Arc::new(
+                exocortex_storage::FalkorStorage::connect(
+                    exocortex_storage::FalkorConfig {
+                        falkor_url: format!("falkor://{url}"),
+                        redis_url: format!("redis://{url}"),
+                        graph_name: format!("exocortex-node-{}", std::process::id()),
+                        org_id: "org".into(),
+                        node_id: format!("node-{}", std::process::id()).into(),
+                    },
+                    ontology.clone(),
+                )
+                .await?,
+            );
+            serve_forever(storage, ontology, node_args).await
+        } else if args.storage == "memory" {
+            // Non-durable topology: same InMemoryStorage the in-process
+            // tests use. CI/dev only — never production.
+            let storage =
+                std::sync::Arc::new(exocortex_storage::InMemoryStorage::new(ontology.clone()));
+            serve_forever(storage, ontology, node_args).await
+        } else {
+            anyhow::bail!(
+                "backend-node needs --storage=falkor://host:port or memory (embedded storage is mcp-standalone)"
+            );
         }
     })
+}
+
+/// Shared backend-node tail: run the node and idle until interrupted.
+async fn serve_forever<S: exocortex_storage::Storage + 'static>(
+    storage: std::sync::Arc<S>,
+    ontology: std::sync::Arc<exocortex_kernel::Ontology>,
+    node_args: backend::BackendNodeArgs,
+) -> anyhow::Result<()> {
+    let node = backend::run_backend_node(storage, ontology, node_args).await?;
+    tracing::info!(addr = %node.local_addr, "backend-node up; serving until interrupted");
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 /// Decode 64 hex chars into a 32-byte key.

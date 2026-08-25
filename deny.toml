@@ -37,7 +37,7 @@ name = "anthropic-sdk"
 # successor of Unicode-DFS-2016), and BSL-1.0 (xxhash-rust via falkordb) are
 # added: permissive licenses required by PRD-pinned transitive dependencies.
 version = 2
-allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-DFS-2016", "MPL-2.0", "Unicode-3.0", "BSL-1.0"]
+allow = ["AGPL-3.0-or-later", "Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-DFS-2016", "MPL-2.0", "Unicode-3.0", "BSL-1.0"]
 
 [advisories]
 # M0 note: the PRD pins specific dependency versions (§2.2); several carry

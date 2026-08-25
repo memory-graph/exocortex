@@ -25,6 +25,10 @@ pub mod cluster {
         tonic::include_proto!("exocortex.cluster.v1");
     }
 }
+/// Canonical batch-integrity helpers (§18.1): checksum + HMAC, the single
+/// workspace implementation shared by every producer and the server.
+pub mod signing;
+
 /// `exocortex.sse.v1` — SSE change-feed events (§2.6.3).
 pub mod sse {
     /// Protocol buffers for `exocortex.sse.v1`.

@@ -34,6 +34,7 @@ enum Cmd {
     /// `kernel-purity` (which scopes to the kernel dep tree).
     NoLlm,
     ProtoSync,
+    WireStandalone,
 }
 
 fn main() -> Result<()> {
@@ -44,6 +45,7 @@ fn main() -> Result<()> {
         Cmd::Bench => bench(),
         Cmd::NoLlm => no_llm(),
         Cmd::ProtoSync => proto_sync(),
+        Cmd::WireStandalone => wire_standalone(),
     }
 }
 
@@ -265,3 +267,117 @@ fn proto_sync() -> anyhow::Result<()> {
     println!("proto-sync ok: vendored wire protos match proto/");
     Ok(())
 }
+
+/// PRD R1/R2: prove `exocortex-wire` is consumable standalone from the
+/// PUBLISHED artifact. Packages the crate, extracts the tarball into a
+/// temp workspace, drops the standalone fixture in beside it (pointing
+/// at the extracted crate), builds, and asserts the fixture's dependency
+/// graph contains exactly one `exocortex-*` crate.
+fn wire_standalone() -> anyhow::Result<()> {
+    use std::process::Command;
+    let out = Command::new("cargo")
+        .args([
+            "package",
+            "-p",
+            "exocortex-wire",
+            "--allow-dirty",
+            "--no-verify",
+        ])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("cargo package -p exocortex-wire failed");
+    }
+    let version = std::fs::read_to_string("crates/exocortex-wire/Cargo.toml")?
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("version.workspace").map(|_| "0.1.0"))
+        .unwrap_or("0.1.0");
+    let crate_file = format!("target/package/exocortex-wire-{version}.crate");
+
+    let tmp = tempfile_dir()?;
+    let extracted = tmp.join("exocortex-wire");
+    std::fs::create_dir_all(&extracted)?;
+    let bytes = std::fs::read(&crate_file)?;
+    unpack_gzip_tar(&bytes, &extracted)?;
+    let inner = extracted.join(format!("exocortex-wire-{version}"));
+
+    // Fixture crate beside the extracted wire, pointing at it by path.
+    let fixture_src = std::path::Path::new("crates/exocortex-wire/tests/standalone");
+    let fixture_dst = tmp.join("fixture");
+    copy_dir(fixture_src, &fixture_dst)?;
+    // Rewrite the fixture's path dep to the EXTRACTED tarball directory
+    // (the extracted wire, not the repo copy — that is the R1 point).
+    let manifest = fixture_dst.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest)?;
+    std::fs::write(
+        &manifest,
+        text.replace(
+            r#"{ path = "../exocortex-wire" }"#,
+            &format!(r#"{{ path = "../exocortex-wire/exocortex-wire-{version}" }}"#),
+        ),
+    )?;
+    std::fs::write(
+        tmp.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"fixture\"]\nresolver = \"2\"\n",
+    )?;
+
+    let build = Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&tmp)
+        .env("CARGO_TARGET_DIR", tmp.join("target"))
+        .output()?;
+    if !build.status.success() {
+        anyhow::bail!(
+            "standalone fixture build failed:
+{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+
+    // R2: exactly one exocortex-* crate in the resolved graph.
+    let tree = Command::new("cargo")
+        .args(["tree", "-p", "wire-standalone-fixture", "-e", "no-dev"])
+        .current_dir(&tmp)
+        .env("CARGO_TARGET_DIR", tmp.join("target"))
+        .output()?;
+    let text = String::from_utf8_lossy(&tree.stdout);
+    let exo_count = text.lines().filter(|l| l.contains("exocortex-")).count();
+    if exo_count != 1 {
+        anyhow::bail!(
+            "standalone fixture must resolve exactly one exocortex-* crate, found {exo_count}:
+{text}"
+        );
+    }
+    let _ = inner;
+    println!("wire-standalone ok: packaged tarball builds a wire-only consumer");
+    Ok(())
+}
+
+fn tempfile_dir() -> anyhow::Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(format!("exo-wire-standalone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Extract the packaged tarball (tar + flate2 crates; gate deps).
+fn unpack_gzip_tar(gz: &[u8], dst: &std::path::Path) -> anyhow::Result<()> {
+    let tarball = flate2::read::GzDecoder::new(gz);
+    let mut archive = tar::Archive::new(tarball);
+    archive.unpack(dst)?;
+    Ok(())
+}
+// sentinel-9182

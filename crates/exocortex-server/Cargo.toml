@@ -55,6 +55,8 @@ http = { workspace = true }
 redis = { workspace = true }
 
 [dev-dependencies]
+exocortex-adapter-sdk = { workspace = true }
+tempfile = "3"
 exocortex-client = { workspace = true }
 exocortex-cache = { workspace = true }
 prost-types = { workspace = true }

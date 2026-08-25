@@ -19,6 +19,7 @@ ORDER=(
   exocortex-kernel
   exocortex-pack-dev-v1
   exocortex-wire
+  exocortex-adapter-sdk
   exocortex-storage
   exocortex-cache
   exocortex-reasoning

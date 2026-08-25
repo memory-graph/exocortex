@@ -11,8 +11,6 @@ use exocortex_wire::ingest::v1::{
     ingest_service_server::IngestService, ExternalKey, IngestBatch, MemoryDraft, ProducerIdentity,
     RegisterSourceRequest, RejectCode,
 };
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 
 fn server() -> IngestServer<InMemoryStorage> {
     let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
@@ -69,11 +67,7 @@ fn batch(memories: Vec<MemoryDraft>) -> IngestBatch {
 }
 
 fn sign(mut b: IngestBatch, key: [u8; 32]) -> IngestBatch {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).unwrap();
-    mac.update(&prost::Message::encode_to_vec(&b));
-    if let Some(p) = b.producer.as_mut() {
-        p.hmac_signature = mac.finalize().into_bytes().to_vec();
-    }
+    exocortex_wire::signing::prepare_batch(&key, &mut b);
     b
 }
 

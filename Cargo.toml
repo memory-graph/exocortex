@@ -5,6 +5,7 @@ members = [
     "crates/exocortex-kernel",
     "crates/exocortex-pack-dev-v1",
     "crates/exocortex-wire",
+    "crates/exocortex-adapter-sdk",
     "crates/exocortex-storage",
     "crates/exocortex-cache",
     "crates/exocortex-reasoning",
@@ -114,6 +115,7 @@ regex       = "1"
 exocortex-kernel = { path = "crates/exocortex-kernel", version = "0.1.0" }
 exocortex-pack-dev-v1 = { path = "crates/exocortex-pack-dev-v1", version = "0.1.0" }
 exocortex-wire = { path = "crates/exocortex-wire", version = "0.1.0" }
+exocortex-adapter-sdk = { path = "crates/exocortex-adapter-sdk", version = "0.1.0" }
 exocortex-storage = { path = "crates/exocortex-storage", version = "0.1.0" }
 exocortex-cache = { path = "crates/exocortex-cache", version = "0.1.0" }
 exocortex-reasoning = { path = "crates/exocortex-reasoning", version = "0.1.0" }

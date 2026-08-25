@@ -1,0 +1,28 @@
+# crates/exocortex-adapter-sdk/Cargo.toml
+[package]
+name    = "exocortex-adapter-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protocol core for Exocortex source adapters: the §18.2 obligations (handshake, fingerprint negotiation, signing, checksum, R-I2 splitting, backoff, durable cursor, reject triage) as one executable library."
+
+[dependencies]
+exocortex-wire = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+axum = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+
+[features]
+# Mock IngestService for adapter authors' own tests (R18). Behind a
+# feature so downstream dep trees stay clean by default.
+testing = ["dep:axum", "dep:futures"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"

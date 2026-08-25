@@ -12,8 +12,6 @@ use exocortex_wire::ingest::v1::{
     ingest_service_server::IngestService, ExternalKey, ExternalSnapshotInfo, IngestBatch,
     MemoryDraft, ProducerIdentity, RegisterSourceRequest, RejectCode,
 };
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 
 fn server() -> IngestServer<InMemoryStorage> {
     let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
@@ -48,11 +46,7 @@ fn draft(key: &str, title: &str) -> MemoryDraft {
 }
 
 fn signed(mut b: IngestBatch) -> IngestBatch {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&[5u8; 32]).unwrap();
-    mac.update(&prost::Message::encode_to_vec(&b));
-    if let Some(p) = b.producer.as_mut() {
-        p.hmac_signature = mac.finalize().into_bytes().to_vec();
-    }
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
     b
 }
 
@@ -240,4 +234,53 @@ fn re_sign(mut b: IngestBatch) -> IngestBatch {
         p.hmac_signature = vec![];
     }
     signed(b)
+}
+
+/// R5: the checksum is verified server-side — a corrupted checksum and an
+/// empty checksum are both `BadChecksum`, never a bypass.
+#[tokio::test]
+async fn bad_checksum_is_rejected() {
+    let srv = server();
+    registered(&srv).await;
+
+    // Valid batch, corrupt the checksum, then sign WITHOUT recomputing it
+    // (sign_batch covers the checksum field; prepare_batch would fix it).
+    let mut b = batch(
+        &snap([0u8; 32].to_vec()),
+        vec![draft("order-9", "corrupt checksum row")],
+    );
+    b.checksum = "deadbeef".into();
+    exocortex_wire::signing::sign_batch(&[5u8; 32], &mut b);
+    let ack = srv
+        .submit(tonic::Request::new(b))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        ack.rejections
+            .iter()
+            .any(|r| r.code == RejectCode::BadChecksum as i32),
+        "corrupted checksum rejected: {:?}",
+        ack.rejections
+    );
+
+    // Empty checksum: also a mismatch (canonical checksum is never empty).
+    let mut b2 = batch(
+        &snap([0u8; 32].to_vec()),
+        vec![draft("order-10", "empty checksum row")],
+    );
+    b2.checksum = String::new();
+    exocortex_wire::signing::sign_batch(&[5u8; 32], &mut b2);
+    let ack2 = srv
+        .submit(tonic::Request::new(b2))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        ack2.rejections
+            .iter()
+            .any(|r| r.code == RejectCode::BadChecksum as i32),
+        "empty checksum rejected: {:?}",
+        ack2.rejections
+    );
 }

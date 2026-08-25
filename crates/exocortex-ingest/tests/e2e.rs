@@ -10,8 +10,6 @@ use exocortex_storage::InMemoryStorage;
 use exocortex_wire::ingest::v1::{
     ingest_service_server::IngestService, MemoryDraft, ProducerIdentity, RegisterSourceRequest,
 };
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 
 fn server() -> IngestServer<InMemoryStorage> {
     let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
@@ -75,11 +73,7 @@ async fn fifty_row_batch_accepted_lsn_monotonic() {
             hmac_signature: vec![],
         }),
     };
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&[5u8; 32]).unwrap();
-    mac.update(&prost::Message::encode_to_vec(&b));
-    if let Some(p) = b.producer.as_mut() {
-        p.hmac_signature = mac.finalize().into_bytes().to_vec();
-    }
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
 
     let ack = srv.submit(Request::new(b)).await.unwrap().into_inner();
     assert_eq!(ack.accepted, 50);
@@ -132,11 +126,7 @@ async fn bad_triple_rejects_whole_batch_naming_the_key() {
             hmac_signature: vec![],
         }),
     };
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&[5u8; 32]).unwrap();
-    mac.update(&prost::Message::encode_to_vec(&b));
-    if let Some(p) = b.producer.as_mut() {
-        p.hmac_signature = mac.finalize().into_bytes().to_vec();
-    }
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
 
     let ack = srv.submit(Request::new(b)).await.unwrap().into_inner();
     assert_eq!(
@@ -180,7 +170,9 @@ async fn client_side_batch_size_gate() {
 
 #[test]
 fn checksum_is_order_independent() {
-    // §13.6 step 3: same input -> same checksum; row order cannot change it.
+    // §13.6 step 3 via the canonical wire checksum (single impl, R3):
+    // same rows in any order -> identical checksum; any change differs.
+    use exocortex_wire::ingest::v1::ProducerIdentity;
     let mk = |k: &str, t: &str| exocortex_wire::ingest::v1::MemoryDraft {
         draft_key: k.into(),
         id: String::new(),
@@ -193,16 +185,39 @@ fn checksum_is_order_independent() {
         valid_until: None,
         external_key: None,
     };
-    let a = vec![mk("k1", "t1"), mk("k2", "t2")];
-    let b = vec![mk("k2", "t2"), mk("k1", "t1")];
+    let batch_of = |ms: Vec<exocortex_wire::ingest::v1::MemoryDraft>| {
+        exocortex_wire::ingest::v1::IngestBatch {
+            org_id: "org".into(),
+            source_uri: "session://t".into(),
+            producer_id: "p".into(),
+            batch_id: "b".into(),
+            mapping_version: "1".into(),
+            ontology_fingerprint: vec![],
+            ceiling: 3,
+            checksum: String::new(),
+            observed_at: None,
+            recorded_at: None,
+            snapshot: None,
+            memories: ms,
+            relationships: vec![],
+            producer: Some(ProducerIdentity {
+                node_id: "n".into(),
+                agent_id: String::new(),
+                adapter_id: String::new(),
+                hmac_signature: vec![],
+            }),
+        }
+    };
+    let a = batch_of(vec![mk("k1", "t1"), mk("k2", "t2")]);
+    let b = batch_of(vec![mk("k2", "t2"), mk("k1", "t1")]);
     assert_eq!(
-        exocortex_client::tools::end_session::compute_checksum(&a),
-        exocortex_client::tools::end_session::compute_checksum(&b)
+        exocortex_wire::signing::canonical_checksum(&a),
+        exocortex_wire::signing::canonical_checksum(&b)
     );
-    let c = vec![mk("k1", "changed")];
+    let c = batch_of(vec![mk("k1", "changed")]);
     assert_ne!(
-        exocortex_client::tools::end_session::compute_checksum(&a),
-        exocortex_client::tools::end_session::compute_checksum(&c)
+        exocortex_wire::signing::canonical_checksum(&a),
+        exocortex_wire::signing::canonical_checksum(&c)
     );
 }
 
@@ -261,11 +276,7 @@ async fn inverse_materialized_on_write() {
                     hmac_signature: vec![],
                 }),
             };
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&[5u8; 32]).unwrap();
-            mac.update(&prost::Message::encode_to_vec(&b));
-            if let Some(p) = b.producer.as_mut() {
-                p.hmac_signature = mac.finalize().into_bytes().to_vec();
-            }
+            exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
             srv.submit(Request::new(b)).await.unwrap().into_inner()
         }
     };
@@ -377,11 +388,7 @@ async fn computed_only_kind_rejected_at_ingest() {
             hmac_signature: vec![],
         }),
     };
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&[5u8; 32]).unwrap();
-    mac.update(&prost::Message::encode_to_vec(&b));
-    if let Some(p) = b.producer.as_mut() {
-        p.hmac_signature = mac.finalize().into_bytes().to_vec();
-    }
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
     let ack = srv.submit(Request::new(b)).await.unwrap().into_inner();
     // Endpoint drafts ride their relationship's rejection (same per-row
     // semantics as the companion-rejection case above).

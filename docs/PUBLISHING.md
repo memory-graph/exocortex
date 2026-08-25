@@ -55,3 +55,13 @@ workspace license/repository metadata applies).
   toolchain requirement for operators
 - **ghcr.io** (planned): push the existing Dockerfile image as
   `ghcr.io/memory-graph/exocortex-node`
+
+## exocortex-adapter-sdk
+
+Workspace member; publishes right after `exocortex-wire` in
+`scripts/publish.sh` ORDER. The `testing` feature (mock IngestService)
+is off by default so downstream dep trees stay clean; adapter authors
+opt in with `features = ["testing"]` for their own tests. New dev-deps
+recorded with the crate: `tempfile` (adapter-sdk), `tar` + `flate2`
+(xtask's wire-standalone gate), `axum`/`futures` optional under
+`testing`.

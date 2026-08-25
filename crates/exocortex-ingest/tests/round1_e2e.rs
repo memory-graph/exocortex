@@ -15,8 +15,6 @@ use exocortex_wire::ingest::v1::{
     ingest_service_server::IngestService, IngestBatch, MemoryDraft, ProducerIdentity,
     RegisterSourceRequest,
 };
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 
 const HMAC_KEY: [u8; 32] = [7u8; 32];
 
@@ -80,11 +78,7 @@ async fn submit(
             hmac_signature: vec![],
         }),
     };
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&HMAC_KEY).unwrap();
-    mac.update(&prost::Message::encode_to_vec(&b));
-    if let Some(p) = b.producer.as_mut() {
-        p.hmac_signature = mac.finalize().into_bytes().to_vec();
-    }
+    exocortex_wire::signing::prepare_batch(&HMAC_KEY, &mut b);
     srv.submit(Request::new(b)).await.unwrap().into_inner()
 }
 
@@ -256,11 +250,7 @@ async fn session_wrapup_enqueues_reasoning_derived_edge() {
             hmac_signature: vec![],
         }),
     };
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&HMAC_KEY).unwrap();
-    mac.update(&prost::Message::encode_to_vec(&b));
-    if let Some(p) = b.producer.as_mut() {
-        p.hmac_signature = mac.finalize().into_bytes().to_vec();
-    }
+    exocortex_wire::signing::prepare_batch(&HMAC_KEY, &mut b);
     let ack = srv
         .submit(tonic::Request::new(b))
         .await
