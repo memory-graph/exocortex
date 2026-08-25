@@ -77,13 +77,14 @@ standing worklist — accepted work items live there or they don't live.
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace --features exocortex-adapter-sdk/testing
 cargo deny check
-cargo xtask kernel-purity   # includes the SDK single-dep assertion
+cargo xtask kernel-purity   # kernel purity + SDK single-dep + worker kernel-ban
 cargo xtask fingerprint     # must be byte-stable: d8bcd004…4e8c
 cargo xtask gen-schemas     # schema drift vs goldens
 cargo xtask no-llm
 cargo xtask proto-sync      # vendored wire protos match proto/
+cargo xtask signing-hygiene # one batch-signing impl; no unsigned submitters
 cargo xtask wire-standalone # packaged wire builds standalone
 cargo xtask bench           # SLO gates (search, k-hop)
 ```

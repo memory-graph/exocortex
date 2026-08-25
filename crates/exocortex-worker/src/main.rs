@@ -32,6 +32,12 @@ struct Args {
     /// `--adapter fixture`: org to submit into.
     #[arg(long, default_value = "org")]
     org: String,
+    /// `--adapter fixture`: producer HMAC key, 64 hex chars. Falls back
+    /// to `$EXOCORTEX_HMAC_KEY`, then the shared dev key `[0x42; 32]` —
+    /// which must match the backend's ingest key (round-3 C2: the
+    /// hardcoded `[5u8; 32]` could never authenticate).
+    #[arg(long)]
+    hmac_key: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -68,6 +74,21 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
+/// Decode 64 hex chars into a 32-byte key. Rejects wrong length or
+/// non-hex input instead of silently degrading.
+fn decode_hex32(hex: &str) -> anyhow::Result<[u8; 32]> {
+    if hex.len() != 64 {
+        anyhow::bail!("HMAC key must be 64 hex chars, got {}", hex.len());
+    }
+    let bytes: Result<Vec<u8>, _> = (0..32)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
+        .collect();
+    let bytes = bytes.map_err(|e| anyhow::anyhow!("bad HMAC key hex: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| unreachable!("32 bytes collected"))
+}
+
 /// The fixture file format (documented for adapter authors):
 ///
 /// ```json
@@ -88,6 +109,16 @@ async fn run_fixture(args: Args) -> anyhow::Result<()> {
     use exocortex_adapter_sdk::{AdapterConfig, AdapterSession, BatchUnit};
     use exocortex_wire::ingest::v1::{MemoryDraft, RelationshipDraft};
 
+    // Key resolution order: --hmac-key > $EXOCORTEX_HMAC_KEY > the
+    // backend's default dev key. A bad hex string is a hard error —
+    // silently falling back to a known key would ship a credential bug.
+    let hmac_key = args
+        .hmac_key
+        .clone()
+        .or_else(|| std::env::var("EXOCORTEX_HMAC_KEY").ok())
+        .map(|hex| decode_hex32(&hex))
+        .transpose()?
+        .unwrap_or([0x42u8; 32]);
     let path = args
         .fixture
         .as_deref()
@@ -144,7 +175,7 @@ async fn run_fixture(args: Args) -> anyhow::Result<()> {
         source_flavor: "custom".into(),
         ceiling: 3,
         backend_url: args.backend.clone(),
-        hmac_key: [5u8; 32],
+        hmac_key,
         max_batch_bytes: 4 * 1024 * 1024,
         cursor_path,
         retry: exocortex_adapter_sdk::RetryPolicy::default(),

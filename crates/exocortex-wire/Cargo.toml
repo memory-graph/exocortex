@@ -4,8 +4,9 @@ name    = "exocortex-wire"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Wire protocols for Exocortex: protobuf schemas for ingestion, cluster envelopes, and the SSE change feed, plus HMAC signing types."
-include = ["/src", "/proto", "/build.rs", "Cargo.toml"]
+include = ["/src", "/proto", "/build.rs", "Cargo.toml", "LICENSE"]
 build   = "build.rs"
 
 [dependencies]

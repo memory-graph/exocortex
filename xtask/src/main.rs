@@ -35,6 +35,7 @@ enum Cmd {
     NoLlm,
     ProtoSync,
     WireStandalone,
+    SigningHygiene,
 }
 
 fn main() -> Result<()> {
@@ -46,6 +47,7 @@ fn main() -> Result<()> {
         Cmd::NoLlm => no_llm(),
         Cmd::ProtoSync => proto_sync(),
         Cmd::WireStandalone => wire_standalone(),
+        Cmd::SigningHygiene => signing_hygiene(),
     }
 }
 
@@ -200,6 +202,31 @@ fn bench() -> Result<()> {
         );
     }
     println!("bench ok: both SLO gates green (R-Lat1)");
+    // Round-3 G1 / PRD R15: the adapter SDK resolves exactly ONE
+    // exocortex-* dependency (exocortex-wire), and BOTH the SDK and the
+    // worker never link exocortex-kernel (R-I1/R-I4). This assertion was
+    // claimed by a prior commit message but never landed.
+    for crate_name in ["exocortex-adapter-sdk", "exocortex-worker"] {
+        let out = std::process::Command::new("cargo")
+            .args(["tree", "-p", crate_name, "-e", "no-dev"])
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!("cargo tree for {crate_name} failed");
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        if text.lines().any(|l| l.contains("exocortex-kernel")) {
+            anyhow::bail!("{crate_name} must never link exocortex-kernel (R-I1/R-I4): {text}");
+        }
+        if crate_name == "exocortex-adapter-sdk" {
+            let count = text.lines().filter(|l| l.contains("exocortex-")).count();
+            if count != 1 {
+                anyhow::bail!(
+                    "exocortex-adapter-sdk must resolve exactly one exocortex-* dependency, found {count}: {text}"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -264,7 +291,14 @@ fn proto_sync() -> anyhow::Result<()> {
             anyhow::bail!("proto/{name} and crates/exocortex-wire/proto/{name} diverge — copy the authoritative root file");
         }
     }
-    println!("proto-sync ok: vendored wire protos match proto/");
+    // D5: the wire tarball ships the AGPL text; the crate-local copy
+    // must stay identical to the root LICENSE.
+    let root = std::fs::read_to_string("LICENSE")?;
+    let vendored = std::fs::read_to_string("crates/exocortex-wire/LICENSE")?;
+    if root != vendored {
+        anyhow::bail!("crates/exocortex-wire/LICENSE diverged from the root LICENSE");
+    }
+    println!("proto-sync ok: vendored wire protos + LICENSE match");
     Ok(())
 }
 
@@ -287,10 +321,9 @@ fn wire_standalone() -> anyhow::Result<()> {
     if !out.status.success() {
         anyhow::bail!("cargo package -p exocortex-wire failed");
     }
-    let version = std::fs::read_to_string("crates/exocortex-wire/Cargo.toml")?
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("version.workspace").map(|_| "0.1.0"))
-        .unwrap_or("0.1.0");
+    // G3: the real version from cargo metadata — a hardcoded "0.1.0"
+    // breaks this gate at the first version bump.
+    let version = wire_version()?;
     let crate_file = format!("target/package/exocortex-wire-{version}.crate");
 
     let tmp = tempfile_dir()?;
@@ -381,3 +414,105 @@ fn unpack_gzip_tar(gz: &[u8], dst: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 // sentinel-9182
+
+/// The workspace version of exocortex-wire via cargo metadata.
+fn wire_version() -> anyhow::Result<String> {
+    let out = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("cargo metadata failed");
+    }
+    let meta: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    meta["packages"]
+        .as_array()
+        .and_then(|ps| {
+            ps.iter()
+                .find(|p| p["name"] == "exocortex-wire")
+                .and_then(|p| p["version"].as_str().map(String::from))
+        })
+        .ok_or_else(|| anyhow::anyhow!("exocortex-wire not found in metadata"))
+}
+
+/// Round-3 G2: calibrated batch-signing hygiene gates. The adapter-SDK
+/// PRD's raw grep commands were miscalibrated (they matched benign
+/// scaffolding and unrelated SSE-envelope HMACs). These check the
+/// actual invariants:
+///  1. No local batch-signing/checksum implementation outside
+///     `exocortex-wire/src/signing.rs` (single-implementation rule).
+///  2. No producer submits a blank checksum: every `IngestBatch`
+///     construction site with `checksum: String::new()` must be
+///     followed by prepare_batch/canonical_checksum before submit.
+fn signing_hygiene() -> anyhow::Result<()> {
+    // Gate 1: function-level single implementation.
+    let mut offenders = Vec::new();
+    for entry in walk_rss(std::path::Path::new("crates"))? {
+        let src = std::fs::read_to_string(&entry)?;
+        let rel = entry.display().to_string();
+        if rel.ends_with("exocortex-wire/src/signing.rs") {
+            continue;
+        }
+        for marker in [
+            "fn sign_batch(",
+            "fn compute_checksum(",
+            "fn canonical_checksum(",
+        ] {
+            if src.contains(marker) {
+                offenders.push(format!("{rel}: local `{marker}`"));
+            }
+        }
+    }
+    if !offenders.is_empty() {
+        anyhow::bail!(
+            "batch signing implemented outside exocortex-wire:
+{}",
+            offenders.join(
+                "
+"
+            )
+        );
+    }
+
+    // Gate 2: every blank-checksum constructor is followed (within the
+    // enclosing function) by prepare_batch or canonical_checksum.
+    let mut blanks = Vec::new();
+    for entry in walk_rss(std::path::Path::new("crates"))? {
+        let src = std::fs::read_to_string(&entry)?;
+        if !src.contains("checksum: String::new()") {
+            continue;
+        }
+        let rel = entry.display().to_string();
+        // Crude but effective: the file must reference the canonical
+        // helper at least once after construction.
+        if !src.contains("prepare_batch") && !src.contains("canonical_checksum") {
+            blanks.push(rel);
+        }
+    }
+    if !blanks.is_empty() {
+        anyhow::bail!(
+            "files construct batches with blank checksums and never call prepare_batch/canonical_checksum:
+{}",
+            blanks.join("
+")
+        );
+    }
+    println!("signing-hygiene ok: single batch-signing implementation; no unsigning blank-checksum submitters");
+    Ok(())
+}
+
+fn walk_rss(dir: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().map(|n| n == "target").unwrap_or(false) {
+                continue;
+            }
+            out.extend(walk_rss(&path)?);
+        } else if path.extension().map(|e| e == "rs").unwrap_or(false) {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}

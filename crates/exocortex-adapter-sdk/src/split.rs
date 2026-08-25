@@ -167,6 +167,20 @@ pub fn split_unit(
 fn validate_unit(unit: &BatchUnit) -> Result<(), SdkError> {
     use std::collections::HashSet;
     let keys: HashSet<&str> = unit.memories.iter().map(|m| m.draft_key.as_str()).collect();
+    // M5: a duplicated draft_key would pass endpoint resolution while
+    // the server persists two independent rows — reject at the source.
+    if keys.len() != unit.memories.len() {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut dups: Vec<&str> = Vec::new();
+        for m in &unit.memories {
+            if !seen.insert(m.draft_key.as_str()) {
+                dups.push(m.draft_key.as_str());
+            }
+        }
+        return Err(SdkError::InvalidUnit {
+            detail: format!("duplicate draft_key(s): {dups:?}"),
+        });
+    }
     for r in &unit.relationships {
         if !keys.contains(r.from_draft_key.as_str()) || !keys.contains(r.to_draft_key.as_str()) {
             return Err(SdkError::InvalidUnit {
@@ -242,7 +256,7 @@ mod tests {
     use super::*;
     use exocortex_wire::ingest::v1::MemoryDraft;
 
-    fn draft(k: &str, big: bool) -> MemoryDraft {
+    pub(super) fn draft(k: &str, big: bool) -> MemoryDraft {
         MemoryDraft {
             draft_key: k.into(),
             id: String::new(),
@@ -257,7 +271,11 @@ mod tests {
         }
     }
 
-    fn unit(seed: &str, memories: Vec<MemoryDraft>, rels: Vec<RelationshipDraft>) -> BatchUnit {
+    pub(super) fn unit(
+        seed: &str,
+        memories: Vec<MemoryDraft>,
+        rels: Vec<RelationshipDraft>,
+    ) -> BatchUnit {
         BatchUnit {
             batch_id_seed: seed.into(),
             memories,
@@ -400,5 +418,27 @@ mod tests {
             split_unit("p", &u, 2048).unwrap_err(),
             SdkError::InvalidUnit { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod m5_tests {
+    use super::tests::{draft, unit};
+    use super::*;
+
+    #[test]
+    fn duplicate_draft_keys_are_rejected() {
+        let err = split_unit(
+            "p",
+            &unit("s", vec![draft("a", false), draft("a", false)], vec![]),
+            2048,
+        )
+        .unwrap_err();
+        match err {
+            SdkError::InvalidUnit { detail } => {
+                assert!(detail.contains("duplicate"), "{detail}");
+            }
+            other => panic!("expected InvalidUnit, got {other:?}"),
+        }
     }
 }

@@ -49,6 +49,8 @@ Requires Rust 1.85 (pinned in `rust-toolchain.toml`) and `protoc`.
 cargo build --release
 cargo test --workspace        # no backend needed, all green
 cargo xtask bench             # SLO gates: search p50<500µs/p99<3ms, k-hop p50<300µs/p99<2ms
+cargo xtask proto-sync       # vendored wire protos + LICENSE match
+cargo xtask signing-hygiene  # one batch-signing implementation
 cargo fmt --check             # enforced in CI
 cargo clippy --workspace      # enforced in CI
 ```

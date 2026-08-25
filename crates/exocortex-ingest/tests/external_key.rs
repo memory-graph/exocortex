@@ -284,3 +284,58 @@ async fn bad_checksum_is_rejected() {
         ack2.rejections
     );
 }
+
+/// Round-3 C4: a pinned-org node rejects foreign-org batches and source
+/// registrations outright — cross-org writes can neither commit nor
+/// publish invalidations.
+#[tokio::test]
+async fn pinned_org_rejects_foreign_batches() {
+    let srv = server().with_org("org");
+    registered(&srv).await;
+
+    // Foreign org batch: validly signed, same source — rejected.
+    let mut b = batch(
+        &snap([0u8; 32].to_vec()),
+        vec![draft("order-x", "foreign org row")],
+    );
+    b.org_id = "evil-org".into();
+    let ack = srv
+        .submit(tonic::Request::new(re_sign(b)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        ack.rejections
+            .iter()
+            .any(|r| r.code == RejectCode::UnknownSource as i32),
+        "foreign org rejected: {:?}",
+        ack.rejections
+    );
+
+    // Foreign registration errors.
+    let err = srv
+        .register_source(tonic::Request::new(RegisterSourceRequest {
+            org_id: "evil-org".into(),
+            source_uri: "custom://x".into(),
+            producer_id: "p".into(),
+            ceiling: 3,
+            source_flavor: "custom".into(),
+        }))
+        .await;
+    assert!(err.is_err(), "foreign org registration rejected");
+
+    // And the row never landed.
+    let committed = {
+        use futures::StreamExt;
+        let storage = srv.storage.clone();
+        let mut ms = storage.stream_all_memories().await;
+        let mut any = false;
+        while let Some(Ok(m)) = ms.next().await {
+            if m.title.contains("foreign org") {
+                any = true;
+            }
+        }
+        any
+    };
+    assert!(!committed, "no cross-org row committed");
+}

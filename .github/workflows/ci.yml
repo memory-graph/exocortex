@@ -32,8 +32,8 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           arguments: --workspace
-      - name: Tests
-        run: cargo test --workspace
+      - name: Tests (SDK integration suites on via workspace feature)
+        run: cargo test --workspace --features exocortex-adapter-sdk/testing
       - name: Kernel purity (R-I1/CR-26)
         run: cargo xtask kernel-purity
       - name: Fingerprint stability (R-T21)
@@ -49,6 +49,8 @@ jobs:
         run: cargo xtask proto-sync
       - name: Wire standalone (packaged-tarball consumer)
         run: cargo xtask wire-standalone
+      - name: Signing hygiene (single batch-signing impl)
+        run: cargo xtask signing-hygiene
       - name: SLO benches (R-Lat1; fail on regression)
         # Shared runners steal CPU; the budgets assume dedicated hardware.
         # x2 keeps the gate meaningful (a 2x regression still fails) while

@@ -13,9 +13,11 @@ use exocortex_adapter_sdk::{instant_sleep, AdapterSession};
 async fn transient_failure_leaves_cursor_untouched() {
     // Window of 3 batches; batch 3 fails at transport level, retries
     // exhaust (max_attempts = 2 for speed).
-    let mut cfg_retry = exocortex_adapter_sdk::RetryPolicy::default();
-    cfg_retry.max_attempts = 2;
-    cfg_retry.jitter = false;
+    let cfg_retry = exocortex_adapter_sdk::RetryPolicy {
+        max_attempts: 2,
+        jitter: false,
+        ..Default::default()
+    };
 
     let mock = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();

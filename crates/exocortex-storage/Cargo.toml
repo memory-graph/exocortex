@@ -4,6 +4,7 @@ name    = "exocortex-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "The Exocortex storage seam: the Storage trait, the registered Cypher catalogue, the FalkorDB adapter, and the in-memory test double."
 
 [dependencies]

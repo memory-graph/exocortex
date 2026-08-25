@@ -1,6 +1,8 @@
 # Exocortex v1 — Round 3 Review (Deep audit of the post-round-2 delta)
 
-**Status:** Open work items from the 2026-08-25 audit. Scope: everything
+**Status:** CLOSED 2026-08-25. C1-C5, G1-G3, D1-D6, and M1/M2/M4/M5
+landed with tests; the remaining minors (M3 bridge loss-windows, M6-M15)
+are recorded below as accepted v1 residue — see each item's note. Scope: everything
 landed since round 2 — B8/B9 identity fixes, the `wire::signing`
 migration + server checksum verification, `exocortex-adapter-sdk` (A1),
 the backend cache-feed bridge, `--storage memory`, publish tooling, and

@@ -19,6 +19,9 @@ use exocortex_wire::ingest::v1::{
 };
 
 use crate::embedding::EmbedderRef;
+
+/// See `IngestServer::org_guard` (SmolStr without importing it here).
+type SmolStrLike = smol_str::SmolStr;
 use crate::entities::EntityExtractor;
 
 /// §18.8.5: the idempotency + source registries keep their last 1000
@@ -42,6 +45,11 @@ pub struct IngestServer<S: Storage> {
     pub ontology: Arc<Ontology>,
     /// Producer authentication key (R-I8).
     pub hmac_key: [u8; 32],
+    /// This server's owning org (round-3 C4): a backend node serves ONE
+    /// org; batches or source registrations naming any other org are
+    /// rejected before validation. `None` disables the guard (tests,
+    /// library embedding).
+    pub org_guard: Option<SmolStrLike>,
     /// Registered source ceilings: (org, source_uri, producer_id) -> ceiling
     /// (R-I3 / R-T11a). LRU-bounded (§18.8.5) and Arc-shared across clones.
     /// std::Mutex: critical sections are pure map ops, never held across awaits.
@@ -66,6 +74,7 @@ impl<S: Storage> Clone for IngestServer<S> {
         // commits through any clone hit the same registries (no
         // `blocking_lock` under async contention).
         Self {
+            org_guard: self.org_guard.clone(),
             storage: self.storage.clone(),
             ontology: self.ontology.clone(),
             hmac_key: self.hmac_key,
@@ -85,10 +94,11 @@ impl<S: Storage> IngestServer<S> {
         self.clone()
     }
 
-    /// Build the server.
+    /// Build the server (unpinned org — tests, library embedding).
     pub fn new(storage: Arc<S>, ontology: Arc<Ontology>, hmac_key: [u8; 32]) -> Self {
         let org = "org".to_string();
         Self {
+            org_guard: None,
             storage,
             ontology,
             hmac_key,
@@ -108,6 +118,15 @@ impl<S: Storage> IngestServer<S> {
     /// Backend config flag: enable the embedding step (§7.5).
     pub fn with_embedder(mut self, embedder: EmbedderRef) -> Self {
         self.embedder = Some(embedder);
+        self
+    }
+
+    /// Pin the owning org (round-3 C4): a backend node serves ONE org;
+    /// submit and register_source reject foreign org ids before any
+    /// validation, so cross-org writes can neither commit nor publish
+    /// invalidations the cache bridge would misapply.
+    pub fn with_org(mut self, org: &str) -> Self {
+        self.org_guard = Some(org.into());
         self
     }
 
@@ -485,6 +504,16 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                 "ontology fingerprint mismatch",
             )));
         }
+        // C4: single-org node — foreign orgs are rejected outright.
+        if let Some(guard) = &self.org_guard {
+            if batch.org_id != guard.as_str() {
+                return Ok(Response::new(ack_reject_all(
+                    &batch,
+                    RejectCode::UnknownSource,
+                    "org does not match this node",
+                )));
+            }
+        }
         // Idempotency: replay returns the original ack.
         {
             let mut seen = self.seen_batches.lock().unwrap();
@@ -664,6 +693,11 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         req: Request<RegisterSourceRequest>,
     ) -> Result<Response<RegisterSourceResponse>, Status> {
         let r = req.into_inner();
+        if let Some(guard) = &self.org_guard {
+            if r.org_id != guard.as_str() {
+                return Err(Status::invalid_argument("org does not match this node"));
+            }
+        }
         let ceiling = Self::vis_from_i32(r.ceiling);
         {
             let mut sources = self.sources.lock().unwrap();

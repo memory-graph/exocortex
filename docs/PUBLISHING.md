@@ -6,7 +6,7 @@ planned for `ghcr.io`).
 
 ## crates.io
 
-All 13 crate names were verified available (2026-08-25). Crates share one
+All 14 crate names were verified available (2026-08-25; exocortex-adapter-sdk joined with A1). Crates share one
 workspace version and must publish in dependency order — `cargo release`
 derives the order from the graph:
 
@@ -22,6 +22,7 @@ crate must exist on crates.io before its dependents verify):
 ```
 exocortex-kernel
   -> exocortex-pack-dev-v1, exocortex-wire
+  -> exocortex-adapter-sdk
   -> exocortex-storage
   -> exocortex-cache, exocortex-reasoning
   -> exocortex-cluster
@@ -38,7 +39,7 @@ workspace license/repository metadata applies).
 ## Requirements already in place
 
 - Workspace `license = "AGPL-3.0-or-later"` + committed `LICENSE`
-- `repository` points at `memory-graph/exocortex`
+- Every crate inherits `repository.workspace = true` (memory-graph/exocortex)
 - Every crate manifest carries a `description`
 - Internal deps use `path + version` (crates.io rewrites to the registry
   version at publish)

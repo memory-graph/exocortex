@@ -333,3 +333,27 @@ fixed at the root:
    commit — the pre-commit gate sequence now includes `fmt --check`.
 
 Final state: all nine workflow gates green on the runner.
+
+### Round 3 (2026-08-25) — record
+
+The round-3 audit (docs/reviews/round-3-review.prd) found the
+adapter-SDK's integration tests were CI-dead (the `testing` feature was
+never enabled — five binaries compiled to zero tests; fixed via a
+self-dev-dependency), the worker fixture key could never authenticate
+(key resolution now --hmac-key / $EXOCORTEX_HMAC_KEY / dev default, with
+hard errors on bad hex), R-I2 splitting measured pre-stamp bytes
+(submit_window now verifies the signed+stamped length and re-splits),
+ingest accepted any org id (single-org nodes now pin `with_org`), and
+`Status::internal` was classified fatal (now retryable). Correction to
+the round-2 close-out record: commit 3ab680c claimed kernel-purity
+asserted the SDK's single dependency — that insertion had silently
+failed and never landed; the assertion now exists (adapter-sdk AND
+worker, kernel-ban + single-dep) alongside a calibrated
+`signing-hygiene` gate replacing the PRD's miscalibrated raw greps.
+PRD verification-table deltas from the shipped reality: R5's tests live
+in ingest/tests/external_key.rs (not checksum.rs); R17's out-of-process
+test lives in exocortex-server/tests/ (not the SDK crate); R21's span is
+per window, not per submit. release.toml returned to the workspace root
+(cargo-release only reads it there); every crate inherits
+repository.workspace; the wire tarball now ships the LICENSE (with a
+proto-sync-guarded copy).

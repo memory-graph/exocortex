@@ -17,3 +17,136 @@ fn noop_adapter_boots_without_backend() {
     child.kill().expect("kill");
     child.wait().expect("reaped");
 }
+
+/// Round-3 C2 + PRD R16's second verify clause: the worker BINARY runs
+/// `--adapter fixture` end-to-end against a real backend-node process
+/// and its batches authenticate (default dev key matches the server's).
+#[tokio::test(flavor = "multi_thread")]
+async fn fixture_adapter_binary_submits_to_real_backend() {
+    use std::process::{Command, Stdio};
+    // The node binary belongs to exocortex-server; from this crate only
+    // our own CARGO_BIN_EXE_ vars exist. Locate the built node relative
+    // to this test binary (target/debug/deps -> target/debug).
+    let node_bin = std::env::current_exe()
+        .expect("test path")
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("exocortex-node"))
+        .filter(|p| p.exists())
+        .expect(
+            "built exocortex-node binary (cargo build -p exocortex-server --bin exocortex-node)",
+        );
+
+    // 1. Boot the real backend (memory storage, default dev cluster
+    //    secret [0x42;32] which the worker now falls back to).
+    let node_port = {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let gossip_port = {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let mut node = Command::new(&node_bin)
+        .args([
+            "--mode",
+            "backend-node",
+            "--storage",
+            "memory",
+            "--bind",
+            &format!("127.0.0.1:{node_port}"),
+            "--gossip-addr",
+            &format!("127.0.0.1:{gossip_port}"),
+            "--bearer-token",
+            "fixture-e2e",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn exocortex-node");
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", node_port)).is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // 2. Fixture file: two memories + one edge.
+    let dir = tempfile::TempDir::new().unwrap();
+    let fixture = dir.path().join("fixture.json");
+    std::fs::write(
+        &fixture,
+        serde_json::json!({
+            "producer_id": "fixture-e2e",
+            "seed": "w1",
+            "cursor": "w1",
+            "memories": [
+                {"draft_key": "k1", "memory_type": "General",
+                 "title": "fixture row one", "content": "c1", "visibility": 3},
+                {"draft_key": "k2", "memory_type": "General",
+                 "title": "fixture row two", "content": "c2", "visibility": 3}
+            ],
+            "relationships": [
+                {"from": "k1", "to": "k2", "kind": "RelatedTo"}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // 3. Run the worker BINARY with the fixture adapter.
+    let out = Command::new(env!("CARGO_BIN_EXE_exocortex-worker"))
+        .args([
+            "--adapter",
+            "fixture",
+            "--backend",
+            &format!("http://127.0.0.1:{node_port}"),
+            "--fixture",
+            fixture.to_str().unwrap(),
+            "--cursor",
+            dir.path().join("fx.cursor").to_str().unwrap(),
+        ])
+        .output()
+        .expect("run exocortex-worker fixture");
+    let _ = node.kill();
+    let _ = node.wait();
+    assert!(
+        out.status.success(),
+        "worker fixture run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The worker logs the settled window; assert the cursor advanced.
+    assert!(
+        std::fs::read_to_string(dir.path().join("fx.cursor"))
+            .map(|c| c == "w1")
+            .unwrap_or(false),
+        "durable cursor advanced to w1"
+    );
+}
+
+/// C2: a malformed HMAC key is a hard error, never a silent fallback.
+#[test]
+fn malformed_hmac_key_fails_loudly() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-worker"))
+        .args([
+            "--adapter",
+            "fixture",
+            "--backend",
+            "http://127.0.0.1:1",
+            "--fixture",
+            "/nonexistent.json",
+            "--hmac-key",
+            "zzzz",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "bad hex must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("HMAC key"), "names the problem: {stderr}");
+}

@@ -200,7 +200,8 @@ pub async fn run_backend_node<S: Storage + 'static>(
 
     // Ingest: gRPC IngestService, embedding-enabled, reasoning-wired.
     let ingest = IngestServer::new(storage.clone(), ontology.clone(), args.cluster_secret)
-        .with_reasoning(reasoning.clone());
+        .with_reasoning(reasoning.clone())
+        .with_org(&org);
     #[cfg(feature = "fastembed")]
     let ingest = ingest.with_embedder(Arc::new(
         exocortex_ingest::embedding::FastEmbedder::bge_small()?,

@@ -1330,6 +1330,7 @@ dependencies = [
  "exocortex-adapter-sdk",
  "exocortex-wire",
  "serde_json",
+ "tempfile",
  "tokio",
  "tonic",
  "tracing",

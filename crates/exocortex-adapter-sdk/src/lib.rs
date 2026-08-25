@@ -306,27 +306,66 @@ impl AdapterSession {
             tracing::info_span!("adapter_submit_window", producer = %self.config.producer_id);
         let _guard = span.enter();
         // Split first — an unsplittable/invalid unit must fail before any
-        // wire traffic.
-        let mut all_batches = Vec::new();
-        for unit in &units {
-            all_batches.extend(split::split_unit(
-                &self.config.producer_id,
-                unit,
-                self.config.max_batch_bytes,
-            )?);
+        // wire traffic. Then STAMP and SIGN, and verify the R-I2 budget
+        // against the actual submitted bytes: the split-time estimate
+        // cannot know org_id/source_uri/fingerprint/signature widths
+        // (round-3 C3 — the old post-check ran pre-stamp and was dead
+        // code). Over-budget batches re-split with the observed
+        // headroom subtracted.
+        let mut budget = self.config.max_batch_bytes;
+        let mut all_batches;
+        loop {
+            all_batches = Vec::new();
+            for unit in &units {
+                all_batches.extend(split::split_unit(&self.config.producer_id, unit, budget)?);
+            }
+            use prost::Message;
+            let mut headroom_violation = None;
+            for b in &mut all_batches {
+                b.org_id = self.config.org_id.clone();
+                b.source_uri = self.config.source_uri.clone();
+                b.producer_id = self.config.producer_id.clone();
+                b.mapping_version = self.config.source_flavor.clone();
+                b.ceiling = self.ceiling;
+                b.ontology_fingerprint = self.fingerprint.to_vec();
+                if let Some(p) = b.producer.as_mut() {
+                    p.node_id = self.config.node_id.clone();
+                    p.agent_id = self.config.producer_id.clone();
+                    p.adapter_id = self.config.adapter_id.clone();
+                }
+                exocortex_wire::signing::prepare_batch(&self.config.hmac_key, b);
+                if b.encoded_len() > self.config.max_batch_bytes {
+                    headroom_violation = Some(b.encoded_len() - self.config.max_batch_bytes);
+                    break;
+                }
+            }
+            match headroom_violation {
+                None => break,
+                Some(over) => {
+                    // Subtract the worst observed overshoot (plus slack)
+                    // and re-split smaller. Bounded: each iteration
+                    // shrinks the budget by >= 1 byte; a single memory
+                    // that cannot fit even alone surfaces as
+                    // `Unsplittable` from split_unit.
+                    let next = budget.saturating_sub(over + 16).max(64);
+                    if next == budget {
+                        // Cannot shrink further: genuinely unsplittable.
+                        let keys: Vec<String> = all_batches
+                            .iter()
+                            .flat_map(|b| b.memories.iter().map(|m| m.draft_key.clone()))
+                            .collect();
+                        return Err(SdkError::Unsplittable { draft_keys: keys });
+                    }
+                    tracing::debug!(over, next, "re-splitting under tightened R-I2 budget");
+                    budget = next;
+                }
+            }
         }
 
         let mut outcome = WindowOutcome::default();
         {
             let mut client = self.client.clone();
             for batch in &mut all_batches {
-                batch.org_id = self.config.org_id.clone();
-                batch.source_uri = self.config.source_uri.clone();
-                batch.producer_id = self.config.producer_id.clone();
-                batch.ceiling = self.ceiling;
-                batch.ontology_fingerprint = self.fingerprint.to_vec();
-                exocortex_wire::signing::prepare_batch(&self.config.hmac_key, batch);
-
                 let mut attempt: u32 = 0;
                 loop {
                     attempt += 1;
@@ -354,7 +393,7 @@ impl AdapterSession {
                                 return Err(SdkError::RetriesExhausted { attempts: attempt });
                             }
                             return Err(SdkError::Fatal {
-                                code: status.code().to_string().parse().unwrap_or(0),
+                                code: status.code() as i32,
                                 detail: status.message().to_string(),
                             });
                         }
@@ -461,14 +500,20 @@ enum Triage {
     Retry,
 }
 
-/// Transport statuses map onto the same triage table: `unavailable` and
-/// friends are retryable; `unauthenticated`/`permission_denied` are fatal.
+/// Transport statuses map onto the same triage table (round-3 C5): the
+/// ingest server surfaces TRANSIENT storage failures as
+/// `Status::internal("storage: …")`, so `Internal` and `Unknown` are
+/// retryable — one backend blip must not kill the session. Genuinely
+/// fatal classes (auth, permissions, malformed request, not-found)
+/// stay fatal.
 fn classify_status(status: &tonic::Status) -> Disposition {
     match status.code() {
         tonic::Code::Unavailable
         | tonic::Code::DeadlineExceeded
         | tonic::Code::ResourceExhausted
-        | tonic::Code::Aborted => Disposition::Retry,
+        | tonic::Code::Aborted
+        | tonic::Code::Internal
+        | tonic::Code::Unknown => Disposition::Retry,
         _ => Disposition::Fatal,
     }
 }
@@ -497,4 +542,22 @@ fn save_cursor(path: &std::path::Path, cursor: &str) -> Result<(), SdkError> {
     std::fs::write(&tmp, cursor)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod feature_canary {
+    /// Round-3 C1: the mock-driven integration tests are
+    /// `#[cfg(feature = "testing")]`. A bare `cargo test -p
+    /// exocortex-adapter-sdk` used to report green while those suites
+    /// compiled to nothing. This canary inverts that: it FAILS unless
+    /// the feature is enabled, so the dark-suite state is loud. Run
+    /// `cargo test-sdk` (alias) or
+    /// `cargo test -p exocortex-adapter-sdk --features testing`.
+    #[test]
+    #[cfg(not(feature = "testing"))]
+    fn testing_feature_is_enabled_for_this_test_run() {
+        panic!(
+            "integration suites are dark: re-run with --features testing              (or `cargo test-sdk`) — see round-3 review C1"
+        );
+    }
 }

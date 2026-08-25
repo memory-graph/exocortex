@@ -4,6 +4,7 @@ name    = "exocortex-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Exocortex adapter host: runs external-source adapters (v1: noop) and forwards batches to the ingest service over gRPC. Never links the kernel."
 
 [[bin]]
@@ -20,3 +21,6 @@ clap = { version = "4", features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

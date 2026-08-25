@@ -4,6 +4,7 @@ name    = "exocortex-pack-dev-v1"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "The dev-domain ontology pack for Exocortex: 13 memory types, 12 entity types, 48 relationship kinds, and Crepe rules D1-D6."
 
 [dependencies]

@@ -125,11 +125,12 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
             std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
         // Storage arms stay concrete (run_backend_node is generic over the
         // backend); a shared tail serves whichever arm won.
-        let cluster_secret = args
-            .cluster_secret
-            .as_deref()
-            .and_then(|hex| decode_hex32(hex).ok())
-            .unwrap_or([0x42u8; 32]);
+        // M2: a PROVIDED secret must parse — silently falling back to the
+        // public dev key on a typo would ship a known-key node.
+        let cluster_secret = match args.cluster_secret.as_deref() {
+            None => [0x42u8; 32],
+            Some(hex) => decode_hex32(hex)?,
+        };
         let bearer_token = resolve_bearer(&args)?;
         let node_id = args
             .node_id
@@ -194,12 +195,18 @@ async fn serve_forever<S: exocortex_storage::Storage + 'static>(
     }
 }
 
-/// Decode 64 hex chars into a 32-byte key.
+/// Decode 64 hex chars into a 32-byte key. Length-checked FIRST so a
+/// short input errors instead of panicking on the slice (round-3 M2).
 fn decode_hex32(hex: &str) -> Result<[u8; 32], anyhow::Error> {
+    if hex.len() != 64 {
+        anyhow::bail!("--cluster-secret must be 64 hex chars, got {}", hex.len());
+    }
     let bytes = (0..32)
         .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
         .collect::<Result<Vec<_>, _>>()?;
-    bytes.try_into().map_err(|_| anyhow::anyhow!("bad hex"))
+    bytes
+        .try_into()
+        .map_err(|_| unreachable!("32 bytes collected"))
 }
 
 /// R-Sec7: the op surface never ships a default credential. Release

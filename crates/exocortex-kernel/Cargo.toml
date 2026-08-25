@@ -4,6 +4,7 @@ name    = "exocortex-kernel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Ontology kernel for Exocortex: memory/relationship types, provenance, visibility, validators, and the deterministic fingerprint. Zero I/O."
 
 [dependencies]

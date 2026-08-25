@@ -4,6 +4,7 @@ name    = "exocortex-adapter-sdk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Protocol core for Exocortex source adapters: the §18.2 obligations (handshake, fingerprint negotiation, signing, checksum, R-I2 splitting, backoff, durable cursor, reject triage) as one executable library."
 
 [dependencies]

@@ -2,3 +2,6 @@
 # .cargo/config.toml — cargo-xtask pattern (https://github.com/matklad/cargo-xtask)
 [alias]
 xtask = "run -p xtask --"
+# Round-3 C1: the SDK's mock-driven integration tests live behind the
+# `testing` feature; this alias runs the FULL suite.
+test-sdk = "test -p exocortex-adapter-sdk --features testing"
