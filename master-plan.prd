@@ -1,6 +1,11 @@
 # Exocortex — Master Plan
 
-**Status:** Open. No entries yet.
+**Status:** Round 2 review open. `round-2-review.prd` is the current
+worklist (B3-B7, W9-W14, H9-H14, P1). Round-1 closure verified by audit:
+14/19 items fully closed with tests; W7/H1/H2/H6 carry residue (H12).
+
+**Process blocker (P1):** the round-1 closure exists only as uncommitted
+working-tree changes — commit it before round-2 work starts.
 
 **Purpose:** The authoritative, phased worklist for this repository. Each
 round of review findings gets its own `round-<n>-review.prd`; accepted
@@ -8,14 +13,54 @@ items are promoted into this file, tracked to done, and never silently
 dropped. Anything not listed here is either shipped or explicitly deferred
 to v2 in the PRD's own terms.
 
-**Current baseline:** see `round-1-review.prd` (88 tests, all gates green,
-two correctness bugs and a set of unwired runtime gaps identified).
+**Current baseline (re-verified 2026-08-23, round 2):** 106 tests,
+0 failed; clippy/fmt/deny green; kernel-purity, fingerprint
+(`d8bcd004…4e8c`, stable), no-llm, and both SLO bench gates green
+(search p99 drifted 680→731µs, still inside the 3ms budget). Full detail:
+`round-2-review.prd`.
 
-## Backlog
+**Known caveat:** no CI pipeline exists — all gates are manual `cargo xtask`
+invocations (round-2 item W10).
+
+## Initial build (M0–M8, shipped 2026-08)
+
+All nine milestones landed in order, one commit each, every gate green at
+each step (88 tests at completion).
+
+| Milestone | Delivered |
+|---|---|
+| M0 | Workspace scaffolding: kernel, wire, xtask; toolchain/dep pins resolved (deviations recorded in `MILESTONE_REPORT.md`) |
+| M1 | Ontology: `pack!` macro engine, dev-v1 pack (13 memory types, 12 entity types, 48 kinds), R-Pk/R-T validators |
+| M2 | Storage: `Storage` trait, registered Cypher catalogue, FalkorDB adapter, InMemory double, bi-temporal reads |
+| M3 | Cache + MCP client: ArcSwap snapshots, 2Q admission, sled WAL, stdio MCP server, search SLO bench (100k) |
+| M4 | Reasoning: Crepe R1–R9 + D1–D6 fixpoints, Steel explain traces + R6, idempotent derived-edge writeback |
+| M5 | Cluster: owner leases with epoch fencing, HMAC-signed envelopes, peer admission, SSE change feed |
+| M6 | Ingestion: IngestService pipeline (HMAC → fingerprint → ceiling → triples), entity extraction, `end_session` tool, worker host |
+| M7 | Operation registry: one entry per operation, MCP+HTTP schema parity, audit ledger, goldens |
+| M8 | Dreams: MCR² + sparsity guardrails, consolidation cycle with rollback, trigger model, discovery proposals |
+
+## Backlog (round 2 — see round-2-review.prd for full detail)
 
 | ID | Item | Source | Status |
 |----|------|--------|--------|
-| — | — | — | — |
+| P1 | Commit the round-1 closure (35 modified + 8 untracked files) | round-2 process finding | blocking |
+| B3 | Fencing tokens never reach storage writes (R-C3) | round-2 | open |
+| B4 | `/v1/changes` ignores `since_lsn`; no replay buffer; no 409 (R-C6) | round-2 | open |
+| B5 | Client-forged SimilarTo persists with Asserted (R-T14) | round-2 | open |
+| B6 | Audit fallback ledger cross-org + volatile (R-A1) | round-2 | open |
+| B7 | Quiet hours block, not reorder, the backlog (R-Dr14) | round-2 | open |
+| W9 | Forbidden §2.5 edges: reasoning/cache/client → storage, unrecorded | round-2 | open |
+| W10 | No CI pipeline for the gate suite | round-2 | open |
+| W11 | Unrecorded deps/deny changes (regex, clap, stats_alloc, wildcard-paths) | round-2 | open |
+| W12 | Default bearer credential + optional SSE auth (R-Sec1/5/7) | round-2 | open |
+| W13 | Cache silently filters visibility violations (CR-22/R-MT4); `get_memory_for` dead code | round-2 | open |
+| W14 | `/health/ready` static; metric families missing; OTel absent (R-O2/3/4) | round-2 | open |
+| H9 | M8 tests weaker than ACs; `abstract` unimplemented | round-2 | open |
+| H10 | Multi-node claims unsubstantiated (no Dockerfile, no leader-kill test) | round-2 | open |
+| H11 | E2E chains split; R-T16a replay missing; online end_session untested | round-2 | open |
+| H12 | Round-1 residue: W7 kill test; RedisFireQueue unwired; H2 persistence; untested fixes | round-2 | open |
+| H13 | Client MCP tool list hand-maintained; 3 stale stubs (M7 parity) | round-2 | open |
+| H14 | Unlisted deferrals: Transitive finder, #11, #13 | round-2 | open |
 
 ## In progress
 
@@ -27,10 +72,31 @@ two correctness bugs and a set of unwired runtime gaps identified).
 
 | ID | Item | Closed by |
 |----|------|-----------|
-| — | — | — |
+| B1 | MCR² alpha off by 1/n (§11.2) | `dreams/src/mcr2.rs`; closed-form ln 5 test |
+| B2 | 2Q duplicate A1in admission; vacuous scan test | `cache/src/lib.rs`; eviction-forcing rewrite |
+| W1 | `end_session` dispatched over stdio (gRPC + WAL offline, §5.2) | `client/src/mcp.rs`; stdio smoke test |
+| W2 | R-T4 inverse materialization on all write paths | kernel `materialize_inverse`; ingest + both backends + R6 |
+| W3 | Backend-assigned embeddings on ingest commit (§7.5) | `ingest/src/embedding.rs`; FakeEmbedder + fastembed feature |
+| W4 | Dreams SimilarTo @0.85 with Computed provenance (R-T14) | `dreams/src/lib.rs`; excluded from hairball |
+| W5 | Reconnecting SSE subscriber: LSN hold-back, R-C6 gap/409, R-C5 stall | `client/src/sync.rs` |
+| W6 | HTTP parity binding: every op over HTTP, CR-9 | `server/src/http_bind.rs`; over-the-wire parity test |
+| W7 | backend-node mode: one listener (gRPC+HTTP+SSE), lease re-election, chitchat gossip | `server/src/backend.rs` — **round-2 audit: prescribed kill-holder test absent (H10/H12)** |
+| W8 | Session-wrapup → reasoning enqueue (§10.7 step 8) | `ingest/src/service.rs`; bounded-wait test |
+| H1 | `--adapter noop` starts without a live backend | `worker/src/main.rs` (lazy channel) |
+| H2 | LRU(1000) idempotency + persisted source ceilings (§18.8.5) | `ingest/src/service.rs` |
+| H3 | `xtask bench` SLO gate + `xtask no-llm` CR-19 grep | `xtask/src/main.rs` |
+| H4 | `/metrics` + `/health/{ready,cluster,sync,hydration}` | mounted in `http_bind.rs` |
+| H5 | Per-client SSE HMAC (R-Sec5); bearer auth on ops (R-Sec7) | `server/src/sse.rs`, `http_bind.rs` |
+| H6 | Small-fry: tag normalization; O(E) k-hop harvest; `get_memory_for` + `PermissionDenied` (R-MT4); no `blocking_lock` in ingest Clone; §14.3 `effective_strength`; Redis fire channel + R-Dr13/R-Dr14 quiet hours | across kernel/storage/reasoning/dreams — **round-2 audit: get_memory_for unwired, fire queue unwired, two fixes untested (H12)** |
+| H7 | Audit ledger routed onto storage templates (R-A1) | `ops/src/audit.rs` (in-process double kept) |
+| H8 | Milestone report residual-work disclosure | `MILESTONE_REPORT.md` round-1 addendum |
 
 ## Deferred to v2 (with PRD citation)
 
 | ID | Item | PRD |
 |----|------|-----|
-| — | — | — |
+| D1 | Iceberg / Delta / parquet-dir adapter workers | §18.4, §24 |
+| D2 | Second-pack demo | §23.26, §24 |
+| D3 | Federation | §24 |
+| D4 | Embedding fine-tuning | §24 |
+| D5 | Ingest-time SimilarTo seeding (`SimilarityCosine`) | §24 q12 (lean: no) |
