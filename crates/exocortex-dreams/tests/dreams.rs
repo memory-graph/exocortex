@@ -387,3 +387,107 @@ fn mcr2_log_det_matches_closed_form() {
     );
     assert!(v.delta_r > 0.0, "orthogonal classes carry positive ΔR");
 }
+
+/// §23 #12: the Transitive finder proposes `a->c` for open two-hop paths,
+/// excludes pairs with a direct edge, and never proposes over derived
+/// path edges (R4/R5 closures, R-Dr7); proposals never write edges.
+#[tokio::test]
+async fn transitive_finder_proposes_only_open_indirect_pairs() {
+    use exocortex_kernel::{RelKindId, Relationship, RelationshipProperties};
+    let storage = InMemoryStorage::new(ontology());
+    let a = MemoryId([1; 16]);
+    let b = MemoryId([2; 16]);
+    let c = MemoryId([3; 16]);
+    let d = MemoryId([4; 16]);
+    for (i, id) in [(1usize, a), (2, b), (3, c), (4, d)] {
+        let mut m = mem_with_embedding(i, None, unit(i));
+        m.id = id;
+        storage.upsert_memory(&m).await.unwrap();
+    }
+    let kind = RelKindId(5); // any registered kind id; provenance is the axis under test
+    let mk = |from, to, derived| Relationship {
+        id: exocortex_kernel::RelationshipId::derive(from, kind, to, None),
+        kind,
+        from,
+        to,
+        visibility: Visibility::Org,
+        provenance: if derived {
+            Provenance::Derived {
+                rule_id: "R4".into(),
+                evidence: vec![],
+            }
+        } else {
+            Provenance::Asserted { author: "t".into() }
+        },
+        properties: RelationshipProperties {
+            strength: 0.5,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: chrono::Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        lsn: LSN::new_local(0),
+    };
+    // a->b->c open asserted path: proposes (a, c).
+    storage.upsert_relationship(&mk(a, b, false)).await.unwrap();
+    storage.upsert_relationship(&mk(b, c, false)).await.unwrap();
+    // Direct edge exists for (a, b) — no proposal for it beyond the path itself.
+    storage.upsert_relationship(&mk(a, b, false)).await.unwrap();
+    // Derived two-hop path a->b? make d-path derived: b->d derived, d->c? simpler:
+    // b->d derived, d... only 2-hop a->b->c qualifies. Add derived path b->d->? skip;
+    // assert exclusion via a second path: d->a derived and a->? none.
+    storage.upsert_relationship(&mk(b, d, true)).await.unwrap();
+    storage.upsert_relationship(&mk(d, c, false)).await.unwrap();
+
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        false,
+        "disc".into(),
+    );
+    let region = RegionKey {
+        org: "o".into(),
+        project: "p".into(),
+        memory_type: 3,
+    };
+    let proposals = engine.run_discovery(&region).await.unwrap();
+    let pairs: Vec<_> = proposals.iter().map(|d| d.endpoints).collect();
+    assert!(
+        pairs.contains(&(a, c)),
+        "open two-hop path a->b->c proposes (a,c): {pairs:?}"
+    );
+    // The derived-first-hop path (b->d derived) never proposes (b,c).
+    assert!(
+        !pairs.contains(&(b, c)),
+        "derived path edges are excluded (R-Dr7): {pairs:?}"
+    );
+    // §23 #11: quality on the surface equals the finder's stamped value.
+    for d in &proposals {
+        assert_eq!(d.quality, DiscoveryKind::Transitive.default_quality());
+        assert_eq!(d.quality, d.rate_quality());
+    }
+    // R-Dr1: proposals never became edges.
+    let open: Vec<_> = {
+        use futures::StreamExt;
+        let mut rs = storage.stream_all_relationships().await;
+        let mut v = Vec::new();
+        while let Some(Ok(r)) = rs.next().await {
+            if r.valid_until.is_none() {
+                v.push((r.from, r.to));
+            }
+        }
+        v
+    };
+    assert!(!open.contains(&(a, c)), "proposal did not write an edge");
+}

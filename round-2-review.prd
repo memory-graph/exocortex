@@ -1,8 +1,8 @@
 # Exocortex v1 — Round 2 Review (Audit of Round-1 Closure)
 
-**Status:** Open work items from the 2026-08-23 audit of the round-1 closure
-against `exocortex-core-prd.md`. This file is the round-2 worklist; accepted
-items get promoted into `master-plan.prd`.
+**Status:** CLOSED 2026-08-25. Every item below landed with its verify
+clause; `master-plan.prd` tracks the closure map and the v2 deferrals
+(D6-D11).
 
 **Method:** deterministic gates re-run fresh, plus four orthogonal reviewers
 (milestone-AC auditor, round-1 closure verifier, invariants/security auditor,

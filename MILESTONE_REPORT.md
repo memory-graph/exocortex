@@ -191,3 +191,93 @@ residual-work list**; the round-1 pass closed all of it:
 `iceberg-adapter` / `delta-adapter` / `parquet-dir-adapter` workers
 (§18.4) and the second-pack demo (§23.26) — the pack seam and the
 worker host already exercise for both.
+
+## Post-review round 2 (2026-08-25)
+
+`round-2-review.prd` is the authoritative round-2 worklist; this pass
+closed all of it. Worklist → code map:
+
+- **B3** fenced writes: `upsert_batch_fenced`/`delete_memory_fenced` on
+  the Storage seam with a lease-token check (Redis GET in Falkor, lease
+  table in InMemory — which also gained real lease semantics: epochs,
+  expiry, single-holder). Dreams consolidates exclusively through the
+  fenced paths and releases its lease on every path. Tests: in-memory
+  fencing (re-election, expiry, held-lease, fenced delete) +
+  FALKOR_URL-gated live suite.
+- **B4** SSE replay: bounded replay ring on `ClusterNode` (single
+  publish path feeds hub + ring); `/v1/changes` honors `?since_lsn`
+  (replay then live), answers `409 Resync Required` with an
+  `x-exocortex-min-lsn` floor header past the window; the client advances
+  past the floor on 409 instead of spinning. Tests: replay order, 409
+  boundary, token-less 401, end-to-end feed timing.
+- **B5** `SimilarTo` forged at the boundary: `RejectCode
+  COMPUTED_KIND_REJECTED` (proto value 12 — additive, wire-compatible);
+  Dreams stays the sole producer (R-T14).
+- **B6** audit tenancy: the ledger is keyed per-org; `audit_range` is
+  org-scoped on both the Cypher template and the volatile fallback.
+- **B7** quiet hours reorder (R-Dr14): deferral only below
+  `QUIET_HOURS_BACKLOG_MIN` (LLEN check); counters reset on completion,
+  not at fire (R-Dr13); backend-node wires the Redis fire drainer
+  (`--redis-url`, `--quiet-hours`).
+- **W9** dependency edges: client→storage removed (types via
+  `exocortex-ops` re-exports; storage is dev-dep only). The
+  reasoning→storage and cache→storage edges are REQUIRED by the PRD's own
+  verbatim skeletons (§10.6 `ReasoningEngine<S: Storage>`; §8.4 imports
+  `exocortex_storage::{...}`) — a §2.5-vs-body conflict, recorded here
+  per ground rule 1 rather than refactored away.
+- **W10** CI: `.github/workflows/ci.yml` runs fmt/clippy/deny/tests/
+  kernel-purity/fingerprint/gen-schemas/no-llm/bench.
+- **W11** unrecorded dep changes, now recorded: `regex` (entity
+  extraction, ingest), `clap` ×3 (worker/server/client binaries),
+  `stats_alloc` (cache dev), `deny.toml allow-wildcard-paths = true`
+  (schema-v2 cargo-deny requires it for the wildcard-path entries the
+  PRD's own deny.toml format used).
+- **W12** no release default credential: `--bearer-token` absent fails
+  fast in release (debug keeps the dev token with a warning); backend
+  SSE requires a token (mcp-standalone keeps the cluster-key default).
+- **W13** `PermissionDenied` surfaces: `get_memory` falls through the
+  cache to `get_memory_for`; invisible rows answer `Unauthorized` (not a
+  silent None) and cold-cache misses fill from storage (R-C8). This also
+  activated the previously dead `get_memory_for` (H6 residue).
+- **W14** readiness is observational: `/health/ready` = hydrated (org
+  graph resident through the writer) ∧ storage ping (new `Storage::ping`
+  — Redis PING in Falkor) ∧ reasoning alive ∧ lease tick < 15s; failed
+  checks named in the 503 body. R-O2 families wired: ops duration
+  histogram, cache rebuild + graph levels, 2Q admission decisions,
+  cluster invalidations, lease transitions. **OTel (R-O3) remains
+  absent** — deferred to v2 (new dependency decision), recorded here.
+- **H9** M8 ACs at full strength: literal 10k dataset; poison rollback
+  rides the real cycle (negative tolerance trips R-Mcr3; merged rows
+  verified closed). **ABSTRACT**: the PRD names the action (§12.1 step 4)
+  without an ontology shape for abstraction rows — v1 stamps multi-member
+  class representatives in `ConsolidationResult.abstracted`; the
+  row-writing variant is an open question (below), not a silent
+  invention.
+- **H10** `Dockerfile` (multi-stage; the compose image), chaos
+  `scripts/chaos-leader-kill.sh` (<2s re-election), compose carries
+  explicit bearer tokens.
+- **H11** the §23 #18 chain end-to-end: gRPC Submit through a booted
+  backend node → storage invalidations (InMemoryStorage now has a real
+  change feed) → cluster hub → SSE → sibling client cache within 500ms;
+  R-T16a two-sync test proves snapshot bumps append assertions.
+- **H13** client MCP surface is registry-driven: `get_memory`/
+  `find_related` implemented over the local cache, stale M4/M7 stubs
+  deleted, parity test pins tool list ⊆ registry ∪ {end_session} with
+  all read ops present (admin ops are HTTP-only by §4.4).
+- **H14** Transitive finder implemented (open 2-hop paths, no direct
+  edge, derived path edges excluded per R-Dr7, proposals never edges);
+  quality reconciled surface↔metric by the single `default_quality`.
+  Contradiction-resolution op (§23 #13) deferred to v2 (below).
+- **H6 residue** closed: fire queue wired (B7), `get_memory_for` live
+  (W13), tag-normalization and `effective_strength` closed-form tests.
+
+### Round-2 open questions
+
+1. **ABSTRACT's ontology shape** (§12.1 step 4): which memory type and
+   edge kinds represent an abstraction row — second-pack ontology work.
+2. **Contradiction resolution op** (§23 #13): D4 propagates; the
+   resolve/accept surface needs a registry design.
+3. **R-O3 OTel**: new dependency decision; propose opentelemetry + otlp
+   feature flag in v2.
+4. **Cross-domain/concurrent-region suites** (§23 #21/#22): recorded as
+   v2 deferrals in `master-plan.prd` (heavy harness work).

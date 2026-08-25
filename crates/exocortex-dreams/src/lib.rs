@@ -112,6 +112,8 @@ pub struct DreamsEngine<S: Storage> {
     pub rx_fire: tokio::sync::Mutex<mpsc::Receiver<(RegionKey, RegionWriteCounters)>>,
     /// Node identity for lease tokens.
     pub node_id: SmolStr,
+    /// Discovery proposals awaiting `accept_discovery` (R-Dr1).
+    pub discoveries: DashMap<uuid::Uuid, Discovery>,
 }
 
 impl<S: Storage + 'static> DreamsEngine<S> {
@@ -135,6 +137,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             tx_fire,
             rx_fire: tokio::sync::Mutex::new(rx_fire),
             node_id,
+            discoveries: DashMap::new(),
         }
     }
 
@@ -549,6 +552,66 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     }
 }
 
+impl<S: Storage + 'static> DreamsEngine<S> {
+    /// §12.1 discovery pass — the Transitive finder (§23 #12): two-hop
+    /// paths `a -e1-> b -e2-> c` with no direct `a->c` edge and no
+    /// derived path edges (R4/R5 write `Derived` provenance; their
+    /// closures must not be re-proposed, R-Dr7). Proposals never touch
+    /// the graph (R-Dr1/R-T16) — they wait in `pending_discoveries` for
+    /// `accept_discovery`.
+    pub async fn run_discovery(&self, region: &RegionKey) -> anyhow::Result<Vec<Discovery>> {
+        use futures::StreamExt;
+        let mut edges: Vec<(MemoryId, MemoryId, u32, bool)> = Vec::new(); // (from, to, kind, derived)
+        let mut rs = self.storage.stream_all_relationships().await;
+        while let Some(Ok(r)) = rs.next().await {
+            let derived = matches!(r.provenance, Provenance::Derived { .. });
+            let open = r.valid_until.is_none();
+            if open {
+                edges.push((r.from, r.to, r.kind.0, derived));
+            }
+        }
+        drop(rs);
+        let direct: std::collections::HashSet<(MemoryId, MemoryId)> =
+            edges.iter().map(|(f, t, _, _)| (*f, *t)).collect();
+
+        let cycle: SmolStr = format!("dream:{}", uuid::Uuid::new_v4()).into();
+        let mut out = Vec::new();
+        'outer: for (a, b, k1, d1) in &edges {
+            for (c_from, c, k2, d2) in &edges {
+                if c_from == b && c != a && !d1 && !d2 && !direct.contains(&(*a, *c)) {
+                    let d = Discovery {
+                        id: uuid::Uuid::new_v4(),
+                        kind: DiscoveryKind::Transitive,
+                        endpoints: (*a, *c),
+                        quality: DiscoveryKind::Transitive.default_quality(),
+                        via_types: (*k1, *k2),
+                        discovery_cycle_id: cycle.clone(),
+                        discovered_at: chrono::Utc::now(),
+                    };
+                    metrics::counter!(
+                        "exocortex_dreams_discoveries_total",
+                        "type" => "transitive",
+                        "quality" => "0.6"
+                    )
+                    .increment(1);
+                    self.discoveries.insert(d.id, d.clone());
+                    out.push(d);
+                    if out.len() >= 16 {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let _ = region;
+        Ok(out)
+    }
+
+    /// Proposals awaiting `accept_discovery` (R-Dr1: proposals, never edges).
+    pub fn pending_discoveries(&self) -> Vec<Discovery> {
+        self.discoveries.iter().map(|e| e.value().clone()).collect()
+    }
+}
+
 /// Discovery proposals (R-Dr1: never edges). Structured, no prose (R-Dr8).
 #[derive(Clone, Debug)]
 pub struct Discovery {
@@ -579,6 +642,20 @@ pub enum DiscoveryKind {
     Orphan,
     /// Transitive closure candidate (excludes R4/R5-derived pairs, R-Dr7).
     Transitive,
+}
+
+impl DiscoveryKind {
+    /// The quality stamped at proposal time — the single value both the
+    /// surface (`Discovery.quality`) and the metric label carry (§23 #11:
+    /// reconciled by construction).
+    pub fn default_quality(self) -> f32 {
+        match self {
+            DiscoveryKind::CrossDomain => 0.9,
+            DiscoveryKind::TemporalEcho => 0.7,
+            DiscoveryKind::Orphan => 0.4,
+            DiscoveryKind::Transitive => 0.6,
+        }
+    }
 }
 
 impl Discovery {

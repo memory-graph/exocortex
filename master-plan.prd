@@ -39,28 +39,11 @@ each step (88 tests at completion).
 | M7 | Operation registry: one entry per operation, MCP+HTTP schema parity, audit ledger, goldens |
 | M8 | Dreams: MCR² + sparsity guardrails, consolidation cycle with rollback, trigger model, discovery proposals |
 
-## Backlog (round 2 — see round-2-review.prd for full detail)
+## Backlog
 
 | ID | Item | Source | Status |
 |----|------|--------|--------|
-| P1 | Commit the round-1 closure (35 modified + 8 untracked files) | round-2 process finding | blocking |
-| B3 | Fencing tokens never reach storage writes (R-C3) | round-2 | open |
-| B4 | `/v1/changes` ignores `since_lsn`; no replay buffer; no 409 (R-C6) | round-2 | open |
-| B5 | Client-forged SimilarTo persists with Asserted (R-T14) | round-2 | open |
-| B6 | Audit fallback ledger cross-org + volatile (R-A1) | round-2 | open |
-| B7 | Quiet hours block, not reorder, the backlog (R-Dr14) | round-2 | open |
-| W9 | Forbidden §2.5 edges: reasoning/cache/client → storage, unrecorded | round-2 | open |
-| W10 | No CI pipeline for the gate suite | round-2 | open |
-| W11 | Unrecorded deps/deny changes (regex, clap, stats_alloc, wildcard-paths) | round-2 | open |
-| W12 | Default bearer credential + optional SSE auth (R-Sec1/5/7) | round-2 | open |
-| W13 | Cache silently filters visibility violations (CR-22/R-MT4); `get_memory_for` dead code | round-2 | open |
-| W14 | `/health/ready` static; metric families missing; OTel absent (R-O2/3/4) | round-2 | open |
-| H9 | M8 tests weaker than ACs; `abstract` unimplemented | round-2 | open |
-| H10 | Multi-node claims unsubstantiated (no Dockerfile, no leader-kill test) | round-2 | open |
-| H11 | E2E chains split; R-T16a replay missing; online end_session untested | round-2 | open |
-| H12 | Round-1 residue: W7 kill test; RedisFireQueue unwired; H2 persistence; untested fixes | round-2 | open |
-| H13 | Client MCP tool list hand-maintained; 3 stale stubs (M7 parity) | round-2 | open |
-| H14 | Unlisted deferrals: Transitive finder, #11, #13 | round-2 | open |
+| — | — | — | — |
 
 ## In progress
 
@@ -72,6 +55,24 @@ each step (88 tests at completion).
 
 | ID | Item | Closed by |
 |----|------|-----------|
+| P1 | Round-1 closure committed | `bb87acd` |
+| B3 | Fenced writes (R-C3) end to end | storage seam + both backends + dreams; fencing tests |
+| B4 | `?since_lsn` replay + 409 + client advance (R-C6) | cluster replay ring + sse handler + client sync |
+| B5 | Forged SimilarTo rejected (R-T14) | `COMPUTED_KIND_REJECTED`; e2e test |
+| B6 | Audit ledger per-org (R-A1) | keyed ledger + org-scoped reads; isolation test |
+| B7 | Quiet hours reorder + counter reset on completion (R-Dr13/14) | fire.rs backlog check; backend fire drainer |
+| W9 | Client storage edge removed; §2.5 conflict recorded | ops re-exports; report deviation |
+| W10 | CI pipeline for every gate | `.github/workflows/ci.yml` |
+| W11 | Unrecorded deps/deny changes recorded | report round-2 addendum |
+| W12 | No release default credential; SSE token required | main.rs resolve_bearer; SseAuth |
+| W13 | PermissionDenied surfaces; get_memory_for wired | get_memory op fallthrough; parity test |
+| W14 | Observational readiness + metric families | http_bind ready checks; ping(); R-O2 emits |
+| H9 | 10k dataset, real poison rollback, abstract stamp | dreams tests; class representatives |
+| H10 | Dockerfile + chaos script + compose tokens | `Dockerfile`, `scripts/chaos-leader-kill.sh` |
+| H11 | gRPC→SSE→sibling chain + R-T16a replay | InMemory change feed; `e2e_chain.rs` |
+| H12 | Round-1 residue closed | fire drainer, get_memory_for, ceiling persist, unit tests |
+| H13 | Registry-driven client MCP surface | mcp.rs list/dispatch; stdio parity test |
+| H14 | Transitive finder; quality reconciled; deferrals recorded | `run_discovery` + test; D7/D8 above |
 | B1 | MCR² alpha off by 1/n (§11.2) | `dreams/src/mcr2.rs`; closed-form ln 5 test |
 | B2 | 2Q duplicate A1in admission; vacuous scan test | `cache/src/lib.rs`; eviction-forcing rewrite |
 | W1 | `end_session` dispatched over stdio (gRPC + WAL offline, §5.2) | `client/src/mcp.rs`; stdio smoke test |
@@ -100,3 +101,9 @@ each step (88 tests at completion).
 | D3 | Federation | §24 |
 | D4 | Embedding fine-tuning | §24 |
 | D5 | Ingest-time SimilarTo seeding (`SimilarityCosine`) | §24 q12 (lean: no) |
+| D6 | OTel export (R-O3) — opentelemetry dep decision | §19, round-2 W14 |
+| D7 | Contradiction-resolution op (§23 #13) | §23 #13, round-2 H14 |
+| D8 | ABSTRACT row-writing variant (ontology shape TBD) | §12.1 step 4, round-2 H9 |
+| D9 | 100-user visibility fuzz + concurrent-region/CrossRegion suites | §23 #21/#22, round-2 H10 |
+| D10 | Wire-protocol throughput fan-out + additive-change rollout tests | §23 #23, round-2 H10 |
+| D11 | Multi-node leader-kill/partition live runs (Dockerfile + chaos script shipped; needs docker in the runner) | §3 M5 AC, round-2 H10 |
