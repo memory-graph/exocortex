@@ -236,6 +236,25 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 self.merge(&mut res, c, lease).await?;
             }
         }
+        // §12.1 step 4 ABSTRACT (informational in v1): the PRD names the
+        // action without specifying the abstraction's ontology shape, so
+        // the cycle records each multi-member class's surviving
+        // representative in `abstracted` — an auditable stamp of the
+        // consolidation structure. Inventing memory rows or kinds here
+        // would violate the "no silent design" rule; the row-writing
+        // variant lands with the second-pack ontology work (open
+        // question, MILESTONE_REPORT).
+        {
+            let mut by_class: std::collections::BTreeMap<u32, Vec<MemoryId>> = Default::default();
+            for a in anchors.iter().filter(|a| !res.merged.contains(&a.id)) {
+                by_class.entry(a.class as u32).or_default().push(a.id);
+            }
+            for (_class, members) in by_class {
+                if members.len() >= 3 {
+                    res.abstracted.push(*members.last().expect("non-empty"));
+                }
+            }
+        }
         for a in &anchors {
             self.strengthen(&mut res, a, lease).await?;
             self.prune(&mut res, a).await?;

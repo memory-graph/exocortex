@@ -81,22 +81,24 @@ fn unit(i: usize) -> Vec<f32> {
 #[tokio::test]
 async fn ten_k_dataset_reduces_cardinality_and_keeps_mcr2() {
     let storage = InMemoryStorage::new(ontology());
-    // 4 base memories x 10 near-duplicates each; the anchor window (top 32
-    // by recency with id tie-break) fills with duplicate groups, so the
-    // cycle merges >= 20% of what it sees (§12.5 step 9's shape).
-    let n_base = 4usize;
-    let dups_per = 10usize;
-    for i in 0..n_base {
-        storage
-            .upsert_memory(&mem_with_embedding(i, None, unit(i)))
-            .await
-            .unwrap();
+    // §12.5 step 9's literal dataset: 10,000 memories in storage. The
+    // anchor window (top 32 by recency) is filled by 8 duplicate groups
+    // x 4 near-duplicates; the remaining 9,968 rows are older fillers
+    // (orthogonal embeddings) that stay outside the window.
+    let groups = 8usize;
+    let dups_per = 4usize;
+    let fillers = 10_000usize - groups * dups_per;
+    for i in 0..fillers {
+        let mut m = mem_with_embedding(i + 100, None, unit(i));
+        m.recorded_at = chrono::Utc::now() - chrono::Duration::days(30 + (i % 30) as i64);
+        storage.upsert_memory(&m).await.unwrap();
+    }
+    for g in 0..groups {
         for d in 0..dups_per {
-            // Duplicates: near-identical embedding (unit + tiny noise).
-            let mut emb = unit(i);
-            emb[(i + d + 1) % 64] = 0.05;
+            let mut emb = unit(g);
+            emb[(g + d + 1) % 64] = 0.05;
             storage
-                .upsert_memory(&mem_with_embedding(i * 1000 + d, Some(i), emb))
+                .upsert_memory(&mem_with_embedding(50_000 + g * 100 + d, Some(g), emb))
                 .await
                 .unwrap();
         }
@@ -135,67 +137,62 @@ async fn ten_k_dataset_reduces_cardinality_and_keeps_mcr2() {
     assert!(res.lease_epoch >= 1);
     assert_eq!(res.owner_node_id, "dreams-1");
     assert!(!res.session_id.is_empty());
-    // R-Dr10: merged ids retained.
+    // R-Dr10: merged ids retained; §12.1 step 4 ABSTRACT stamps the
+    // multi-member classes' representatives.
     assert!(!res.merged.is_empty());
+    assert!(
+        !res.abstracted.is_empty(),
+        "abstract records class representatives: input={} merged={}",
+        res.memories_input,
+        res.merged.len()
+    );
 }
 
 #[tokio::test]
 async fn poison_consolidation_flags_regression_and_rolls_back() {
     let storage = InMemoryStorage::new(ontology());
-    // One tight cluster + one outlier; merge the outlier into the cluster
-    // via a hand-crafted candidate would degrade ΔR. Simulate via a tiny
-    // engine with rollback enabled and a manufactured regression.
+    // A negative tolerance turns the R-Mcr3 guard into a tripwire: ANY
+    // ΔR movement (even the normal post-merge improvement) registers as a
+    // regression, so the cycle exercises the REAL rollback path — merged
+    // rows are closed back via the fenced delete, not hand arithmetic.
     let engine = DreamsEngine::new(
         Arc::new(storage.clone_dyn()),
         DreamsTrigger::default(),
-        0.01,
+        -0.5, // poisoned tolerance (R-Mcr3 trips unconditionally)
         0.05,
         true, // rollback_on_regression
         "dreams-1".into(),
     );
-    // Embeddings: two well-separated classes; merging across them degrades.
-    let mut a = vec![1.0f32, 0.0];
-    let mut b = vec![0.0f32, 1.0];
-    let _ = (&mut a, &mut b);
-    let mut m0 = mem_with_embedding(0, None, a.clone());
-    m0.id = MemoryId([1; 16]);
-    let mut m1 = mem_with_embedding(1, None, b.clone());
-    m1.id = MemoryId([2; 16]);
-    storage.upsert_memory(&m0).await.unwrap();
-    storage.upsert_memory(&m1).await.unwrap();
-
-    // Compute ΔR before/after a cross-class merge to prove the guard math.
-    let e = MCR2Engine::default();
-    let set = vec![
-        MemoryWithEmbedding {
-            id: m0.id,
-            class: 3,
-            embedding: a,
-        },
-        MemoryWithEmbedding {
-            id: m1.id,
-            class: 3,
-            embedding: b,
-        },
-    ];
-    let before = e.compute(&set).unwrap();
-    // After "merging": the pair collapses to one row — ΔR changes; for the
-    // poison case we assert the guard fires on a synthetic regression.
-    let poison_after = before.delta_r - 0.5;
-    assert!(
-        poison_after < before.delta_r - 0.01,
-        "R-Mcr3 tolerance trips"
-    );
-
-    // The engine path: force a regression by dropping the surviving set to
-    // fewer, well-separated rows (the cycle detects and rolls back).
+    // Two duplicate groups so the cycle genuinely merges rows first.
+    for g in 0..2usize {
+        for d in 0..3usize {
+            let mut emb = unit(g);
+            emb[(g + d + 1) % 64] = 0.05;
+            storage
+                .upsert_memory(&mem_with_embedding(60_000 + g * 100 + d, Some(g), emb))
+                .await
+                .unwrap();
+        }
+    }
     let region = RegionKey {
         org: "o".into(),
         project: "p".into(),
         memory_type: 3,
     };
     let res = engine.try_consolidate(&region).await.expect("cycle");
-    let _ = res; // single-pass on 2 rows either passes or records honestly
+    assert!(!res.merged.is_empty(), "the cycle merged duplicate rows");
+    assert!(
+        res.regression,
+        "R-Mcr3 guard fired on the poisoned tolerance"
+    );
+    // Rollback really ran: every merged row is closed in storage.
+    for id in &res.merged {
+        let row = storage.get_memory(id).await.unwrap().expect("row present");
+        assert!(
+            row.valid_until.is_some(),
+            "rollback closed merged row {id:?}"
+        );
+    }
 }
 
 #[tokio::test]

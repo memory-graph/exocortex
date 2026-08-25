@@ -112,6 +112,18 @@ pub struct SnapshotVersion {
     pub backend_lsn: u64,
 }
 
+/// Decode 32 hex chars into a 16-byte id.
+fn unhex32(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 impl ExocortexMcp {
     /// `exocortex.search_memories` (§7.12; p50 500µs / p99 3ms).
     #[tool(
@@ -159,31 +171,67 @@ impl ExocortexMcp {
         serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
-    /// `exocortex.traverse_relationships` — wired at M4/M7.
+    /// `exocortex.get_memory` (registry op, client-side over the cache).
     #[tool(
-        name = "exocortex.traverse_relationships",
-        description = "Bounded k-hop typed traversal (arrives with the reasoning milestone)."
+        name = "exocortex.get_memory",
+        description = "Fetch one memory by hex id from the local org graph."
     )]
-    pub async fn traverse_relationships_stub(&self) -> Result<String, String> {
-        Err("not implemented until M4/M7".to_string())
+    pub async fn get_memory(&self, #[tool(param)] id: String) -> Result<String, String> {
+        let bytes = unhex32(&id).ok_or_else(|| "id must be 32 hex chars".to_string())?;
+        let mid = exocortex_kernel::MemoryId(bytes);
+        match self.cache.get_memory(&self.org, &mid, &self.vc) {
+            Some(m) => {
+                #[derive(Serialize)]
+                struct Out {
+                    id: String,
+                    title: String,
+                    memory_type: u8,
+                }
+                serde_json::to_string(&Out {
+                    id,
+                    title: m.title.to_string(),
+                    memory_type: m.memory_type,
+                })
+                .map_err(|e| e.to_string())
+            }
+            None => Ok(serde_json::json!({ "memory": null }).to_string()),
+        }
     }
 
-    /// `exocortex.get_chain` — wired at M4/M7.
+    /// `exocortex.find_related` (registry op, client-side over the cache).
     #[tool(
-        name = "exocortex.get_chain",
-        description = "Provenance chain for a memory (arrives with the reasoning milestone)."
+        name = "exocortex.find_related",
+        description = "Bounded k-hop neighborhood of a memory (hex id anchor, depth <= 4)."
     )]
-    pub async fn get_chain_stub(&self) -> Result<String, String> {
-        Err("not implemented until M4/M7".to_string())
-    }
-
-    /// `exocortex.explain_edge` — wired at M4.
-    #[tool(
-        name = "exocortex.explain_edge",
-        description = "Structured proof for a derived edge (arrives with the reasoning milestone)."
-    )]
-    pub async fn explain_edge_stub(&self) -> Result<String, String> {
-        Err("not implemented until M4".to_string())
+    pub async fn find_related(
+        &self,
+        #[tool(param)] anchor: String,
+        #[tool(param)] k: Option<u8>,
+    ) -> Result<String, String> {
+        let bytes = unhex32(&anchor).ok_or_else(|| "anchor must be 32 hex chars".to_string())?;
+        let spec = exocortex_ops::TraversalSpec {
+            direction: exocortex_ops::Direction::Both,
+            kinds: Default::default(),
+            max_depth: k.unwrap_or(2).min(4),
+            max_nodes: 128,
+            visibility_ctx: self.vc.clone(),
+            as_of: None,
+        };
+        let hits = self
+            .cache
+            .traverse(&self.org, &exocortex_kernel::MemoryId(bytes), &spec);
+        let out: Vec<_> = hits
+            .iter()
+            .map(|m| {
+                use std::fmt::Write as _;
+                let mut hex = String::with_capacity(32);
+                for b in m.id.0 {
+                    let _ = write!(hex, "{b:02x}");
+                }
+                serde_json::json!({ "id": hex, "title": m.title.to_string() })
+            })
+            .collect();
+        serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
     /// `exocortex.end_session` (§13.6): wrapup batch submit. Online: gRPC
@@ -365,15 +413,33 @@ impl ServerHandler for ExocortexMcp {
         _pagination: rmcp::model::PaginatedRequestParam,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::Error> {
+        // H13/M7: the tool catalogue is registry-driven. Every registry
+        // function the client executes locally (the interactive-read set)
+        // plus the session-capture tool are listed; admin/write ops are
+        // backend HTTP-surface only by design.
+        let mut tools = vec![
+            Self::search_memories_tool_attr(),
+            Self::get_memory_tool_attr(),
+            Self::find_related_tool_attr(),
+            Self::end_session_tool_attr(),
+        ];
+        for entry in exocortex_ops::entries() {
+            let dispatchable = matches!(
+                entry.mcp_tool_name,
+                "exocortex.search_memories" | "exocortex.get_memory" | "exocortex.find_related"
+            );
+            if dispatchable && !tools.iter().any(|t| t.name == entry.mcp_tool_name) {
+                if let Ok(t) = serde_json::from_value::<rmcp::model::Tool>(serde_json::json!({
+                    "name": entry.mcp_tool_name,
+                    "description": entry.name,
+                })) {
+                    tools.push(t);
+                }
+            }
+        }
         Ok(rmcp::model::ListToolsResult {
             next_cursor: None,
-            tools: vec![
-                Self::search_memories_tool_attr(),
-                Self::traverse_relationships_stub_tool_attr(),
-                Self::get_chain_stub_tool_attr(),
-                Self::explain_edge_stub_tool_attr(),
-                Self::end_session_tool_attr(),
-            ],
+            tools,
         })
     }
 
@@ -386,13 +452,13 @@ impl ServerHandler for ExocortexMcp {
         let tcc = ToolCallContext::new(self, request, context);
         match tcc.name() {
             "exocortex.search_memories" => Self::search_memories_tool_call(tcc).await,
-            "exocortex.traverse_relationships" => {
-                Self::traverse_relationships_stub_tool_call(tcc).await
-            }
-            "exocortex.get_chain" => Self::get_chain_stub_tool_call(tcc).await,
-            "exocortex.explain_edge" => Self::explain_edge_stub_tool_call(tcc).await,
+            "exocortex.get_memory" => Self::get_memory_tool_call(tcc).await,
+            "exocortex.find_related" => Self::find_related_tool_call(tcc).await,
             "exocortex.end_session" => Self::end_session_tool_call(tcc).await,
-            _other => Err(rmcp::Error::invalid_params("method not found", None)),
+            _other => Err(rmcp::Error::invalid_params(
+                "method not found (backend-only operations are served over HTTP)",
+                None,
+            )),
         }
     }
 }

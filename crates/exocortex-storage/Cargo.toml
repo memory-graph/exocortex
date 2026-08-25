@@ -16,6 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 smol_str = { workspace = true }
 futures = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 once_cell = { workspace = true }
 chrono = { workspace = true }
 smallvec = { workspace = true }

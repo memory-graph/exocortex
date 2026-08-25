@@ -17,6 +17,9 @@ use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId,
 pub struct InMemoryStorage {
     inner: std::sync::Arc<InMemoryInner>,
     lsn: std::sync::Arc<AtomicU64>,
+    /// Change-feed fan-out (§9.1): every committed write publishes an
+    /// invalidation so the double exercises the full cluster/SSE path.
+    feed: tokio::sync::broadcast::Sender<Invalidation>,
 }
 
 struct InMemoryInner {
@@ -42,6 +45,7 @@ impl Clone for InMemoryStorage {
         Self {
             inner: self.inner.clone(),
             lsn: self.lsn.clone(),
+            feed: self.feed.clone(),
         }
     }
 }
@@ -58,6 +62,7 @@ impl InMemoryStorage {
                 lease_epochs: Default::default(),
             }),
             lsn: std::sync::Arc::new(AtomicU64::new(0)),
+            feed: tokio::sync::broadcast::channel(4096).0,
         }
     }
     /// A clone handle sharing the same underlying state (tests and caches).
@@ -122,7 +127,15 @@ impl InMemoryStorage {
         let mut store = self.inner.rels.lock().unwrap();
         let mut r = r.clone();
         r.lsn = exocortex_kernel::LSN::new_backend(lsn);
-        store.entry(r.id).or_default().push(r);
+        store.entry(r.id).or_default().push(r.clone());
+        drop(store);
+        let _ = self.feed.send(Invalidation::RelationshipUpserted {
+            id: r.id,
+            from: r.from,
+            to: r.to,
+            kind: r.kind,
+            lsn,
+        });
         Ok(CommitRecord {
             lsn,
             committed_at: Utc::now(),
@@ -139,7 +152,10 @@ impl Storage for InMemoryStorage {
         let mut store = self.inner.memories.lock().unwrap();
         let mut m = m.clone();
         m.lsn = exocortex_kernel::LSN::new_backend(lsn);
-        store.entry(m.id).or_default().push(m);
+        let id = m.id;
+        store.entry(id).or_default().push(m);
+        drop(store);
+        let _ = self.feed.send(Invalidation::MemoryUpserted { id, lsn });
         Ok(CommitRecord {
             lsn,
             committed_at: Utc::now(),
@@ -170,6 +186,8 @@ impl Storage for InMemoryStorage {
                 last.lsn = exocortex_kernel::LSN::new_backend(lsn);
             }
         }
+        drop(store);
+        let _ = self.feed.send(Invalidation::MemoryDeleted { id: *id, lsn });
         Ok(CommitRecord {
             lsn,
             committed_at: Utc::now(),
@@ -420,14 +438,21 @@ impl Storage for InMemoryStorage {
         &self,
         _r: &RegionKey,
     ) -> Result<BoxStream<'_, Result<Invalidation, StorageError>>, StorageError> {
-        Ok(Box::pin(futures::stream::empty()))
+        // Wildcard regions (§9.1): the double fans every invalidation to
+        // every subscriber regardless of the requested region key.
+        let rx = self.feed.subscribe();
+        use futures::StreamExt as _;
+        Ok(Box::pin(
+            tokio_stream::wrappers::BroadcastStream::new(rx)
+                .filter_map(|item| async move { item.ok().map(Ok) }),
+        ))
     }
     fn capabilities(&self) -> StorageCapabilities {
         StorageCapabilities {
             bi_temporal: true,
             streaming: true,
             leases: true,
-            change_feed: false,
+            change_feed: true,
             max_traversal_depth: 4,
         }
     }

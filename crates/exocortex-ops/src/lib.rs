@@ -13,7 +13,7 @@ pub mod operations;
 /// Client-facing shared types (§2.5 routes the client through ops; these
 /// re-exports let the client crate consume the visibility/delta vocabulary
 /// without a direct edge into the storage adapter crate).
-pub use exocortex_storage::{Invalidation, VisibilityContext};
+pub use exocortex_storage::{Direction, Invalidation, TraversalSpec, VisibilityContext};
 
 use async_trait::async_trait;
 use schemars::JsonSchema;

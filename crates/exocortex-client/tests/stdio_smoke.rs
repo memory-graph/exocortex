@@ -221,3 +221,78 @@ fn uuid_rand_bytes() -> [u8; 16] {
     let mix = nanos ^ (pid << 64);
     mix.to_be_bytes()
 }
+
+/// H13 (M7 task 3): the client's MCP tool catalogue is registry-driven —
+/// every interactive-read registry op is dispatchable client-side, every
+/// listed tool names a registry op (or the §13.5 session-capture tool),
+/// and no stale stubs remain.
+#[test]
+fn mcp_tool_list_matches_registry() {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-mcp-client"));
+    let dir = std::env::temp_dir().join(format!("exo-mcp-registry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    cmd.args(["--org", "registry", "--user", "tester"])
+        .arg("--data-dir")
+        .arg(&dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut client = Client {
+        child: cmd.spawn().expect("spawn"),
+    };
+    client.send_all(&[
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "t", "version": "0" }
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        }),
+    ]);
+    let _init = client.read_line();
+    let tools = client.read_line();
+    if tools.get("result").is_none() {
+        eprintln!("tools/list failed: {tools:?}");
+    }
+    let listed: Vec<String> = tools["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+
+    let registry: Vec<_> = exocortex_ops::entries()
+        .iter()
+        .map(|e| e.mcp_tool_name.to_string())
+        .collect();
+    // Read ops must all be client-dispatchable.
+    for read_op in [
+        "exocortex.search_memories",
+        "exocortex.get_memory",
+        "exocortex.find_related",
+    ] {
+        assert!(registry.contains(&read_op.to_string()));
+        assert!(
+            listed.contains(&read_op.to_string()),
+            "{read_op} listed on the client surface"
+        );
+    }
+    // No phantom tools: everything listed is a registry op or end_session.
+    for name in &listed {
+        assert!(
+            registry.contains(name) || name == "exocortex.end_session",
+            "{name} is not a registry tool"
+        );
+    }
+    // No stale stubs.
+    assert!(!listed.iter().any(|t| t.contains("traverse_relationships")));
+    assert!(!listed.iter().any(|t| t.contains("get_chain")));
+    assert!(!listed.iter().any(|t| t.contains("explain_edge")));
+}

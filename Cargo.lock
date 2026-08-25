@@ -1231,6 +1231,7 @@ dependencies = [
  "chrono",
  "clap",
  "exocortex-cache",
+ "exocortex-client",
  "exocortex-cluster",
  "exocortex-dreams",
  "exocortex-ingest",
@@ -1246,6 +1247,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "prost",
+ "prost-types",
  "redis 0.27.6",
  "rmcp",
  "serde",
@@ -1279,6 +1281,7 @@ dependencies = [
  "smol_str",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
