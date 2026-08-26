@@ -48,12 +48,22 @@ workspace license/repository metadata applies).
 
 ## Binaries
 
+- **Installer (primary)**: tag push (`git tag v0.1.0 && git push
+  memory-graph v0.1.0`) triggers `.github/workflows/release.yml` —
+  cross-platform release builds (macOS arm64 via macos-14, Intel via
+  macos-13, Linux x64) for all three binaries, sha256 checksums, and an
+  auto-generated `install.sh` attached to the GitHub Release:
+
+  ```sh
+  curl -LsSf     https://github.com/memory-graph/exocortex/releases/latest/download/install.sh | sh
+  ```
+
+  The script resolves `latest` (or honors `$INSTALL_VERSION`), picks the
+  platform archive, and installs into `$CARGO_HOME/bin`. No Rust
+  toolchain or protoc required — that was the point.
 - **git install**: `cargo install --git
   https://github.com/memory-graph/exocortex --bin exocortex-node` (needs
   `protoc`)
-- **cargo-dist** (planned): release builds for macOS arm64/x64 and Linux
-  x64 attached to GitHub Releases on tag push — removes the protoc/Rust
-  toolchain requirement for operators
 - **ghcr.io** (planned): push the existing Dockerfile image as
   `ghcr.io/memory-graph/exocortex-node`
 

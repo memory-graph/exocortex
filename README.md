@@ -14,10 +14,19 @@ next session ◀── agent queries search/find_related ◀┘
 
 ## Quickstart (local MCP server)
 
-**Prerequisites:** Rust 1.85+ ([rustup](https://rustup.rs)) and `protoc`
-(`brew install protobuf` / `apt install protobuf-compiler`).
-
 ### 1. Install
+
+**macOS (arm64/Intel) or Linux (x64):**
+
+```sh
+curl -LsSf https://github.com/memory-graph/exocortex/releases/latest/download/install.sh | sh
+```
+
+Installs `exocortex-mcp-client` (plus `exocortex-node` and
+`exocortex-worker` for team mode) into `~/.cargo/bin`. No Rust toolchain
+or protoc needed.
+
+**From source** (any platform; needs Rust 1.85+ and `protoc`):
 
 ```sh
 cargo install --git https://github.com/memory-graph/exocortex --bin exocortex-mcp-client
