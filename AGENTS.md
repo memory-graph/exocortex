@@ -14,6 +14,25 @@ authoritative spec is `docs/prd/exocortex-core-prd.md` (§-references
 throughout the code point into it); `docs/master-plan.prd` is the
 standing worklist — accepted work items live there or they don't live.
 
+## How work is organized
+
+The master plan (`docs/master-plan.prd`) is the single source of truth
+for what is being done. Every unit of work follows this lifecycle:
+
+1. **Proposed** — an item enters the plan's Backlog with an ID, a
+   one-line description, and a source (PRD §, review round, bug PRD).
+2. **In progress** — moved to the In-progress table with an owner.
+3. **Done** — moved to Done WITH closing evidence (commit sha, test
+   file, or gate name) in the same commit that closes it.
+4. **Deferred** — moved to the v2 table with a PRD citation; nothing is
+   silently dropped.
+
+Review rounds (`docs/reviews/round-<n>-review.prd`) audit completed
+work; their findings flow back through the same lifecycle with their own
+IDs. If you are asked to do something not in the plan, add it to the
+plan first. If you finish something, close it in the plan in the same
+commit — a stale plan is a lie about the repo.
+
 ## Layout
 
 - `crates/exocortex-kernel` — ontology core (types, provenance,
@@ -114,11 +133,10 @@ is pinned 1.85.0. Live-backend suites (`--features integration` with
 | What should this feature do? | `docs/prd/exocortex-core-prd.md` (the §-refs) |
 | What's accepted work? | `docs/master-plan.prd` |
 | What was delivered/deviated? | `docs/MILESTONE_REPORT.md` |
-| What did reviews find? | `docs/reviews/round-{1,2}-review.prd` |
+| What did reviews find? | `docs/reviews/round-{1,2,3}-review.prd` |
 | How do we publish? | `docs/PUBLISHING.md` (`scripts/publish.sh`) |
 | Known bugs, fixed? | `docs/bug-prd-external-key-identity.md` |
 | Future adapter work? | `docs/prd/mintlify-docs-integration-prd.md` |
 
-When a change closes or opens a work item, update `docs/master-plan.prd`
-in the same commit — the plan is the audit trail, and a stale plan is a
-lie about the repo.
+The closing rule of every task: the master plan reflects reality at
+every commit (see "How work is organized" above).
