@@ -1,117 +1,159 @@
 # Exocortex
 
-**The Open-Source Palantir — the Ontology, in-house. A memory graph for coding agents.**
-
-Coding harnesses (Claude Code, Codex, Cursor, custom agents) have short memories: every session starts cold, and what you taught the harness yesterday is gone today. Stuffing transcripts into context is expensive and lossy — the useful memory isn't the transcript, it's the *distilled outcome*: what got fixed, what was decided, what worked, what didn't.
-
-Exocortex is the substrate where those outcomes accumulate. It is a typed, provenance-stamped memory graph that harnesses read and write over [MCP](https://modelcontextprotocol.io) — sub-millisecond locally, durable at org scale on a backend, consolidated over time by an event-driven dreaming cycle.
+**A memory graph for your coding agent.** Your harness (Claude Code,
+Codex, Cursor, any MCP client) forgets everything between sessions.
+Exocortex is where the useful parts accumulate: what got fixed, what was
+decided, what worked, what didn't — typed, searchable, and provably
+deterministic. No LLM inside; all intelligence stays in your agent.
 
 ```
-session ends ──▶ end_session(wrapup) ──▶ typed nodes + edges ──▶ WAL ──▶ sync to backend
-                                                                    │
-next session ◀── MCP query (sub-ms local cache) ◀── SSE change feed ◀┘
-                                                                    │
-                              Dreams cycle (merge · abstract · prune · discover)
+session ends ──▶ agent calls end_session ──▶ typed nodes + edges stored
+                                                    │
+next session ◀── agent queries search/find_related ◀┘
 ```
 
-## Why it's different
+## Quickstart (local MCP server)
 
-- **No LLM inside. Ever.** The harness has the LLM; Exocortex only produces structured data. That is what makes it deterministic, testable, and fast enough for the interactive path. Enforced by a CI gate that greps the workspace for LLM crates and endpoints.
-- **The ontology is the product.** Memories are typed nodes; the reasoning power lives in 48 typed relationship kinds (8 buckets) with strength, confidence, evidence counts, and bi-temporal validity on every edge. Everything carries provenance (`Asserted` / `Derived` / `Computed` / `Extracted` / `Proposed` / `ExternalSnapshot`) — you always know *why the system believes this* and *when it was true*.
-- **Personal and org scale, same binary.** A solo developer runs `mcp-standalone` (embedded storage, no cluster). An org runs `backend-node` (3+ nodes, one graph per org, `Visibility` labels do the isolation). Deployment topology is a runtime flag, never a fork.
-- **Kernel + packs.** The ontology kernel is universal; domains ship as Rust extension packs. v1 includes `exocortex-pack-dev-v1` (13 memory types, 12 entity types, 48 relationship kinds). A legal or medical pack is a crate that registers against the same seam — packs are code, not config.
+**Prerequisites:** Rust 1.85+ ([rustup](https://rustup.rs)) and `protoc`
+(`brew install protobuf` / `apt install protobuf-compiler`).
 
-## Repository layout
-
-| Crate | Role |
-|---|---|
-| `exocortex-kernel` | Ontology core: types, provenance, visibility, validators, fingerprint. Zero I/O. |
-| `exocortex-pack-dev-v1` | The dev-domain pack (13/12/48 + Crepe rules D1–D6). |
-| `exocortex-wire` | Protobuf schemas (ingest, cluster, SSE) + envelope signing types. |
-| `exocortex-storage` | The one storage seam: `Storage` trait, Cypher catalogue, FalkorDB adapter, in-memory double. |
-| `exocortex-cache` | Lock-free local read path: ArcSwap snapshots, 2Q admission, zero-alloc hot reads. |
-| `exocortex-reasoning` | Datalog (Crepe R1–R9) + Scheme (Steel) rule engines; derived-edge writeback. |
-| `exocortex-cluster` | Chubby-style leases with epoch fencing, HMAC-signed envelopes, SSE change feed. |
-| `exocortex-ingest` | The Ingestion Protocol server: HMAC → fingerprint → ceiling → triples → embeddings. |
-| `exocortex-ops` | Operation registry: every action registered once, served over MCP *and* HTTP identically. |
-| `exocortex-dreams` | Event-driven consolidation: MCR² rate reduction, sparsity guardrails, discovery proposals. |
-| `exocortex-server` | The node binary (`exocortex-node`): MCP standalone or backend cluster mode. |
-| `exocortex-client` | The MCP client binary (`exocortex-mcp-client`): local cache, WAL, sync. |
-| `exocortex-worker` | The adapter host: runs out-of-process adapters against `IngestService`. |
-
-`xtask` carries the quality gates (`kernel-purity`, `fingerprint`, `gen-schemas`, `no-llm`, `bench`).
-
-## Quick start
-
-Requires Rust 1.85 (pinned in `rust-toolchain.toml`) and `protoc`.
+### 1. Install
 
 ```sh
-cargo build --release
-cargo test --workspace        # no backend needed, all green
-cargo xtask bench             # SLO gates: search p50<500µs/p99<3ms, k-hop p50<300µs/p99<2ms
-cargo xtask proto-sync       # vendored wire protos + LICENSE match
-cargo xtask signing-hygiene  # one batch-signing implementation
-cargo fmt --check             # enforced in CI
-cargo clippy --workspace      # enforced in CI
-```
-
-Or install the binaries straight from git (needs `protoc` on PATH):
-
-```sh
-cargo install --git https://github.com/memory-graph/exocortex --bin exocortex-node
 cargo install --git https://github.com/memory-graph/exocortex --bin exocortex-mcp-client
 ```
 
-### Personal mode (solo developer)
+or from a checkout:
 
 ```sh
-cargo run --release -p exocortex-server --bin exocortex-node -- --mode mcp-standalone
+git clone https://github.com/memory-graph/exocortex
+cd exocortex
+cargo build --release -p exocortex-client
+# binary at target/release/exocortex-mcp-client
 ```
 
-Boots a local node with supervised embedded storage. Point your MCP harness at the client binary, or run the MCP client directly:
+### 2. Register with your agent
+
+The server speaks MCP over stdio. Add it to your agent's MCP config:
+
+**Claude Code**
 
 ```sh
-cargo run --release -p exocortex-client --bin exocortex-mcp-client -- --org my-org --user me
+claude mcp add exocortex -- exocortex-mcp-client --org my-org --user me
 ```
 
-The harness calls `exocortex.search_memories`, `exocortex.get_memory`, `exocortex.find_related`, `exocortex.end_session` (the session-wrapup write; offline it buffers to a local WAL and reports `{local_lsns, sync_pending}`), `exocortex.promote_visibility`, `exocortex.accept_discovery`, and `exocortex.list_audit_records`.
+**Codex / Cursor / any MCP client** — point the stdio server config at
+the binary:
 
-### Org mode (backend cluster)
-
-```sh
-docker build -t exocortex-node:local .
-docker compose -f crates/exocortex-cluster/tests/docker-compose-cluster.yml up -d --build
+```json
+{
+  "mcpServers": {
+    "exocortex": {
+      "command": "exocortex-mcp-client",
+      "args": ["--org", "my-org", "--user", "me"]
+    }
+  }
+}
 ```
 
-Three nodes + one FalkorDB. Every operation is available over authenticated HTTP with identical outputs to the MCP surface; the SSE change feed (`/v1/changes?since_lsn=N&token=…`) keeps client caches current, with a bounded replay window and `409 Resync Required` past it. Release builds refuse to start without `--bearer-token`.
+If you installed from a checkout, use the full path to
+`target/release/exocortex-mcp-client`.
 
-Chaos-check leader re-election (PRD bound: < 2s):
+### 3. Tell your agent to use it
 
-```sh
-./scripts/chaos-leader-kill.sh
-```
+Drop this in your agent's instructions (CLAUDE.md / AGENTS.md / system
+prompt):
 
-## The guarantees
+> At the end of each session, call `exocortex.end_session` with a
+> structured wrapup: memories for what was fixed, decided, blocked, or
+> learned (types: Task, Problem, Solution, Fix, Error, CodePattern,
+> Command, Project, Technology, …), plus optional edges between them
+> (Solves, Causes, Uses, Requires, …).
+>
+> At the start of each session and whenever context would help, call
+> `exocortex.search_memories` for what we already know (e.g. "payment
+> service auth", "feature-X blockers") and `exocortex.find_related` to
+> pull the neighborhood around a past memory.
 
-| Property | How it's enforced |
+That's it. Sessions now compound.
+
+### The tools your agent gets
+
+| Tool | What it does |
 |---|---|
-| Deterministic, no LLM | CI gate `cargo xtask no-llm`; zero LLM crates or endpoints in the workspace. |
-| Interactive latency | Bench-asserted SLOs that fail CI on regression (shared-runner tolerance ×2, clamped). |
-| Ontology coherence | 32-byte fingerprint pinned in storage and verified on peer admission and every client envelope. |
-| Stale-leader safety | Chubby-style leases with monotonic epochs; owner-only writes go through fenced storage calls that reject stale tokens before any row commits. |
-| Bi-temporality | Two time axes on every row; a re-synced external source appends assertions, never overwrites. |
-| Tenant isolation | One graph per org; visibility enforced at the storage read (`PermissionDenied`, never a silent empty result) and on the per-org audit ledger. |
-| Auditability | Every action appends an immutable audit record (action, actor, org, input digest, LSN). |
-| Kernel purity | CI gate: the kernel's dependency tree may not contain adapter, HTTP, or LLM crates. |
+| `exocortex.search_memories` | Ranked free-text search over titles/tags of your org's graph. |
+| `exocortex.get_memory` | Fetch one memory by hex id. |
+| `exocortex.find_related` | Bounded k-hop neighborhood of a memory. |
+| `exocortex.end_session` | Submit the session wrapup (1+ memory drafts, optional edges). Offline, it buffers to a local WAL and syncs later. |
 
-## Observability
+### Flags
 
-`/metrics` (Prometheus), `/health/ready` (200 only when hydrated ∧ storage reachable ∧ reasoning alive ∧ lease fresh — failed checks are named in the 503 body), `/health/cluster`, `/health/sync`, `/health/hydration`.
+| Flag | Default | Meaning |
+|---|---|---|
+| `--org` | `personal` | Your org id (personal use = any string). |
+| `--user` | `dev` | Your user id — drives Private-memory visibility. |
+| `--backend` | none | Backend URL for shared-org mode (see below). Omitted: standalone with synthetic seed data. |
+| `--auth-token` | none | Bearer token for the backend. |
+| `--hmac-key` | none | 64-hex-char producer key for backend submits. |
+| `--data-dir` | OS data home | Where the offline WAL lives. |
 
-## Status
+## How memory works
 
-v1 complete: milestones M0–M8 shipped, two review rounds closed, all gates green in CI, live FalkorDB suites and the multi-node chaos harness verified against Docker. The [PRD](docs/prd/exocortex-core-prd.md) is the source of truth; [master plan](docs/master-plan.prd) tracks state and v2 deferrals (Iceberg/Delta adapters, federation, second pack, OTel). Agents and contributors: start with [AGENTS.md](AGENTS.md); specs, reviews, and publishing live in [docs/](docs/).
+- **Sessions end with a wrapup.** Your agent distills the session into
+  typed memories (a handful per call keeps quality high) and typed
+  edges. That write is the only required habit; everything else is
+  automatic.
+- **Everything is typed and provenance-stamped.** Memories are nodes;
+  48 relationship kinds (Solves, Causes, Prevents, Uses, …) are the
+  reasoning surface. Every row carries provenance (who/what asserted
+  it, or which rule derived it) and bi-temporal validity — you can
+  always ask "why does the system believe this?" and "when was it
+  true?"
+- **Deterministic, private by default.** No LLM runs inside Exocortex.
+  Reads come from the local in-memory graph (sub-millisecond p50).
+  Without `--backend`, nothing leaves your machine.
+- **Org memory.** Point multiple developers' clients at one backend and
+  their wrapups merge into a shared graph: `Visibility` labels
+  (private/project/team/org) do the isolation, and the backend
+  periodically runs a consolidation pass ("Dreams") that merges
+  near-duplicates and proposes — never writes — cross-domain
+  connections.
+
+## Team mode (optional backend)
+
+```sh
+cargo install --git https://github.com/memory-graph/exocortex --bin exocortex-node
+exocortex-node --mode backend-node --storage falkor://falkordb:6379 \
+  --bind 0.0.0.0:8080 --bearer-token <token>
+```
+
+Then run clients with `--backend http://host:8080 --auth-token <token>`.
+Every operation is also available over authenticated HTTP; the SSE
+change feed keeps each client's local cache current. See the
+[PRD](docs/prd/exocortex-core-prd.md) (§4 deployment, §17 tenancy) and
+[Dockerfile](Dockerfile) / [compose harness](crates/exocortex-cluster/tests/docker-compose-cluster.yml)
+for cluster topologies.
+
+## Project layout
+
+`exocortex-kernel` (ontology core, zero I/O) · `exocortex-pack-dev-v1`
+(dev-domain pack) · `exocortex-wire` (protocols + signing) ·
+`exocortex-storage` (FalkorDB + in-memory) · `exocortex-cache`
+(lock-free read path) · `exocortex-reasoning` (Datalog + Scheme rules) ·
+`exocortex-cluster` (leases, SSE feed) · `exocortex-ingest` ·
+`exocortex-ops` (MCP/HTTP registry) · `exocortex-dreams` (consolidation)
+· `exocortex-adapter-sdk` (external-source adapters) ·
+`exocortex-server` / `-client` / `-worker` (binaries). All crates are on
+crates.io.
+
+## Contributing & docs
+
+Start with [AGENTS.md](AGENTS.md) — the repo's rules, gates, and where
+everything is documented: [PRD](docs/prd/exocortex-core-prd.md) (the
+spec), [master plan](docs/master-plan.prd) (state),
+[MILESTONE_REPORT](docs/MILESTONE_REPORT.md) (what shipped/deviated),
+[reviews](docs/reviews/) (audit trails), [PUBLISHING](docs/PUBLISHING.md).
 
 ## License
 
-AGPL-3.0-or-later. See [LICENSE](LICENSE).
+AGPL-3.0-or-later — see [LICENSE](LICENSE).
