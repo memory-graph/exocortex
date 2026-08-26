@@ -37,13 +37,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14        # aarch64-apple-darwin (M-series)
+          # Both Apple targets build on macos-14 (arm64): rustc
+          # cross-compiles x86_64-apple-darwin natively there. The
+          # dedicated macos-13 (Intel) runners are being deprecated and
+          # queue for an hour+, which would stall every release.
+          - os: macos-14
             target: aarch64-apple-darwin
             archive: tar.gz
-          - os: macos-13        # x86_64-apple-darwin (Intel)
+          - os: macos-14
             target: x86_64-apple-darwin
             archive: tar.gz
-          - os: ubuntu-22.04    # x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
     runs-on: ${{ matrix.os }}
