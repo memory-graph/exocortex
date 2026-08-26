@@ -130,8 +130,16 @@ That's it. Sessions now compound.
 
 ## Team mode (optional backend)
 
+The quickstart installer already includes `exocortex-node` — if you ran
+it, skip the install line. From source:
+
 ```sh
 cargo install --git https://github.com/memory-graph/exocortex --bin exocortex-node
+```
+
+Run the node:
+
+```sh
 exocortex-node --mode backend-node --storage falkor://falkordb:6379 \
   --bind 0.0.0.0:8080 --bearer-token <token>
 ```
