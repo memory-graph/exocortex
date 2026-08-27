@@ -122,6 +122,16 @@ fn uuid_v4_hex() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+fn one_memory(draft_key: &str, type_label: &str, title: &str) -> serde_json::Value {
+    serde_json::json!({
+        "draft_key": draft_key,
+        "memory_type": type_label,
+        "title": title,
+        "content": "body",
+        "visibility": "org"
+    })
+}
+
 fn search_hits(payload: &serde_json::Value) -> Vec<serde_json::Value> {
     let text = payload["result"]["content"][0]["text"]
         .as_str()
@@ -168,4 +178,97 @@ fn in_session_read_back_after_offline_write() {
         local_lsn.is_some_and(|n| n >= acked_lsn),
         "R-M7 stamp reflects the offline write (got {local_lsn:?}, acked {acked_lsn})"
     );
+}
+
+/// AC2: restart over the same `--data-dir` — the write is still
+/// searchable and the id is byte-stable (the WAL-stored id, not a
+/// regeneration). Requires F3 boot seeding.
+#[test]
+fn cross_restart_read_back_with_stable_ids() {
+    let dir = tempdir();
+    let id = {
+        let mut first = Client::spawn(&dir);
+        let mut msgs = Client::init_msgs();
+        msgs.push(Client::end_session(
+            serde_json::json!([one_memory("d", "CodePattern", "Adopt blake3 for ids")]),
+            serde_json::json!([]),
+        ));
+        msgs.push(Client::search("blake3"));
+        first.send_all(&msgs);
+        let _init = first.read_line();
+        let ack = first.read_line();
+        assert!(ack.get("result").is_some(), "write ok: {ack}");
+        let search = first.read_line();
+        let hits = search_hits(&search);
+        assert_eq!(hits.len(), 1, "in-session hit (F2): {hits:?}");
+        hits[0]["id"].as_str().unwrap().to_string()
+    };
+    let mut second = Client::spawn(&dir);
+    let mut msgs = Client::init_msgs();
+    msgs.push(Client::search("blake3"));
+    second.send_all(&msgs);
+    let _init = second.read_line();
+    let search = second.read_line();
+    let hits = search_hits(&search);
+    assert_eq!(hits.len(), 1, "write survives restart: {hits:?}");
+    assert_eq!(
+        hits[0]["id"].as_str().unwrap(),
+        id,
+        "WAL-stored id byte-stable across restart"
+    );
+}
+
+/// AC6: boot seeding covers EVERY WAL state — Pending, Synced, and
+/// Failed entries are all searchable after a restart. In standalone
+/// nothing else will ever deliver these rows server-side, so the WAL
+/// is their only read path.
+#[test]
+fn boot_seeds_pending_synced_and_failed_entries() {
+    let dir = tempdir();
+    {
+        let mut first = Client::spawn(&dir);
+        let mut msgs = Client::init_msgs();
+        for title in [
+            "Palladium purge panics",
+            "Silver sync stalls",
+            "Flax failure flakes",
+        ] {
+            msgs.push(Client::end_session(
+                serde_json::json!([one_memory("d", "Problem", title)]),
+                serde_json::json!([]),
+            ));
+        }
+        first.send_all(&msgs);
+        let _init = first.read_line();
+        for i in 0..3 {
+            let ack = first.read_line();
+            assert!(ack.get("result").is_some(), "write {i} ok: {ack}");
+        }
+    }
+    {
+        // Settle two of the three entries directly in the WAL (the
+        // states a drain leaves behind), then drop the handle.
+        let wal = exocortex_client::wal::Wal::open(&dir.join("wal")).unwrap();
+        let states = wal.states_for_test();
+        assert_eq!(states.len(), 3);
+        wal.mark_synced(states[0].0, 500).unwrap();
+        wal.mark_failed(states[1].0).unwrap();
+        drop(wal);
+    }
+    let mut second = Client::spawn(&dir);
+    let mut msgs = Client::init_msgs();
+    for q in ["palladium", "silver", "flax"] {
+        msgs.push(Client::search(q));
+    }
+    second.send_all(&msgs);
+    let _init = second.read_line();
+    for (i, title_part) in ["palladium", "silver", "flax"].into_iter().enumerate() {
+        let search = second.read_line();
+        let hits = search_hits(&search);
+        assert_eq!(
+            hits.len(),
+            1,
+            "search {i} (`{title_part}`) must hit its write in ANY wal state: {hits:?}"
+        );
+    }
 }

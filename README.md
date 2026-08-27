@@ -165,7 +165,7 @@ authenticated HTTP.
 |---|---|---|
 | `--org` | `personal` | Your org id (personal use = any string). |
 | `--user` | `dev` | Your user id — drives Private-memory visibility. |
-| `--backend` | none | Backend URL for shared-org mode (see below). Omitted: standalone personal mode (local WAL; read-back ships in 0.2.1 — until then writes buffer durably but search does not return them; see docs/bug-prd-standalone-readback.md). |
+| `--backend` | none | Backend URL for shared-org mode (see below). Omitted: standalone personal mode — writes land in the local WAL and are searchable immediately and across restarts (the WAL is the embedded store). |
 | `--auth-token` | none | Bearer token for the backend. |
 | `--hmac-key` | none | 64-hex-char producer key for backend submits. |
 | `--data-dir` | OS data home | Where the offline WAL and the playbook live. |

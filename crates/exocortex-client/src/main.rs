@@ -2,9 +2,9 @@
 //!
 //! M3: stdio MCP surface over the ArcSwap cache; WAL for offline writes;
 //! SSE subscription arrives at M5. Startup: load the effective ontology
-//! (fail on fingerprint mismatch with the stored cache state), reseed the
-//! cache from the backend (or synthetic data in standalone dev mode),
-//! install the Agent Playbook (D5), serve.
+//! (fail on fingerprint mismatch with the stored cache state), seed the
+//! cache (backend: reseed from the server over SSE; standalone: from the
+//! local WAL, SR-PRD F3), install the Agent Playbook (D5), serve.
 
 use exocortex_client::{mcp, wal};
 
@@ -22,7 +22,9 @@ use exocortex_ops::VisibilityContext;
 #[derive(Debug, Parser)]
 #[command(name = "exocortex-mcp-client", version)]
 struct Args {
-    /// Backend base URL (M5+). Omitted: serve synthetic data.
+    /// Backend base URL (M5+). Omitted: standalone personal mode —
+    /// writes buffer to the local WAL and are readable immediately and
+    /// across restarts (SR-PRD F1-F5).
     #[arg(long)]
     backend: Option<String>,
     /// Bearer token for the backend (attached to every ingest call;
@@ -72,65 +74,6 @@ fn org_visibility(org: &str, user: &str) -> VisibilityContext {
         team_ids: Default::default(),
         max_visibility: Visibility::Org,
     }
-}
-
-fn synth_snapshot() -> Arc<exocortex_cache::GraphSnapshot> {
-    use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, LSN};
-    let mut snap = exocortex_cache::GraphSnapshot::empty();
-    for (i, (title, tag)) in [
-        ("Fix flaky auth test", "auth"),
-        ("Parser handles nested generics", "parser"),
-        ("Cache snapshot swap", "cache"),
-        ("Cluster lease fencing", "cluster"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let m = Memory {
-            id: MemoryId::new_v7(),
-            memory_type: 7,
-            title: title.into(),
-            content: format!("{title}: synthetic body {i}"),
-            summary: None,
-            tags: [tag].into_iter().map(Into::into).collect(),
-            visibility: Visibility::Org,
-            provenance: Provenance::Asserted {
-                author: "synthetic".into(),
-                producer_kind: None,
-            },
-            context: MemoryContext {
-                timestamp: chrono::Utc::now(),
-                project_id: Some("demo".into()),
-                project_path: None,
-                team_id: None,
-                tenant_id: None,
-                session_id: None,
-                user_id: Some("dev".into()),
-                created_by: None,
-                files_involved: Default::default(),
-                languages: Default::default(),
-                frameworks: Default::default(),
-                technologies: Default::default(),
-                git_commit: None,
-                git_branch: None,
-                working_directory: None,
-                entities: Default::default(),
-                additional_metadata: serde_json::Value::Null,
-            },
-            importance: exocortex_kernel::memory::F01::new(0.5).unwrap(),
-            confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
-            effectiveness: None,
-            usage_count: 0,
-            valid_from: chrono::Utc::now(),
-            valid_until: None,
-            recorded_at: chrono::Utc::now(),
-            invalidated_by: None,
-            embedding: None,
-            lsn: LSN::new_backend(i as u64 + 1),
-        };
-        snap.push_test_memory(m);
-    }
-    Arc::new(snap)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -189,24 +132,40 @@ fn main() -> anyhow::Result<()> {
         return verify(&args, &ontology, &data_dir);
     }
 
-    // Cache seed. CL5 (audit): synthetic data is STANDALONE DEV MODE only —
-    // with `--backend` configured, reads must be honestly empty rather than
-    // fabricated ("Fix flaky auth test" & co. are startup filler, not
-    // memories).
+    // Cache seed. CL5 (audit): with `--backend` configured, reads must be
+    // honestly empty until the SSE feed delivers server rows ("Fix flaky
+    // auth test" & co. were startup filler, not memories). SR-PRD F3:
+    // standalone seeds from ALL WAL entries — every state, because in
+    // standalone nothing else will ever deliver these rows server-side.
     let (cache, _writer_rx) = LocalCache::new(2 * 1024 * 1024 * 1024);
     let cache = Arc::new(cache);
-    match args.backend.as_ref() {
-        None => cache.publish(&args.org.clone(), synth_snapshot()),
-        Some(_) => cache.publish(
-            &args.org.clone(),
-            Arc::new(exocortex_cache::GraphSnapshot::empty()),
-        ),
-    }
 
-    // WAL: offline write buffer (buffer-only at M3).
+    // WAL: offline write buffer + (standalone) the embedded store.
     let wal = Arc::new(wal::Wal::open(&data_dir.join("wal"))?);
     if wal.near_full() {
         tracing::warn!("WAL Near Full (R-Sc8)");
+    }
+
+    match args.backend.as_ref() {
+        None => {
+            let entries = wal.entries();
+            let last_lsn = entries.last().map(|e| e.local_lsn).unwrap_or(0);
+            let rows = exocortex_client::materialize::materialize_all(&ontology, &entries);
+            if !rows.dropped_edges.is_empty() {
+                tracing::warn!(?rows.dropped_edges, "standalone seed dropped edges");
+            }
+            cache.seed_local(&args.org, &rows.memories, &rows.edges, last_lsn);
+            tracing::info!(
+                memories = rows.memories.len(),
+                batches = entries.len(),
+                "standalone boot seeded from WAL"
+            );
+        }
+        // F3: backend mode seeds NOTHING — the drain commits rows
+        // server-side under server ids, SSE/reseed delivers them, and WAL
+        // ids differ, so seeding would duplicate. Mode switching is clean:
+        // standalone rows only ever exist in a standalone snapshot.
+        Some(_) => cache.seed_local(&args.org, &[], &[], 0),
     }
 
     let server = mcp::ExocortexMcp::new(

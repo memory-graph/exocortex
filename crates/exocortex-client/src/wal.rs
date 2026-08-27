@@ -226,6 +226,18 @@ impl Wal {
         decode_entry(&raw).ok()
     }
 
+    /// SR-PRD F3: every entry in local-LSN order, ALL states — standalone
+    /// boot seeds from the WAL because nothing else will ever deliver
+    /// these rows server-side (`Pending`, `Synced`, and `Failed` alike).
+    pub fn entries(&self) -> Vec<WalEntry> {
+        self.tree
+            .iter()
+            .values()
+            .flatten()
+            .filter_map(|v| decode_entry(&v).ok())
+            .collect()
+    }
+
     /// D5 `--tail-audit`: the N most recent entries (newest first),
     /// pending + settled, with the fields a developer scanning "did my
     /// wrapup fire?" needs. Undecodable entries are listed by LSN rather

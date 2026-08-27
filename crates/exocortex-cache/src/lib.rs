@@ -830,6 +830,31 @@ impl LocalCache {
         self.admit(&org.into());
     }
 
+    /// SR-PRD F3: standalone boot seeding — build ONE fresh snapshot
+    /// from the materialized WAL rows and publish it (the public boot
+    /// path; `publish` itself stays benches/tests-only). Rows with ids
+    /// already resident upsert in place (CR1), so re-seeding converges.
+    /// The backend arm seeds nothing: drained rows return server-side
+    /// over SSE under server ids, and WAL ids differ, so seeding there
+    /// would duplicate.
+    pub fn seed_local(
+        &self,
+        org: &str,
+        memories: &[Memory],
+        relationships: &[Relationship],
+        last_local_lsn: u64,
+    ) {
+        let mut snap = GraphSnapshot::empty();
+        for m in memories {
+            snap.insert_memory(m.clone());
+        }
+        for r in relationships {
+            snap.insert_relationship(r.clone());
+        }
+        snap.last_local_lsn = last_local_lsn;
+        self.publish(org, Arc::new(snap));
+    }
+
     /// Submit a writer message (tests + client wiring).
     pub async fn submit(&self, w: CacheWrite) {
         let _ = self.writer.send(w).await;

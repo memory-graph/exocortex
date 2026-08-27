@@ -1,5 +1,6 @@
 //! M3 acceptance: the `exocortex-mcp-client` binary runs, speaks MCP over
-//! stdio, and returns synthetic data for `search_memories`.
+//! stdio, and serves the local graph (SR-PRD: honestly empty on a fresh
+//! data dir — no synthetic filler — and seeded from the WAL on restart).
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -56,10 +57,21 @@ impl Drop for Client {
     }
 }
 
+/// SR-PRD F4/AC4: a fresh standalone `--data-dir` answers honestly
+/// empty — no fabricated rows — while the tool surface and the R-M7
+/// version stamp still work.
 #[test]
-fn serves_mcp_over_stdio_with_synthetic_search_results() {
+fn serves_mcp_over_stdio_honestly_empty_on_fresh_dir() {
+    let dir = tempdir();
     let mut c = Client::spawn_with(|cmd| {
-        cmd.args(["--org", "smoke", "--user", "tester"]);
+        cmd.args([
+            "--org",
+            "smoke",
+            "--user",
+            "tester",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
     });
     c.send_all(&[
         serde_json::json!({
@@ -109,14 +121,17 @@ fn serves_mcp_over_stdio_with_synthetic_search_results() {
         .expect("content text");
     let payload: serde_json::Value = serde_json::from_str(text).expect("payload JSON");
     let memories = payload["memories"].as_array().expect("memories");
-    assert!(!memories.is_empty(), "synthetic data returned");
     assert!(
-        memories[0]["title"].as_str().unwrap().contains("auth"),
-        "ranked hit matches the query"
+        memories.is_empty(),
+        "fresh data dir answers honestly empty (no synthetic seed): {memories:?}"
     );
     assert!(
         payload["snapshot_version"]["backend_lsn"].is_u64(),
         "R-M7 version stamp present"
+    );
+    assert!(
+        payload["snapshot_version"]["local_lsn"].is_u64(),
+        "R-M7 local stamp present"
     );
 }
 

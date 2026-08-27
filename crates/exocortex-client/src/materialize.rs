@@ -168,6 +168,26 @@ pub fn materialize_entry(
     out
 }
 
+/// SR-PRD F3: fold ALL WAL entries (every state — standalone never
+/// delivers any of them server-side) into one row set for boot seeding.
+/// Entries materialize in local-LSN order, so a later entry's
+/// cross-batch edge resolves against everything written before it;
+/// targets that never existed locally are dropped per the entry rule.
+pub fn materialize_all(ontology: &Ontology, entries: &[WalEntry]) -> Materialized {
+    let mut acc = Materialized::default();
+    let mut known: HashMap<MemoryId, (u8, Visibility)> = HashMap::new();
+    for entry in entries {
+        let rows = materialize_entry(ontology, entry, &|id| known.get(id).copied());
+        acc.dropped_edges.extend(rows.dropped_edges);
+        for m in rows.memories {
+            known.insert(m.id, (m.memory_type, m.visibility));
+            acc.memories.push(m);
+        }
+        acc.edges.extend(rows.edges);
+    }
+    acc
+}
+
 /// One hint → one `Relationship`, mirroring the backend mint
 /// (`service.rs`): derived id, W5 narrower-endpoint visibility, kind
 /// default strength / 0.8 confidence when the hint carries none.
