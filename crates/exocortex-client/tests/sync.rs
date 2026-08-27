@@ -194,36 +194,6 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
         tokio::spawn(async move { cache.run(storage, rx).await });
     }
 
-    let app = exocortex_server::sse::sse_router(
-        cluster.clone(),
-        exocortex_server::sse::SseAuth::OptionalToken,
-    );
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    // Seed one memory so the cache org exists, then subscribe from LSN 0.
-    let seed = test_memory("seed", 1);
-    storage.upsert_memory(&seed).await.unwrap();
-    cache.reseed_from_storage(&*storage, &"org".into()).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let cfg = {
-        let mut c = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
-        c.backoff = Duration::from_millis(50);
-        c
-    };
-    let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 0, None));
-    // Let the subscriber establish its stream before the first publish so
-    // the run exercises the live path (not a 409/replay detour).
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    // Commit an upsert on the backend and publish it through the hub. The
-    // broadcast can race the subscriber's connect, so the fan-out retries
-    // until the cache observes the row (stale duplicates are dropped by the
-    // LSN gate).
     let vc = VisibilityContext {
         user_id: "u".into(),
         org_id: "org".into(),
@@ -231,9 +201,53 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
         team_ids: Default::default(),
         max_visibility: exocortex_kernel::Visibility::Org,
     };
+    let (server_cache, _server_rx) = LocalCache::new(1024 * 1024);
+    let ctx = Arc::new(exocortex_ops::OpContext {
+        visibility_ctx: vc.clone(),
+        storage: storage.clone() as Arc<dyn Storage>,
+        cache: Arc::new(server_cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
+        ontology: Some(onto.clone()),
+    });
+    let bind = exocortex_server::http_bind::HttpBind::new(ctx, "feed-bearer".into());
+    let app = bind.router(Some(exocortex_server::sse::sse_router(
+        cluster.clone(),
+        exocortex_server::sse::SseAuth::RequiredToken,
+    )));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // Seed one memory, then require the authenticated full-image boundary
+    // before measuring the subsequent live update.
+    let seed = test_memory("seed", 1);
+    storage.upsert_memory(&seed).await.unwrap();
+
+    let hydrated = Arc::new(tokio::sync::Notify::new());
+    let cfg = {
+        let mut c = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+        c.backoff = Duration::from_millis(50);
+        c.bearer = Some("feed-bearer".into());
+        c.client_token = Some("feed-bearer".into());
+        c.client_key = Some(exocortex_wire::signing::derive_sse_client_key(
+            &HMAC_KEY,
+            "feed-bearer",
+        ));
+        c.hydration_ready = Some(hydrated.clone());
+        c
+    };
+    let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 0, None));
+    tokio::time::timeout(Duration::from_secs(2), hydrated.notified())
+        .await
+        .expect("authenticated graph reseed reaches the client");
+
+    // Commit an upsert on the backend and publish it through the already-live
+    // authenticated stream. Stale duplicate fan-out is harmless at the gate.
     let m = test_memory("pushed-via-sse", 2);
     let commit = storage.upsert_memory(&m).await.unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     let mut seen = false;
     while tokio::time::Instant::now() < deadline {
         let _ = cluster.admit_and_publish(cluster.envelope(Invalidation::MemoryUpserted {
