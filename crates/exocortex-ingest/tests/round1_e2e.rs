@@ -158,8 +158,12 @@ async fn dreams_cycle_over_ingested_data() {
         "dreams-e2e".into(),
     );
     let region = RegionKey {
-        org: "o".into(),
-        project: "p".into(),
+        // This library-level fixture intentionally runs without an
+        // authenticated principal, so ingest cannot stamp an authoritative
+        // tenant/project. Exercise the supported aggregate cycle; production
+        // named-region validation is covered by the Dreams region regression.
+        org: "*".into(),
+        project: "*".into(),
         memory_type: onto.memory_type_id("Solution").unwrap(),
     };
     let res = engine.try_consolidate(&region).await.expect("cycle");
