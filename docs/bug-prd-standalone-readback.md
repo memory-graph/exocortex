@@ -2,7 +2,7 @@
 
 | Bug PRD | | Three defects in `exocortex-client` that make the zero-setup personal mode write-durable but read-blind |
 |:---|:---|:---|
-| **Author**: Gregory Dickson | **Status**: Open (amended 2026-08-26 after review: F1 triple validation, F2 public cache API, F3 ordering + all-states seeding, F5 dep-graph constraint, sequencing) **Created**: 2026-08-26 | **Visibility**: Internal |
+| **Author**: Gregory Dickson | **Status**: **Closed** — shipped as `exocortex-client 0.2.1` (2026-08-26; F3+F4 landed as one commit: replacing the boot seed left the synth path dead code; all seven acceptance criteria covered, see `client/tests/standalone_readback.rs`) **Created**: 2026-08-26 | **Visibility**: Internal |
 
 ## Summary
 

@@ -1,5 +1,17 @@
 # Exocortex — Master Plan
 
+**Status:** SR-PRD shipped. **[2026-08-26, night]** Standalone
+read-back (F1-F5) landed as `exocortex-client 0.2.1` (see the Done
+table's SR-PRD rows). The zero-setup mode's write→read loop is closed:
+in-session read-back (AC1), cross-restart seeding with byte-stable ids
+(AC2), edges + Conversation grouping traversable (AC3), honest-empty
+fresh installs — the synthetic seed is gone (AC4, F4 folded into the
+F3 commit: replacing the boot seed left it dead code), backend mode
+unchanged (AC5), all-states WAL seeding (AC6), dangling cross-batch
+edges dropped-never-served (AC7). The grouping builders are pinned
+byte-identical to the backend commit path by parity test. README gap
+note retired.
+
 **Status:** A-PRD shipped. **[2026-08-26, later]** The Agent
 Instructions PRD (rev 5, D1-D10 + the §4.5/§4.8/§4.9/§4.10 mechanics)
 landed as `exocortex-client 0.2.0` — worklist→code map in the Done
@@ -10,8 +22,8 @@ R-T4 companions the playbook must not teach). **Reopened** by a
 deployment-model review: `docs/bug-prd-standalone-readback.md` (SR-PRD)
 — the zero-setup mode's writes are durable but invisible to every read
 (three defects: no live write-back, no boot seeding, synthetic filler
-answering searches instead). F1-F5 ship as 0.2.1; the README flags the
-gap until they do.
+answering searches instead). F1-F5 ship as 0.2.1; ~~the README flags
+the gap until they do~~ (closed same day).
 
 **Status (2026-08-26, earlier):** Round 3 complete. Reopened by a
 codebase-wide defect audit (`docs/bug-prd-codebase-audit.md`) — 70
@@ -32,20 +44,23 @@ items are promoted into this file, tracked to done, and never silently
 dropped. Anything not listed here is either shipped or explicitly deferred
 to v2 in the PRD's own terms.
 
-**Current baseline (2026-08-26, post-A-PRD):** 213 tests / 1 flaky
-across 71 suites (`cargo test --workspace --features
+**Current baseline (2026-08-26, post-SR-PRD):** 223 tests / 1 flaky
+across 72 suites (`cargo test --workspace --features
 exocortex-adapter-sdk/testing` — the feature is mandatory: a lib canary
-fails any run that would leave the SDK's mock-driven suites dark). The
-one failure is the known `sync.rs` 500ms SSE flake under full parallel
-load (pre-existing; passes on clean serial runs — and `e2e_chain`'s
-same-class window now shows the same behavior under union runs: 3/3
-green serially). Full gate pipeline green: fmt, clippy, deny, tests,
-kernel-purity, fingerprint (`e1f7d17b…ddc9b2`, unchanged through A-PRD),
-gen-schemas (7 operations — preflight_wrapup joined the registry),
-**gen-playbook (new: playbook facts vs pack + RejectCode; instruction
-block ≤ 300 words)**, no-llm, proto-sync, signing-hygiene,
-wire-standalone, plus the five seam gates. `exocortex-client` at 0.2.0;
-the other 13 crates at 0.1.0.
+fails any run that would leave the SDK's mock-driven suites dark; count
+with `--no-fail-fast` — fail-fast stops at the first flaky binary). The one failure is the known
+`sse_feed_observed_by_client_cache_within_500ms` 500ms window under
+full parallel load (pre-existing; passes on clean serial runs —
+`e2e_chain` shows the same class occasionally). Full gate pipeline
+green: fmt, clippy, deny, tests, kernel-purity, fingerprint
+(`e1f7d17b…ddc9b2`, unchanged through SR-PRD), gen-schemas (7
+operations), gen-playbook (48 kinds / 47 assertable), no-llm,
+proto-sync, signing-hygiene, wire-standalone, plus the five seam
+gates. `exocortex-client` at 0.2.1; the other 13 crates at 0.1.0.
+
+**Prior baseline (2026-08-26, post-A-PRD):** 213 tests / 1 flaky
+across 71 suites. Full gate pipeline green as above; fingerprint
+`e1f7d17b…ddc9b2`; `exocortex-client` at 0.2.0.
 
 **Post-audit baseline (2026-08-26, pre-A-PRD):** 194 tests / 0 failed
 across 70 suites; fingerprint `e1f7d17b…ddc9b2`; SLO benches green
@@ -103,7 +118,7 @@ each step (88 tests at completion).
 | WS3-WS5 | Wire: NaN strength persisted, `confidence == 0.0` silently rewritten, unknown `Visibility` discriminants coerced to the widest value | audit §5 | **Done** — WS3 (admit_and_publish, above); WS4 non-finite/out-of-range rejected (`nan_strength_rejected`); WS5 unknown discriminants rejected fail-closed (`unknown_visibility_discriminant_rejected`) |
 | GATE1 | Five proposed seam gates: `storage-conformance`, `write-path-parity`, `dead-enforcement`, `auth-coverage`, `artifact-equivalence` | audit §9 | **Done** — all five wired as `cargo xtask` commands (AGENTS.md gate list updated); each fails when its underlying suite fails |
 | A-PRD | Agent instructions & onboarding (playbook, preflight, grouping, producer kind, telemetry, maintenance loop) | `agent-instructions-prd.md` rev 5 | **Done** — D1-D10 shipped as `exocortex-client 0.2.0`; see the Done table's A-PRD row for the worklist-to-code map |
-| SR-PRD | Standalone read-back (F1-F5): materializer, live write-back, boot seeding, synthetic-seed removal, local D6 parity — the zero-setup mode write→read loop | `docs/bug-prd-standalone-readback.md` | Proposed — offline writes are durable but invisible to every read, in-session and cross-restart, while search returns synthetic filler. Ships as 0.2.1 |
+| SR-PRD | Standalone read-back (F1-F5): materializer, live write-back, boot seeding, synthetic-seed removal, local D6 parity — the zero-setup mode write→read loop | `docs/bug-prd-standalone-readback.md` | **Done** — shipped as `exocortex-client 0.2.1`; one commit per fix (F3+F4 combined — replacing the boot seed left the synth path dead code); all seven acceptance criteria covered by `client/tests/standalone_readback.rs` (AC5 additionally by `e2e_chain` + the CL5 stdio test) |
 
 
 ## In progress
@@ -132,6 +147,12 @@ are recorded in the "Rounds 4-5" section below.
 | WS3-WS5 | Wire: peer admission bypass impossible, non-finite strength rejected, unknown visibility discriminants fail closed | `node.rs`, `service.rs`; cluster `rules.rs`, `ingest.rs` tests |
 | GATE1 | Five seam gates: `storage-conformance`, `write-path-parity`, `dead-enforcement`, `auth-coverage`, `artifact-equivalence` | `xtask/src/main.rs`; `write_path_parity.rs`, `auth_coverage.rs`, gate-named test suites |
 | TOOLING | Fixed pre-existing `xtask bench` bug: the SDK single-dependency check counted the crate's own root line (always failed) | `xtask/src/main.rs` |
+| **SR-PRD (standalone read-back, 0.2.1)** | | |
+| F1 materializer | ONE WAL-entry → kernel-rows function: backend field set (Asserted CodingAgent under the drain's identity, 0.5/0.8, normalized tags, stored context, local LSN), hints resolved + kernel `validate_triple` (standalone never drains — the only triple check these edges get), dangling/invalid dropped and recorded | `client/src/materialize.rs`; unit tests `materialized_memory_matches_backend_field_set`, `dangling_cross_batch_hint_is_dropped`, `invalid_triple_is_rejected`, `in_batch_edge_materializes_with_derived_id` |
+| F2 live write-back | `LocalCache::apply_local` (ONE copy-on-write swap: rows + edges + R-M7 stamp; auto-creates the org graph; `advance_local_lsn` kept as the LSN-only degrade path); write path reads the entry back through F1 | `cache/src/lib.rs`, `client/src/mcp.rs`, `client/src/wal.rs::entry`; `standalone_readback.rs::in_session_read_back_after_offline_write`; dead-enforcement gate now pins `apply_local` |
+| F3+F4 boot seeding + synth removal | standalone boot seeds from ALL WAL entries (`Pending`/`Synced`/`Failed` — nothing else ever delivers them) via `materialize_all` + `seed_local`; backend seeds nothing (server ids differ); `synth_snapshot` deleted; honest-empty fresh installs; README gap note retired | `client/src/main.rs`; `standalone_readback.rs::cross_restart_read_back_with_stable_ids`, `boot_seeds_pending_synced_and_failed_entries`; `stdio_smoke.rs::serves_mcp_over_stdio_honestly_empty_on_fresh_dir` |
+| F5 grouping parity | client-side `grouping_node_local`/`grouping_edge_local` (ingest dev-deps client — a src-dep would cycle) minted per session entry; pinned byte-identical to `exocortex-ingest`'s builders | `client/src/materialize.rs`; `standalone_readback.rs::grouping_parity_with_backend_commit_path`, `edges_and_grouping_readable_dangling_edge_harmless`, lib `grouping_rows_minted_per_session` |
+| P-release | `exocortex-client` 0.2.1 | `Cargo.toml` |
 | **A-PRD (agent instructions, PRD rev 5)** | | |
 | D1 playbook | Versioned playbook compiled into the client, installed to `~/.exocortex/`, generated kind/reject tables + `xtask gen-playbook` drift gate (authored-only filter: 48 kinds / 47 assertable, companions excluded) | `client/src/playbook.rs` + `playbook/v1_0_0.md`; `xtask gen-playbook` (CI) |
 | D2 preflight | `preflight_wrapup` registered in OPS (one handler, MCP+HTTP+goldens), `end_session` self-preflights (r4), correction hints from the merged wire guidance table, `unverified` boundary list | `ops/src/preflight.rs` + `operations.rs`; `client/src/tools/end_session.rs`; `wire/src/corrections.rs` (adapter-sdk classify now thin); `ingest/tests/grouping.rs`, `client/tests/stdio_smoke.rs` |

@@ -510,7 +510,9 @@ mod tests {
         let e = entry_with(vec![d]);
         let m = materialize_entry(&onto, "org", &e, &|_| None);
         assert!(
-            m.edges.iter().all(|r| r.to != e.memories[0].edge_hints[0].to),
+            m.edges
+                .iter()
+                .all(|r| r.to != e.memories[0].edge_hints[0].to),
             "dangling edge dropped (only grouping edges remain)"
         );
         assert_eq!(m.dropped_edges.len(), 1);
@@ -608,7 +610,11 @@ mod tests {
             e.memories[0].context.timestamp,
         )
         .unwrap();
-        assert_eq!(m.memories.last().unwrap().id, node.id, "conversation node minted");
+        assert_eq!(
+            m.memories.last().unwrap().id,
+            node.id,
+            "conversation node minted"
+        );
         let in_session = onto.kind_id("InSession").unwrap();
         assert_eq!(
             m.edges

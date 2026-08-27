@@ -1,7 +1,7 @@
 # crates/exocortex-client/Cargo.toml
 [package]
 name    = "exocortex-client"
-version = "0.2.0" # P9: the agent-instructions release
+version = "0.2.1" # SR-PRD: standalone read-back (write→read loop in the zero-setup mode)
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
