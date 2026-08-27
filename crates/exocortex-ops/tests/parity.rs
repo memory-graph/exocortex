@@ -8,7 +8,7 @@ use exocortex_cache::{GraphSnapshot, LocalCache};
 use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
 use exocortex_ops::operations::{ops_vc, GetMemoryInput, PromoteVisibilityInput};
 use exocortex_ops::{entries, OpContext, Operation};
-use exocortex_storage::InMemoryStorage;
+use exocortex_storage::{DiscoveryProposal, InMemoryStorage, RegionKey};
 
 fn ontology() -> Arc<exocortex_kernel::Ontology> {
     Arc::new(
@@ -191,6 +191,56 @@ async fn accept_discovery_writes_audit_record_and_edge() {
     b.memory_type = 2; // Problem (to-side: Error | Problem)
     ctx.storage.upsert_memory(&a).await.unwrap();
     ctx.storage.upsert_memory(&b).await.unwrap();
+    let causes = onto.kind_id("Causes").expect("Causes registered");
+    let proposal = DiscoveryProposal {
+        discovery_id: "11111111-1111-1111-1111-111111111111".into(),
+        region: RegionKey {
+            org: "org".into(),
+            project: "*".into(),
+            memory_type: a.memory_type,
+        },
+        from: a.id,
+        to: b.id,
+        kind: causes,
+        proposed_visibility: Visibility::Project,
+        caller_scope: ctx.visibility_ctx.clone(),
+        issued_at: chrono::Utc::now(),
+    };
+    ctx.storage
+        .create_discovery_proposal(&proposal)
+        .await
+        .unwrap();
+    let mut widened = proposal.clone();
+    widened.discovery_id = "widened-proposal".into();
+    widened.proposed_visibility = Visibility::Public;
+    assert!(matches!(
+        ctx.storage.create_discovery_proposal(&widened).await,
+        Err(exocortex_storage::StorageError::ProposalMismatch)
+    ));
+    let mut endpoint_mismatch = proposal.clone();
+    endpoint_mismatch.discovery_id = "endpoint-mismatch".into();
+    ctx.storage
+        .create_discovery_proposal(&endpoint_mismatch)
+        .await
+        .unwrap();
+    let mismatch = exocortex_ops::operations::AcceptDiscoveryOp
+        .handle(
+            &ctx,
+            exocortex_ops::operations::AcceptDiscoveryInput {
+                discovery_id: "endpoint-mismatch".into(),
+                from: hex(&b.id),
+                to: hex(&a.id),
+                kind: "Causes".into(),
+            },
+        )
+        .await;
+    assert!(matches!(mismatch, Err(exocortex_ops::OpError::BadInput(_))));
+    assert!(ctx
+        .storage
+        .get_discovery_proposal("endpoint-mismatch")
+        .await
+        .unwrap()
+        .is_some());
     // IN3: the caller-supplied kind is resolved and validated (R-T17):
     // (Problem, Causes, Problem) is a legal triple; the committed edge
     // carries the RESOLVED kind, never RelKindId(0).
@@ -209,7 +259,6 @@ async fn accept_discovery_writes_audit_record_and_edge() {
     assert!(!out.edge_id.is_empty());
     assert!(out.audit_lsn > 0, "R-A2: acceptance is audited");
     use futures::StreamExt as _;
-    let causes = onto.kind_id("Causes").expect("Causes registered");
     let mut rs = ctx.storage.stream_all_relationships().await;
     let mut mine = None;
     while let Some(Ok(r)) = rs.next().await {
@@ -222,8 +271,30 @@ async fn accept_discovery_writes_audit_record_and_edge() {
         committed.from, a.id,
         "IN3: the asserted edge, not its R-T4 inverse companion"
     );
+    assert_eq!(
+        committed.visibility,
+        Visibility::Project,
+        "acceptance may not widen beyond the proposal"
+    );
 
     // An illegal triple is rejected (R-T17 now enforced here).
+    ctx.storage
+        .create_discovery_proposal(&DiscoveryProposal {
+            discovery_id: "22222222-2222-2222-2222-222222222222".into(),
+            region: RegionKey {
+                org: "org".into(),
+                project: "*".into(),
+                memory_type: a.memory_type,
+            },
+            from: a.id,
+            to: b.id,
+            kind: onto.kind_id("Solves").unwrap(),
+            proposed_visibility: Visibility::Org,
+            caller_scope: ctx.visibility_ctx.clone(),
+            issued_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
     let err = exocortex_ops::operations::AcceptDiscoveryOp
         .handle(
             &ctx,
@@ -238,6 +309,19 @@ async fn accept_discovery_writes_audit_record_and_edge() {
         .map(|o| o.audit_lsn)
         .expect_err("illegal triple rejected");
     assert!(matches!(err, exocortex_ops::OpError::BadInput(_)));
+
+    let fabricated = exocortex_ops::operations::AcceptDiscoveryOp
+        .handle(
+            &ctx,
+            exocortex_ops::operations::AcceptDiscoveryInput {
+                discovery_id: "33333333-3333-3333-3333-333333333333".into(),
+                from: hex(&a.id),
+                to: hex(&b.id),
+                kind: "Causes".into(),
+            },
+        )
+        .await;
+    assert!(matches!(fabricated, Err(exocortex_ops::OpError::NotFound)));
 }
 
 #[test]

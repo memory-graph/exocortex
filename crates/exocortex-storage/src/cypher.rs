@@ -453,6 +453,117 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "batch_audit_append",
+        read_only: false,
+        required_params: &[
+            "action",
+            "actor",
+            "org_id",
+            "input_digest",
+            "output_ids",
+            "fingerprint",
+            "lease_epoch",
+            "recorded_at",
+            "lsn"
+        ],
+        cypher: r#"
+            CREATE (a:_AuditRecord {
+                action: $action, actor: $actor, org_id: $org_id,
+                input_digest: $input_digest, output_ids: $output_ids,
+                fingerprint: $fingerprint, lease_epoch: $lease_epoch,
+                recorded_at: $recorded_at, lsn: $lsn})
+        "#,
+    });
+
+    reg!(Template {
+        id: "discovery_proposal_create",
+        read_only: false,
+        required_params: &[
+            "discovery_id",
+            "org_id",
+            "region_project",
+            "region_memory_type",
+            "from",
+            "to",
+            "kind",
+            "visibility",
+            "caller_scope_json",
+            "issued_at",
+            "props_json"
+        ],
+        cypher: r#"
+            MERGE (p:_DiscoveryProposal {discovery_id: $discovery_id})
+            ON CREATE SET p.org_id = $org_id,
+                          p.region_project = $region_project,
+                          p.region_memory_type = $region_memory_type,
+                          p.from = $from, p.to = $to, p.kind = $kind,
+                          p.visibility = $visibility,
+                          p.caller_scope_json = $caller_scope_json,
+                          p.issued_at = $issued_at,
+                          p.props_json = $props_json
+            WITH p
+            WHERE p.org_id = $org_id
+              AND p.region_project = $region_project
+              AND p.region_memory_type = $region_memory_type
+              AND p.from = $from AND p.to = $to AND p.kind = $kind
+              AND p.visibility = $visibility
+              AND p.caller_scope_json = $caller_scope_json
+              AND p.issued_at = $issued_at
+            RETURN p.discovery_id AS discovery_id
+        "#,
+    });
+
+    reg!(Template {
+        id: "discovery_proposal_get",
+        read_only: true,
+        required_params: &["discovery_id"],
+        cypher: r#"
+            MATCH (p:_DiscoveryProposal {discovery_id: $discovery_id})
+            WHERE p.consumed_at IS NULL
+            RETURN p.props_json AS props_json LIMIT 1
+        "#,
+    });
+
+    reg!(Template {
+        id: "discovery_accept_guard",
+        read_only: false,
+        required_params: &[
+            "discovery_id",
+            "org_id",
+            "region_project",
+            "region_memory_type",
+            "from",
+            "to",
+            "kind",
+            "visibility",
+            "caller_scope_json"
+        ],
+        cypher: r#"
+            MATCH (p:_DiscoveryProposal {discovery_id: $discovery_id}),
+                  (proposal_from:Memory {id: $from}),
+                  (proposal_to:Memory {id: $to})
+            WHERE p.consumed_at IS NULL
+              AND p.org_id = $org_id
+              AND p.region_project = $region_project
+              AND p.region_memory_type = $region_memory_type
+              AND p.from = $from AND p.to = $to AND p.kind = $kind
+              AND p.visibility = $visibility
+              AND p.caller_scope_json = $caller_scope_json
+        "#,
+    });
+
+    reg!(Template {
+        id: "discovery_proposal_consume",
+        read_only: false,
+        required_params: &["discovery_id", "consumed_at"],
+        cypher: r#"
+            MATCH (p:_DiscoveryProposal {discovery_id: $discovery_id})
+            WHERE p.consumed_at IS NULL
+            SET p.consumed_at = $consumed_at
+        "#,
+    });
+
+    reg!(Template {
         id: "audit_range",
         read_only: true,
         required_params: &["org_id", "since_lsn", "limit"],

@@ -727,6 +727,31 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         Ok(out)
     }
 
+    /// Persist one discovery for a specific caller and asserted relationship
+    /// kind. The lifecycle surface (R6-B11) can call this when presenting a
+    /// pending discovery; acceptance then requires this exact immutable scope.
+    pub async fn issue_discovery_proposal(
+        &self,
+        discovery: &Discovery,
+        region: &RegionKey,
+        relationship_kind: exocortex_kernel::RelKindId,
+        proposed_visibility: exocortex_kernel::Visibility,
+        caller_scope: exocortex_storage::VisibilityContext,
+    ) -> anyhow::Result<exocortex_storage::DiscoveryProposal> {
+        let proposal = exocortex_storage::DiscoveryProposal {
+            discovery_id: discovery.id.to_string().into(),
+            region: region.clone(),
+            from: discovery.endpoints.0,
+            to: discovery.endpoints.1,
+            kind: relationship_kind,
+            proposed_visibility,
+            caller_scope,
+            issued_at: discovery.discovered_at,
+        };
+        self.storage.create_discovery_proposal(&proposal).await?;
+        Ok(proposal)
+    }
+
     /// Proposals awaiting `accept_discovery` (R-Dr1: proposals, never edges).
     pub fn pending_discoveries(&self) -> Vec<Discovery> {
         self.discoveries.iter().map(|e| e.value().clone()).collect()

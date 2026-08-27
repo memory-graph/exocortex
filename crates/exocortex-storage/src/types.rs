@@ -65,7 +65,7 @@ pub enum Direction {
 
 /// The per-request identity + visibility scope. Every read is filtered by this
 /// at the storage boundary; there is no "unfiltered read" surface (CR-22).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VisibilityContext {
     /// Calling user.
     pub user_id: SmolStr,
@@ -77,6 +77,64 @@ pub struct VisibilityContext {
     pub team_ids: SmallVec<[SmolStr; 4]>,
     /// Effective ceiling.
     pub max_visibility: Visibility,
+}
+
+/// Immutable server-issued discovery proposal. Acceptance must match every
+/// field and the exact caller scope that received the proposal (R6-B05).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DiscoveryProposal {
+    /// Opaque server-issued discovery identifier.
+    pub discovery_id: SmolStr,
+    /// Exact graph region in which the proposal was discovered.
+    pub region: RegionKey,
+    /// Proposed source endpoint.
+    pub from: MemoryId,
+    /// Proposed destination endpoint.
+    pub to: MemoryId,
+    /// Proposed relationship kind.
+    pub kind: RelKindId,
+    /// Maximum visibility the accepted edge may carry.
+    pub proposed_visibility: Visibility,
+    /// Exact caller and authorization scope to which this proposal was issued.
+    pub caller_scope: VisibilityContext,
+    /// Server timestamp at issuance.
+    pub issued_at: DateTime<Utc>,
+}
+
+/// Audit payload coupled to a protected mutation by storage (R6-B18).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditEvent {
+    /// Stable action name.
+    pub action: SmolStr,
+    /// Authenticated actor identity.
+    pub actor: SmolStr,
+    /// Owning organization.
+    pub org_id: SmolStr,
+    /// Digest of the canonical action input.
+    pub input_digest: [u8; 32],
+    /// Identifiers produced by the action.
+    pub output_ids: SmallVec<[SmolStr; 8]>,
+    /// Ontology fingerprint at execution.
+    pub fingerprint: [u8; 32],
+    /// Owner lease epoch, when applicable.
+    pub lease_epoch: Option<u64>,
+    /// Time the action was recorded.
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// Atomic discovery acceptance request.
+#[derive(Clone, Debug)]
+pub struct DiscoveryAcceptance {
+    /// Exact proposal identifier.
+    pub discovery_id: SmolStr,
+    /// Exact issuing region.
+    pub region: RegionKey,
+    /// Current authenticated caller scope.
+    pub caller_scope: VisibilityContext,
+    /// Asserted edge built from the immutable proposal.
+    pub relationship: exocortex_kernel::Relationship,
+    /// Required immutable audit event.
+    pub audit: AuditEvent,
 }
 
 /// One authoritative §17.2 memory visibility decision, shared by storage and

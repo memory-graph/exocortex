@@ -35,8 +35,25 @@ struct InMemoryInner {
     leases: Mutex<HashMap<LeaseKey, InMemoryLease>>,
     /// Monotonic fencing-epoch counter per lease key (never resets).
     lease_epochs: Mutex<HashMap<LeaseKey, u64>>,
+    proposals: Mutex<HashMap<smol_str::SmolStr, StoredProposal>>,
+    audits: Mutex<Vec<serde_json::Value>>,
     #[cfg(test)]
     fence_checkpoint: Mutex<Option<std::sync::Arc<FenceCheckpoint>>>,
+    #[cfg(test)]
+    atomic_fault: Mutex<Option<AtomicFault>>,
+}
+
+#[derive(Clone)]
+struct StoredProposal {
+    proposal: DiscoveryProposal,
+    consumed: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum AtomicFault {
+    Mutation,
+    Audit,
 }
 
 #[cfg(test)]
@@ -71,9 +88,13 @@ impl InMemoryStorage {
                 ontology,
                 leases: Default::default(),
                 lease_epochs: Default::default(),
+                proposals: Default::default(),
+                audits: Default::default(),
                 mutation_gate: Default::default(),
                 #[cfg(test)]
                 fence_checkpoint: Default::default(),
+                #[cfg(test)]
+                atomic_fault: Default::default(),
             }),
             lsn: std::sync::Arc::new(AtomicU64::new(0)),
             feed: tokio::sync::broadcast::channel(4096).0,
@@ -279,6 +300,41 @@ impl InMemoryStorage {
             edge_id: None,
         }
     }
+
+    fn audit_value(audit: &AuditEvent, lsn: u64) -> serde_json::Value {
+        fn digest_hex(bytes: &[u8; 32]) -> String {
+            use std::fmt::Write as _;
+            let mut out = String::with_capacity(64);
+            for byte in bytes {
+                let _ = write!(out, "{byte:02x}");
+            }
+            out
+        }
+        serde_json::json!({
+            "action": audit.action,
+            "actor": audit.actor,
+            "org_id": audit.org_id,
+            "input_digest": digest_hex(&audit.input_digest),
+            "output_ids": audit.output_ids,
+            "fingerprint": digest_hex(&audit.fingerprint),
+            "lease_epoch": audit.lease_epoch.map(|epoch| epoch.to_string()).unwrap_or_default(),
+            "recorded_at": audit.recorded_at.to_rfc3339(),
+            "lsn": lsn,
+        })
+    }
+
+    #[cfg(test)]
+    fn take_atomic_fault(&self, expected: AtomicFault) -> bool {
+        let mut fault = self.inner.atomic_fault.lock().unwrap();
+        if fault.as_ref().is_some_and(|actual| {
+            std::mem::discriminant(actual) == std::mem::discriminant(&expected)
+        }) {
+            fault.take();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[async_trait]
@@ -381,6 +437,198 @@ impl Storage for InMemoryStorage {
             node_id: None,
             edge_id: None,
         })
+    }
+    async fn upsert_memory_audited(
+        &self,
+        memory: &Memory,
+        audit: &AuditEvent,
+    ) -> Result<CommitRecord, StorageError> {
+        let (record, invalidation) = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            let mut memories = self.inner.memories.lock().unwrap().clone();
+            let mut audits = self.inner.audits.lock().unwrap().clone();
+            let lsn = self.lsn.load(Ordering::SeqCst) + 1;
+            let now = Utc::now();
+            let mut row = memory.clone();
+            row.lsn = exocortex_kernel::LSN::new_backend(lsn);
+            memories.insert(row.id, vec![row]);
+            #[cfg(test)]
+            if self.take_atomic_fault(AtomicFault::Mutation) {
+                return Err(StorageError::Backend("injected mutation failure".into()));
+            }
+            audits.push(Self::audit_value(audit, lsn));
+            #[cfg(test)]
+            if self.take_atomic_fault(AtomicFault::Audit) {
+                return Err(StorageError::Backend("injected audit failure".into()));
+            }
+            *self.inner.memories.lock().unwrap() = memories;
+            *self.inner.audits.lock().unwrap() = audits;
+            self.lsn.store(lsn, Ordering::SeqCst);
+            (
+                CommitRecord {
+                    lsn,
+                    committed_at: now,
+                    node_id: None,
+                    edge_id: None,
+                },
+                Invalidation::MemoryUpserted { id: memory.id, lsn },
+            )
+        };
+        let _ = self.feed.send(invalidation);
+        Ok(record)
+    }
+
+    async fn create_discovery_proposal(
+        &self,
+        proposal: &DiscoveryProposal,
+    ) -> Result<(), StorageError> {
+        if proposal.region.org != proposal.caller_scope.org_id
+            || proposal.proposed_visibility > proposal.caller_scope.max_visibility
+            || (!proposal.region.project.is_empty()
+                && proposal.region.project != "*"
+                && !proposal
+                    .caller_scope
+                    .project_ids
+                    .contains(&proposal.region.project))
+        {
+            return Err(StorageError::ProposalMismatch);
+        }
+        let _gate = self.inner.mutation_gate.lock().unwrap();
+        let mut proposals = self.inner.proposals.lock().unwrap();
+        match proposals.get(&proposal.discovery_id) {
+            Some(stored) if stored.proposal == *proposal => Ok(()),
+            Some(_) => Err(StorageError::ProposalMismatch),
+            None => {
+                proposals.insert(
+                    proposal.discovery_id.clone(),
+                    StoredProposal {
+                        proposal: proposal.clone(),
+                        consumed: false,
+                    },
+                );
+                Ok(())
+            }
+        }
+    }
+
+    async fn get_discovery_proposal(
+        &self,
+        discovery_id: &str,
+    ) -> Result<Option<DiscoveryProposal>, StorageError> {
+        Ok(self
+            .inner
+            .proposals
+            .lock()
+            .unwrap()
+            .get(discovery_id)
+            .filter(|stored| !stored.consumed)
+            .map(|stored| stored.proposal.clone()))
+    }
+
+    async fn accept_discovery(
+        &self,
+        acceptance: &DiscoveryAcceptance,
+    ) -> Result<CommitRecord, StorageError> {
+        let (record, invalidations) = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            let mut proposals = self.inner.proposals.lock().unwrap().clone();
+            let mut relationships = self.inner.rels.lock().unwrap().clone();
+            let mut audits = self.inner.audits.lock().unwrap().clone();
+            let stored = proposals
+                .get_mut(&acceptance.discovery_id)
+                .ok_or(StorageError::ProposalNotFound)?;
+            if stored.consumed {
+                return Err(StorageError::ProposalNotFound);
+            }
+            let proposal = &stored.proposal;
+            let relationship = &acceptance.relationship;
+            if proposal.region != acceptance.region
+                || proposal.caller_scope != acceptance.caller_scope
+                || proposal.from != relationship.from
+                || proposal.to != relationship.to
+                || proposal.kind != relationship.kind
+                || proposal.proposed_visibility != relationship.visibility
+                || proposal.region.org != acceptance.audit.org_id
+                || proposal.caller_scope.user_id != acceptance.audit.actor
+                || relationship.visibility > acceptance.caller_scope.max_visibility
+            {
+                return Err(StorageError::ProposalMismatch);
+            }
+            stored.consumed = true;
+            let lsn = self.lsn.load(Ordering::SeqCst) + 1;
+            let now = Utc::now();
+            let mut row = relationship.clone();
+            row.lsn = exocortex_kernel::LSN::new_backend(lsn);
+            relationships.insert(row.id, vec![row.clone()]);
+            let mut next_lsn = lsn;
+            let mut invalidations = vec![Invalidation::RelationshipUpserted {
+                id: row.id,
+                from: row.from,
+                to: row.to,
+                kind: row.kind,
+                lsn,
+            }];
+            if let Some(mut inverse) =
+                exocortex_kernel::materialize_inverse(&self.inner.ontology, relationship)
+            {
+                next_lsn += 1;
+                inverse.lsn = exocortex_kernel::LSN::new_backend(next_lsn);
+                relationships.insert(inverse.id, vec![inverse.clone()]);
+                invalidations.push(Invalidation::RelationshipUpserted {
+                    id: inverse.id,
+                    from: inverse.from,
+                    to: inverse.to,
+                    kind: inverse.kind,
+                    lsn: next_lsn,
+                });
+            }
+            #[cfg(test)]
+            if self.take_atomic_fault(AtomicFault::Mutation) {
+                return Err(StorageError::Backend("injected mutation failure".into()));
+            }
+            audits.push(Self::audit_value(&acceptance.audit, lsn));
+            #[cfg(test)]
+            if self.take_atomic_fault(AtomicFault::Audit) {
+                return Err(StorageError::Backend("injected audit failure".into()));
+            }
+            *self.inner.proposals.lock().unwrap() = proposals;
+            *self.inner.rels.lock().unwrap() = relationships;
+            *self.inner.audits.lock().unwrap() = audits;
+            self.lsn.store(next_lsn, Ordering::SeqCst);
+            (
+                CommitRecord {
+                    lsn,
+                    committed_at: now,
+                    node_id: None,
+                    edge_id: None,
+                },
+                invalidations,
+            )
+        };
+        for invalidation in invalidations {
+            let _ = self.feed.send(invalidation);
+        }
+        Ok(record)
+    }
+
+    async fn audit_range(
+        &self,
+        org_id: &str,
+        since_lsn: u64,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>, StorageError> {
+        Ok(self
+            .inner
+            .audits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                row["org_id"] == org_id && row["lsn"].as_u64().is_some_and(|lsn| lsn > since_lsn)
+            })
+            .take(limit as usize)
+            .cloned()
+            .collect())
     }
     async fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>, StorageError> {
         Ok(self
@@ -658,7 +906,7 @@ pub fn org_visibility_ctx(org: &str, user: &str) -> VisibilityContext {
 #[cfg(test)]
 mod atomic_fence_tests {
     use super::*;
-    use exocortex_kernel::{MemoryContext, Provenance, LSN};
+    use exocortex_kernel::{MemoryContext, Provenance, RelationshipProperties, LSN};
 
     fn memory() -> Memory {
         Memory {
@@ -771,5 +1019,135 @@ mod atomic_fence_tests {
         let new = rx.await.unwrap().unwrap();
         assert!(new.epoch > old.epoch);
         assert!(storage.get_memory(&row.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn discovery_acceptance_rolls_back_mutation_and_audit_faults() {
+        for fault in [AtomicFault::Mutation, AtomicFault::Audit] {
+            let ontology = std::sync::Arc::new(
+                exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                    .unwrap(),
+            );
+            let storage = InMemoryStorage::new(ontology);
+            let from = memory();
+            let to = memory();
+            storage.upsert_memory(&from).await.unwrap();
+            storage.upsert_memory(&to).await.unwrap();
+            let scope = org_visibility_ctx("org", "alice");
+            let discovery_id: smol_str::SmolStr = "proposal-atomic".into();
+            let region = RegionKey {
+                org: "org".into(),
+                project: "*".into(),
+                memory_type: from.memory_type,
+            };
+            let kind = exocortex_kernel::kinds::SOLVES;
+            storage
+                .create_discovery_proposal(&DiscoveryProposal {
+                    discovery_id: discovery_id.clone(),
+                    region: region.clone(),
+                    from: from.id,
+                    to: to.id,
+                    kind,
+                    proposed_visibility: Visibility::Org,
+                    caller_scope: scope.clone(),
+                    issued_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+            let relationship = Relationship {
+                id: RelationshipId::derive(from.id, kind, to.id, Some(&discovery_id)),
+                kind,
+                from: from.id,
+                to: to.id,
+                visibility: Visibility::Org,
+                provenance: Provenance::Asserted {
+                    author: "alice".into(),
+                    producer_kind: None,
+                },
+                properties: RelationshipProperties {
+                    strength: 0.5,
+                    confidence: 0.8,
+                    context: Some("discovery:proposal-atomic".into()),
+                    evidence_count: 1,
+                    success_rate: None,
+                    validation_count: 0,
+                    counter_evidence_count: 0,
+                    last_validated: Utc::now(),
+                },
+                description: None,
+                bidirectional: false,
+                valid_from: Utc::now(),
+                valid_until: None,
+                recorded_at: Utc::now(),
+                invalidated_by: None,
+                lsn: LSN::new_local(0),
+            };
+            let acceptance = DiscoveryAcceptance {
+                discovery_id: discovery_id.clone(),
+                region,
+                caller_scope: scope,
+                relationship: relationship.clone(),
+                audit: AuditEvent {
+                    action: "accept_discovery".into(),
+                    actor: "alice".into(),
+                    org_id: "org".into(),
+                    input_digest: [7; 32],
+                    output_ids: ["edge".into()].into_iter().collect(),
+                    fingerprint: storage.ontology_fingerprint(),
+                    lease_epoch: None,
+                    recorded_at: Utc::now(),
+                },
+            };
+            *storage.inner.atomic_fault.lock().unwrap() = Some(fault);
+            assert!(storage.accept_discovery(&acceptance).await.is_err());
+            assert!(storage
+                .get_discovery_proposal(&discovery_id)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(storage.relationship_history(&relationship.id).is_empty());
+            assert!(storage.audit_range("org", 0, 10).await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn visibility_promotion_rolls_back_mutation_and_audit_faults() {
+        for fault in [AtomicFault::Mutation, AtomicFault::Audit] {
+            let ontology = std::sync::Arc::new(
+                exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                    .unwrap(),
+            );
+            let storage = InMemoryStorage::new(ontology);
+            let mut original = memory();
+            original.visibility = Visibility::Private;
+            storage.upsert_memory(&original).await.unwrap();
+            let mut promoted = original.clone();
+            promoted.visibility = Visibility::Org;
+            let audit = AuditEvent {
+                action: "promote_visibility".into(),
+                actor: "alice".into(),
+                org_id: "org".into(),
+                input_digest: [3; 32],
+                output_ids: ["memory".into()].into_iter().collect(),
+                fingerprint: storage.ontology_fingerprint(),
+                lease_epoch: None,
+                recorded_at: Utc::now(),
+            };
+            *storage.inner.atomic_fault.lock().unwrap() = Some(fault);
+            assert!(storage
+                .upsert_memory_audited(&promoted, &audit)
+                .await
+                .is_err());
+            assert_eq!(
+                storage
+                    .get_memory(&original.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .visibility,
+                Visibility::Private
+            );
+            assert!(storage.audit_range("org", 0, 10).await.unwrap().is_empty());
+        }
     }
 }

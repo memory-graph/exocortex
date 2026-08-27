@@ -191,6 +191,15 @@ fn hex(id: &[u8; 16]) -> String {
     out
 }
 
+fn hex_digest(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 fn unhex(s: &str) -> Option<[u8; 16]> {
     let mut out = [0u8; 16];
     for (i, slot) in out.iter_mut().enumerate() {
@@ -428,6 +437,38 @@ impl FalkorStorage {
         })
     }
 
+    fn audit_params(audit: &AuditEvent, lsn: u64) -> serde_json::Value {
+        serde_json::json!({
+            "action": audit.action,
+            "actor": audit.actor,
+            "org_id": audit.org_id,
+            "input_digest": hex_digest(&audit.input_digest),
+            "output_ids": audit.output_ids,
+            "fingerprint": hex_digest(&audit.fingerprint),
+            "lease_epoch": audit.lease_epoch.map(|e| e.to_string()).unwrap_or_default(),
+            "recorded_at": audit.recorded_at.to_rfc3339(),
+            "lsn": lsn,
+        })
+    }
+
+    fn proposal_params(proposal: &DiscoveryProposal) -> Result<serde_json::Value, StorageError> {
+        Ok(serde_json::json!({
+            "discovery_id": proposal.discovery_id,
+            "org_id": proposal.region.org,
+            "region_project": proposal.region.project,
+            "region_memory_type": proposal.region.memory_type,
+            "from": hex(&proposal.from.0),
+            "to": hex(&proposal.to.0),
+            "kind": proposal.kind.0,
+            "visibility": proposal.proposed_visibility as u8,
+            "caller_scope_json": serde_json::to_string(&proposal.caller_scope)
+                .map_err(|e| StorageError::Backend(e.to_string()))?,
+            "issued_at": proposal.issued_at.to_rfc3339(),
+            "props_json": serde_json::to_string(proposal)
+                .map_err(|e| StorageError::Backend(e.to_string()))?,
+        }))
+    }
+
     /// Row write without inverse materialization (R-T4 terminal).
     async fn upsert_relationship_row(
         &self,
@@ -532,6 +573,36 @@ impl FalkorStorage {
             ));
         }
         Ok((text, bound))
+    }
+
+    async fn run_atomic_parts(
+        &self,
+        parts: &[(&str, serde_json::Value)],
+    ) -> Result<bool, StorageError> {
+        let mut params = Vec::new();
+        let mut bodies = Vec::with_capacity(parts.len());
+        for (index, (template, values)) in parts.iter().enumerate() {
+            let (body, mut bound) =
+                self.namespaced_template(template, values, &format!("a{index}"))?;
+            bodies.push(body);
+            params.append(&mut bound);
+        }
+        params.sort_by(|a, b| a.0.cmp(&b.0));
+        let prefix = params
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let body = bodies.join("\nWITH 1 AS __atomic_step\n");
+        let text =
+            format!("CYPHER {prefix} WITH 1 AS __atomic_step\n{body}\nRETURN 1 AS committed");
+        let mut graph = self.client.select_graph(self.graph.clone());
+        let result = graph
+            .query(text.as_str())
+            .execute()
+            .await
+            .map_err(|e| StorageError::Backend(format!("atomic mutation failed: {e}")))?;
+        Ok(result.data.count() > 0)
     }
 
     /// Allocate a contiguous block of `n` LSNs. Allocation may leave a gap
@@ -844,6 +915,196 @@ impl Storage for FalkorStorage {
             node_id: None,
             edge_id: None,
         })
+    }
+
+    async fn upsert_memory_audited(
+        &self,
+        memory: &Memory,
+        audit: &AuditEvent,
+    ) -> Result<CommitRecord, StorageError> {
+        let lsn = self.next_lsn().await?;
+        let now = Utc::now();
+        let label = self
+            .ontology
+            .memory_type_names
+            .get(memory.memory_type as usize)
+            .ok_or_else(|| {
+                StorageError::Backend(format!("bad memory_type {}", memory.memory_type))
+            })?;
+        let parts = [
+            (
+                "batch_upsert_memory",
+                self.memory_params(memory, lsn, label),
+            ),
+            ("batch_audit_append", Self::audit_params(audit, lsn)),
+        ];
+        if !self.run_atomic_parts(&parts).await? {
+            return Err(StorageError::Backend(
+                "audited memory mutation produced no commit".into(),
+            ));
+        }
+        self.publish(Invalidation::MemoryUpserted { id: memory.id, lsn })
+            .await;
+        Ok(CommitRecord {
+            lsn,
+            committed_at: now,
+            node_id: None,
+            edge_id: None,
+        })
+    }
+
+    async fn create_discovery_proposal(
+        &self,
+        proposal: &DiscoveryProposal,
+    ) -> Result<(), StorageError> {
+        if proposal.region.org != proposal.caller_scope.org_id
+            || proposal.proposed_visibility > proposal.caller_scope.max_visibility
+            || (!proposal.region.project.is_empty()
+                && proposal.region.project != "*"
+                && !proposal
+                    .caller_scope
+                    .project_ids
+                    .contains(&proposal.region.project))
+        {
+            return Err(StorageError::ProposalMismatch);
+        }
+        let rows = self
+            .run_template(
+                "discovery_proposal_create",
+                &Self::proposal_params(proposal)?,
+                false,
+            )
+            .await?;
+        if rows.is_empty() {
+            Err(StorageError::ProposalMismatch)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn get_discovery_proposal(
+        &self,
+        discovery_id: &str,
+    ) -> Result<Option<DiscoveryProposal>, StorageError> {
+        let rows = self
+            .run_template(
+                "discovery_proposal_get",
+                &serde_json::json!({ "discovery_id": discovery_id }),
+                true,
+            )
+            .await?;
+        let Some(FalkorValue::String(json)) = rows.first().and_then(|row| row.first()) else {
+            return Ok(None);
+        };
+        serde_json::from_str(json)
+            .map(Some)
+            .map_err(|e| StorageError::CorruptMetadata {
+                key: "discovery_proposal",
+                detail: e.to_string(),
+            })
+    }
+
+    async fn accept_discovery(
+        &self,
+        acceptance: &DiscoveryAcceptance,
+    ) -> Result<CommitRecord, StorageError> {
+        let relationship = &acceptance.relationship;
+        if acceptance.region.org != acceptance.caller_scope.org_id
+            || acceptance.audit.org_id != acceptance.caller_scope.org_id
+            || acceptance.audit.actor != acceptance.caller_scope.user_id
+            || relationship.visibility > acceptance.caller_scope.max_visibility
+        {
+            return Err(StorageError::ProposalMismatch);
+        }
+        let mut relationships = vec![relationship.clone()];
+        if let Some(inverse) = exocortex_kernel::materialize_inverse(&self.ontology, relationship) {
+            relationships.push(inverse);
+        }
+        let block = self.next_lsn_block(relationships.len()).await?;
+        let now = Utc::now();
+        let mut parts = Vec::with_capacity(relationships.len() + 3);
+        parts.push((
+            "discovery_accept_guard",
+            serde_json::json!({
+                "discovery_id": acceptance.discovery_id,
+                "org_id": acceptance.region.org,
+                "region_project": acceptance.region.project,
+                "region_memory_type": acceptance.region.memory_type,
+                "from": hex(&relationship.from.0),
+                "to": hex(&relationship.to.0),
+                "kind": relationship.kind.0,
+                "visibility": relationship.visibility as u8,
+                "caller_scope_json": serde_json::to_string(&acceptance.caller_scope)
+                    .map_err(|e| StorageError::Backend(e.to_string()))?,
+            }),
+        ));
+        for (offset, row) in relationships.iter().enumerate() {
+            let lsn = block.start + offset as u64;
+            parts.push((
+                "batch_upsert_relationship",
+                serde_json::json!({
+                    "rel_id": hex(&row.id.0), "from": hex(&row.from.0), "to": hex(&row.to.0),
+                    "kind_label": self.kind_label(row.kind)?,
+                    "props_json": FalkorStorage::props_json(row, lsn),
+                    "visibility": row.visibility as u8,
+                    "valid_from": row.valid_from.to_rfc3339(),
+                    "valid_until": row.valid_until.map(|t| t.to_rfc3339()),
+                    "invalidated_by": row.invalidated_by.map(|id| hex(&id.0)),
+                    "recorded_at": row.recorded_at.to_rfc3339(), "lsn": lsn,
+                }),
+            ));
+        }
+        parts.push((
+            "discovery_proposal_consume",
+            serde_json::json!({
+                "discovery_id": acceptance.discovery_id,
+                "consumed_at": now.to_rfc3339(),
+            }),
+        ));
+        parts.push((
+            "batch_audit_append",
+            Self::audit_params(&acceptance.audit, block.start),
+        ));
+        if !self.run_atomic_parts(&parts).await? {
+            return Err(StorageError::ProposalMismatch);
+        }
+        for (offset, row) in relationships.iter().enumerate() {
+            self.publish(Invalidation::RelationshipUpserted {
+                id: row.id,
+                from: row.from,
+                to: row.to,
+                kind: row.kind,
+                lsn: block.start + offset as u64,
+            })
+            .await;
+        }
+        Ok(CommitRecord {
+            lsn: block.start,
+            committed_at: now,
+            node_id: None,
+            edge_id: None,
+        })
+    }
+
+    async fn audit_range(
+        &self,
+        org_id: &str,
+        since_lsn: u64,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>, StorageError> {
+        let rows = self
+            .run_template(
+                "audit_range",
+                &serde_json::json!({
+                    "org_id": org_id, "since_lsn": since_lsn, "limit": limit,
+                }),
+                true,
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.first().map(falkor_value_to_json))
+            .collect())
     }
 
     async fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>, StorageError> {

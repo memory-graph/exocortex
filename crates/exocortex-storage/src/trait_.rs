@@ -6,8 +6,9 @@ use futures::stream::BoxStream;
 use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId};
 
 use crate::types::{
-    CommitRecord, CypherQuery, Embedding, GraphSnapshot, Invalidation, LeaseKey, MemoryFilter,
-    OwnerLease, RegionKey, ResultSet, StorageBackendId, StorageCapabilities, TraversalSpec,
+    AuditEvent, CommitRecord, CypherQuery, DiscoveryAcceptance, DiscoveryProposal, Embedding,
+    GraphSnapshot, Invalidation, LeaseKey, MemoryFilter, OwnerLease, RegionKey, ResultSet,
+    StorageBackendId, StorageCapabilities, TraversalSpec,
 };
 
 /// Errors surfaced by every `Storage` implementation.
@@ -45,6 +46,13 @@ pub enum StorageError {
         /// Epoch of the stale lease presented with the write.
         lease_epoch: u64,
     },
+    /// No unconsumed server-issued proposal exists for the supplied id.
+    #[error("discovery proposal not found")]
+    ProposalNotFound,
+    /// Proposal fields or caller scope do not exactly match the persisted
+    /// server-issued record.
+    #[error("discovery proposal scope or fields do not match")]
+    ProposalMismatch,
 }
 
 /// The one deliberate seam (§6.0): every subsystem above storage depends on
@@ -69,6 +77,57 @@ pub trait Storage: Send + Sync + 'static {
     async fn upsert_relationship(&self, r: &Relationship) -> crate::Result<CommitRecord>;
     /// Soft-delete a relationship: close `valid_until`.
     async fn delete_relationship(&self, id: &RelationshipId) -> crate::Result<CommitRecord>;
+    /// Atomically upsert a protected memory mutation and its required audit
+    /// event. Neither may commit without the other (R6-B18).
+    async fn upsert_memory_audited(
+        &self,
+        memory: &Memory,
+        audit: &AuditEvent,
+    ) -> crate::Result<CommitRecord> {
+        let _ = (memory, audit);
+        Err(StorageError::Backend(
+            "audited mutations unsupported".into(),
+        ))
+    }
+    /// Persist one immutable server-issued discovery proposal. Reissuing the
+    /// same id is idempotent only when every scoped field is identical.
+    async fn create_discovery_proposal(&self, proposal: &DiscoveryProposal) -> crate::Result<()> {
+        let _ = proposal;
+        Err(StorageError::Backend(
+            "discovery proposals unsupported".into(),
+        ))
+    }
+    /// Load an unconsumed proposal by id for validation and edge construction.
+    async fn get_discovery_proposal(
+        &self,
+        discovery_id: &str,
+    ) -> crate::Result<Option<DiscoveryProposal>> {
+        let _ = discovery_id;
+        Err(StorageError::Backend(
+            "discovery proposals unsupported".into(),
+        ))
+    }
+    /// Atomically consume a matching proposal, write its asserted edge, and
+    /// append the required audit event. Any failure leaves all three unchanged.
+    async fn accept_discovery(
+        &self,
+        acceptance: &DiscoveryAcceptance,
+    ) -> crate::Result<CommitRecord> {
+        let _ = acceptance;
+        Err(StorageError::Backend(
+            "discovery acceptance unsupported".into(),
+        ))
+    }
+    /// Read durable audit rows for one organization after an LSN.
+    async fn audit_range(
+        &self,
+        org_id: &str,
+        since_lsn: u64,
+        limit: u32,
+    ) -> crate::Result<Vec<serde_json::Value>> {
+        let _ = (org_id, since_lsn, limit);
+        Err(StorageError::Backend("audit storage unsupported".into()))
+    }
 
     // ---- Reads (interactive path) ----
 

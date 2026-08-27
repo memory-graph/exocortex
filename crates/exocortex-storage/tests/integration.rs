@@ -14,8 +14,9 @@ use exocortex_kernel::{
 };
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{
-    CypherQuery, FalkorConfig, FalkorStorage, Invalidation, LeaseKey, OwnerLease, RegionKey,
-    Storage, TraversalSpec, VisibilityContext,
+    AuditEvent, CypherQuery, DiscoveryAcceptance, DiscoveryProposal, FalkorConfig, FalkorStorage,
+    Invalidation, LeaseKey, OwnerLease, RegionKey, Storage, StorageError, TraversalSpec,
+    VisibilityContext,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -255,6 +256,80 @@ itest!(malformed_fingerprint_fails_closed_without_rewrite, {
         .unwrap();
     assert_eq!(persisted.rows, vec![serde_json::json!([malformed])]);
 });
+
+itest!(
+    discovery_acceptance_is_scoped_consumed_and_audited_atomically,
+    {
+        let s = connect("discovery-atomic").await;
+        let from = mem("proposal-from", 0, Visibility::Org);
+        let to = mem("proposal-to", 2, Visibility::Org);
+        s.upsert_memory(&from).await.unwrap();
+        s.upsert_memory(&to).await.unwrap();
+        let kind = exocortex_kernel::kinds::CAUSES;
+        let scope = VisibilityContext {
+            user_id: "alice".into(),
+            org_id: "test-org".into(),
+            project_ids: Default::default(),
+            team_ids: Default::default(),
+            max_visibility: Visibility::Org,
+        };
+        let region = RegionKey {
+            org: "test-org".into(),
+            project: "*".into(),
+            memory_type: from.memory_type,
+        };
+        let proposal = DiscoveryProposal {
+            discovery_id: "live-proposal".into(),
+            region: region.clone(),
+            from: from.id,
+            to: to.id,
+            kind,
+            proposed_visibility: Visibility::Project,
+            caller_scope: scope.clone(),
+            issued_at: Utc::now(),
+        };
+        s.create_discovery_proposal(&proposal).await.unwrap();
+        let mut conflicting = proposal.clone();
+        conflicting.to = MemoryId::new_v7();
+        assert!(matches!(
+            s.create_discovery_proposal(&conflicting).await,
+            Err(StorageError::ProposalMismatch)
+        ));
+        let mut relationship = rel(from.id, to.id, kind.0);
+        relationship.visibility = Visibility::Project;
+        relationship.id = RelationshipId::derive(from.id, kind, to.id, Some("live-proposal"));
+        let acceptance = DiscoveryAcceptance {
+            discovery_id: proposal.discovery_id.clone(),
+            region,
+            caller_scope: scope,
+            relationship: relationship.clone(),
+            audit: AuditEvent {
+                action: "accept_discovery".into(),
+                actor: "alice".into(),
+                org_id: "test-org".into(),
+                input_digest: [9; 32],
+                output_ids: ["edge".into()].into_iter().collect(),
+                fingerprint: s.ontology_fingerprint(),
+                lease_epoch: None,
+                recorded_at: Utc::now(),
+            },
+        };
+        let committed = s.accept_discovery(&acceptance).await.unwrap();
+        assert!(committed.lsn > 0);
+        assert!(s
+            .get_discovery_proposal("live-proposal")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            s.accept_discovery(&acceptance).await,
+            Err(StorageError::ProposalMismatch)
+        ));
+        let audits = s.audit_range("test-org", 0, 10).await.unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0]["action"], "accept_discovery");
+    }
+);
 
 itest!(three_hop_traverse, {
     let s = connect("node-1").await;

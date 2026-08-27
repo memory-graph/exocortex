@@ -396,14 +396,7 @@ impl Operation for PromoteVisibilityOp {
             return Err(OpError::BadInput("promotion only widens".into()));
         }
         m.visibility = to;
-        let commit = ctx
-            .storage
-            .upsert_memory(&m)
-            .await
-            .map_err(|e| OpError::Storage(e.to_string()))?;
-
-        // R-A1: the audit record shares the action's transaction; v1 appends
-        // immediately after the commit with the commit's LSN.
+        // R-A1: storage commits the mutation and audit record together.
         let record = crate::audit::AuditRecord {
             action: "promote_visibility".into(),
             actor: ctx.visibility_ctx.user_id.clone(),
@@ -416,9 +409,13 @@ impl Operation for PromoteVisibilityOp {
             fingerprint: ctx.storage.ontology_fingerprint(),
             lease_epoch: None,
             recorded_at: chrono::Utc::now(),
-            lsn: commit.lsn,
         };
-        let audit_lsn = crate::audit::append_audit(ctx, &record).await?;
+        let commit = ctx
+            .storage
+            .upsert_memory_audited(&m, &record)
+            .await
+            .map_err(|e| OpError::Storage(e.to_string()))?;
+        let audit_lsn = commit.lsn;
 
         Ok(PromoteVisibilityOutput {
             memory_id: input.memory_id,
@@ -483,6 +480,17 @@ impl Operation for AcceptDiscoveryOp {
     async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
         let from = unhex(&input.from)?;
         let to = unhex(&input.to)?;
+        let proposal = ctx
+            .storage
+            .get_discovery_proposal(&input.discovery_id)
+            .await
+            .map_err(|e| OpError::Storage(e.to_string()))?
+            .ok_or(OpError::NotFound)?;
+        if proposal.caller_scope != ctx.visibility_ctx {
+            return Err(OpError::Unauthorized(
+                "discovery proposal was issued to a different caller scope".into(),
+            ));
+        }
         // IN3 (audit): resolve the CALLER-SUPPLIED kind through the
         // effective ontology — the old code silently wrote RelKindId(0) for
         // every acceptance — and run the same R-T17 triple validation the
@@ -491,6 +499,11 @@ impl Operation for AcceptDiscoveryOp {
         let kind = ontology
             .kind_id(&input.kind)
             .ok_or_else(|| OpError::BadInput(format!("unknown kind `{}`", input.kind)))?;
+        if proposal.from != from || proposal.to != to || proposal.kind != kind {
+            return Err(OpError::BadInput(
+                "acceptance does not match the issued discovery proposal".into(),
+            ));
+        }
         if input.kind == "SimilarTo" {
             return Err(OpError::BadInput(
                 "SimilarTo is computed-only (R-T14); accept a discovery instead".into(),
@@ -498,13 +511,13 @@ impl Operation for AcceptDiscoveryOp {
         }
         let from_mem = ctx
             .storage
-            .get_memory(&from)
+            .get_memory_for(&from, &ctx.visibility_ctx)
             .await
             .map_err(|e| OpError::Storage(e.to_string()))?
             .ok_or(OpError::NotFound)?;
         let to_mem = ctx
             .storage
-            .get_memory(&to)
+            .get_memory_for(&to, &ctx.visibility_ctx)
             .await
             .map_err(|e| OpError::Storage(e.to_string()))?
             .ok_or(OpError::NotFound)?;
@@ -522,7 +535,7 @@ impl Operation for AcceptDiscoveryOp {
             kind,
             from,
             to,
-            visibility: ctx.visibility_ctx.max_visibility,
+            visibility: proposal.proposed_visibility,
             provenance: exocortex_kernel::Provenance::Asserted {
                 author: ctx.visibility_ctx.user_id.clone(),
                 producer_kind: None,
@@ -545,11 +558,6 @@ impl Operation for AcceptDiscoveryOp {
             invalidated_by: None,
             lsn: exocortex_kernel::LSN::new_local(0),
         };
-        let commit = ctx
-            .storage
-            .upsert_relationship(&rel)
-            .await
-            .map_err(|e| OpError::Storage(e.to_string()))?;
         let record = crate::audit::AuditRecord {
             action: "accept_discovery".into(),
             actor: ctx.visibility_ctx.user_id.clone(),
@@ -557,13 +565,29 @@ impl Operation for AcceptDiscoveryOp {
             input_digest: crate::audit::digest_input(&serde_json::json!({
                 "discovery_id": input.discovery_id,
             })),
-            output_ids: [input.discovery_id.clone().into()].into_iter().collect(),
+            output_ids: [hex32(&rel.id.0).into()].into_iter().collect(),
             fingerprint: ctx.storage.ontology_fingerprint(),
             lease_epoch: None,
             recorded_at: chrono::Utc::now(),
-            lsn: commit.lsn,
         };
-        let audit_lsn = crate::audit::append_audit(ctx, &record).await?;
+        let commit = ctx
+            .storage
+            .accept_discovery(&exocortex_storage::DiscoveryAcceptance {
+                discovery_id: proposal.discovery_id,
+                region: proposal.region,
+                caller_scope: ctx.visibility_ctx.clone(),
+                relationship: rel.clone(),
+                audit: record,
+            })
+            .await
+            .map_err(|e| match e {
+                exocortex_storage::StorageError::ProposalNotFound => OpError::NotFound,
+                exocortex_storage::StorageError::ProposalMismatch => {
+                    OpError::Unauthorized("proposal scope no longer matches".into())
+                }
+                other => OpError::Storage(other.to_string()),
+            })?;
+        let audit_lsn = commit.lsn;
         Ok(AcceptDiscoveryOutput {
             edge_id: hex32(&rel.id.0),
             audit_lsn,
