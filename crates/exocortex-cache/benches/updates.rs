@@ -4,9 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use exocortex_cache::{CacheWrite, LocalCache};
-use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
+use exocortex_kernel::{
+    Memory, MemoryContext, MemoryId, Provenance, Relationship, RelationshipId, Visibility, LSN,
+};
 use exocortex_pack_dev_v1::pack_def;
-use exocortex_storage::{InMemoryStorage, Invalidation};
+use exocortex_storage::{InMemoryStorage, Invalidation, Storage};
 
 fn memory(i: usize) -> Memory {
     Memory {
@@ -53,6 +55,43 @@ fn memory(i: usize) -> Memory {
     }
 }
 
+fn relationship(i: usize, from: MemoryId, to: MemoryId) -> Relationship {
+    let now = chrono::Utc::now();
+    Relationship {
+        id: RelationshipId::derive(
+            from,
+            exocortex_kernel::kinds::FIXES,
+            to,
+            Some(&i.to_string()),
+        ),
+        kind: exocortex_kernel::kinds::FIXES,
+        from,
+        to,
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "bench".into(),
+            producer_kind: None,
+        },
+        properties: exocortex_kernel::RelationshipProperties {
+            strength: 0.5,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: now,
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: now,
+        valid_until: None,
+        recorded_at: now,
+        invalidated_by: None,
+        lsn: LSN::new_local(0),
+    }
+}
+
 fn main() {
     const RESIDENT: usize = 20_000;
     const DELTAS: usize = 256;
@@ -66,6 +105,7 @@ fn main() {
     let storage = Arc::new(InMemoryStorage::new(ontology));
     let writer = rt.spawn({
         let cache = cache.clone();
+        let storage = storage.clone();
         async move { cache.run(storage, rx).await }
     });
 
@@ -90,6 +130,43 @@ fn main() {
     let update = update_started.elapsed();
     let publications = cache.snapshot_publications() - baseline_publications;
 
+    const RELATIONSHIPS: usize = 10_000;
+    const POINT_READS: usize = 1_000;
+    let endpoint_a = memory(0);
+    let endpoint_b = memory(1);
+    let relationships: Vec<_> = (0..RELATIONSHIPS)
+        .map(|i| relationship(i, endpoint_a.id, endpoint_b.id))
+        .collect();
+    rt.block_on(storage.upsert_batch(&[endpoint_a.clone(), endpoint_b.clone()], &relationships))
+        .unwrap();
+    let target = relationships.last().unwrap().id;
+    let point_invalidation_started = Instant::now();
+    rt.block_on(async {
+        cache
+            .submit(CacheWrite::Apply(Invalidation::RelationshipUpserted {
+                id: target,
+                from: endpoint_a.id,
+                to: endpoint_b.id,
+                kind: exocortex_kernel::kinds::FIXES,
+                lsn: (RESIDENT + DELTAS + RELATIONSHIPS) as u64,
+            }))
+            .await;
+        cache.flush().await;
+    });
+    let point_invalidation = point_invalidation_started.elapsed();
+    assert!(cache
+        .graphs_snapshot("bench-org")
+        .unwrap()
+        .by_rel_id
+        .contains_key(&target));
+    let edge_fetch_started = Instant::now();
+    rt.block_on(async {
+        for _ in 0..POINT_READS {
+            assert!(storage.get_relationship(&target).await.unwrap().is_some());
+        }
+    });
+    let edge_fetch = edge_fetch_started.elapsed();
+
     // Generous shared-CI ceilings. The publication assertion is the primary
     // scaling gate: one graph clone/swap for a queued delta burst, not 256.
     let multiplier = std::env::var("SLO_MULTIPLIER")
@@ -99,10 +176,19 @@ fn main() {
         .clamp(1.0, 3.0);
     let hydration_budget = Duration::from_secs(2).mul_f64(multiplier);
     let update_budget = Duration::from_millis(500).mul_f64(multiplier);
+    let edge_fetch_budget = Duration::from_millis(100).mul_f64(multiplier);
+    let point_invalidation_budget = Duration::from_millis(100).mul_f64(multiplier);
     println!(
         "cache update gate: hydrate {RESIDENT}={hydration:?}; {DELTAS} invalidations={update:?}; publications={publications}"
     );
-    let ok = hydration < hydration_budget && update < update_budget && publications == 1;
+    println!(
+        "indexed relationship gate: point invalidation over {RELATIONSHIPS} rows={point_invalidation:?}; {POINT_READS} reads={edge_fetch:?}"
+    );
+    let ok = hydration < hydration_budget
+        && update < update_budget
+        && publications == 1
+        && edge_fetch < edge_fetch_budget
+        && point_invalidation < point_invalidation_budget;
     println!(
         "cache update/hydration SLO gate: {}",
         if ok { "PASS" } else { "FAIL" }
