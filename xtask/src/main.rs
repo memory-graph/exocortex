@@ -97,6 +97,26 @@ fn main() -> Result<()> {
 }
 
 fn deployment_acceptance() -> Result<()> {
+    let compose =
+        std::fs::read_to_string("crates/exocortex-cluster/tests/docker-compose-cluster.yml")?;
+    for node in ["node1", "node2", "node3"] {
+        let marker = format!("  {node}:\n");
+        let section = compose
+            .split_once(&marker)
+            .map(|(_, tail)| tail)
+            .and_then(|tail| {
+                tail.split_once("\n  node")
+                    .map(|(section, _)| section)
+                    .or(Some(tail))
+            })
+            .ok_or_else(|| anyhow::anyhow!("chaos compose is missing service {node}"))?;
+        anyhow::ensure!(
+            section.contains("    build:\n")
+                && section.contains("      context: ../../..\n")
+                && section.contains("      dockerfile: Dockerfile\n"),
+            "chaos compose service {node} must build the current root Dockerfile; image-only services can silently run a stale local tag"
+        );
+    }
     run(
         &["build", "-p", "exocortex-client", "-p", "exocortex-server"],
         &[],
@@ -118,7 +138,7 @@ fn deployment_acceptance() -> Result<()> {
             "deployment mode {mode} did not execute all nine rules: {stdout}"
         );
     }
-    println!("deployment-acceptance ok: one artifact selected 3 modes; each executed 9 rules");
+    println!("deployment-acceptance ok: chaos nodes build the current image; one artifact selected 3 modes; each executed 9 rules");
     Ok(())
 }
 
