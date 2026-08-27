@@ -33,12 +33,12 @@ Exocortex is that ontology as a single Rust binary, under an OSS license,
 fed by your agents today — your documents and analytics tables next —
 instead of a data team. Claude Code, Codex, Cursor, any MCP client
 writes to it and reads from it — so what your org learns in one session
-is what it knows in the next. Documents are the next feed:
-`exocortex-adapter-mintlify`, the reference Ingestion Protocol adapter
-(PRD'd in-repo, in development), turns pages tagged with `exocortex:`
-frontmatter into typed memories — deterministically, no LLM anywhere
-in the loop. Analytics tables follow the same seam via the planned
-S3 Tables / Iceberg adapter. The ontology's shape (type-tagged
+is what it knows in the next. Documents feed the same graph through
+[`exocortex-adapter-mintlify`](https://github.com/memory-graph/exocortex-adapter-mintlify),
+the reference Ingestion Protocol adapter: pages tagged with `exocortex:`
+frontmatter land as identity-stable typed memories — deterministically,
+no LLM anywhere in the loop. Analytics tables follow the same seam via
+the planned S3 Tables / Iceberg adapter. The ontology's shape (type-tagged
 memories + a typed edge vocabulary, not per-type payload schemas) was
 validated by our prior memory-graph deployment; Exocortex is that idea
 as one fast, governed binary.
@@ -339,6 +339,14 @@ Run the node:
 ```sh
 exocortex-node --mode backend-node --storage falkor://falkordb:6379 \
   --bind 0.0.0.0:8080 --bearer-token <token>
+```
+
+Back up and restore the org's durable graph (disaster recovery —
+byte-faithful rows modulo storage-assigned LSNs, fingerprint-gated):
+
+```sh
+exocortex-node --mode backend-node --storage falkor://falkordb:6379   --graph-name my-org --export-org org-backup.json
+exocortex-node --mode backend-node --storage falkor://falkordb:6379   --graph-name my-org --import-org org-backup.json
 ```
 
 Then run clients with `--backend http://host:8080 --auth-token <token>`.
