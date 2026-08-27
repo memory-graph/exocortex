@@ -20,12 +20,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use exocortex_cluster::{ClusterNode, Replay};
-use exocortex_kernel::{MemoryId, RelationshipId};
+use exocortex_kernel::{Memory, MemoryId, Relationship, RelationshipId};
 use exocortex_storage::{
     memory_visible, relationship_visible, Invalidation, Storage, StorageError, VisibilityContext,
 };
 use exocortex_wire::cluster::v1::InvalidationEnvelope;
 use exocortex_wire::sse::v1::invalidation::Kind;
+
+#[derive(serde::Serialize)]
+struct ClientGraphSnapshot {
+    memories: Vec<Memory>,
+    relationships: Vec<Relationship>,
+}
 
 /// Whether `/v1/changes` demands a per-client token (R-Sec5).
 /// `backend-node` requires one; `mcp-standalone` (loopback-only) keeps
@@ -58,11 +64,7 @@ pub fn sse_router<S: Storage + 'static>(
 /// Derive the per-client SSE key (R-Sec5): provisioned clients receive this
 /// key out-of-band alongside their token.
 pub fn derive_client_sse_key(cluster_key: &[u8; 32], token: &str) -> [u8; 32] {
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(cluster_key)
-        .expect("HMAC accepts any key length");
-    mac.update(b"sse-client:");
-    mac.update(token.as_bytes());
-    mac.finalize().into_bytes().into()
+    exocortex_wire::signing::derive_sse_client_key(cluster_key, token)
 }
 
 async fn handler<S: Storage + 'static>(
@@ -72,6 +74,7 @@ async fn handler<S: Storage + 'static>(
 ) -> Response {
     let mut token = None;
     let mut since_lsn = None;
+    let mut seed = false;
     if let Some(qs) = q.as_deref() {
         for pair in qs.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
@@ -83,6 +86,7 @@ async fn handler<S: Storage + 'static>(
                         }
                     }
                     "since_lsn" => since_lsn = v.parse::<u64>().ok(),
+                    "seed" => seed = v == "true",
                     _ => {}
                 }
             }
@@ -92,32 +96,57 @@ async fn handler<S: Storage + 'static>(
     if auth == SseAuth::RequiredToken && (token.is_none() || principal.is_none()) {
         return (http::StatusCode::UNAUTHORIZED, "missing SSE credentials").into_response();
     }
+    // Subscribe before building an initial image so commits concurrent with
+    // hydration are buffered for delivery immediately after the snapshot.
+    let rx = cluster.subscribe_local();
+    let visibility = principal.map(|Extension(vc)| vc);
+    let initial_snapshot = if seed {
+        match graph_reseed_envelope(&cluster, visibility.as_ref()).await {
+            Ok(envelope) => Some(envelope),
+            Err(error) => {
+                tracing::warn!(?error, "SSE initial hydration failed");
+                return http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
+    } else {
+        None
+    };
     // R-C6: a reconnect older than the replay window must reseed, not
     // silently skip deltas. The 409 carries the buffer floor so the client
     // can resume (and rehydrate the gap via its resync hook).
-    let replay = match since_lsn {
-        Some(n) => match cluster.replay_since(n) {
-            Replay::Fresh(envs) => envs,
-            Replay::TooOld => {
-                let mut resp = (http::StatusCode::CONFLICT, "Resync Required").into_response();
-                if let Ok(v) = http::HeaderValue::from_str(&cluster.replay_floor().to_string()) {
-                    resp.headers_mut().insert("x-exocortex-min-lsn", v);
+    let replay = if seed {
+        vec![]
+    } else {
+        match since_lsn {
+            Some(n) => match cluster.replay_since(n) {
+                Replay::Fresh(envs) => envs,
+                Replay::TooOld => {
+                    let mut resp = (http::StatusCode::CONFLICT, "Resync Required").into_response();
+                    if let Ok(v) = http::HeaderValue::from_str(&cluster.replay_floor().to_string())
+                    {
+                        resp.headers_mut().insert("x-exocortex-min-lsn", v);
+                    }
+                    return resp;
                 }
-                return resp;
-            }
-        },
-        None => vec![],
+            },
+            None => vec![],
+        }
     };
 
-    let rx = cluster.subscribe_local();
     let node_id = cluster.node_id.to_string();
-    let visibility = principal.map(|Extension(vc)| vc);
     // R-Sec5: token → per-client key; envelopes re-sign with it.
     let client_key = token.map(|t| derive_client_sse_key(&cluster.hmac_key, &t));
     let stream = async_stream::stream! {
         let mut rx = tokio_stream::wrappers::BroadcastStream::new(rx);
         // Initial comment anchors the connection before the first delta.
         yield Ok::<Event, Infallible>(Event::default().comment(format!("exocortex {node_id}")));
+        if let Some(mut env) = initial_snapshot {
+            if let Some(key) = &client_key {
+                resign(key, &mut env);
+            }
+            let payload = B64::encode(&prost_encode(&env));
+            yield Ok(Event::default().event("inv").data(payload));
+        }
         // R-C6 replay first (LSN order); the client's LSN gate dedups any
         // overlap with the live stream that follows.
         for env in replay {
@@ -170,27 +199,33 @@ async fn prepare_for_subscriber<S: Storage + 'static>(
     visibility: Option<&VisibilityContext>,
 ) -> Result<InvalidationEnvelope, StorageError> {
     let Some(vc) = visibility else {
-        return Ok(env);
+        return hydrate_upsert(cluster, env, None).await;
     };
     let inv = env
         .inv
         .as_ref()
         .ok_or_else(|| StorageError::Backend("SSE envelope missing invalidation".into()))?;
     let lsn = inv.backend_lsn;
-    let visible = match inv.kind.as_ref() {
+    let kind = inv.kind.clone();
+    let visible = match kind.as_ref() {
         Some(Kind::MemoryUpserted(row)) => {
-            memory_event_visible(cluster.storage.as_ref(), &row.id, vc).await?
+            memory_event_row(cluster.storage.as_ref(), &row.id, Some(vc))
+                .await?
+                .is_some()
         }
         Some(Kind::MemoryDeleted(row)) => {
             memory_event_visible(cluster.storage.as_ref(), &row.id, vc).await?
         }
         Some(Kind::RelationshipUpserted(row)) => {
-            relationship_event_visible(cluster.storage.as_ref(), &row.id, vc).await?
+            relationship_event_row(cluster.storage.as_ref(), &row.id, Some(vc))
+                .await?
+                .is_some()
         }
         Some(Kind::RelationshipDeleted(row)) => {
             relationship_event_visible(cluster.storage.as_ref(), &row.id, vc).await?
         }
         Some(Kind::VisibilityAdvance(_)) => true,
+        Some(Kind::GraphReseed(_)) => true,
         None => {
             return Err(StorageError::Backend(
                 "SSE invalidation missing event kind".into(),
@@ -198,9 +233,43 @@ async fn prepare_for_subscriber<S: Storage + 'static>(
         }
     };
     if visible {
-        Ok(env)
+        hydrate_upsert(cluster, env, Some(vc)).await
     } else {
         Ok(cluster.envelope(Invalidation::VisibilityAdvance { lsn }))
+    }
+}
+
+async fn hydrate_upsert<S: Storage + 'static>(
+    cluster: &ClusterNode<S>,
+    env: InvalidationEnvelope,
+    vc: Option<&VisibilityContext>,
+) -> Result<InvalidationEnvelope, StorageError> {
+    let kind = env.inv.as_ref().and_then(|inv| inv.kind.clone());
+    let lsn = env.inv.as_ref().map(|inv| inv.backend_lsn).unwrap_or(0);
+    match kind {
+        Some(Kind::MemoryUpserted(row)) => {
+            let memory = memory_event_row(cluster.storage.as_ref(), &row.id, vc)
+                .await?
+                .ok_or_else(|| StorageError::Backend("visible SSE memory disappeared".into()))?;
+            Ok(cluster.envelope(Invalidation::MemorySnapshotUpserted {
+                memory: Box::new(memory),
+                lsn,
+            }))
+        }
+        Some(Kind::RelationshipUpserted(row)) => {
+            let relationship = relationship_event_row(cluster.storage.as_ref(), &row.id, vc)
+                .await?
+                .ok_or_else(|| {
+                    StorageError::Backend("visible SSE relationship disappeared".into())
+                })?;
+            Ok(
+                cluster.envelope(Invalidation::RelationshipSnapshotUpserted {
+                    relationship: Box::new(relationship),
+                    lsn,
+                }),
+            )
+        }
+        _ => Ok(env),
     }
 }
 
@@ -215,6 +284,18 @@ async fn memory_event_visible<S: Storage>(
         .await?
         .as_ref()
         .is_some_and(|memory| memory_visible(memory, vc)))
+}
+
+async fn memory_event_row<S: Storage>(
+    storage: &S,
+    raw_id: &[u8],
+    vc: Option<&VisibilityContext>,
+) -> Result<Option<Memory>, StorageError> {
+    let id = MemoryId(decode_id(raw_id)?);
+    Ok(storage
+        .get_memory(&id)
+        .await?
+        .filter(|memory| vc.is_none_or(|vc| memory_visible(memory, vc))))
 }
 
 async fn relationship_event_visible<S: Storage>(
@@ -246,6 +327,94 @@ async fn relationship_event_visible<S: Storage>(
         (Some(from), Some(to)) => relationship_visible(&relationship, from, to, vc),
         _ => false,
     })
+}
+
+async fn relationship_event_row<S: Storage>(
+    storage: &S,
+    raw_id: &[u8],
+    vc: Option<&VisibilityContext>,
+) -> Result<Option<Relationship>, StorageError> {
+    let id = RelationshipId(decode_id(raw_id)?);
+    let mut rows = storage.stream_all_relationships().await;
+    while let Some(row) = rows.next().await {
+        let relationship = row?;
+        if relationship.id != id {
+            continue;
+        }
+        let Some(vc) = vc else {
+            return Ok(Some(relationship));
+        };
+        let endpoints = storage
+            .get_memories(&[relationship.from, relationship.to])
+            .await?;
+        let from = endpoints
+            .iter()
+            .find(|memory| memory.id == relationship.from);
+        let to = endpoints.iter().find(|memory| memory.id == relationship.to);
+        return Ok(match (from, to) {
+            (Some(from), Some(to)) if relationship_visible(&relationship, from, to, vc) => {
+                Some(relationship)
+            }
+            _ => None,
+        });
+    }
+    Ok(None)
+}
+
+async fn graph_reseed_envelope<S: Storage + 'static>(
+    cluster: &ClusterNode<S>,
+    visibility: Option<&VisibilityContext>,
+) -> Result<InvalidationEnvelope, StorageError> {
+    let now = chrono::Utc::now();
+    let mut all_memories = std::collections::HashMap::new();
+    let mut memories = Vec::new();
+    let mut frontier = 0;
+    let mut memory_rows = cluster.storage.stream_all_memories().await;
+    while let Some(row) = memory_rows.next().await {
+        let mut memory = row?;
+        frontier = frontier.max(memory.lsn.value);
+        let live =
+            memory.valid_until.is_none_or(|until| until > now) && memory.invalidated_by.is_none();
+        let visible = visibility.is_none_or(|vc| memory_visible(&memory, vc));
+        all_memories.insert(memory.id, memory.clone());
+        if live && visible {
+            memory.embedding = None;
+            memories.push(memory);
+        }
+    }
+    let mut relationships = Vec::new();
+    let mut relationship_rows = cluster.storage.stream_all_relationships().await;
+    while let Some(row) = relationship_rows.next().await {
+        let relationship = row?;
+        frontier = frontier.max(relationship.lsn.value);
+        let live = relationship.valid_until.is_none_or(|until| until > now)
+            && relationship.invalidated_by.is_none();
+        if !live {
+            continue;
+        }
+        let visible = match visibility {
+            None => true,
+            Some(vc) => match (
+                all_memories.get(&relationship.from),
+                all_memories.get(&relationship.to),
+            ) {
+                (Some(from), Some(to)) => relationship_visible(&relationship, from, to, vc),
+                _ => false,
+            },
+        };
+        if visible {
+            relationships.push(relationship);
+        }
+    }
+    let snapshot_json = serde_json::to_vec(&ClientGraphSnapshot {
+        memories,
+        relationships,
+    })
+    .map_err(|error| StorageError::Backend(error.to_string()))?;
+    Ok(cluster.envelope(Invalidation::GraphReseed {
+        snapshot_json,
+        lsn: frontier,
+    }))
 }
 
 fn decode_id(raw: &[u8]) -> Result<[u8; 16], StorageError> {

@@ -25,6 +25,17 @@ use exocortex_wire::WIRE_VERSION;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+#[derive(serde::Deserialize)]
+struct ClientGraphSnapshot {
+    memories: Vec<exocortex_kernel::Memory>,
+    relationships: Vec<exocortex_kernel::Relationship>,
+}
+
+enum DecodedEvent {
+    Change(Invalidation, u64),
+    Reseed(ClientGraphSnapshot, u64),
+}
+
 /// Errors surfaced by the subscriber.
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -64,6 +75,10 @@ pub struct SseSyncConfig {
     /// Optional first-connection signal for supervisors and deterministic
     /// integration tests. A permit is emitted after the SSE handshake.
     pub connection_ready: Option<Arc<tokio::sync::Notify>>,
+    /// Signal emitted only after an initial/recovery snapshot is visible.
+    pub hydration_ready: Option<Arc<tokio::sync::Notify>>,
+    /// Org graph replaced by a full SSE reseed.
+    pub org: smol_str::SmolStr,
 }
 
 impl SseSyncConfig {
@@ -80,6 +95,8 @@ impl SseSyncConfig {
             gap_timeout: Duration::from_secs(2),
             backoff: Duration::from_secs(1),
             connection_ready: None,
+            hydration_ready: None,
+            org: "org".into(),
         }
     }
 }
@@ -88,6 +105,27 @@ impl SseSyncConfig {
 /// unrecoverable gap): invoked before a resubscribe so the caller can
 /// reseed the cache from storage.
 pub type ResyncFn = Box<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send>;
+
+/// Start the production backend cache lifecycle and return only after the
+/// authenticated SSE subscriber has atomically installed its first graph
+/// image. Both spawned loops remain live for continuous updates/recovery.
+pub async fn hydrate_and_start_backend_sync(
+    mut cfg: SseSyncConfig,
+    cache: Arc<LocalCache>,
+    writer_rx: tokio::sync::mpsc::Receiver<CacheWrite>,
+) -> tokio::task::JoinHandle<()> {
+    let writer_cache = cache.clone();
+    tokio::spawn(async move {
+        writer_cache
+            .run(Arc::new(crate::no_backend::NoBackendStorage), writer_rx)
+            .await;
+    });
+    let hydrated = Arc::new(tokio::sync::Notify::new());
+    cfg.hydration_ready = Some(hydrated.clone());
+    let sync = tokio::spawn(run_sse_sync(cfg, cache, 0, None));
+    hydrated.notified().await;
+    sync
+}
 
 /// Verify an envelope: wire version, fingerprint, HMAC-SHA256 over fields
 /// 1..4 (R-W4). Same scheme as `ClusterNode::admit`, inlined so the client
@@ -127,6 +165,19 @@ pub fn decode_envelope(
     fingerprint: &[u8; 32],
     payload: &str,
 ) -> Result<(Invalidation, u64), SyncError> {
+    match decode_event(hmac_key, fingerprint, payload)? {
+        DecodedEvent::Change(invalidation, lsn) => Ok((invalidation, lsn)),
+        DecodedEvent::Reseed(_, _) => Err(SyncError::BadPayload(
+            "graph reseed is not a row invalidation".into(),
+        )),
+    }
+}
+
+fn decode_event(
+    hmac_key: &[u8; 32],
+    fingerprint: &[u8; 32],
+    payload: &str,
+) -> Result<DecodedEvent, SyncError> {
     let raw = b64_decode(payload).ok_or_else(|| SyncError::BadPayload("base64".into()))?;
     let env = InvalidationEnvelope::decode(raw.as_slice())
         .map_err(|e| SyncError::BadPayload(e.to_string()))?;
@@ -155,8 +206,14 @@ pub fn decode_envelope(
     };
     let inv = match inv_pb.kind {
         Some(exocortex_wire::sse::v1::invalidation::Kind::MemoryUpserted(m)) => {
-            Invalidation::MemoryUpserted {
-                id: MemoryId(id16(&m.id)?),
+            let id = MemoryId(id16(&m.id)?);
+            let memory: exocortex_kernel::Memory = serde_json::from_slice(&m.snapshot_json)
+                .map_err(|error| SyncError::BadPayload(format!("memory snapshot: {error}")))?;
+            if memory.id != id {
+                return Err(SyncError::BadPayload("memory snapshot id mismatch".into()));
+            }
+            Invalidation::MemorySnapshotUpserted {
+                memory: Box::new(memory),
                 lsn,
             }
         }
@@ -167,11 +224,22 @@ pub fn decode_envelope(
             }
         }
         Some(exocortex_wire::sse::v1::invalidation::Kind::RelationshipUpserted(r)) => {
-            Invalidation::RelationshipUpserted {
-                id: RelationshipId(id16(&r.id)?),
-                from: MemoryId(id16(&r.from)?),
-                to: MemoryId(id16(&r.to)?),
-                kind: exocortex_kernel::RelKindId(r.kind),
+            let id = RelationshipId(id16(&r.id)?);
+            let relationship: exocortex_kernel::Relationship =
+                serde_json::from_slice(&r.snapshot_json).map_err(|error| {
+                    SyncError::BadPayload(format!("relationship snapshot: {error}"))
+                })?;
+            if relationship.id != id
+                || relationship.from != MemoryId(id16(&r.from)?)
+                || relationship.to != MemoryId(id16(&r.to)?)
+                || relationship.kind != exocortex_kernel::RelKindId(r.kind)
+            {
+                return Err(SyncError::BadPayload(
+                    "relationship snapshot identity mismatch".into(),
+                ));
+            }
+            Invalidation::RelationshipSnapshotUpserted {
+                relationship: Box::new(relationship),
                 lsn,
             }
         }
@@ -184,9 +252,14 @@ pub fn decode_envelope(
         Some(exocortex_wire::sse::v1::invalidation::Kind::VisibilityAdvance(_)) => {
             Invalidation::VisibilityAdvance { lsn }
         }
+        Some(exocortex_wire::sse::v1::invalidation::Kind::GraphReseed(snapshot)) => {
+            let snapshot = serde_json::from_slice(&snapshot.snapshot_json)
+                .map_err(|error| SyncError::BadPayload(format!("graph snapshot: {error}")))?;
+            return Ok(DecodedEvent::Reseed(snapshot, lsn));
+        }
         None => return Err(SyncError::BadPayload("no kind".into())),
     };
-    Ok((inv, lsn))
+    Ok(DecodedEvent::Change(inv, lsn))
 }
 
 /// The LSN hold-back gate: releases invalidations strictly in
@@ -275,6 +348,7 @@ pub async fn run_sse_sync(
     resync: Option<ResyncFn>,
 ) {
     let mut backoff = cfg.backoff;
+    let mut needs_seed = next_lsn == 0;
     loop {
         let since = next_lsn.saturating_sub(1);
         let mut url = format!(
@@ -284,6 +358,9 @@ pub async fn run_sse_sync(
         if let Some(token) = &cfg.client_token {
             url.push_str("&token=");
             url.push_str(token);
+        }
+        if needs_seed {
+            url.push_str("&seed=true");
         }
         tracing::info!(%url, "sse subscribe");
         let mut gate = LsnGate::new(next_lsn);
@@ -324,8 +401,8 @@ pub async fn run_sse_sync(
                     Ok(es::SSE::Event(ev)) => {
                         if ev.event_type == "inv" {
                             let verify_key = cfg.client_key.unwrap_or(cfg.hmac_key);
-                            match decode_envelope(&verify_key, &cfg.fingerprint, &ev.data) {
-                                Ok((inv, lsn)) => {
+                            match decode_event(&verify_key, &cfg.fingerprint, &ev.data) {
+                                Ok(DecodedEvent::Change(inv, lsn)) => {
                                     for released in gate.push(lsn, inv) {
                                         next_lsn = next_lsn.max(lsn + 1);
                                         metrics::counter!("exocortex_sync_envelopes_applied_total")
@@ -334,12 +411,35 @@ pub async fn run_sse_sync(
                                     }
                                     next_lsn = next_lsn.max(gate.next_lsn());
                                 }
-                                Err(e) => tracing::warn!(%e, "envelope dropped"),
+                                Ok(DecodedEvent::Reseed(snapshot, lsn)) => {
+                                    cache
+                                        .reseed_rows(
+                                            cfg.org.clone(),
+                                            snapshot.memories,
+                                            snapshot.relationships,
+                                            lsn,
+                                        )
+                                        .await;
+                                    next_lsn = lsn.saturating_add(1);
+                                    gate = LsnGate::new(next_lsn);
+                                    needs_seed = false;
+                                    backoff = cfg.backoff;
+                                    if let Some(ready) = &cfg.hydration_ready {
+                                        ready.notify_one();
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%e, "envelope rejected; full reseed required");
+                                    needs_seed = true;
+                                    reconnect_reason = "invalid hydrated envelope";
+                                    break;
+                                }
                             }
                         }
                         if let Some(missing) = gate.gap_expired(cfg.gap_timeout) {
                             tracing::warn!(missing, "lsn gap; resubscribing");
                             next_lsn = missing;
+                            needs_seed = true;
                             reconnect_reason = "lsn gap";
                             break;
                         }
@@ -350,14 +450,7 @@ pub async fn run_sse_sync(
                         // floor. Without advancing `next_lsn` the client
                         // would 409-loop on the same un-bridgeable gap.
                         tracing::warn!("409 resync required");
-                        if let Some(min) = resp
-                            .get_header_value("x-exocortex-min-lsn")
-                            .ok()
-                            .flatten()
-                            .and_then(|v| v.parse::<u64>().ok())
-                        {
-                            next_lsn = next_lsn.max(min);
-                        }
+                        needs_seed = true;
                         reconnect_reason = "409 resync";
                         break;
                     }

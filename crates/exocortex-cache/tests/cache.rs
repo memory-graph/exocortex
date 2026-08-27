@@ -116,7 +116,6 @@ async fn reseed_matches_storage_after_every_write() {
             .await
             .unwrap();
         cache.reseed_from_storage(&store, &"org".into()).await;
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let ctx = vc(Visibility::Org, "u");
         let hits = cache.search("org", "m", 100, &ctx);
         assert_eq!(hits.len(), i + 1, "reseed reflects write {}", i);
@@ -138,7 +137,6 @@ async fn apply_invalidations_cow() {
     let m0 = mem("seed-a", Visibility::Org, None);
     store.upsert_memory(&m0).await.unwrap();
     cache.reseed_from_storage(&store, &"org".into()).await;
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     // Apply an upsert through the change feed.
     let m1 = mem("seed-b", Visibility::Org, None);
@@ -151,11 +149,43 @@ async fn apply_invalidations_cow() {
             },
         ))
         .await;
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    cache.flush().await;
 
     let ctx = vc(Visibility::Org, "u");
     assert!(cache.get_memory("org", &m0.id, &ctx).is_some());
     assert!(cache.get_memory("org", &m1.id, &ctx).is_some());
+    writer.abort();
+}
+
+#[tokio::test]
+async fn relationship_fetch_failure_does_not_advance_backend_lsn() {
+    let store = InMemoryStorage::new(ontology());
+    let (cache, rx) = LocalCache::new(64 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let store = store.clone_dyn();
+        async move { cache.run(Arc::new(store), rx).await }
+    });
+    cache.reseed_from_storage(&store, &"org".into()).await;
+    let before = cache.version("org").unwrap().backend_lsn;
+    cache
+        .submit(CacheWrite::Apply(
+            exocortex_storage::Invalidation::RelationshipUpserted {
+                id: exocortex_kernel::RelationshipId([0xEE; 16]),
+                from: MemoryId([1; 16]),
+                to: MemoryId([2; 16]),
+                kind: exocortex_kernel::RelKindId(1),
+                lsn: 99,
+            },
+        ))
+        .await;
+    cache.flush().await;
+    assert_eq!(
+        cache.version("org").unwrap().backend_lsn,
+        before,
+        "a missing/failing row fetch cannot acknowledge its LSN"
+    );
     writer.abort();
 }
 
@@ -273,10 +303,11 @@ async fn snapshot_swap_isolation() {
                     s.push_test_memory(m.clone());
                     Arc::new(s)
                 },
+                ack: None,
             })
             .await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cache.flush().await;
 
     // The held snapshot is unchanged (Arc isolation).
     assert_eq!(reader_snapshot.search_offsets.len(), 10);
@@ -380,7 +411,6 @@ async fn upsert_replaces_stale_version() {
     let a = mem("alpha-wide", Visibility::Org, None);
     storage.upsert_memory(&a).await.unwrap();
     cache.reseed_from_storage(&storage, &"org".into()).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Re-upsert the SAME id with a new title (and a narrowed visibility,
     // which search must respect).
@@ -394,7 +424,7 @@ async fn upsert_replaces_stale_version() {
             exocortex_storage::Invalidation::MemoryUpserted { id: a.id, lsn: 2 },
         ))
         .await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cache.flush().await;
 
     // The OLD key yields nothing (the stale node is gone, not merely
     // shadowed); the NEW key yields exactly one hit at the new visibility.
@@ -415,7 +445,7 @@ async fn upsert_replaces_stale_version() {
             exocortex_storage::Invalidation::MemoryDeleted { id: a.id, lsn: 3 },
         ))
         .await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cache.flush().await;
     let hits = cache.search("org", "alpha-renamed", 10, &owner);
     assert!(hits.is_empty(), "no orphan copies survive the delete");
     writer.abort();
@@ -462,7 +492,6 @@ async fn search_resolves_correct_node_after_index_reuse() {
         storage.upsert_memory(&m).await.unwrap();
     }
     cache.reseed_from_storage(&storage, &"org".into()).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Delete the last, then insert two fresh rows (node indices get reused).
     storage.delete_memory(&ids[3]).await.unwrap();
@@ -480,7 +509,7 @@ async fn search_resolves_correct_node_after_index_reuse() {
             ))
             .await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cache.flush().await;
 
     let ctx = vc(Visibility::Org, "alice");
     let hits = cache.search("org", "fresh-two", 10, &ctx);
@@ -540,7 +569,6 @@ async fn relationship_reupsert_does_not_duplicate() {
     };
     storage.upsert_relationship(&rel).await.unwrap();
     cache.reseed_from_storage(&storage, &"org".into()).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let inv = exocortex_storage::Invalidation::RelationshipUpserted {
         id: rel.id,
@@ -551,7 +579,7 @@ async fn relationship_reupsert_does_not_duplicate() {
     };
     cache.submit(CacheWrite::Apply(inv.clone())).await;
     cache.submit(CacheWrite::Apply(inv)).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cache.flush().await;
 
     let snap = cache.graphs_snapshot("org").expect("resident");
     let count = snap

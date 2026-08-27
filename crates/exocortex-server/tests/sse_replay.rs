@@ -29,11 +29,8 @@ fn cluster(cap: usize) -> Arc<ClusterNode<InMemoryStorage>> {
     Arc::new(node)
 }
 
-fn envelope(node: &ClusterNode<InMemoryStorage>, id: u8, lsn: u64) -> InvalidationEnvelope {
-    node.envelope(Invalidation::MemoryUpserted {
-        id: MemoryId([id; 16]),
-        lsn,
-    })
+fn envelope(node: &ClusterNode<InMemoryStorage>, _id: u8, lsn: u64) -> InvalidationEnvelope {
+    node.envelope(Invalidation::VisibilityAdvance { lsn })
 }
 
 async fn serve(

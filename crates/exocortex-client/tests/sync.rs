@@ -92,8 +92,8 @@ fn envelope_decode_verifies_hmac_fingerprint_and_wire_version() {
         onto.fingerprint,
         HMAC_KEY,
     );
-    let env = node.envelope(Invalidation::MemoryUpserted {
-        id: MemoryId([7; 16]),
+    let env = node.envelope(Invalidation::MemorySnapshotUpserted {
+        memory: Box::new(test_memory("decoded", 7)),
         lsn: 42,
     });
     let payload = b64_encode(&env.encode_to_vec());
@@ -102,8 +102,8 @@ fn envelope_decode_verifies_hmac_fingerprint_and_wire_version() {
         .expect("verified envelope decodes");
     assert_eq!(lsn, 42);
     match inv {
-        Invalidation::MemoryUpserted { id, lsn } => {
-            assert_eq!(id, MemoryId([7; 16]));
+        Invalidation::MemorySnapshotUpserted { memory, lsn } => {
+            assert_eq!(memory.id, MemoryId([7; 16]));
             assert_eq!(lsn, 42);
         }
         other => panic!("wrong kind: {other:?}"),
@@ -335,8 +335,8 @@ async fn per_client_sse_hmac_verifies_with_derived_key() {
 
     // A client holding the WRONG derived key must reject them.
     let wrong = derive_client_sse_key(&[1u8; 32], token);
-    let env = cluster.envelope(Invalidation::MemoryUpserted {
-        id: m.id,
+    let env = cluster.envelope(Invalidation::MemorySnapshotUpserted {
+        memory: Box::new(m.clone()),
         lsn: commit.lsn,
     });
     let payload = b64_encode(&env.encode_to_vec());
@@ -403,6 +403,87 @@ fn test_memory(title: &str, n: u8) -> exocortex_kernel::Memory {
         embedding: None,
         lsn: LSN::new_local(0),
     }
+}
+
+/// R6-B06: exercise the exact production lifecycle helper. It must not return
+/// before an authenticated full image is visible, and its retained writer/SSE
+/// tasks must continue applying later commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn production_backend_sync_hydrates_before_ready_and_stays_live() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let initial = test_memory("initial-backend-row", 71);
+    storage.upsert_memory(&initial).await.unwrap();
+    let cluster = Arc::new(ClusterNode::new(
+        storage.clone(),
+        "production-sync".into(),
+        onto.fingerprint,
+        HMAC_KEY,
+    ));
+
+    let (server_cache, _server_rx) = LocalCache::new(1024 * 1024);
+    let principal =
+        exocortex_ops::operations::ops_vc("org", "reader", exocortex_kernel::Visibility::Org);
+    let ctx = Arc::new(exocortex_ops::OpContext {
+        visibility_ctx: principal.clone(),
+        storage: storage.clone() as Arc<dyn Storage>,
+        cache: Arc::new(server_cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
+        ontology: Some(onto.clone()),
+    });
+    let bind = exocortex_server::http_bind::HttpBind::new(ctx, "sync-bearer".into());
+    let app = bind.router(Some(exocortex_server::sse::sse_router(
+        cluster.clone(),
+        exocortex_server::sse::SseAuth::RequiredToken,
+    )));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (cache, writer_rx) = LocalCache::new(16 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+    cfg.bearer = Some("sync-bearer".into());
+    cfg.client_token = Some("sync-bearer".into());
+    cfg.client_key = Some(exocortex_wire::signing::derive_sse_client_key(
+        &HMAC_KEY,
+        "sync-bearer",
+    ));
+    cfg.backoff = Duration::from_millis(20);
+    let sync = tokio::time::timeout(
+        Duration::from_secs(2),
+        exocortex_client::sync::hydrate_and_start_backend_sync(cfg, cache.clone(), writer_rx),
+    )
+    .await
+    .expect("production lifecycle reaches hydrated readiness");
+    assert!(
+        cache.get_memory("org", &initial.id, &principal).is_some(),
+        "initial backend image is visible before readiness returns"
+    );
+
+    let live = test_memory("continuous-backend-row", 72);
+    let commit = storage.upsert_memory(&live).await.unwrap();
+    // A03: the acceptance clock begins at the committed backend write, not at
+    // process startup or subscriber construction.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let _ = cluster.admit_and_publish(cluster.envelope(Invalidation::MemoryUpserted {
+        id: live.id,
+        lsn: commit.lsn,
+    }));
+    while cache.get_memory("org", &live.id, &principal).is_none()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sync.abort();
+    assert!(
+        cache.get_memory("org", &live.id, &principal).is_some(),
+        "retained writer and SSE task continuously apply later commits"
+    );
 }
 
 /// Standard-alphabet base64 encode (mirror of the server's encoder).

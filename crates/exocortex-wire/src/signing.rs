@@ -21,6 +21,16 @@ use crate::ingest::v1::{IngestBatch, RegisterSourceRequest};
 
 type HmacSha256 = Hmac<sha2::Sha256>;
 
+/// Derive the per-subscriber SSE verification key from the cluster key and
+/// opaque client token (R-Sec5).
+pub fn derive_sse_client_key(cluster_key: &[u8; 32], token: &str) -> [u8; 32] {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(cluster_key).expect("HMAC accepts any key length");
+    mac.update(b"sse-client:");
+    mac.update(token.as_bytes());
+    mac.finalize().into_bytes().into()
+}
+
 /// Version tag baked into the checksum preimage so a deliberate format
 /// change is visible: old and new checksums differ even for identical rows.
 const CHECKSUM_VERSION: &str = "exocortex-checksum-v1";

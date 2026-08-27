@@ -344,12 +344,17 @@ pub enum CacheWrite {
         org: SmolStr,
         /// The freshly built snapshot.
         snapshot: Arc<GraphSnapshot>,
+        /// Optional completion signal for readiness/resync callers.
+        ack: Option<tokio::sync::oneshot::Sender<()>>,
     },
     /// Evict an org graph entirely.
     Evict(
         /// Org to evict.
         SmolStr,
     ),
+    /// Deterministic test/readiness barrier: acknowledged after all earlier
+    /// writer messages have been applied.
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 impl LocalCache {
@@ -380,7 +385,7 @@ impl LocalCache {
         while let Some(msg) = rx.recv().await {
             match msg {
                 CacheWrite::Apply(inv) => self.apply(&*storage, inv).await,
-                CacheWrite::Reseed { org, snapshot } => {
+                CacheWrite::Reseed { org, snapshot, ack } => {
                     // R-O2 families: rebuild counts + graph size levels.
                     metrics::counter!("exocortex_cache_rebuild_total", "reason" => "reseed")
                         .increment(1);
@@ -406,9 +411,15 @@ impl LocalCache {
                         })
                         .store(snapshot);
                     self.admit(&org);
+                    if let Some(ack) = ack {
+                        let _ = ack.send(());
+                    }
                 }
                 CacheWrite::Evict(org) => {
                     self.graphs.remove(&org);
+                }
+                CacheWrite::Barrier(ack) => {
+                    let _ = ack.send(());
                 }
             }
         }
@@ -447,8 +458,16 @@ impl LocalCache {
                 next.last_backend_lsn = next.last_backend_lsn.max(lsn);
             }
             Invalidation::RelationshipUpserted { id, lsn, .. } => {
-                if let Ok(Some(r)) = fetch_relationship(storage, &id).await {
-                    next.insert_relationship(r);
+                match fetch_relationship(storage, &id).await {
+                    Ok(Some(r)) => next.insert_relationship(r),
+                    Ok(None) => {
+                        tracing::warn!("relationship invalidation row missing; LSN not advanced");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, "relationship invalidation fetch failed");
+                        return;
+                    }
                 }
                 next.last_backend_lsn = next.last_backend_lsn.max(lsn);
             }
@@ -458,6 +477,18 @@ impl LocalCache {
             }
             Invalidation::VisibilityAdvance { lsn } => {
                 next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+            }
+            Invalidation::MemorySnapshotUpserted { memory, lsn } => {
+                next.insert_memory(*memory);
+                next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+            }
+            Invalidation::RelationshipSnapshotUpserted { relationship, lsn } => {
+                next.insert_relationship(*relationship);
+                next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+            }
+            Invalidation::GraphReseed { .. } => {
+                tracing::warn!("graph reseed reached cache apply path; LSN not advanced");
+                return;
             }
         }
         let new_bytes = next.est_bytes;
@@ -872,6 +903,15 @@ impl LocalCache {
         let _ = self.writer.send(w).await;
     }
 
+    /// Wait until the single writer has applied every previously submitted
+    /// message. Tests use this instead of timing guesses.
+    pub async fn flush(&self) {
+        let (ack, done) = tokio::sync::oneshot::channel();
+        if self.writer.send(CacheWrite::Barrier(ack)).await.is_ok() {
+            let _ = done.await;
+        }
+    }
+
     /// Direct publish, bypassing the writer channel. For benches and tests
     /// that exercise the read path without a storage-backed writer loop;
     /// production writes always go through `run` + `submit`.
@@ -899,13 +939,43 @@ impl LocalCache {
     /// snapshot for one org (§8.4 `reseed_from_storage`).
     pub async fn reseed_from_storage<S: Storage>(&self, storage: &S, org: &SmolStr) {
         let snap = GraphSnapshot::from_storage(storage).await;
-        let _ = self
+        self.reseed_snapshot(org.clone(), snap).await;
+    }
+
+    /// Atomically publish a complete backend image and wait until the writer
+    /// has made it visible. This is the backend client's readiness boundary.
+    pub async fn reseed_rows(
+        &self,
+        org: SmolStr,
+        memories: Vec<Memory>,
+        relationships: Vec<Relationship>,
+        backend_lsn: u64,
+    ) {
+        let mut snapshot = GraphSnapshot::empty();
+        for memory in memories {
+            snapshot.insert_memory(memory);
+        }
+        for relationship in relationships {
+            snapshot.insert_relationship(relationship);
+        }
+        snapshot.last_backend_lsn = backend_lsn;
+        self.reseed_snapshot(org, snapshot).await;
+    }
+
+    async fn reseed_snapshot(&self, org: SmolStr, snapshot: GraphSnapshot) {
+        let (ack, done) = tokio::sync::oneshot::channel();
+        if self
             .writer
             .send(CacheWrite::Reseed {
-                org: org.clone(),
-                snapshot: Arc::new(snap),
+                org,
+                snapshot: Arc::new(snapshot),
+                ack: Some(ack),
             })
-            .await;
+            .await
+            .is_ok()
+        {
+            let _ = done.await;
+        }
     }
 }
 

@@ -180,7 +180,7 @@ fn main() -> anyhow::Result<()> {
     // auth test" & co. were startup filler, not memories). SR-PRD F3:
     // standalone seeds from ALL WAL entries — every state, because in
     // standalone nothing else will ever deliver these rows server-side.
-    let (cache, _writer_rx) = LocalCache::new(2 * 1024 * 1024 * 1024);
+    let (cache, writer_rx) = LocalCache::new(2 * 1024 * 1024 * 1024);
     let cache = Arc::new(cache);
 
     // WAL: offline write buffer + (standalone) the embedded store.
@@ -237,6 +237,28 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(async move {
         let mut server = server;
         if let Some(backend) = backend {
+            // R6-B06: backend reads are not ready until a caller-filtered
+            // graph image is installed. Retain the single writer, start the
+            // authenticated continuous SSE loop, and wait for its first
+            // atomic reseed before exposing MCP over stdio.
+            let bearer = auth_token
+                .clone()
+                .expect("backend authentication validated before runtime startup");
+            let mut sync_config =
+                exocortex_client::sync::SseSyncConfig::new(backend.clone(), hmac_key, fingerprint);
+            sync_config.bearer = Some(bearer.clone());
+            sync_config.client_token = Some(bearer.clone());
+            sync_config.client_key = Some(exocortex_wire::signing::derive_sse_client_key(
+                &hmac_key, &bearer,
+            ));
+            sync_config.org = org.clone().into();
+            let _sync = exocortex_client::sync::hydrate_and_start_backend_sync(
+                sync_config,
+                cache.clone(),
+                writer_rx,
+            )
+            .await;
+
             let endpoint = tonic::transport::Endpoint::from_shared(backend.clone())
                 .map_err(|e| anyhow::anyhow!("bad --backend {backend}: {e}"))?;
             let channel = endpoint.connect_lazy();

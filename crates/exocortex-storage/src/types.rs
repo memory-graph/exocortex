@@ -318,6 +318,27 @@ pub enum Invalidation {
         /// Backend LSN of the hidden commit.
         lsn: u64,
     },
+    /// A hydrated memory upsert carried by the client-facing SSE feed.
+    MemorySnapshotUpserted {
+        /// Complete row, already visibility-filtered by the server.
+        memory: Box<exocortex_kernel::Memory>,
+        /// Backend LSN of the commit.
+        lsn: u64,
+    },
+    /// A hydrated relationship upsert carried by the client-facing SSE feed.
+    RelationshipSnapshotUpserted {
+        /// Complete row, already visibility-filtered by the server.
+        relationship: Box<exocortex_kernel::Relationship>,
+        /// Backend LSN of the commit.
+        lsn: u64,
+    },
+    /// A serialized, caller-filtered full graph image for SSE reseeding.
+    GraphReseed {
+        /// JSON payload interpreted by the client sync layer.
+        snapshot_json: Vec<u8>,
+        /// Backend frontier represented by the image.
+        lsn: u64,
+    },
 }
 
 /// What a storage backend supports; drives capability-gated code paths.
@@ -353,7 +374,10 @@ impl Invalidation {
             | Invalidation::MemoryDeleted { lsn, .. }
             | Invalidation::RelationshipUpserted { lsn, .. }
             | Invalidation::RelationshipDeleted { lsn, .. }
-            | Invalidation::VisibilityAdvance { lsn } => *lsn,
+            | Invalidation::VisibilityAdvance { lsn }
+            | Invalidation::MemorySnapshotUpserted { lsn, .. }
+            | Invalidation::RelationshipSnapshotUpserted { lsn, .. }
+            | Invalidation::GraphReseed { lsn, .. } => *lsn,
         }
     }
 }

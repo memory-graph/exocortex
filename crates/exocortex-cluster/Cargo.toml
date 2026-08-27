@@ -26,6 +26,7 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 axum = { workspace = true }
 eventsource-client = { workspace = true }
+serde_json = { workspace = true } # R6-B06: hydrate signed SSE row snapshots
 
 [features]
 integration = []
@@ -33,6 +34,5 @@ integration = []
 [dev-dependencies]
 exocortex-server = { workspace = true }
 chrono = { workspace = true }
-serde_json = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
 tokio = { workspace = true }
