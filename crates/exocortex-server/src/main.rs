@@ -3,6 +3,7 @@
 //! `--mode mcp-standalone`: local, no backend; process-local FalkorDB via the
 //! supervisor (§4.3). `--mode backend-node` / `--mode embedded` land with M5+.
 
+mod org_backup;
 mod supervisor;
 
 use exocortex_server::backend;
@@ -69,6 +70,17 @@ struct Args {
     /// FalkorDB module path for the embedded supervisor.
     #[arg(long)]
     falkordb_module: Option<std::path::PathBuf>,
+    /// FalkorDB graph name (backend-node and one-shot modes). Durable
+    /// deployments MUST pin one: the default is stable per org, so a
+    /// restart serves the same graph.
+    #[arg(long, default_value = "exocortex-org")]
+    graph_name: String,
+    /// BR2 one-shot: export the org's graph to a JSON file, exit.
+    #[arg(long)]
+    export_org: Option<std::path::PathBuf>,
+    /// BR2 one-shot: restore an org backup file into storage, exit.
+    #[arg(long)]
+    import_org: Option<std::path::PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -81,6 +93,15 @@ fn main() -> anyhow::Result<()> {
     // Force-link the pack so its inventory registration runs in this binary.
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
     let _ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
+
+    // BR2 one-shot modes: org backup/restore against the selected
+    // storage, then exit (no cluster, no serving).
+    if args.export_org.is_some() || args.import_org.is_some() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return runtime.block_on(org_backup_main(args));
+    }
 
     match args.mode {
         Mode::McpStandalone => {
@@ -123,6 +144,71 @@ fn main() -> anyhow::Result<()> {
             anyhow::bail!("--mode embedded is the in-process path used by tests");
         }
     }
+}
+
+/// BR2: one-shot org backup/restore against the selected storage.
+/// Runs without the cluster (no leases to contend with) — the DR model
+/// is an admin operation against quiesced storage.
+async fn org_backup_main(args: Args) -> anyhow::Result<()> {
+    let ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
+    let fingerprint = {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(64);
+        for b in ontology.fingerprint.0 {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    };
+    let org = "org";
+    if let Some(path) = &args.export_org {
+        if let Some(url) = args.storage.strip_prefix("falkor://") {
+            let storage = exocortex_storage::FalkorStorage::connect(
+                exocortex_storage::FalkorConfig {
+                    falkor_url: format!("falkor://{url}"),
+                    redis_url: format!("redis://{url}"),
+                    graph_name: args.graph_name.clone(),
+                    org_id: org.into(),
+                    node_id: format!("node-{}", std::process::id()).into(),
+                },
+                ontology.clone(),
+            )
+            .await?;
+            let (m, r) = org_backup::export_org(&storage, org, &fingerprint, path).await?;
+            println!("{m} memories, {r} relationships -> {}", path.display());
+        } else if args.storage == "memory" {
+            anyhow::bail!("--storage=memory is non-durable; export from falkor:// instead");
+        } else {
+            anyhow::bail!("one-shot export needs --storage=falkor://host:port");
+        }
+        return Ok(());
+    }
+    if let Some(path) = &args.import_org {
+        if let Some(url) = args.storage.strip_prefix("falkor://") {
+            let storage = exocortex_storage::FalkorStorage::connect(
+                exocortex_storage::FalkorConfig {
+                    falkor_url: format!("falkor://{url}"),
+                    redis_url: format!("redis://{url}"),
+                    graph_name: args.graph_name.clone(),
+                    org_id: org.into(),
+                    node_id: format!("node-{}", std::process::id()).into(),
+                },
+                ontology.clone(),
+            )
+            .await?;
+            let report = org_backup::import_org(&storage, &ontology, org, path).await?;
+            println!(
+                "{} memories, {} relationships restored from {}",
+                report.memories,
+                report.relationships,
+                path.display()
+            );
+        } else if args.storage == "memory" {
+            anyhow::bail!("--storage=memory is non-durable; import targets falkor:// instead");
+        } else {
+            anyhow::bail!("one-shot import needs --storage=falkor://host:port");
+        }
+    }
+    Ok(())
 }
 
 /// `--mode backend-node` (M5): storage + cluster + ingest + HTTP + SSE +
@@ -172,7 +258,7 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
                     exocortex_storage::FalkorConfig {
                         falkor_url: format!("falkor://{url}"),
                         redis_url: format!("redis://{url}"),
-                        graph_name: format!("exocortex-node-{}", std::process::id()),
+                        graph_name: args.graph_name.clone(),
                         org_id: "org".into(),
                         node_id: format!("node-{}", std::process::id()).into(),
                     },

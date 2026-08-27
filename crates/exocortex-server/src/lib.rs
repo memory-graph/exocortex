@@ -7,4 +7,5 @@
 
 pub mod backend;
 pub mod http_bind;
+pub mod org_backup;
 pub mod sse;
