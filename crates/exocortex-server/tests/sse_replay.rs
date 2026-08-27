@@ -433,6 +433,7 @@ async fn replay_filters_relationship_upserts_and_deletes_by_endpoint_scope() {
     ] {
         let _ = node.admit_and_publish(node.envelope(invalidation));
     }
+    let relationship_streams_before = storage.reasoning_query_counts().1;
     let addr = serve_for(node, project_reader()).await;
     let (status, body) = get_status_and_body(
         addr,
@@ -465,6 +466,11 @@ async fn replay_filters_relationship_upserts_and_deletes_by_endpoint_scope() {
             hidden_delete.lsn,
             visible_delete.lsn
         ]
+    );
+    assert_eq!(
+        storage.reasoning_query_counts().1,
+        relationship_streams_before,
+        "per-subscriber replay uses the relationship-id point seam, never a graph scan"
     );
 }
 

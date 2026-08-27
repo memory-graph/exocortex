@@ -31,11 +31,23 @@ struct ClientGraphSnapshot {
     relationships: Vec<Relationship>,
 }
 
+const MAX_RESEED_ROWS: usize = 50_000;
+const MAX_RESEED_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CONCURRENT_RESEEDS: usize = 2;
+
+struct SseState<S: Storage> {
+    cluster: Arc<ClusterNode<S>>,
+    reseeds: Arc<tokio::sync::Semaphore>,
+}
+
 /// The `/v1/changes` SSE router over a cluster node's local hub.
 pub fn sse_router<S: Storage + 'static>(cluster: Arc<ClusterNode<S>>) -> axum::Router {
     axum::Router::new()
         .route("/v1/changes", axum::routing::get(handler))
-        .with_state(cluster)
+        .with_state(Arc::new(SseState {
+            cluster,
+            reseeds: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESEEDS)),
+        }))
 }
 
 /// Derive the per-client SSE key (R-Sec5): provisioned clients receive this
@@ -45,11 +57,12 @@ pub fn derive_client_sse_key(cluster_key: &[u8; 32], token: &str) -> [u8; 32] {
 }
 
 async fn handler<S: Storage + 'static>(
-    State(cluster): State<Arc<ClusterNode<S>>>,
+    State(state): State<Arc<SseState<S>>>,
     RawQuery(q): RawQuery,
     headers: http::HeaderMap,
     principal: Option<Extension<VisibilityContext>>,
 ) -> Response {
+    let cluster = state.cluster.clone();
     let mut since_lsn = None;
     let mut seed = false;
     if let Some(qs) = q.as_deref() {
@@ -76,6 +89,20 @@ async fn handler<S: Storage + 'static>(
     // hydration are buffered for delivery immediately after the snapshot.
     let rx = cluster.subscribe_local();
     let visibility = principal.map(|Extension(vc)| vc);
+    let _reseed_permit = if seed {
+        match state.reseeds.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return (
+                    http::StatusCode::TOO_MANY_REQUESTS,
+                    "SSE hydration concurrency limit reached",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
     let initial_snapshot = if seed {
         match graph_reseed_envelope(&cluster, visibility.as_ref()).await {
             Ok(envelope) => Some(envelope),
@@ -142,22 +169,27 @@ async fn handler<S: Storage + 'static>(
             yield Ok(Event::default().event("inv").data(payload));
         }
         while let Some(item) = rx.next().await {
-            if let Ok(env) = item {
-                let mut env = match prepare_for_subscriber(&cluster, env, visibility.as_ref()).await {
-                    Ok(env) => env,
-                    Err(error) => {
-                        tracing::warn!(?error, "closing SSE stream after visibility lookup failure");
-                        return;
-                    }
-                };
-                if let Some(key) = &client_key {
-                    if env.hmac.is_empty() || cluster.verify_hmac(&env).is_ok() {
-                        resign(key, &mut env);
-                    }
+            let env = match item {
+                Ok(env) => env,
+                Err(error) => {
+                    tracing::warn!(?error, "closing lagged SSE stream for replay recovery");
+                    return;
                 }
-                let payload = B64::encode(&prost_encode(&env));
-                yield Ok(Event::default().event("inv").data(payload));
+            };
+            let mut env = match prepare_for_subscriber(&cluster, env, visibility.as_ref()).await {
+                Ok(env) => env,
+                Err(error) => {
+                    tracing::warn!(?error, "closing SSE stream after visibility lookup failure");
+                    return;
+                }
+            };
+            if let Some(key) = &client_key {
+                if env.hmac.is_empty() || cluster.verify_hmac(&env).is_ok() {
+                    resign(key, &mut env);
+                }
             }
+            let payload = B64::encode(&prost_encode(&env));
+            yield Ok(Event::default().event("inv").data(payload));
         }
     };
     Sse::new(stream)
@@ -185,17 +217,28 @@ async fn prepare_for_subscriber<S: Storage + 'static>(
     let kind = inv.kind.clone();
     let visible = match kind.as_ref() {
         Some(Kind::MemoryUpserted(row)) => {
-            memory_event_row(cluster.storage.as_ref(), &row.id, Some(vc))
-                .await?
-                .is_some()
+            return match memory_event_row(cluster.storage.as_ref(), &row.id, Some(vc)).await? {
+                Some(memory) => Ok(cluster.envelope(Invalidation::MemorySnapshotUpserted {
+                    memory: Box::new(memory),
+                    lsn,
+                })),
+                None => Ok(cluster.envelope(Invalidation::VisibilityAdvance { lsn })),
+            };
         }
         Some(Kind::MemoryDeleted(row)) => {
             memory_event_visible(cluster.storage.as_ref(), &row.id, vc).await?
         }
         Some(Kind::RelationshipUpserted(row)) => {
-            relationship_event_row(cluster.storage.as_ref(), &row.id, Some(vc))
-                .await?
-                .is_some()
+            return match relationship_event_row(cluster.storage.as_ref(), &row.id, Some(vc)).await?
+            {
+                Some(relationship) => Ok(cluster.envelope(
+                    Invalidation::RelationshipSnapshotUpserted {
+                        relationship: Box::new(relationship),
+                        lsn,
+                    },
+                )),
+                None => Ok(cluster.envelope(Invalidation::VisibilityAdvance { lsn })),
+            };
         }
         Some(Kind::RelationshipDeleted(row)) => {
             relationship_event_visible(cluster.storage.as_ref(), &row.id, vc).await?
@@ -280,16 +323,7 @@ async fn relationship_event_visible<S: Storage>(
     vc: &VisibilityContext,
 ) -> Result<bool, StorageError> {
     let id = RelationshipId(decode_id(raw_id)?);
-    let mut rows = storage.stream_all_relationships().await;
-    let mut relationship = None;
-    while let Some(row) = rows.next().await {
-        let row = row?;
-        if row.id == id {
-            relationship = Some(row);
-            break;
-        }
-    }
-    let Some(relationship) = relationship else {
+    let Some(relationship) = storage.get_relationship(&id).await? else {
         return Ok(false);
     };
     let endpoints = storage
@@ -311,30 +345,25 @@ async fn relationship_event_row<S: Storage>(
     vc: Option<&VisibilityContext>,
 ) -> Result<Option<Relationship>, StorageError> {
     let id = RelationshipId(decode_id(raw_id)?);
-    let mut rows = storage.stream_all_relationships().await;
-    while let Some(row) = rows.next().await {
-        let relationship = row?;
-        if relationship.id != id {
-            continue;
+    let Some(relationship) = storage.get_relationship(&id).await? else {
+        return Ok(None);
+    };
+    let Some(vc) = vc else {
+        return Ok(Some(relationship));
+    };
+    let endpoints = storage
+        .get_memories(&[relationship.from, relationship.to])
+        .await?;
+    let from = endpoints
+        .iter()
+        .find(|memory| memory.id == relationship.from);
+    let to = endpoints.iter().find(|memory| memory.id == relationship.to);
+    Ok(match (from, to) {
+        (Some(from), Some(to)) if relationship_visible(&relationship, from, to, vc) => {
+            Some(relationship)
         }
-        let Some(vc) = vc else {
-            return Ok(Some(relationship));
-        };
-        let endpoints = storage
-            .get_memories(&[relationship.from, relationship.to])
-            .await?;
-        let from = endpoints
-            .iter()
-            .find(|memory| memory.id == relationship.from);
-        let to = endpoints.iter().find(|memory| memory.id == relationship.to);
-        return Ok(match (from, to) {
-            (Some(from), Some(to)) if relationship_visible(&relationship, from, to, vc) => {
-                Some(relationship)
-            }
-            _ => None,
-        });
-    }
-    Ok(None)
+        _ => None,
+    })
 }
 
 async fn graph_reseed_envelope<S: Storage + 'static>(
@@ -348,6 +377,7 @@ async fn graph_reseed_envelope<S: Storage + 'static>(
     let mut memory_rows = cluster.storage.stream_all_memories().await;
     while let Some(row) = memory_rows.next().await {
         let mut memory = row?;
+        ensure_reseed_budget(all_memories.len() + 1, 0)?;
         frontier = frontier.max(memory.lsn.value);
         let live =
             memory.valid_until.is_none_or(|until| until > now) && memory.invalidated_by.is_none();
@@ -359,9 +389,12 @@ async fn graph_reseed_envelope<S: Storage + 'static>(
         }
     }
     let mut relationships = Vec::new();
+    let mut relationship_rows_seen = 0usize;
     let mut relationship_rows = cluster.storage.stream_all_relationships().await;
     while let Some(row) = relationship_rows.next().await {
         let relationship = row?;
+        relationship_rows_seen += 1;
+        ensure_reseed_budget(all_memories.len() + relationship_rows_seen, 0)?;
         frontier = frontier.max(relationship.lsn.value);
         let live = relationship.valid_until.is_none_or(|until| until > now)
             && relationship.invalidated_by.is_none();
@@ -387,10 +420,25 @@ async fn graph_reseed_envelope<S: Storage + 'static>(
         relationships,
     })
     .map_err(|error| StorageError::Backend(error.to_string()))?;
+    ensure_reseed_budget(0, snapshot_json.len())?;
     Ok(cluster.envelope(Invalidation::GraphReseed {
         snapshot_json,
         lsn: frontier,
     }))
+}
+
+fn ensure_reseed_budget(rows: usize, bytes: usize) -> Result<(), StorageError> {
+    if rows > MAX_RESEED_ROWS {
+        return Err(StorageError::Backend(format!(
+            "SSE hydration exceeds {MAX_RESEED_ROWS} rows"
+        )));
+    }
+    if bytes > MAX_RESEED_BYTES {
+        return Err(StorageError::Backend(format!(
+            "SSE hydration exceeds {MAX_RESEED_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn decode_id(raw: &[u8]) -> Result<[u8; 16], StorageError> {
@@ -463,4 +511,16 @@ impl B64 {
 fn prost_encode(env: &exocortex_wire::cluster::v1::InvalidationEnvelope) -> Vec<u8> {
     use prost::Message;
     env.encode_to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_reseed_budget, MAX_RESEED_BYTES, MAX_RESEED_ROWS};
+
+    #[test]
+    fn hydration_budget_is_inclusive_and_fail_closed() {
+        assert!(ensure_reseed_budget(MAX_RESEED_ROWS, MAX_RESEED_BYTES).is_ok());
+        assert!(ensure_reseed_budget(MAX_RESEED_ROWS + 1, 0).is_err());
+        assert!(ensure_reseed_budget(0, MAX_RESEED_BYTES + 1).is_err());
+    }
 }
