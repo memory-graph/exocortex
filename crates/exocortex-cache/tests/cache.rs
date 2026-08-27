@@ -522,6 +522,23 @@ async fn search_resolves_correct_node_after_index_reuse() {
     writer.abort();
 }
 
+#[test]
+fn repeated_replacements_keep_search_index_bounded() {
+    let mut snapshot = GraphSnapshot::empty();
+    let mut row = mem("version-0000", Visibility::Org, None);
+    for version in 0..2_000 {
+        row.title = format!("version-{version:04}").into();
+        snapshot.push_test_memory(row.clone());
+    }
+
+    assert_eq!(snapshot.petgraph.node_count(), 1);
+    assert!(
+        snapshot.search_arena.len() <= 2 * (row.title.len() + " rust\n".len()) + 1024,
+        "replacement history leaked into the search arena: {} bytes",
+        snapshot.search_arena.len()
+    );
+}
+
 /// CR5 (audit): re-upserting the same RelationshipId replaces the edge —
 /// no parallel duplicates.
 #[tokio::test]

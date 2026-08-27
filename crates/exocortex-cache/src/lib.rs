@@ -48,6 +48,10 @@ pub struct GraphSnapshot {
     /// (CR3: keyed by arena slot, resolved to a NodeIndex per entry — never
     /// assumed to equal the node index, which StableGraph reuses).
     pub search_nodes: Vec<NodeIndex>,
+    /// Bytes occupied by live search keys. The backing arena is compacted
+    /// when stale replacement history would make it more than twice this
+    /// size, keeping index memory proportional to resident rows.
+    search_live_bytes: usize,
     /// Relationship id -> edge index (CR5: upserts replace, deletes O(1)).
     pub by_rel_id: DashMap<RelationshipId, petgraph::stable_graph::EdgeIndex>,
     /// This client's local WAL frontier.
@@ -111,6 +115,7 @@ impl GraphSnapshot {
             search_arena: String::new(),
             search_offsets: Vec::new(),
             search_nodes: Vec::new(),
+            search_live_bytes: 0,
             by_rel_id: DashMap::new(),
             last_local_lsn: 0,
             last_backend_lsn: 0,
@@ -157,12 +162,15 @@ impl GraphSnapshot {
         // CR3: the arena slot records the node it belongs to; StableGraph
         // may reuse freed node indices, so the slot index is never assumed
         // to equal the node index.
+        let search_key = Self::search_key(&m);
         self.search_offsets.push(self.search_arena.len() as u32);
-        self.search_arena.push_str(&Self::search_key(&m));
+        self.search_arena.push_str(&search_key);
         self.search_arena.push(NL);
+        self.search_live_bytes += search_key.len() + NL.len_utf8();
         let ix = self.petgraph.add_node(m.clone());
         self.search_nodes.push(ix);
         self.by_id.insert(m.id, ix);
+        self.compact_search_index_if_needed();
         ix
     }
 
@@ -180,6 +188,9 @@ impl GraphSnapshot {
                         }
                     }
                 }
+                self.search_live_bytes = self
+                    .search_live_bytes
+                    .saturating_sub(Self::search_key(&m).len() + NL.len_utf8());
             }
             // Blank the removed key in place (arena stays append-only). The
             // CR3 parallel array may hold MORE THAN ONE slot pointing at
@@ -206,6 +217,34 @@ impl GraphSnapshot {
             }
             self.petgraph.remove_node(ix);
         }
+    }
+
+    fn compact_search_index_if_needed(&mut self) {
+        const MIN_COMPACTION_GARBAGE: usize = 1024;
+        let garbage = self
+            .search_arena
+            .len()
+            .saturating_sub(self.search_live_bytes);
+        if garbage < MIN_COMPACTION_GARBAGE || self.search_arena.len() <= self.search_live_bytes * 2
+        {
+            return;
+        }
+        let mut arena = String::with_capacity(self.search_live_bytes);
+        let mut offsets = Vec::with_capacity(self.petgraph.node_count());
+        let mut nodes = Vec::with_capacity(self.petgraph.node_count());
+        for ix in self.petgraph.node_indices() {
+            let Some(memory) = self.petgraph.node_weight(ix) else {
+                continue;
+            };
+            offsets.push(arena.len() as u32);
+            arena.push_str(&Self::search_key(memory));
+            arena.push(NL);
+            nodes.push(ix);
+        }
+        self.search_arena = arena;
+        self.search_offsets = offsets;
+        self.search_nodes = nodes;
+        debug_assert_eq!(self.search_arena.len(), self.search_live_bytes);
     }
 
     /// Insert a relationship between existing memories.
@@ -992,6 +1031,7 @@ fn clone_snapshot(src: &GraphSnapshot) -> GraphSnapshot {
         search_arena: src.search_arena.clone(),
         search_offsets: src.search_offsets.clone(),
         search_nodes: src.search_nodes.clone(),
+        search_live_bytes: src.search_live_bytes,
         by_rel_id: src.by_rel_id.clone(),
         last_local_lsn: src.last_local_lsn,
         last_backend_lsn: src.last_backend_lsn,
