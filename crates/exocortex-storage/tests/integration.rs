@@ -437,15 +437,13 @@ itest!(three_hop_traverse, {
 });
 
 itest!(bi_temporal_valid_at, {
-    // The §6.4 upsert template MERGEs memories by id (history-preserving
-    // supersession uses distinct rows + `invalidated_by`, not in-place
-    // versions), so bi-temporality is asserted over validity windows here.
     let s = connect("node-1").await;
     let t0 = Utc::now() - Duration::hours(2);
     let t1 = Utc::now() - Duration::hours(1);
     let mut windowed = mem("vt", 2, Visibility::Org);
     windowed.valid_from = t0;
     windowed.valid_until = Some(t1);
+    windowed.recorded_at = t0;
     s.upsert_memory(&windowed).await.unwrap();
 
     let at0 = s
@@ -466,16 +464,55 @@ itest!(bi_temporal_valid_at, {
         "not valid before t0"
     );
 
-    // Supersession with a fresh row: the old row closes, the new one opens.
-    let mut successor = mem("vt2", 2, Visibility::Org);
+    // A later external snapshot of the same identity appends an assertion;
+    // it must not destroy the earlier validity window.
+    let mut successor = windowed.clone();
+    successor.content = "later snapshot".into();
     successor.valid_from = t1;
+    successor.valid_until = None;
+    successor.recorded_at = t1;
     s.upsert_memory(&successor).await.unwrap();
+    let old = s
+        .valid_at(&windowed.id, t0)
+        .await
+        .unwrap()
+        .expect("earlier assertion remains addressable");
+    assert_ne!(old.content, successor.content);
     let at1 = s
         .valid_at(&successor.id, t1)
         .await
         .unwrap()
         .expect("successor valid at t1");
     assert_eq!(at1.id, successor.id);
+    assert_eq!(at1.content, successor.content);
+    let t2 = t1 + Duration::seconds(1);
+    let mut correction = successor.clone();
+    correction.content = "later correction".into();
+    correction.valid_from = t0;
+    correction.recorded_at = t2;
+    s.upsert_memory(&correction).await.unwrap();
+    assert_eq!(
+        s.valid_at(&successor.id, t1)
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        successor.content,
+        "future-recorded correction must not leak into an earlier knowledge cut"
+    );
+    assert_eq!(
+        s.valid_at(&successor.id, t2)
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        correction.content
+    );
+    assert_eq!(
+        s.get_memory(&successor.id).await.unwrap().unwrap().content,
+        correction.content,
+        "ordinary reads expose only the current row"
+    );
 });
 
 itest!(lease_race_single_winner, {

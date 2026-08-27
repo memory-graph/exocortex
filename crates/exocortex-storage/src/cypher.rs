@@ -66,6 +66,9 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                 m.project_id        = $project_id,
                 m.team_id           = $team_id,
                 m.lsn               = $lsn
+            CREATE (h:_MemoryAssertion {id: $id, visibility: $visibility,
+                valid_from: $valid_from, valid_until: $valid_until,
+                recorded_at: $recorded_at, props_json: $props_json, lsn: $lsn})
             RETURN id(m) AS node_id, m.lsn AS lsn
         "#,
     });
@@ -111,6 +114,9 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                 m.project_id        = $project_id,
                 m.team_id           = $team_id,
                 m.lsn               = $lsn
+            CREATE (h:_MemoryAssertion {id: $id, visibility: $visibility,
+                valid_from: $valid_from, valid_until: $valid_until,
+                recorded_at: $recorded_at, props_json: $props_json, lsn: $lsn})
         "#,
     });
 
@@ -123,7 +129,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         required_params: &["id"],
         cypher: r#"
             OPTIONAL MATCH (m:Memory {id: $id})
-            DELETE m
+            OPTIONAL MATCH (h:_MemoryAssertion {id: $id})
+            DELETE m, h
         "#,
     });
 
@@ -133,8 +140,9 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         required_params: &["rel_id"],
         cypher: r#"
             OPTIONAL MATCH ()-[r]->()
-            WHERE r.rel_id = $rel_id
-            DELETE r
+            WHERE r.id = $rel_id
+            OPTIONAL MATCH (h:_RelationshipAssertion {id: $rel_id})
+            DELETE r, h
         "#,
     });
 
@@ -179,6 +187,10 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                                    invalidated_by: $invalidated_by,
                                    props_json: $props_json,
                                    lsn: $lsn}]->(b)
+            CREATE (h:_RelationshipAssertion {id: $rel_id,
+                visibility: $visibility, valid_from: $valid_from,
+                valid_until: $valid_until, recorded_at: $recorded_at,
+                props_json: $props_json, lsn: $lsn})
             RETURN id(r) AS edge_id
         "#,
     });
@@ -213,6 +225,10 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                                    invalidated_by: $invalidated_by,
                                    props_json: $props_json,
                                    lsn: $lsn}]->(b)
+            CREATE (h:_RelationshipAssertion {id: $rel_id,
+                visibility: $visibility, valid_from: $valid_from,
+                valid_until: $valid_until, recorded_at: $recorded_at,
+                props_json: $props_json, lsn: $lsn})
         "#,
     });
 
@@ -440,11 +456,12 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         read_only: true,
         required_params: &["id", "at", "max_visibility"],
         cypher: r#"
-            MATCH (m:Memory {id: $id})
-            WHERE m.valid_from <= $at
-              AND (m.valid_until IS NULL OR m.valid_until > $at)
+            MATCH (m:_MemoryAssertion {id: $id})
+            WHERE m.recorded_at <= $at AND m.valid_from <= $at
               AND m.visibility <= $max_visibility
-            RETURN m ORDER BY m.recorded_at DESC LIMIT 1
+            WITH m ORDER BY m.lsn DESC LIMIT 1
+            WHERE m.valid_until IS NULL OR m.valid_until > $at
+            RETURN m
         "#,
     });
 
@@ -541,6 +558,9 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (m:Memory {id: $id})
             WHERE m.valid_until IS NULL
             SET m.valid_until = $now, m.lsn = $lsn, m.props_json = $props_json
+            CREATE (h:_MemoryAssertion {id: $id, visibility: m.visibility,
+                valid_from: m.valid_from, valid_until: $now,
+                recorded_at: $now, props_json: $props_json, lsn: $lsn})
             RETURN id(m) AS node_id
         "#,
     });
@@ -554,6 +574,9 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             SET m.valid_until = $now,
                 m.lsn = $lsn,
                 m.props_json = $props_json
+            CREATE (h:_MemoryAssertion {id: $id, visibility: m.visibility,
+                valid_from: m.valid_from, valid_until: $now,
+                recorded_at: $now, props_json: $props_json, lsn: $lsn})
         "#,
     });
 
@@ -568,6 +591,10 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MATCH ()-[r]->() WHERE r.id = $rel_id AND r.valid_until IS NULL
             SET r.valid_until = $now, r.lsn = $lsn, r.props_json = $props_json
+            CREATE (h:_RelationshipAssertion {id: $rel_id,
+                visibility: r.visibility, valid_from: r.valid_from,
+                valid_until: $now, recorded_at: $now,
+                props_json: $props_json, lsn: $lsn})
             RETURN id(r) AS edge_id
         "#,
     });
@@ -587,11 +614,15 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         read_only: true,
         required_params: &["at", "max_visibility"],
         cypher: r#"
-            MATCH (m:Memory)
-            WHERE m.valid_from <= $at
-              AND (m.valid_until IS NULL OR m.valid_until > $at)
+            MATCH (m:_MemoryAssertion)
+            WHERE m.recorded_at <= $at AND m.valid_from <= $at
               AND m.visibility <= $max_visibility
-            RETURN count(m) AS memories
+            WITH m.id AS assertion_id, max(m.lsn) AS assertion_lsn
+            MATCH (current:_MemoryAssertion)
+            WHERE current.id = assertion_id AND current.lsn = assertion_lsn
+              AND current.valid_from <= $at
+              AND (current.valid_until IS NULL OR current.valid_until > $at)
+            RETURN count(current) AS memories
         "#,
     });
 
@@ -600,12 +631,15 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         read_only: true,
         required_params: &["at", "max_visibility"],
         cypher: r#"
-            MATCH ()-[r]->()
-            WHERE r.valid_from <= $at
-              AND (r.valid_until IS NULL OR r.valid_until > $at)
+            MATCH (r:_RelationshipAssertion)
+            WHERE r.recorded_at <= $at AND r.valid_from <= $at
               AND r.visibility <= $max_visibility
-              AND r.lsn IS NOT NULL
-            RETURN count(r) AS relationships
+            WITH r.id AS assertion_id, max(r.lsn) AS assertion_lsn
+            MATCH (current:_RelationshipAssertion)
+            WHERE current.id = assertion_id AND current.lsn = assertion_lsn
+              AND current.valid_from <= $at
+              AND (current.valid_until IS NULL OR current.valid_until > $at)
+            RETURN count(current) AS relationships
         "#,
     });
 

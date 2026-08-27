@@ -227,11 +227,9 @@ impl InMemoryStorage {
         let mut store = self.inner.rels.lock().unwrap();
         let mut r = r.clone();
         r.lsn = exocortex_kernel::LSN::new_backend(lsn);
-        // ST7/ST8 (audit): overwrite in place — one current row per id, the
-        // same semantics the FalkorDB adapter's MERGE gives. The double's
-        // old per-id version stack was a model the production backend does
-        // not have.
-        store.insert(r.id, vec![r.clone()]);
+        // R-T16a: retain every assertion while exposing the newest row as
+        // current through the ordinary read APIs.
+        store.entry(r.id).or_default().push(r.clone());
         drop(store);
         self.index_relationship(r.id, r.from, r.to);
         let _ = self.feed.send(Invalidation::RelationshipUpserted {
@@ -282,7 +280,7 @@ impl InMemoryStorage {
             next += 1;
             let mut m = m.clone();
             m.lsn = exocortex_kernel::LSN::new_backend(next);
-            staged_m.insert(m.id, vec![m.clone()]);
+            staged_m.entry(m.id).or_default().push(m.clone());
             invalidations.push(Invalidation::MemoryUpserted {
                 id: m.id,
                 lsn: next,
@@ -298,7 +296,7 @@ impl InMemoryStorage {
             next += 1;
             let mut r = r.clone();
             r.lsn = exocortex_kernel::LSN::new_backend(next);
-            staged_r.insert(r.id, vec![r.clone()]);
+            staged_r.entry(r.id).or_default().push(r.clone());
             invalidations.push(Invalidation::RelationshipUpserted {
                 id: r.id,
                 from: r.from,
@@ -318,7 +316,7 @@ impl InMemoryStorage {
                 }
                 next += 1;
                 inv.lsn = exocortex_kernel::LSN::new_backend(next);
-                staged_r.insert(inv.id, vec![inv.clone()]);
+                staged_r.entry(inv.id).or_default().push(inv.clone());
                 invalidations.push(Invalidation::RelationshipUpserted {
                     id: inv.id,
                     from: inv.from,
@@ -345,9 +343,12 @@ impl InMemoryStorage {
         let now = Utc::now();
         let mut store = self.inner.memories.lock().unwrap();
         if let Some(h) = store.get_mut(id) {
-            if let Some(last) = h.last_mut() {
-                last.valid_until = Some(now);
-                last.lsn = exocortex_kernel::LSN::new_backend(lsn);
+            if let Some(last) = h.last().cloned() {
+                let mut closed = last;
+                closed.valid_until = Some(now);
+                closed.recorded_at = now;
+                closed.lsn = exocortex_kernel::LSN::new_backend(lsn);
+                h.push(closed);
             }
         }
         CommitRecord {
@@ -403,10 +404,8 @@ impl Storage for InMemoryStorage {
         let mut m = m.clone();
         m.lsn = exocortex_kernel::LSN::new_backend(lsn);
         let id = m.id;
-        // ST7/ST8 (audit): overwrite in place — one current row per id,
-        // matching the FalkorDB adapter's MERGE and the trait's "current
-        // versions" streaming contract.
-        store.insert(id, vec![m]);
+        // R-T16a: assertion history is append-only; current reads select last.
+        store.entry(id).or_default().push(m);
         drop(store);
         let _ = self.feed.send(Invalidation::MemoryUpserted { id, lsn });
         Ok(CommitRecord {
@@ -470,10 +469,14 @@ impl Storage for InMemoryStorage {
         // relationship deletions must reach the change feed.
         let mut closed = false;
         if let Some(h) = store.get_mut(id) {
-            if let Some(last) = h.last_mut() {
+            if let Some(last) = h.last().cloned() {
                 if last.valid_until.is_none() {
-                    last.valid_until = Some(Utc::now());
-                    last.lsn = exocortex_kernel::LSN::new_backend(lsn);
+                    let now = Utc::now();
+                    let mut closed_row = last;
+                    closed_row.valid_until = Some(now);
+                    closed_row.recorded_at = now;
+                    closed_row.lsn = exocortex_kernel::LSN::new_backend(lsn);
+                    h.push(closed_row);
                     closed = true;
                 }
             }
@@ -882,13 +885,21 @@ impl Storage for InMemoryStorage {
             backend_lsn: self.lsn.load(Ordering::SeqCst),
             memory_count: store
                 .values()
-                .filter_map(|h| h.last())
-                .filter(|m| valid(m.valid_from, &m.valid_until))
+                .filter(|h| {
+                    h.iter()
+                        .rev()
+                        .find(|m| m.recorded_at <= t && m.valid_from <= t)
+                        .is_some_and(|m| valid(m.valid_from, &m.valid_until))
+                })
                 .count() as u64,
             relationship_count: rels
                 .values()
-                .filter_map(|h| h.last())
-                .filter(|r| valid(r.valid_from, &r.valid_until))
+                .filter(|h| {
+                    h.iter()
+                        .rev()
+                        .find(|r| r.recorded_at <= t && r.valid_from <= t)
+                        .is_some_and(|r| valid(r.valid_from, &r.valid_until))
+                })
                 .count() as u64,
         })
     }
@@ -898,12 +909,14 @@ impl Storage for InMemoryStorage {
         at: DateTime<Utc>,
     ) -> Result<Option<Memory>, StorageError> {
         let store = self.inner.memories.lock().unwrap();
-        // ST7 (audit): the double overwrites in place, so exactly one row
-        // per id exists — the same semantics the FalkorDB adapter serves.
         Ok(store
             .get(id)
-            .and_then(|h| h.last())
-            .filter(|m| m.valid_from <= at && m.valid_until.is_none_or(|v| v > at))
+            .and_then(|h| {
+                h.iter()
+                    .rev()
+                    .find(|m| m.recorded_at <= at && m.valid_from <= at)
+                    .filter(|m| m.valid_until.is_none_or(|v| v > at))
+            })
             .cloned())
     }
     async fn query_cypher(&self, _q: &CypherQuery) -> Result<ResultSet, StorageError> {

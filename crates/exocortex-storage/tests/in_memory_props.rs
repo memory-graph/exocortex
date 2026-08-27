@@ -124,12 +124,8 @@ proptest! {
         });
     }
 
-    /// Bi-temporal round-trip under the SHARED backend semantics (ST7,
-    /// audit): an upsert of the same id overwrites in place — one current
-    /// row per id, exactly what the FalkorDB adapter's MERGE serves. The
-    /// superseding version's valid window is what `valid_at` answers; the
-    /// superseded version is no longer addressable by time (that model was
-    /// a double-only fiction the production backend could not serve).
+    /// Re-syncing a stable external identity appends an assertion version
+    /// while ordinary streaming continues to expose one current row.
     #[test]
     fn bi_temporal_roundtrip_prop(
         content_a in "[a-z]{1,10}",
@@ -145,23 +141,34 @@ proptest! {
             let mut v1 = base_memory("p".into(), content_a.clone(), 2, 1);
             v1.valid_from = t0;
             v1.valid_until = Some(t1);
+            v1.recorded_at = t0;
             store.upsert_memory(&v1).await.unwrap();
             // Current version is readable across its own window.
             let at_t0 = store.valid_at(&v1.id, t0).await.unwrap().unwrap();
-            prop_assert_eq!(at_t0.content, content_a);
-            // Supersede in place: the surviving row's window governs.
+            prop_assert_eq!(at_t0.content.as_str(), content_a.as_str());
+            // A later snapshot keeps the earlier assertion addressable.
             let mut v2 = v1.clone();
             v2.content = content_b.clone();
             v2.valid_from = t1;
             v2.valid_until = None;
+            v2.recorded_at = t1;
             store.upsert_memory(&v2).await.unwrap();
-            let superseded = store.valid_at(&v1.id, t0).await.unwrap();
-            prop_assert!(
-                superseded.is_none(),
-                "superseded version no longer addressable (ST7 shared semantics)"
-            );
+            let superseded = store.valid_at(&v1.id, t0).await.unwrap().unwrap();
+            prop_assert_eq!(superseded.content.as_str(), content_a.as_str());
             let at_t1 = store.valid_at(&v1.id, t1).await.unwrap().unwrap();
-            prop_assert_eq!(at_t1.content, content_b);
+            prop_assert_eq!(at_t1.content.as_str(), content_b.as_str());
+            // A correction may refer to the original valid-time while being
+            // learned later; it must not leak into an earlier knowledge cut.
+            let t2 = t1 + Duration::seconds(1);
+            let mut correction = v2.clone();
+            correction.content = "correction".into();
+            correction.valid_from = t0;
+            correction.recorded_at = t2;
+            store.upsert_memory(&correction).await.unwrap();
+            let still_v2 = store.valid_at(&v1.id, t1).await.unwrap().unwrap();
+            prop_assert_eq!(still_v2.content.as_str(), content_b.as_str());
+            let corrected = store.valid_at(&v1.id, t2).await.unwrap().unwrap();
+            prop_assert_eq!(corrected.content.as_str(), "correction");
             let before = store.valid_at(&v1.id, t0 - Duration::hours(1)).await.unwrap();
             prop_assert!(before.is_none());
             // Streaming sees exactly one row per id (ST8).
@@ -174,6 +181,7 @@ proptest! {
                 }
             }
             prop_assert_eq!(rows, 1);
+            prop_assert_eq!(store.memory_history(&v1.id).len(), 3);
             Ok::<(), proptest::test_runner::TestCaseError>(())
         });
     }
