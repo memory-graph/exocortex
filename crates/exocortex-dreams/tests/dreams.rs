@@ -14,7 +14,7 @@ use exocortex_kernel::{
     Embedding, EmbeddingModel, Memory, MemoryContext, MemoryId, Provenance, RelKindId,
     Relationship, RelationshipId, RelationshipProperties, Visibility, LSN,
 };
-use exocortex_storage::{InMemoryStorage, RegionKey, Storage};
+use exocortex_storage::{InMemoryStorage, RegionKey, Storage, VisibilityContext};
 
 fn ontology() -> Arc<exocortex_kernel::Ontology> {
     Arc::new(
@@ -724,6 +724,70 @@ async fn transitive_finder_proposes_only_open_indirect_pairs() {
         v
     };
     assert!(!open.contains(&(a, c)), "proposal did not write an edge");
+
+    let discovery = proposals
+        .iter()
+        .find(|proposal| proposal.endpoints == (a, c))
+        .unwrap();
+    engine
+        .issue_discovery_proposal(
+            discovery,
+            &region,
+            kind,
+            Visibility::Org,
+            VisibilityContext {
+                user_id: "u".into(),
+                org_id: "o".into(),
+                project_ids: vec!["p".into()].into(),
+                team_ids: Default::default(),
+                max_visibility: Visibility::Org,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !engine
+            .pending_discoveries()
+            .iter()
+            .any(|pending| pending.id == discovery.id),
+        "persisted proposals leave the bounded in-memory pending set"
+    );
+}
+
+#[tokio::test]
+async fn pruning_scans_once_and_records_only_closed_rows_in_the_region() {
+    let storage = InMemoryStorage::new(ontology());
+    for i in 0..2 {
+        storage
+            .upsert_memory(&mem_with_embedding(300 + i, None, unit(i)))
+            .await
+            .unwrap();
+    }
+    let mut closed = mem_with_embedding(310, None, unit(10));
+    closed.valid_until = Some(chrono::Utc::now());
+    storage.upsert_memory(&closed).await.unwrap();
+    let mut foreign = mem_with_embedding(311, None, unit(11));
+    foreign.valid_until = Some(chrono::Utc::now());
+    foreign.context.project_id = Some("other".into());
+    storage.upsert_memory(&foreign).await.unwrap();
+
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        false,
+        "prune-once".into(),
+    );
+    let result = engine
+        .try_consolidate(&RegionKey {
+            org: "o".into(),
+            project: "p".into(),
+            memory_type: 3,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.pruned, vec![(closed.id, PruneReason::Redundant)]);
 }
 
 fn discovery_test_relationship(from: MemoryId, to: MemoryId) -> exocortex_kernel::Relationship {
@@ -859,6 +923,11 @@ async fn discovery_budget_selects_the_same_bounded_pairs() {
         .map(|proposal| proposal.endpoints)
         .collect();
     assert_eq!(first.len(), exocortex_dreams::MAX_DISCOVERIES_PER_CYCLE);
+    assert_eq!(
+        engine.pending_discoveries().len(),
+        exocortex_dreams::MAX_DISCOVERIES_PER_CYCLE,
+        "a later cycle replaces rather than accumulates pending proposals"
+    );
     assert_eq!(
         first, second,
         "the capped proposal set must be reproducible"

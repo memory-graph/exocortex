@@ -30,6 +30,10 @@ use trigger::{DreamsTrigger, RegionWriteCounters};
 pub const SIMILAR_TO_THRESHOLD: f32 = 0.85;
 /// Maximum structured discovery proposals emitted by one production cycle.
 pub const MAX_DISCOVERIES_PER_CYCLE: usize = 16;
+/// Maximum two-hop path candidates inspected by one discovery cycle.
+pub const MAX_DISCOVERY_PATH_INSPECTIONS: usize = 50_000;
+
+type DiscoveryEdge = (MemoryId, MemoryId, u32, bool);
 
 /// The audit record stamped per cycle — every field R-Dr4 mandates.
 #[derive(Clone, Debug)]
@@ -424,9 +428,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         if !res.strengthened.is_empty() {
             self.mutation_checkpoint(&mut mutations)?;
         }
-        for a in &anchors {
-            self.prune(&mut res, a).await?;
-        }
+        self.prune(&mut res, region).await?;
         res.memories_output = (res.memories_input as usize - res.merged.len()).max(0) as u32;
 
         // §12.1 step 5 / R-T14: SimilarTo edges over the surviving anchors —
@@ -809,15 +811,17 @@ impl<S: Storage + 'static> DreamsEngine<S> {
 
     /// Prune: closed rows (valid_until set) are recorded Redundant — the
     /// audit trail survives the memory (R-Dr9/R-Dr10).
-    async fn prune(
-        &self,
-        res: &mut ConsolidationResult,
-        _a: &MemoryWithEmbedding,
-    ) -> anyhow::Result<()> {
+    async fn prune(&self, res: &mut ConsolidationResult, region: &RegionKey) -> anyhow::Result<()> {
         use futures::StreamExt;
         let mut ms = self.storage.stream_all_memories().await;
-        while let Some(Ok(m)) = ms.next().await {
-            if m.valid_until.is_some() {
+        while let Some(row) = ms.next().await {
+            let m = row?;
+            let in_region = (region.org == "*"
+                || m.context.tenant_id.as_deref() == Some(region.org.as_str()))
+                && (region.project == "*"
+                    || m.context.project_id.as_deref() == Some(region.project.as_str()))
+                && m.memory_type == region.memory_type;
+            if in_region && m.valid_until.is_some() {
                 res.pruned.push((m.id, PruneReason::Redundant));
             }
         }
@@ -881,9 +885,10 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     pub async fn run_discovery(&self, region: &RegionKey) -> anyhow::Result<Vec<Discovery>> {
         self.validate_region(region).await?;
         use futures::StreamExt;
-        let mut edges: Vec<(MemoryId, MemoryId, u32, bool)> = Vec::new(); // (from, to, kind, derived)
+        let mut edges: Vec<DiscoveryEdge> = Vec::new(); // (from, to, kind, derived)
         let mut rs = self.storage.stream_all_relationships().await;
-        while let Some(Ok(r)) = rs.next().await {
+        while let Some(row) = rs.next().await {
+            let r = row?;
             let derived = matches!(r.provenance, Provenance::Derived { .. });
             let open = r.valid_until.is_none();
             if open {
@@ -895,36 +900,30 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         // ordering makes the capped proposal set reproducible across adapters
         // and process restarts.
         edges.sort_by_key(|(from, to, kind, derived)| (*from, *to, *kind, *derived));
-        let direct: std::collections::HashSet<(MemoryId, MemoryId)> =
-            edges.iter().map(|(f, t, _, _)| (*f, *t)).collect();
+        let (candidates, _) = transitive_candidates(&edges, MAX_DISCOVERY_PATH_INSPECTIONS);
 
         let cycle: SmolStr = format!("dream:{}", uuid::Uuid::new_v4()).into();
-        let mut out = Vec::new();
-        'outer: for (a, b, k1, d1) in &edges {
-            for (c_from, c, k2, d2) in &edges {
-                if c_from == b && c != a && !d1 && !d2 && !direct.contains(&(*a, *c)) {
-                    let d = Discovery {
-                        id: uuid::Uuid::new_v4(),
-                        kind: DiscoveryKind::Transitive,
-                        endpoints: (*a, *c),
-                        quality: DiscoveryKind::Transitive.default_quality(),
-                        via_types: (*k1, *k2),
-                        discovery_cycle_id: cycle.clone(),
-                        discovered_at: chrono::Utc::now(),
-                    };
-                    metrics::counter!(
-                        "exocortex_dreams_discoveries_total",
-                        "type" => "transitive",
-                        "quality" => "0.6"
-                    )
-                    .increment(1);
-                    self.discoveries.insert(d.id, d.clone());
-                    out.push(d);
-                    if out.len() >= MAX_DISCOVERIES_PER_CYCLE {
-                        break 'outer;
-                    }
-                }
-            }
+        let out: Vec<_> = candidates
+            .into_iter()
+            .map(|(a, c, k1, k2)| Discovery {
+                id: uuid::Uuid::new_v4(),
+                kind: DiscoveryKind::Transitive,
+                endpoints: (a, c),
+                quality: DiscoveryKind::Transitive.default_quality(),
+                via_types: (k1, k2),
+                discovery_cycle_id: cycle.clone(),
+                discovered_at: chrono::Utc::now(),
+            })
+            .collect();
+        self.discoveries.clear();
+        for discovery in &out {
+            metrics::counter!(
+                "exocortex_dreams_discoveries_total",
+                "type" => "transitive",
+                "quality" => "0.6"
+            )
+            .increment(1);
+            self.discoveries.insert(discovery.id, discovery.clone());
         }
         let _ = region;
         Ok(out)
@@ -952,12 +951,87 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             issued_at: discovery.discovered_at,
         };
         self.storage.create_discovery_proposal(&proposal).await?;
+        self.discoveries.remove(&discovery.id);
         Ok(proposal)
     }
 
     /// Proposals awaiting `accept_discovery` (R-Dr1: proposals, never edges).
     pub fn pending_discoveries(&self) -> Vec<Discovery> {
         self.discoveries.iter().map(|e| e.value().clone()).collect()
+    }
+}
+
+fn transitive_candidates(
+    edges: &[DiscoveryEdge],
+    inspection_budget: usize,
+) -> (Vec<(MemoryId, MemoryId, u32, u32)>, usize) {
+    let direct: std::collections::HashSet<(MemoryId, MemoryId)> =
+        edges.iter().map(|(from, to, _, _)| (*from, *to)).collect();
+    let mut outgoing: std::collections::BTreeMap<MemoryId, Vec<&DiscoveryEdge>> =
+        std::collections::BTreeMap::new();
+    for edge in edges {
+        outgoing.entry(edge.0).or_default().push(edge);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    let mut inspected = 0usize;
+    'paths: for (a, b, k1, first_derived) in edges {
+        if *first_derived {
+            continue;
+        }
+        let Some(next_edges) = outgoing.get(b) else {
+            continue;
+        };
+        for (_, c, k2, second_derived) in next_edges {
+            if inspected >= inspection_budget {
+                break 'paths;
+            }
+            inspected += 1;
+            let candidate = (*a, *c, *k1, *k2);
+            if !*second_derived && c != a && !direct.contains(&(*a, *c)) && seen.insert(candidate) {
+                out.push(candidate);
+                if out.len() >= MAX_DISCOVERIES_PER_CYCLE {
+                    break 'paths;
+                }
+            }
+        }
+    }
+    (out, inspected)
+}
+
+#[cfg(test)]
+mod discovery_scaling_tests {
+    use super::*;
+
+    #[test]
+    fn indexed_discovery_is_linear_for_disjoint_edges_and_budgeted_for_dense_paths() {
+        let disjoint: Vec<_> = (0..10_000u32)
+            .map(|i| {
+                let mut from = [0u8; 16];
+                from[..4].copy_from_slice(&(i * 2).to_be_bytes());
+                let mut to = [0u8; 16];
+                to[..4].copy_from_slice(&(i * 2 + 1).to_be_bytes());
+                (MemoryId(from), MemoryId(to), 1, false)
+            })
+            .collect();
+        let (candidates, inspected) = transitive_candidates(&disjoint, 50_000);
+        assert!(candidates.is_empty());
+        assert_eq!(
+            inspected, 0,
+            "unconnected edges require no global pair scan"
+        );
+
+        let hub = MemoryId([0x7f; 16]);
+        let mut dense = Vec::new();
+        for i in 0..400u32 {
+            let mut endpoint = [0u8; 16];
+            endpoint[..4].copy_from_slice(&i.to_be_bytes());
+            dense.push((MemoryId(endpoint), hub, 1, false));
+            dense.push((hub, MemoryId(endpoint), 2, true));
+        }
+        dense.sort_by_key(|edge| (edge.0, edge.1, edge.2, edge.3));
+        let (_, inspected) = transitive_candidates(&dense, 97);
+        assert_eq!(inspected, 97, "dense candidate work stops at its budget");
     }
 }
 
