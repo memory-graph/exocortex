@@ -609,7 +609,7 @@ impl<S: Storage> IngestServer<S> {
             }
             v
         } else {
-            from_mem.visibility.min(to_mem.visibility)
+            exocortex_kernel::relationship_visibility(from_mem.visibility, to_mem.visibility)
         };
         // R-T17 via the kernel's one triple check (W2): both sides
         // required, no local copy.

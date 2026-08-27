@@ -569,18 +569,20 @@ async fn transitive_evidence_is_the_two_hops() {
         m.title = format!("n{i}").into();
         m
     };
-    let (a, b, c) = (mk(1), mk(2), mk(3));
+    let (mut a, mut b, c) = (mk(1), mk(2), mk(3));
+    a.visibility = exocortex_kernel::Visibility::Project;
+    b.visibility = exocortex_kernel::Visibility::Team;
     for m in [&a, &b, &c] {
         storage.upsert_memory(m).await.unwrap();
     }
-    let rel = |from: MemoryId, to: MemoryId| {
+    let rel = |from: MemoryId, to: MemoryId, visibility| {
         use exocortex_kernel::*;
         Relationship {
             id: RelationshipId::derive(from, dep, to, None),
             kind: dep,
             from,
             to,
-            visibility: Visibility::Org,
+            visibility,
             provenance: Provenance::Asserted {
                 author: "t".into(),
                 producer_kind: None,
@@ -604,8 +606,14 @@ async fn transitive_evidence_is_the_two_hops() {
             lsn: LSN::new_backend(1),
         }
     };
-    storage.upsert_relationship(&rel(a.id, b.id)).await.unwrap();
-    storage.upsert_relationship(&rel(b.id, c.id)).await.unwrap();
+    storage
+        .upsert_relationship(&rel(a.id, b.id, Visibility::Private))
+        .await
+        .unwrap();
+    storage
+        .upsert_relationship(&rel(b.id, c.id, Visibility::Team))
+        .await
+        .unwrap();
 
     let engine = ReasoningEngine::new(Arc::new(storage.clone_dyn()), 16, 2);
     engine.k_hop_reason(a.id, 2).await;
@@ -617,16 +625,21 @@ async fn transitive_evidence_is_the_two_hops() {
     while let Some(Ok(r)) = rs.next().await {
         if let exocortex_kernel::Provenance::Derived { rule_id, evidence } = &r.provenance {
             if rule_id == "R4" {
-                found = Some(evidence.clone());
+                found = Some((evidence.clone(), r.visibility));
             }
         }
     }
-    let ev = found.expect("R4 transitive edge derived");
+    let (ev, visibility) = found.expect("R4 transitive edge derived");
     assert_eq!(ev.len(), 2, "CR12: exactly the two hops, got {ev:?}");
     let hop1 = RelationshipId::derive(a.id, dep, b.id, None);
     let hop2 = RelationshipId::derive(b.id, dep, c.id, None);
     assert!(
         ev.contains(&hop1) && ev.contains(&hop2),
         "the two hops: {ev:?}"
+    );
+    assert_eq!(
+        visibility,
+        Visibility::Private,
+        "derived edge is no wider than either endpoint or supporting hop"
     );
 }

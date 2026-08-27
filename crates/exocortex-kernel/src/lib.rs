@@ -60,4 +60,4 @@ pub use ontology::Ontology;
 pub use pack::{PackDef, PackVersion};
 pub use provenance::{ExternalKey, ExternalSnapshot, ProducerKind, Provenance};
 pub use relationship::{materialize_inverse, Relationship, RelationshipProperties};
-pub use visibility::Visibility;
+pub use visibility::{narrowest_visibility, relationship_visibility, Visibility};

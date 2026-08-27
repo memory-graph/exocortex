@@ -224,7 +224,7 @@ fn rebuild_batch(
                 .get(&hint.kind)
                 .map(|k| k.display_name.to_string())
                 .ok_or_else(|| format!("kind id {:?} no longer resolves", hint.kind))?;
-            let narrower = vis_of(i).min(vis_of(to_pos));
+            let narrower = exocortex_kernel::relationship_visibility(vis_of(i), vis_of(to_pos));
             rels.push(WireRel {
                 from_draft_key: keys[i].clone(),
                 to_draft_key: keys[to_pos].clone(),

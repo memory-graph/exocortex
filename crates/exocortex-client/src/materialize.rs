@@ -294,7 +294,7 @@ pub fn grouping_edge_local(
         kind,
         from: member.id,
         to: node.id,
-        visibility: member.visibility.min(node.visibility),
+        visibility: exocortex_kernel::relationship_visibility(member.visibility, node.visibility),
         provenance: Provenance::Derived {
             rule_id: format!("grouping:{GROUPING_FLAVOR}").into(),
             evidence: vec![],
@@ -376,7 +376,7 @@ fn relationship_from_hint(
         from: from.id,
         to,
         // W5: never more visible than either endpoint.
-        visibility: from.visibility.min(to_vis),
+        visibility: exocortex_kernel::relationship_visibility(from.visibility, to_vis),
         // Same assertion identity the drained batch would carry.
         provenance: Provenance::Asserted {
             author: crate::drain::PRODUCER_ID.into(),

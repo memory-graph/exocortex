@@ -25,3 +25,43 @@ impl Visibility {
         (self as u8) <= (ceiling as u8)
     }
 }
+
+/// A relationship can never be visible more broadly than either endpoint.
+pub fn relationship_visibility(from: Visibility, to: Visibility) -> Visibility {
+    from.min(to)
+}
+
+/// Fold endpoint/evidence visibility into the narrowest authorized result.
+pub fn narrowest_visibility(
+    visibilities: impl IntoIterator<Item = Visibility>,
+) -> Option<Visibility> {
+    visibilities.into_iter().min()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{narrowest_visibility, relationship_visibility, Visibility};
+
+    #[test]
+    fn derived_visibility_is_never_wider_than_endpoints_or_evidence() {
+        for from in [
+            Visibility::Private,
+            Visibility::Project,
+            Visibility::Team,
+            Visibility::Org,
+        ] {
+            for to in [
+                Visibility::Private,
+                Visibility::Project,
+                Visibility::Team,
+                Visibility::Org,
+            ] {
+                assert_eq!(relationship_visibility(from, to), from.min(to));
+            }
+        }
+        assert_eq!(
+            narrowest_visibility([Visibility::Org, Visibility::Team, Visibility::Project,]),
+            Some(Visibility::Project)
+        );
+    }
+}

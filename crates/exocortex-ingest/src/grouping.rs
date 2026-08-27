@@ -155,7 +155,7 @@ pub fn grouping_edge(
         from: member.id,
         to: node.id,
         // W5's rule at the source: never more visible than either end.
-        visibility: member.visibility.min(node.visibility),
+        visibility: exocortex_kernel::relationship_visibility(member.visibility, node.visibility),
         provenance: Provenance::Derived {
             rule_id: format!("grouping:{}", rule.flavor).into(),
             evidence: vec![],

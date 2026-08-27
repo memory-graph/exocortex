@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use exocortex_kernel::{MemoryId, Provenance, Relationship, RelationshipId, Visibility};
+use exocortex_kernel::{MemoryId, Provenance, Relationship, RelationshipId};
 use exocortex_storage::Storage;
 use tokio::sync::mpsc;
 use tracing::{instrument, warn};
@@ -280,16 +280,26 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         let ontology = self.storage_ontology();
         let mut new_rels: Vec<Relationship> = Vec::new();
         let now = chrono::Utc::now();
+        let mut memory_visibility = std::collections::HashMap::new();
+        {
+            use futures::StreamExt;
+            let mut memories = self.storage.stream_all_memories().await;
+            while let Some(Ok(memory)) = memories.next().await {
+                memory_visibility.insert(memory.id, memory.visibility);
+            }
+        }
 
         // Kind-aware adjacency for resolving transitive support edges.
         let mut adj: std::collections::HashMap<
             MemoryId,
             Vec<(MemoryId, exocortex_kernel::RelKindId, RelationshipId)>,
         > = std::collections::HashMap::new();
+        let mut evidence_visibility = std::collections::HashMap::new();
         {
             use futures::StreamExt;
             let mut rels = self.storage.stream_all_relationships().await;
             while let Some(Ok(r)) = rels.next().await {
+                evidence_visibility.insert(r.id, r.visibility);
                 adj.entry(r.from).or_default().push((r.to, r.kind, r.id));
             }
         }
@@ -323,6 +333,20 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
                         strength: f32,
                         shared_count: u32,
                         evidence: Vec<RelationshipId>| {
+            let Some(from_visibility) = memory_visibility.get(&from).copied() else {
+                return;
+            };
+            let Some(to_visibility) = memory_visibility.get(&to).copied() else {
+                return;
+            };
+            let visibility = exocortex_kernel::narrowest_visibility(
+                [from_visibility, to_visibility].into_iter().chain(
+                    evidence
+                        .iter()
+                        .filter_map(|id| evidence_visibility.get(id).copied()),
+                ),
+            )
+            .expect("two endpoint visibilities");
             let kind = derived_kind(&ontology, rule_id);
             // CR6 (audit): the rule id is part of the derived identity —
             // R7/R8/R9 all map to RelatedTo, and sharing one id let the
@@ -334,7 +358,7 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
                 kind,
                 from,
                 to,
-                visibility: Visibility::Org,
+                visibility,
                 provenance: Provenance::Derived {
                     rule_id: rule_id.into(),
                     evidence,
