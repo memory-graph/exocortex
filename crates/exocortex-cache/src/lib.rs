@@ -228,6 +228,19 @@ impl GraphSnapshot {
                 self.est_bytes = self.est_bytes.saturating_sub(Self::estimate(&m));
                 self.remove_memory_indexes(&m, ix);
             }
+            let incident_ids = self
+                .petgraph
+                .edges_directed(ix, petgraph::Direction::Outgoing)
+                .chain(
+                    self.petgraph
+                        .edges_directed(ix, petgraph::Direction::Incoming),
+                )
+                .map(|edge| edge.weight().id)
+                .collect::<std::collections::HashSet<_>>();
+            for relationship_id in incident_ids {
+                self.by_rel_id.remove(&relationship_id);
+                self.est_bytes = self.est_bytes.saturating_sub(256);
+            }
             self.petgraph.remove_node(ix);
         }
     }

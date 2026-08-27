@@ -355,6 +355,66 @@ async fn memory_upsert_preserves_incident_relationships() {
 }
 
 #[tokio::test]
+async fn node_delete_clears_incident_ids_before_edge_index_reuse() {
+    let (cache, rx) = LocalCache::new(64 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    let store = Arc::new(InMemoryStorage::new(ontology()));
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let store = store.clone();
+        async move { cache.run(store, rx).await }
+    });
+    let first = mem("first", Visibility::Org, None);
+    let second = mem("second", Visibility::Org, None);
+    let third = mem("third", Visibility::Org, None);
+    let fourth = mem("fourth", Visibility::Org, None);
+    let removed = rel(first.id, second.id, 51);
+    let survivor = rel(third.id, fourth.id, 52);
+    cache
+        .reseed_rows(
+            "org".into(),
+            vec![first.clone(), second, third, fourth],
+            vec![removed.clone()],
+            1,
+        )
+        .await;
+
+    cache
+        .submit(CacheWrite::Apply(
+            exocortex_storage::Invalidation::MemoryDeleted {
+                id: first.id,
+                lsn: 2,
+            },
+        ))
+        .await;
+    cache.flush().await;
+    cache
+        .submit(CacheWrite::Apply(
+            exocortex_storage::Invalidation::RelationshipSnapshotUpserted {
+                relationship: Box::new(survivor.clone()),
+                lsn: 3,
+            },
+        ))
+        .await;
+    cache.flush().await;
+    cache
+        .submit(CacheWrite::Apply(
+            exocortex_storage::Invalidation::RelationshipDeleted {
+                id: removed.id,
+                lsn: 4,
+            },
+        ))
+        .await;
+    cache.flush().await;
+
+    let snapshot = cache.graphs_snapshot("org").expect("resident");
+    assert!(!snapshot.by_rel_id.contains_key(&removed.id));
+    assert!(snapshot.by_rel_id.contains_key(&survivor.id));
+    assert_eq!(snapshot.petgraph.edge_count(), 1);
+    writer.abort();
+}
+
+#[tokio::test]
 async fn released_snapshot_buffer_makes_isolated_update_delta_only() {
     let (cache, rx) = LocalCache::new(64 * 1024 * 1024);
     let cache = Arc::new(cache);
