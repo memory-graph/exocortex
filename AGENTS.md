@@ -137,6 +137,7 @@ is pinned 1.85.0. Live-backend suites (`--features integration` with
 | Question | Answer |
 |---|---|
 | What should this feature do? | `docs/prd/exocortex-core-prd.md` (the §-refs) |
+| How do I write an ontology pack? | `docs/ONTOLOGY_GUIDE.md` |
 | What's accepted work? | `docs/master-plan.prd` |
 | What was delivered/deviated? | `docs/MILESTONE_REPORT.md` |
 | What did reviews find? | `docs/reviews/round-{1,2,3}-review.prd` |

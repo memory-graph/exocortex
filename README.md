@@ -96,6 +96,35 @@ Three hard properties:
 3. **Local-first.** Without `--backend`, nothing leaves your machine.
    With one, the network carries only background sync and consolidation.
 
+## Not our first memory system
+
+Exocortex is the complete evolution of **memory-graph**, our first
+memory solution — a production deployment that ran the write→read loop
+daily (embedded storage, zero setup, on the order of a dozen writes a
+day at its heaviest) and validated the shape everything here is built
+on: type-tagged memories plus a typed edge vocabulary, no per-type
+payload schemas, proven across five storage backends.
+
+Running it also taught us what to change — and Exocortex is that change,
+end to end:
+
+- **One ontology definition; every surface generated from it.** The
+  original's taxonomy drifted between its own surfaces — its session
+  model lived in one API and not the other. Exocortex's kernel + packs
+  generate the MCP schemas, the storage layer, and the SDK from one
+  source, and drift is a CI gate instead of a lesson.
+- **Governance from day one.** Provenance on every fact, mandatory
+  visibility, bi-temporal validity, an audit ledger behind every
+  action — enforced by the type system, not a policy layer bolted on
+  after the fact.
+- **Consolidation that is measured, not hoped for.** The original
+  accumulated. Exocortex's Dreams cycles merge and prune under MCR² and
+  sparsity guardrails, scored before and after every cycle, rolled back
+  on regression.
+- **MCP-native and agent-fed.** Claude Code, Codex, Cursor, any harness
+  writes and reads directly — the loop that made memory-graph valuable
+  is the centerline of a product any agent can use.
+
 ## Quickstart (local MCP server)
 
 ### 1. Install
@@ -275,7 +304,9 @@ This is the product. Everything else exists to serve it.
   Domains ship as packs: v1 includes `exocortex-pack-dev-v1` for the
   dev loop, and a legal, medical, or sales ontology is a Rust crate
   registering its own types, kinds, and rules through the same seam.
-  Packs are code, not config.
+  Packs are code, not config — the
+  [ontology development guide](docs/ONTOLOGY_GUIDE.md) covers how to
+  design and write one.
 
 ### What Exocortex is not
 
