@@ -18,8 +18,8 @@ fire, write nothing.
 **Types you'll usually write:** `Fix`, `Solution`, `Problem`, `Error`,
 `CodePattern`, `Command`, `Technology` (full list: playbook).
 
-**Edges:** typed; the full 48-kind catalogue is in
-`~/.exocortex/playbook.md`. Link within the batch by `draft_key`, or
+**Edges:** typed; `exocortex-mcp-client --verify` locates the 48-kind
+catalogue. Link within the batch by `draft_key`, or
 to an existing memory by `to_memory_id` (32-hex id from search
 results). When in doubt, use `RelatedTo`. Never assert `SimilarTo`
 (computed-only).
@@ -45,5 +45,5 @@ search on every turn.
 same turn. Never drop one silently — surface any unfixable rejection
 in your final message.
 
-Session ids are stamped by the client; you don't manage them. Full
-reference: `~/.exocortex/playbook.md`.
+Session ids are client-stamped; you don't manage them. Full reference:
+the playbook path printed by `exocortex-mcp-client --verify`.

@@ -191,8 +191,9 @@ exocortex-mcp-client --dump-block >> CLAUDE.md   # or AGENTS.md / .cursorrules
 exocortex-mcp-client --verify                    # green/red install checklist
 ```
 
-On first run the client also installs the full Agent Playbook at
-`~/.exocortex/playbook.md` — the reference for the 47 assertable edge
+On first run the client also installs the full Agent Playbook under the
+OS data home; `exocortex-mcp-client --verify` prints its exact path. It is
+the reference for the 47 assertable edge
 kinds (the 48th, `SimilarTo`, is computed by Dreams and can never be
 written), the reject-code table, and supersession rules. Harness-specific
 setup (what "accepted edit" means, where the config lives, failure

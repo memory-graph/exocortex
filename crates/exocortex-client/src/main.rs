@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use rmcp::ServiceExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 use exocortex_cache::LocalCache;
 use exocortex_kernel::{Ontology, Visibility};
@@ -38,7 +39,7 @@ struct Args {
     #[arg(long, default_value = "dev")]
     user: String,
     /// Data directory for the WAL and the playbook (defaults to the
-    /// user's data home; `~/.exocortex` when unset).
+    /// platform's user data home).
     #[arg(long)]
     data_dir: Option<std::path::PathBuf>,
     /// Producer HMAC key (64 hex chars) for backend submits.
@@ -119,7 +120,7 @@ fn main() -> anyhow::Result<()> {
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
     let ontology: Arc<Ontology> = Arc::new(exocortex_kernel::pack::load_registered_packs()?);
 
-    // WAL + playbook home (D5: `~/.exocortex` by default; --data-dir for
+    // WAL + playbook home (D5: OS data home by default; --data-dir for
     // tests and multi-tenant setups).
     let data_dir = args.data_dir.clone().unwrap_or_else(|| {
         dirs_fallback().unwrap_or_else(|_| std::env::temp_dir().join("exocortex"))
@@ -277,12 +278,47 @@ fn main() -> anyhow::Result<()> {
             server = server.with_end_session(Arc::new(tool));
         }
         tracing::info!(org = %org, "exocortex-mcp-client serving MCP over stdio");
-        let service = server
-            .serve((tokio::io::stdin(), tokio::io::stdout()))
-            .await?;
-        service.waiting().await?;
+        serve_mcp_stdio(server).await?;
         Ok::<(), anyhow::Error>(())
     })?;
+    Ok(())
+}
+
+/// Serve the MCP 2024-11-05 initialize flow used by rmcp 0.1.x while remaining
+/// discoverable by SEP-2575 clients such as Crush v0.91.x. A method-not-found
+/// response to `server/discover` is the specified signal for those clients to
+/// fall back to the legacy initialize handshake.
+async fn serve_mcp_stdio(server: mcp::ExocortexMcp) -> anyhow::Result<()> {
+    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut first = String::new();
+    if input.read_line(&mut first).await? == 0 {
+        anyhow::bail!("expect initialize or server/discover request");
+    }
+
+    let request: serde_json::Value = serde_json::from_str(&first)?;
+    if request["method"] == "server/discover" {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+            "error": {
+                "code": -32601,
+                "message": "Method not found"
+            }
+        });
+        let mut output = tokio::io::stdout();
+        output.write_all(response.to_string().as_bytes()).await?;
+        output.write_all(b"\n").await?;
+        output.flush().await?;
+
+        let service = server.serve((input, output)).await?;
+        service.waiting().await?;
+    } else {
+        // rmcp owns the legacy handshake. Replay the line already consumed by
+        // protocol detection, then preserve any bytes buffered behind it.
+        let replay = std::io::Cursor::new(first.into_bytes()).chain(input);
+        let service = server.serve((replay, tokio::io::stdout())).await?;
+        service.waiting().await?;
+    }
     Ok(())
 }
 

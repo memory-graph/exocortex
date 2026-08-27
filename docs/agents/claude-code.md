@@ -26,9 +26,9 @@ curl -fsSL https://github.com/exocortex/exocortex/releases/latest/download/insta
 }
 ```
 
-Standalone (no backend, offline WAL, synthetic dev data): omit all four
-flags. On first run the client installs the playbook at
-`~/.exocortex/playbook.md` and prints a notice on stderr.
+Standalone (no backend, offline WAL embedded store): omit all four
+flags. On first run the client installs the playbook under the OS data
+home and prints a notice on stderr; `--verify` prints its exact path.
 
 ## 3. The `CLAUDE.md` block
 

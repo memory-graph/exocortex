@@ -100,6 +100,18 @@ fn serves_mcp_over_stdio_honestly_empty_on_fresh_dir() {
         init.get("result").is_some(),
         "initialize must succeed: {init}"
     );
+    assert_eq!(
+        init["result"]["serverInfo"]["name"], "exocortex-mcp-client",
+        "bootstrap must use Exocortex server metadata: {init}"
+    );
+    assert!(
+        init["result"]["capabilities"]["tools"].is_object(),
+        "bootstrap must advertise the tool capability before the host sends initialized: {init}"
+    );
+    assert!(
+        init["result"]["instructions"].as_str().is_some(),
+        "bootstrap must advertise the producer-neutral instructions: {init}"
+    );
     let tools = c.read_line();
     let names: Vec<String> = tools["result"]["tools"]
         .as_array()
@@ -133,6 +145,63 @@ fn serves_mcp_over_stdio_honestly_empty_on_fresh_dir() {
         payload["snapshot_version"]["local_lsn"].is_u64(),
         "R-M7 local stamp present"
     );
+}
+
+/// DF2: Crush v0.91.x probes with SEP-2575 discovery. A legacy server must
+/// return method-not-found so Crush falls back to initialize/initialized, then
+/// exposes the same tool catalogue as any other MCP host.
+#[test]
+fn falls_back_from_sep_2575_discovery_for_crush() {
+    let dir = tempdir();
+    let mut c = Client::spawn_with(|cmd| {
+        cmd.args(["--data-dir", dir.to_str().unwrap()]);
+    });
+    c.send_all(&[
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/clientCapabilities": { "roots": { "listChanged": true } },
+                    "io.modelcontextprotocol/clientInfo": { "name": "crush", "version": "v0.91.2" },
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                }
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": { "roots": { "listChanged": true } },
+                "clientInfo": { "name": "crush", "version": "v0.91.2" }
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
+        }),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }),
+    ]);
+
+    let discover = c.read_line();
+    assert_eq!(
+        discover["error"]["code"], -32601,
+        "SEP-2575 legacy fallback signal: {discover}"
+    );
+
+    let init = c.read_line();
+    assert!(
+        init["result"]["capabilities"]["tools"].is_object(),
+        "fallback initialize advertises tools: {init}"
+    );
+
+    let tools = c.read_line();
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert!(names.contains(&"exocortex.search_memories"), "{names:?}");
+    assert!(names.contains(&"exocortex.end_session"), "{names:?}");
 }
 
 /// §13.6.2 / Success Criteria #2 shape: the harness calls

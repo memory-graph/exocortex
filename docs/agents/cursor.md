@@ -25,8 +25,9 @@ Cursor reads `~/.cursor/mcp.json`:
 }
 ```
 
-Standalone (offline WAL, synthetic dev data): omit all four flags. On
-first run the client installs the playbook at `~/.exocortex/playbook.md`.
+Standalone (offline WAL embedded store): omit all four flags. On first
+run the client installs the playbook under the OS data home; `--verify`
+prints its exact path.
 
 ## 3. The instruction block
 

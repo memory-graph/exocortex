@@ -509,13 +509,11 @@ fn json_error(error: &str, message: impl std::fmt::Display) -> String {
 }
 
 impl ServerHandler for ExocortexMcp {
-    /// Initialize: identify the server to the harness.
-    async fn initialize(
-        &self,
-        _request: rmcp::model::InitializeRequestParam,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<rmcp::model::InitializeResult, rmcp::Error> {
-        Ok(rmcp::model::InitializeResult {
+    /// Identify the server and advertise its tool surface during the rmcp
+    /// bootstrap. rmcp 0.1.x answers the first initialize request directly
+    /// from `get_info`; overriding `initialize` alone is therefore inert.
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo {
             capabilities: rmcp::model::ServerCapabilities {
                 tools: Some(rmcp::model::ToolsCapability { list_changed: None }),
                 ..Default::default()
@@ -529,7 +527,7 @@ impl ServerHandler for ExocortexMcp {
             // surface we control without user action.
             instructions: Some("Exocortex typed memory graph. Read with exocortex.search_memories / exocortex.find_related. To write, submit with exocortex.end_session (1-5 typed memories, ≤200-char titles, edges by draft_key or memory id) — it validates locally and explains any rejection. exocortex.preflight_wrapup checks a batch without writing.".into()),
             ..Default::default()
-        })
+        }
     }
 
     /// List the registered Functions (§7.12).

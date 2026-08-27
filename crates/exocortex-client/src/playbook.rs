@@ -35,7 +35,7 @@ pub fn block_hash() -> String {
     format!("sha256:{}", hex(&sha256(BLOCK.as_bytes())))
 }
 
-/// D5: install the playbook under `~/.exocortex/` (or `--data-dir`),
+/// D5: install the playbook under the OS data home (or `--data-dir`),
 /// idempotently. Writes the version-tagged file, (re)points the
 /// `playbook.md` symlink at it, and writes `version.txt`. Returns the
 /// user-facing notice when a NEW version was installed (first run or
