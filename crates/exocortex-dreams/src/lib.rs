@@ -1,4 +1,3 @@
-// crates/exocortex-dreams/src/lib.rs
 //! The Dreams cycle (§12): event-driven consolidation on the owner-elected
 //! backend node — MCR² before/after (R-Mcr3), sparsity before/after
 //! (R-Mcr5/R-Mcr6), the four consolidation actions, and the full R-Dr4

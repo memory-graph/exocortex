@@ -1,4 +1,3 @@
-// crates/exocortex-dreams/src/fire.rs
 //! §12.2 transport + quiet hours: the Dreams fire channel as Redis
 //! RPUSH/BLPOP (`exocortex:dreams:queue`), with the R-Dr13 Lua counter
 //! reset and the R-Dr14 quiet-hours preference ordering. The in-process

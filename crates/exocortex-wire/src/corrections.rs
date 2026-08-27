@@ -1,4 +1,3 @@
-// crates/exocortex-wire/src/corrections.rs
 //! The ONE reject-guidance table (agent-instructions PRD §4.2): every
 //! `RejectCode` maps to exactly one disposition AND one correction
 //! template. Exhaustive, no wildcard — a new variant added to the proto

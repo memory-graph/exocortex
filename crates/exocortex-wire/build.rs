@@ -1,4 +1,3 @@
-// crates/exocortex-wire/build.rs
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Manifest-relative so the crate builds both from the repo and from
     // the published tarball (protos ship inside the package).

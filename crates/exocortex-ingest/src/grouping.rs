@@ -1,4 +1,3 @@
-// crates/exocortex-ingest/src/grouping.rs
 //! D6 (agent-instructions PRD §3.6): per-flavor backend write grouping.
 //!
 //! The turn-level trigger only works if multiple batches from one

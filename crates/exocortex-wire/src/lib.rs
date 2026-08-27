@@ -1,4 +1,3 @@
-// crates/exocortex-wire/src/lib.rs
 //! Cluster-internal wire schemas. This crate never links `exocortex-kernel`,
 //! so it can be depended on by `exocortex-worker` without dragging the kernel
 //! into out-of-process adapters.

@@ -1,4 +1,3 @@
-// crates/exocortex-client/src/playbook.rs
 //! D1/D3 (agent-instructions PRD): the versioned Agent Playbook, compiled
 //! into the client binary. One version string governs the playbook and
 //! the `CLAUDE.md`/`AGENTS.md` block — they are two views of one

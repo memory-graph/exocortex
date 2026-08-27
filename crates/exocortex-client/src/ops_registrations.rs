@@ -1,4 +1,3 @@
-// crates/exocortex-client/src/ops_registrations.rs
 //! D2/D3 through the operation registry (CR-9): `preflight_wrapup` and
 //! `playbook_version` register as `OperationEntry`s here so every
 //! surface that links this crate — the stdio MCP server and any HTTP

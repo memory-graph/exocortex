@@ -1,4 +1,3 @@
-// crates/exocortex-client/src/drain.rs
 //! The WAL drain (W1 / audit §6.1): buffered offline wrapups finally reach
 //! the backend. Each `Pending` entry is rebuilt into an `IngestBatch` and
 //! signed FRESH through `exocortex_wire::signing::prepare_batch` — stored

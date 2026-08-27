@@ -1,4 +1,3 @@
-// crates/exocortex-reasoning/src/engine.rs
 //! The two-language runtime (§10.6): asynchronous reasoning over a queue,
 //! Crepe fixpoints on k-hop bounded fact scopes, derived-edge writeback with
 //! `Provenance::Derived`, and R6 (`reverse_solves`) as a Steel program.

@@ -1,4 +1,3 @@
-// crates/exocortex-client/src/tools/end_session.rs
 //! MCP tool the harness calls at the end of a productive turn (§13.5,
 //! agent-instructions PRD P8). Wraps 1-5 memory drafts into an
 //! IngestBatch (§18.6) and submits over gRPC. Entities are NOT accepted

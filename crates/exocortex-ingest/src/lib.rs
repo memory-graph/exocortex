@@ -1,4 +1,3 @@
-// crates/exocortex-ingest/src/lib.rs
 //! The Ingestion Protocol server (§7.13, §18): the single validated write
 //! path. `IngestService.Submit` runs the kernel validation pipeline
 //! (fingerprint, source admission + ceiling, R-T11a no-widening, R-T17

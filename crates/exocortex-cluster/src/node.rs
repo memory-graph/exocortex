@@ -1,4 +1,3 @@
-// crates/exocortex-cluster/src/node.rs
 //! `ClusterNode` (§9.7): signs storage invalidations into protobuf
 //! envelopes, fans them out to the local SSE hub (and peers via Redis
 //! pub-sub), and verifies peer admission — wire version, ontology

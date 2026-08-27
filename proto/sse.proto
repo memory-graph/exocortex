@@ -1,4 +1,3 @@
-// proto/sse.proto
 syntax = "proto3";
 package exocortex.sse.v1;
 message Invalidation {

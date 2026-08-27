@@ -1,4 +1,3 @@
-// crates/exocortex-ops/src/lib.rs
 //! The operation registry (§21): every capability implements `Operation`,
 //! registers one `OperationEntry` via `inventory::submit!`, and both the MCP
 //! tool catalogue and the OpenAPI surface enumerate the SAME registry

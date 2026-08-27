@@ -1,4 +1,3 @@
-// crates/exocortex-server/src/sse.rs
 //! The client-facing SSE change feed (§9.3, §9.7): one long-lived stream per
 //! subscription; events carry protobuf-encoded envelopes as base64 payloads
 //! with heartbeats so clients detect stalls (R-C5).

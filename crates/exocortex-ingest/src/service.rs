@@ -1,4 +1,3 @@
-// crates/exocortex-ingest/src/service.rs
 //! The `IngestService` tonic implementation (§18.7): HMAC first (R-I8),
 //! then the §7.13 pipeline; batches are atomic and the ack names the first
 //! offending draft_key with its RejectCode.

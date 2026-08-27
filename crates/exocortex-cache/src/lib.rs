@@ -1,4 +1,3 @@
-// crates/exocortex-cache/src/lib.rs
 //! Lock-free readers, single-writer coordination. The graph itself is a
 //! petgraph::StableGraph wrapped in ArcSwap so the read side never blocks.
 //!

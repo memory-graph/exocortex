@@ -1,4 +1,3 @@
-// crates/exocortex-dreams/src/mcr2.rs
 //! The MCR² engine (§11.6) and the graph-sparsity diagnostic (§11.6.1).
 //! ΔR = R(Z) − R^c(Z|Π) per Yu et al. NeurIPS 2020; computed via
 //! log-determinants of covariance matrices (Ma et al. TPAMI 2007 is the

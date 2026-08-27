@@ -1,4 +1,3 @@
-// crates/exocortex-kernel/src/lib.rs
 //! Exocortex kernel — universal ontology machinery.
 //!
 //! The kernel defines the shape of a `Memory`, a `Relationship`, and the rules

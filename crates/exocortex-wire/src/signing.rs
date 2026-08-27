@@ -1,4 +1,3 @@
-// crates/exocortex-wire/src/signing.rs
 //! The canonical batch-integrity helpers (§18.1 / §13.6 step 3).
 //!
 //! One implementation, shared by every producer and by the ingest server:

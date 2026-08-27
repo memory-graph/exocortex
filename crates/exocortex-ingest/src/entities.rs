@@ -1,4 +1,3 @@
-// crates/exocortex-ingest/src/entities.rs
 //! The entity-extraction table (§7.2 R-T18): one compiled regex set per
 //! EntityType, deterministic, versioned with the pack. Entities are
 //! extracted server-side; the harness never supplies them.

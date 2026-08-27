@@ -1,4 +1,3 @@
-// crates/exocortex-server/src/backend.rs
 //! `--mode backend-node` (M5): storage, cluster, ingest, reasoning, Dreams,
 //! HTTP parity, SSE, lease re-election, and chitchat gossip on one process.
 //! The gRPC IngestService and the HTTP surface share a single axum listener

@@ -1,4 +1,3 @@
-// crates/exocortex-storage/src/lib.rs
 //! The storage seam: the `Storage` trait, the FalkorDB adapter, and the
 //! `InMemoryStorage` test double (§6). Cypher never leaves this crate (CR-10).
 

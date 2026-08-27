@@ -1,4 +1,3 @@
-// crates/exocortex-server/src/http_bind.rs
 //! The HTTP parity surface (§21.1, CR-9): every operation registered in
 //! `exocortex_ops::entries()` is mounted at its `(method, http_path)` with a
 //! shared `Arc<OpContext>`, behind bearer-token auth (R-Sec7). The same

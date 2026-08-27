@@ -1,4 +1,3 @@
-// crates/exocortex-adapter-sdk/src/retry.rs
 //! Backoff computation with injectable time (R14): delays come from a
 //! pure function of the policy and attempt number, and the session's
 //! sleep is a pluggable future so tests assert delay sequences without

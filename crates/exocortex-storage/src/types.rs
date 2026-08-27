@@ -1,4 +1,3 @@
-// crates/exocortex-storage/src/types.rs
 use chrono::{DateTime, Utc};
 use exocortex_kernel::{
     EntityId, Memory, MemoryId, RelKindId, Relationship, RelationshipId, Visibility,

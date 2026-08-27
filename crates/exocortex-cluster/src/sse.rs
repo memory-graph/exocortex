@@ -1,4 +1,3 @@
-// crates/exocortex-cluster/src/sse.rs
 //! Conversion between storage `Invalidation` events and the
 //! `exocortex.sse.v1` protobuf shape carried inside envelopes.
 

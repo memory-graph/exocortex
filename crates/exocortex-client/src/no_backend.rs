@@ -1,4 +1,3 @@
-// crates/exocortex-client/src/no_backend.rs
 //! IN10 (audit): a `Storage` that answers "no backend". The MCP read
 //! tools dispatch through the ONE registry implementation
 //! (`exocortex_ops::entries()` → `entry.handler`), exactly like the HTTP

@@ -1,4 +1,3 @@
-// crates/exocortex-cluster/src/lib.rs
 //! Backend-only cluster machinery (§9): Chubby-style Redis leases with
 //! fencing epochs, HMAC-signed invalidation envelopes, peer admission gated
 //! on wire version + ontology fingerprint (§9.1), and the SSE surface used

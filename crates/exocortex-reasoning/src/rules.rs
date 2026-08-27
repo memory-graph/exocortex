@@ -1,4 +1,3 @@
-// crates/exocortex-reasoning/src/rules.rs
 // The crepe! macro generates the relation structs without doc comments;
 // documenting the macro's output is not possible, so this module relaxes
 // missing_docs for the generated items only.

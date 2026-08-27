@@ -1,4 +1,3 @@
-// crates/exocortex-adapter-sdk/src/classify.rs
 //! Reject triage (R13), thin over the ONE wire table (agent-instructions
 //! PRD §4.2). `exocortex_wire::corrections` owns the exhaustive
 //! `RejectCode → { disposition, correction }` mapping; this module keeps

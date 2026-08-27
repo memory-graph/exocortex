@@ -1,4 +1,3 @@
-// crates/exocortex-adapter-sdk/src/split.rs
 //! Batch splitting (R9/R10/R11): one `BatchUnit` becomes ≥1 signed
 //! `IngestBatch`es, each within `max_batch_bytes` (R-I2), each with every
 //! relationship co-located with its endpoint drafts (§18.1 forbids

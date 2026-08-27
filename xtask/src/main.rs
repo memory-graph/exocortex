@@ -1,4 +1,3 @@
-// xtask/src/main.rs
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 

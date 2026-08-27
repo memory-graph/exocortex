@@ -1,4 +1,3 @@
-// crates/exocortex-client/src/sync.rs
 //! The reconnecting SSE subscriber (M5.4, §9.3): connects to
 //! `$backend/v1/changes?since_lsn=<last>`, decodes base64 protobuf
 //! invalidation envelopes, verifies the envelope HMAC and ontology

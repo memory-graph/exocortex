@@ -1,4 +1,3 @@
-// crates/exocortex-adapter-sdk/src/lib.rs
 //! The Exocortex adapter protocol core (Layer A).
 //!
 //! `docs/prd/exocortex-core-prd.md` §18.2 defines seven normative adapter

@@ -1,4 +1,3 @@
-// crates/exocortex-ops/src/audit.rs
 //! The audit log (§21.4): every Action appends exactly one immutable
 //! record before the ack returns; storage-backed via the Cypher catalogue's
 //! `audit_append` / `audit_range` templates (R-A1..R-A3).

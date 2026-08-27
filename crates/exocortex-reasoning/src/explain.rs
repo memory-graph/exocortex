@@ -1,4 +1,3 @@
-// crates/exocortex-reasoning/src/explain.rs
 //! Steel-embedded explanation traces (§10.3, §10.7 step 7): walks derivation
 //! provenance backwards and renders a structured sexp tree. Prose, if
 //! wanted, is rendered by the harness's LLM — Exocortex ships the tree only.

@@ -1,4 +1,3 @@
-// crates/exocortex-adapter-sdk/src/testing.rs
 //! A scriptable `IngestService` mock (R18) for adapter authors' own
 //! tests. Serves the real gRPC surface on a random local port and lets a
 //! test script: rate-limit, force transport failure, drift the

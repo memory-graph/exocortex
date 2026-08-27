@@ -1,4 +1,3 @@
-// crates/exocortex-ops/src/operations.rs
 //! The registered operation set (§21.1 examples): find_related, get_memory,
 //! traverse, wrapup submit, promote_visibility, accept_discovery,
 //! retract_edge, and the audit read surface (R-A3).

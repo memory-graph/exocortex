@@ -1,4 +1,3 @@
-// crates/exocortex-ingest/src/embedding.rs
 //! The backend-assigned embedding step (§7.5): `title + content` is embedded
 //! after entity extraction, on the ingest commit path only — the client never
 //! computes embeddings (§24 q1) and the interactive read path never touches

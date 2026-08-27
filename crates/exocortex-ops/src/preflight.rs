@@ -1,4 +1,3 @@
-// crates/exocortex-client/src/preflight.rs
 //! D2 (agent-instructions PRD §3.2): the client-local validation pass.
 //! One implementation, used by BOTH `end_session`'s self-preflight (r4)
 //! and the `preflight_wrapup` operation — the same kernel functions

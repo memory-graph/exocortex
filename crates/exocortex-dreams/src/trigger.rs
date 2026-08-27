@@ -1,4 +1,3 @@
-// crates/exocortex-dreams/src/trigger.rs
 //! The write-counter trigger model (§12.2): event-driven, never scheduled.
 
 /// Per-region write counters.

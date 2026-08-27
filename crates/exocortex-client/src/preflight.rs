@@ -1,4 +1,3 @@
-// crates/exocortex-client/src/preflight.rs
 //! Client-side facade over the ONE preflight implementation, which
 //! lives in `exocortex-ops` (D2/CR-9): the same registry handler serves
 //! the client's MCP dispatch and the backend's HTTP bind, running the

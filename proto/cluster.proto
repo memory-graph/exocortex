@@ -1,4 +1,3 @@
-// proto/cluster.proto
 syntax = "proto3";
 package exocortex.cluster.v1;
 import "sse.proto";
