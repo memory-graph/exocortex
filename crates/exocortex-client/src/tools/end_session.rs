@@ -150,6 +150,19 @@ impl EndSessionTool {
                 None,
             ));
         }
+        if args.edges.len() > exocortex_wire::limits::MAX_EDGES_PER_BATCH {
+            return Err(rmcp::Error::invalid_params(
+                "edges: at most 64 relationships per request",
+                None,
+            ));
+        }
+        for memory in &args.memories {
+            if let Err(detail) =
+                exocortex_wire::limits::validate_memory_fields(&memory.content, &memory.tags)
+            {
+                return Err(rmcp::Error::invalid_params(detail, None));
+            }
+        }
         // r4 self-preflight: the SAME local pass preflight_wrapup runs,
         // before any wire work. Invalid batches never leave the process.
         let cache = self.cache.clone();

@@ -8,11 +8,13 @@
 
 use exocortex_client::{mcp, wal};
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use clap::Parser;
 use rmcp::ServiceExt;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
 use exocortex_cache::LocalCache;
 use exocortex_kernel::{Ontology, Visibility};
@@ -296,7 +298,11 @@ fn main() -> anyhow::Result<()> {
 /// response to `server/discover` is the specified signal for those clients to
 /// fall back to the legacy initialize handshake.
 async fn serve_mcp_stdio(server: mcp::ExocortexMcp) -> anyhow::Result<()> {
-    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+    let input = FrameLimitedReader::new(
+        tokio::io::stdin(),
+        exocortex_wire::limits::MAX_MCP_REQUEST_BYTES,
+    );
+    let mut input = tokio::io::BufReader::new(input);
     let mut first = String::new();
     if input.read_line(&mut first).await? == 0 {
         anyhow::bail!("expect initialize or server/discover request");
@@ -327,6 +333,54 @@ async fn serve_mcp_stdio(server: mcp::ExocortexMcp) -> anyhow::Result<()> {
         service.waiting().await?;
     }
     Ok(())
+}
+
+/// Reject an oversized newline-delimited MCP frame while it is being read, so
+/// an attacker cannot make the stdio server allocate an unbounded `String`
+/// before JSON decoding. The byte count excludes the line-feed delimiter.
+struct FrameLimitedReader<R> {
+    inner: R,
+    frame_bytes: usize,
+    max_frame_bytes: usize,
+}
+
+impl<R> FrameLimitedReader<R> {
+    fn new(inner: R, max_frame_bytes: usize) -> Self {
+        Self {
+            inner,
+            frame_bytes: 0,
+            max_frame_bytes,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for FrameLimitedReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                for byte in &buf.filled()[filled_before..] {
+                    if *byte == b'\n' {
+                        self.frame_bytes = 0;
+                    } else {
+                        self.frame_bytes = self.frame_bytes.saturating_add(1);
+                        if self.frame_bytes > self.max_frame_bytes {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "MCP request exceeds fixed byte ceiling",
+                            )));
+                        }
+                    }
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
 }
 
 /// D5 `--tail-audit [--last N]`: the most recent local writes from the
@@ -499,4 +553,41 @@ fn dirs_fallback() -> Result<std::path::PathBuf, anyhow::Error> {
         return Ok(dir);
     }
     anyhow::bail!("no HOME")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameLimitedReader;
+    use tokio::io::AsyncBufReadExt;
+
+    #[tokio::test]
+    async fn mcp_frame_limit_accepts_just_under_and_boundary_then_rejects_plus_one() {
+        let mut under_input = vec![b'x'; 7];
+        under_input.push(b'\n');
+        let mut reader = tokio::io::BufReader::new(FrameLimitedReader::new(
+            std::io::Cursor::new(under_input),
+            8,
+        ));
+        let mut line = String::new();
+        assert_eq!(reader.read_line(&mut line).await.unwrap(), 8);
+
+        let exact = vec![b'x'; 8];
+        let mut exact_input = exact.clone();
+        exact_input.push(b'\n');
+        let mut reader = tokio::io::BufReader::new(FrameLimitedReader::new(
+            std::io::Cursor::new(exact_input),
+            8,
+        ));
+        let mut line = String::new();
+        assert_eq!(reader.read_line(&mut line).await.unwrap(), 9);
+
+        let mut oversized = exact;
+        oversized.push(b'x');
+        oversized.push(b'\n');
+        let mut reader =
+            tokio::io::BufReader::new(FrameLimitedReader::new(std::io::Cursor::new(oversized), 8));
+        let mut line = String::new();
+        let err = reader.read_line(&mut line).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 }

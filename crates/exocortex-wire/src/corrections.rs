@@ -75,6 +75,10 @@ pub fn guidance(code: RejectCode) -> RejectGuidance {
             disposition: Disposition::Permanent,
             correction: "Malformed external coordinates (table_uuid must be 16 bytes, schema_hash 32). Cannot occur for session wrapups; report it as a bug.",
         },
+        ResourceLimitExceeded => RejectGuidance {
+            disposition: Disposition::Permanent,
+            correction: "Reduce request bytes, content, tags, or edges to the advertised fixed limits.",
+        },
         BadChecksum => RejectGuidance {
             disposition: Disposition::Permanent,
             correction: "Batch checksum mismatch. The batch was mutated after signing; rebuild it from the drafts.",
@@ -119,6 +123,7 @@ mod tests {
             (ComputedKindRejected, Disposition::Permanent),
             (Unknown, Disposition::Permanent),
             (InvalidExternalKey, Disposition::Permanent),
+            (ResourceLimitExceeded, Disposition::Permanent),
             (Unauthorized, Disposition::Fatal),
             (UnknownSource, Disposition::Fatal),
             (IncompatibleOntology, Disposition::Fatal),

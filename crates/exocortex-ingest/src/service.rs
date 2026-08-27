@@ -804,6 +804,15 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                 "checksum mismatch",
             )));
         }
+        if let Err(detail) =
+            exocortex_wire::limits::validate_batch_resources(&batch.memories, &batch.relationships)
+        {
+            return Ok(Response::new(ack_reject_all(
+                &batch,
+                RejectCode::ResourceLimitExceeded,
+                detail,
+            )));
+        }
         // Step 1: ontology fingerprint.
         if !self.ontology_matches(&batch) {
             return Ok(Response::new(ack_reject_all(

@@ -25,6 +25,8 @@ pub mod cluster {
         tonic::include_proto!("exocortex.cluster.v1");
     }
 }
+/// Cross-transport resource ceilings enforced before expensive work.
+pub mod limits;
 /// Canonical batch-integrity helpers (§18.1): checksum + HMAC, the single
 /// workspace implementation shared by every producer and the server.
 pub mod signing;

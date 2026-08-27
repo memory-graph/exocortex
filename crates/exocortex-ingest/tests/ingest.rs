@@ -135,6 +135,48 @@ async fn missing_hmac_rejected_before_anything() {
 }
 
 #[tokio::test]
+async fn resource_ceiling_rejects_before_ontology_or_storage_work() {
+    let srv = server();
+    let edge = exocortex_wire::ingest::v1::RelationshipDraft {
+        from_draft_key: "a".into(),
+        to_draft_key: "b".into(),
+        kind: "Fixes".into(),
+        strength: 1.0,
+        confidence: 1.0,
+        context: String::new(),
+        visibility: 1,
+        to_memory_id: String::new(),
+    };
+
+    let mut exact = batch(vec![]);
+    exact.relationships = vec![edge.clone(); exocortex_wire::limits::MAX_EDGES_PER_BATCH];
+    let exact = sign(exact, [5u8; 32]);
+    let exact_ack = srv
+        .submit(tonic::Request::new(exact))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(exact_ack
+        .rejections
+        .iter()
+        .all(|row| row.code == RejectCode::IncompatibleOntology as i32));
+
+    let mut oversized = batch(vec![]);
+    oversized.relationships = vec![edge; exocortex_wire::limits::MAX_EDGES_PER_BATCH + 1];
+    let oversized = sign(oversized, [5u8; 32]);
+    let oversized_ack = srv
+        .submit(tonic::Request::new(oversized))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(oversized_ack.accepted, 0);
+    assert!(oversized_ack
+        .rejections
+        .iter()
+        .all(|row| row.code == RejectCode::ResourceLimitExceeded as i32));
+}
+
+#[tokio::test]
 async fn fingerprint_mismatch_rejects_whole_batch() {
     let srv = server();
     registered(&srv, 3).await;

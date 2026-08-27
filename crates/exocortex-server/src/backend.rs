@@ -295,7 +295,8 @@ pub async fn run_backend_node<S: Storage + 'static>(
     });
 
     let grpc = tonic::service::Routes::new(
-        exocortex_wire::ingest::v1::ingest_service_server::IngestServiceServer::new(ingest),
+        exocortex_wire::ingest::v1::ingest_service_server::IngestServiceServer::new(ingest)
+            .max_decoding_message_size(exocortex_wire::limits::MAX_MCP_REQUEST_BYTES),
     )
     .into_axum_router();
     let sse = crate::sse::sse_router(cluster.clone(), crate::sse::SseAuth::RequiredToken);

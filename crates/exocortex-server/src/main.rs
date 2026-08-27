@@ -324,9 +324,10 @@ struct SourcePolicyRow {
     ceiling: u8,
 }
 
-fn load_source_policy(
-    path: Option<&std::path::Path>,
-) -> anyhow::Result<Vec<((String, String, String), exocortex_kernel::Visibility)>> {
+type SourcePolicyKey = (String, String, String);
+type SourcePolicyEntry = (SourcePolicyKey, exocortex_kernel::Visibility);
+
+fn load_source_policy(path: Option<&std::path::Path>) -> anyhow::Result<Vec<SourcePolicyEntry>> {
     let path = path.ok_or_else(|| {
         anyhow::anyhow!("--source-policy is required for backend-node (use [] for no producers)")
     })?;

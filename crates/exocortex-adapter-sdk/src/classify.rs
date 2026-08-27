@@ -37,6 +37,7 @@ mod tests {
             (RejectCode::ComputedKindRejected, Disposition::Permanent),
             (RejectCode::Unknown, Disposition::Permanent),
             (RejectCode::InvalidExternalKey, Disposition::Permanent),
+            (RejectCode::ResourceLimitExceeded, Disposition::Permanent),
             (RejectCode::Unauthorized, Disposition::Fatal),
             (RejectCode::UnknownSource, Disposition::Fatal),
             (RejectCode::IncompatibleOntology, Disposition::Fatal),

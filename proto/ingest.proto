@@ -169,6 +169,7 @@ enum RejectCode {
   // bytes (§18.6), snapshot schema_hash must be 32 (§18.6). Rejected
   // rather than lossy-coerced.
   INVALID_EXTERNAL_KEY = 13;
+  RESOURCE_LIMIT_EXCEEDED = 14; // fixed request/content/tag/edge ceilings
 }
 message SubmitOne { oneof body { IngestBatch batch = 1; } }
 message SubmitAck { IngestAck ack = 1; }
