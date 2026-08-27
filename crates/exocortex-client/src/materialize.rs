@@ -174,7 +174,20 @@ pub fn materialize_entry(
     // make multi-batch sessions converge on one node (CR1 upsert).
     if !entry.session_id.is_empty() {
         if let Some(first_ts) = entry.memories.first().map(|d| d.context.timestamp) {
-            if let Some(node) = grouping_node_local(ontology, org, &entry.session_id, first_ts) {
+            if let Some(mut node) = grouping_node_local(ontology, org, &entry.session_id, first_ts)
+            {
+                if let Some(scope) = out.memories.first() {
+                    node.visibility = out
+                        .memories
+                        .iter()
+                        .map(|memory| memory.visibility)
+                        .min()
+                        .unwrap_or(scope.visibility);
+                    node.context.tenant_id = scope.context.tenant_id.clone();
+                    node.context.user_id = scope.context.user_id.clone();
+                    node.context.project_id = scope.context.project_id.clone();
+                    node.context.team_id = scope.context.team_id.clone();
+                }
                 for m in &out.memories {
                     match grouping_edge_local(ontology, m, &node, first_ts) {
                         Some(e) => out.edges.push(e),
