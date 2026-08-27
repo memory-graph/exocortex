@@ -171,7 +171,7 @@ each step (88 tests at completion).
 | R6-B30-20 | PRD §23 #20: direct three-node owner-leased full Dreams event-lifecycle acceptance | Codex | Confirmed missing during B30 traceability; implementation in progress |
 | R6-B30-24 | PRD §23 #24: default-tolerance hairball-producing cycle plus independent ΔR/hairball guards | Codex | Confirmed missing during B30 traceability; implementation in progress |
 | R6-B30-25 | PRD §23 #25: executable kernel-name absence and omit-dev-pack link failure | Codex | Pack counts and runtime unbound constants are covered; exact build contracts remain unproved |
-| R6-B30-27 | PRD §23 #27: exhaustive RejectCode suite plus additional-assertion snapshot semantics | Codex | `RATE_LIMITED` has no production emitter; snapshot-as-additional-assertion conflicts with raw-key identity plus current-row Falkor parity; D1 defers only live adapter |
+| R6-B30-27 | PRD §23 #27: exhaustive RejectCode suite plus additional-assertion snapshot semantics | Codex | In progress — concurrent submit admission now emits deterministic `RATE_LIMITED` before ontology/storage work (`saturated_submit_capacity_emits_rate_limited_without_storage_work`); exhaustive catalogue and snapshot-as-additional-assertion storage history remain open; D1 defers only the live adapter |
 | R6-A1 | Advisory test quality and cleanup (A01-A08) | Codex | Round 6 remediation in progress |
 | R6-Q1 | Evidence R6-U01 through R6-U04 and promote confirmed defects | Codex | Investigation in progress |
 

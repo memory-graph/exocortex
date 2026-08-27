@@ -108,6 +108,8 @@ pub struct IngestServer<S: Storage> {
     /// merge threshold); the ring is rebuilt from nothing on restart, so
     /// hints degrade to none — never wrong.
     pub recent: Arc<Mutex<std::collections::VecDeque<RecentEmbedding>>>,
+    /// Shared concurrency admission for expensive batch validation/commit.
+    pub submit_permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// One ring entry.
@@ -134,6 +136,7 @@ pub const RECENT_RING_LEN: usize = 512;
 /// The hint threshold: Dreams' merge threshold (§12.5 step 5) — the same
 /// cosine bar means "near-duplicate" means the same thing everywhere.
 pub const SIMILAR_HINT_THRESHOLD: f32 = 0.92;
+const DEFAULT_CONCURRENT_SUBMITS: usize = 64;
 
 impl<S: Storage> Clone for IngestServer<S> {
     fn clone(&self) -> Self {
@@ -156,6 +159,7 @@ impl<S: Storage> Clone for IngestServer<S> {
             require_admin_ceiling: self.require_admin_ceiling,
             require_request_principal: self.require_request_principal,
             recent: self.recent.clone(),
+            submit_permits: self.submit_permits.clone(),
         }
     }
 }
@@ -189,7 +193,15 @@ impl<S: Storage> IngestServer<S> {
             require_admin_ceiling: false,
             require_request_principal: false,
             recent: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            submit_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CONCURRENT_SUBMITS)),
         }
+    }
+
+    /// Bound concurrent batch work. A saturated server returns the protocol's
+    /// deterministic `RATE_LIMITED` rejection before ontology or storage work.
+    pub fn with_submit_concurrency_limit(mut self, limit: usize) -> Self {
+        self.submit_permits = Arc::new(tokio::sync::Semaphore::new(limit));
+        self
     }
 
     /// Backend config flag: enable the embedding step (§7.5).
@@ -840,6 +852,16 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                 detail,
             )));
         }
+        let _submit_permit = match self.submit_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Ok(Response::new(ack_reject_all(
+                    &batch,
+                    RejectCode::RateLimited,
+                    "concurrent ingestion limit reached",
+                )))
+            }
+        };
         // Step 1: ontology fingerprint.
         if !self.ontology_matches(&batch) {
             return Ok(Response::new(ack_reject_all(

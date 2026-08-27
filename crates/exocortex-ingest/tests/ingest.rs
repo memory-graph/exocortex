@@ -114,6 +114,26 @@ async fn e2e_valid_batch_accepted_with_monotonic_lsn() {
 }
 
 #[tokio::test]
+async fn saturated_submit_capacity_emits_rate_limited_without_storage_work() {
+    let srv = server().with_submit_concurrency_limit(0);
+    registered(&srv, 3).await;
+    let before = srv.storage.take_read_counts();
+    let ack = srv
+        .submit(tonic::Request::new(signed_batch(
+            &srv,
+            vec![draft("rate-limited", "Fix", 1)],
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(ack
+        .rejections
+        .iter()
+        .all(|row| row.code == RejectCode::RateLimited as i32));
+    assert_eq!(srv.storage.take_read_counts(), before);
+}
+
+#[tokio::test]
 async fn concurrent_identical_submits_have_one_durable_winner() {
     let srv = Arc::new(server());
     registered(&srv, 3).await;
