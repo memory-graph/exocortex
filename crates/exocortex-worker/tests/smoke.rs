@@ -68,6 +68,7 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
             "memory",
             "--bind",
             &format!("127.0.0.1:{node_port}"),
+            "--allow-plaintext-loopback",
             "--gossip-addr",
             &format!("127.0.0.1:{gossip_port}"),
             "--bearer-token",

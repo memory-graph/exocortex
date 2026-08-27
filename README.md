@@ -339,8 +339,14 @@ Run the node:
 
 ```sh
 exocortex-node --mode backend-node --storage falkor://falkordb:6379 \
-  --bind 0.0.0.0:8080 --bearer-token <token>
+  --bind 0.0.0.0:8080 --tls-cert /run/secrets/exocortex/tls.crt \
+  --tls-key /run/secrets/exocortex/tls.key --bearer-token <token>
 ```
+
+Shared/LAN binds require an operator-provided TLS certificate and key.
+For local development only, plaintext must be explicitly enabled with
+`--bind 127.0.0.1:8080 --allow-plaintext-loopback`; the node rejects that
+mode for every non-loopback address.
 
 Back up and restore the org's durable graph (disaster recovery —
 byte-faithful rows modulo storage-assigned LSNs, fingerprint-gated):
@@ -350,7 +356,7 @@ exocortex-node --mode backend-node --storage falkor://falkordb:6379   --graph-na
 exocortex-node --mode backend-node --storage falkor://falkordb:6379   --graph-name my-org --import-org org-backup.json
 ```
 
-Then run clients with `--backend http://host:8080 --auth-token <token>`.
+Then run clients with `--backend https://host:8080 --auth-token <token>`.
 Every operation is also available over authenticated HTTP; the SSE
 change feed keeps each client's local cache current. See the
 [PRD](docs/prd/exocortex-core-prd.md) (§4 deployment, §17 tenancy) and

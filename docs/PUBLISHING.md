@@ -76,3 +76,14 @@ opt in with `features = ["testing"]` for their own tests. New dev-deps
 recorded with the crate: `tempfile` (adapter-sdk), `tar` + `flate2`
 (xtask's wire-standalone gate), `axum`/`futures` optional under
 `testing`.
+
+`exocortex-server` directly depends on `axum-server` with its Rustls feature.
+The shared backend listener serves HTTP, SSE, and gRPC on one TLS socket;
+Axum's built-in `serve` helper accepts only a plaintext `TcpListener`, so the
+TLS listener is an explicit runtime dependency rather than application code
+reimplementing certificate parsing and HTTP/2 negotiation.
+
+`exocortex-server` also depends directly on `rustls` to select the Ring crypto
+provider before constructing that listener. Transitive workspace consumers
+enable both supported providers, so Rustls cannot infer one from the unified
+feature set at runtime.

@@ -11,6 +11,7 @@
 set -euo pipefail
 
 COMPOSE=crates/exocortex-cluster/tests/docker-compose-cluster.yml
+TLS_CA=crates/exocortex-server/tests/fixtures/localhost-cert.pem
 
 leader_of() { docker compose -f "$COMPOSE" ps --format json \
     | jq -r 'select(.Service|startswith("node")) | .Service + " " + .State' \
@@ -24,7 +25,7 @@ waited=0
 while [ -z "$leader" ] && [ "$waited" -lt 15000 ]; do
   for i in 1 2 3; do
     port=$((8080 + i))
-    holder=$(curl -sf "http://127.0.0.1:${port}/health/cluster" 2>/dev/null         | jq -r '.leader_node_id // empty' || true)
+    holder=$(curl --cacert "$TLS_CA" -sf "https://127.0.0.1:${port}/health/cluster" 2>/dev/null         | jq -r '.leader_node_id // empty' || true)
     if [ -n "$holder" ]; then leader="$holder"; break; fi
   done
   [ -z "$leader" ] && { sleep 0.5; waited=$((waited + 500)); }
@@ -43,7 +44,7 @@ new_leader=""
 while [ "$(now_ms)" -lt "$deadline" ]; do
   for i in 1 2 3; do
     port=$((8080 + i))
-    holder=$(curl -sf "http://127.0.0.1:${port}/health/cluster" 2>/dev/null | jq -r '.leader_node_id // empty' || true)
+    holder=$(curl --cacert "$TLS_CA" -sf "https://127.0.0.1:${port}/health/cluster" 2>/dev/null | jq -r '.leader_node_id // empty' || true)
     if [ -n "$holder" ] && [ "$holder" != "$leader" ]; then new_leader="$holder"; break 2; fi
   done
   sleep 0.1

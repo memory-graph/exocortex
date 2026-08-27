@@ -13,6 +13,7 @@ use exocortex_storage::InMemoryStorage;
 fn args(bind: &str, gossip: u16, seeds: Vec<String>) -> BackendNodeArgs {
     BackendNodeArgs {
         bind: bind.into(),
+        transport: exocortex_server::backend::TransportSecurity::PlaintextLoopback,
         node_id: format!("node-{gossip}"),
         cluster_secret: [7u8; 32],
         bearer_token: "test-bearer".into(),
@@ -182,6 +183,88 @@ async fn chitchat_state_carries_wire_version_and_fingerprint() {
     assert_eq!(kv("wire_version"), "1");
     assert_eq!(kv("ontology_fingerprint").len(), 64);
     handle.shutdown().await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_listener_uses_tls_and_refuses_plaintext() {
+    use exocortex_wire::ingest::v1::ingest_service_client::IngestServiceClient;
+    use exocortex_wire::ingest::v1::FingerprintRequest;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
+
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let mut tls_args = args("127.0.0.1:0", 43001, vec![]);
+    tls_args.transport = exocortex_server::backend::TransportSecurity::Tls {
+        certificate: "tests/fixtures/localhost-cert.pem".into(),
+        private_key: "tests/fixtures/localhost-key.pem".into(),
+    };
+    let node = run_backend_node(storage, onto, tls_args)
+        .await
+        .expect("valid TLS listener boots");
+
+    let ca = Certificate::from_pem(include_bytes!("fixtures/localhost-cert.pem"));
+    let endpoint = Endpoint::from_shared(format!("https://localhost:{}", node.local_addr.port()))
+        .unwrap()
+        .tls_config(
+            ClientTlsConfig::new()
+                .ca_certificate(ca)
+                .domain_name("localhost"),
+        )
+        .unwrap();
+    let channel = endpoint.connect().await.expect("trusted TLS handshake");
+    let response = IngestServiceClient::new(channel)
+        .fingerprint(FingerprintRequest {})
+        .await
+        .expect("gRPC shares the TLS listener");
+    assert_eq!(response.into_inner().fingerprint.len(), 32);
+
+    let mut plaintext = tokio::net::TcpStream::connect(node.local_addr)
+        .await
+        .unwrap();
+    plaintext
+        .write_all(b"GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(1), plaintext.read_to_end(&mut bytes)).await;
+    assert!(
+        !bytes.starts_with(b"HTTP/1.1 200"),
+        "shared listener must not answer plaintext HTTP"
+    );
+}
+
+#[tokio::test]
+async fn malformed_tls_material_fails_before_listener_startup() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let mut bad = args("127.0.0.1:0", 43002, vec![]);
+    bad.transport = exocortex_server::backend::TransportSecurity::Tls {
+        certificate: "tests/fixtures/localhost-cert.pem".into(),
+        private_key: "tests/fixtures/localhost-cert.pem".into(),
+    };
+    assert!(run_backend_node(storage, onto, bad).await.is_err());
+}
+
+#[tokio::test]
+async fn plaintext_transport_rejects_non_loopback_library_bind() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let shared = args("0.0.0.0:0", 43003, vec![]);
+    let error = match run_backend_node(storage, onto, shared).await {
+        Ok(_) => panic!("library callers cannot bypass the loopback restriction"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("restricted to loopback"),
+        "unexpected startup error: {error:#}"
+    );
 }
 
 /// R-O4: readiness is observational — when the storage probe fails and the

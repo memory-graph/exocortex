@@ -52,6 +52,7 @@ fn spawn_node() -> Node {
             "memory",
             "--bind",
             &format!("127.0.0.1:{port}"),
+            "--allow-plaintext-loopback",
             "--gossip-addr",
             &format!("127.0.0.1:{gossip}"),
             "--bearer-token",

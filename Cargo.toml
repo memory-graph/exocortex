@@ -71,6 +71,8 @@ falkordb    = { version = "0.3", features = ["tokio"] }          # M0 pin check:
 redis       = { version = "0.27", features = ["tokio-comp", "aio"] }
 sled        = "0.34"
 axum        = { version = "0.7", features = ["macros", "http2"] }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tower       = "0.5"
 tower-http  = { version = "0.6", features = ["trace", "cors", "compression-full"] }
 eventsource-client = "0.13"

@@ -18,11 +18,28 @@ use exocortex_storage::{LeaseKey, Storage};
 
 use crate::http_bind::{HealthSnapshot, HttpBind};
 
+/// Network transport accepted by the shared HTTP/SSE/gRPC listener.
+#[derive(Clone, Debug)]
+pub enum TransportSecurity {
+    /// TLS with an operator-provided PEM certificate chain and private key.
+    Tls {
+        /// PEM certificate chain presented to clients.
+        certificate: std::path::PathBuf,
+        /// PEM private key matching `certificate`.
+        private_key: std::path::PathBuf,
+    },
+    /// Explicit local development mode. Startup validation restricts this to
+    /// an IP loopback bind, so it cannot expose bearer tokens on a LAN/WAN.
+    PlaintextLoopback,
+}
+
 /// Backend-node wiring knobs (§4.2 flags land here).
 #[derive(Clone)]
 pub struct BackendNodeArgs {
     /// Ingress bind (`http + gRPC`).
     pub bind: String,
+    /// TLS for shared binds, or explicitly loopback-only plaintext.
+    pub transport: TransportSecurity,
     /// Node identity (lease tokens, envelopes, gossip).
     pub node_id: String,
     /// Cluster-shared HMAC key (R-Sec4).
@@ -73,6 +90,11 @@ pub async fn run_backend_node<S: Storage + 'static>(
     ontology: Arc<Ontology>,
     args: BackendNodeArgs,
 ) -> anyhow::Result<BackendNode> {
+    // Parse TLS material and bind before starting any background subsystem.
+    // Bad transport configuration is a startup failure, never a node that
+    // appears alive while its protected listener is absent.
+    let ingress = BoundIngress::bind(&args.bind, &args.transport).await?;
+    let local_addr = ingress.local_addr()?;
     let org: Arc<str> = "org".into();
 
     // Read path: cache + writer loop over the same storage. The writer
@@ -302,13 +324,15 @@ pub async fn run_backend_node<S: Storage + 'static>(
     let sse = crate::sse::sse_router(cluster.clone(), crate::sse::SseAuth::RequiredToken);
     let app = bind.router(Some(sse)).merge(grpc);
 
-    let listener = tokio::net::TcpListener::bind(&args.bind).await?;
-    let local_addr = listener.local_addr()?;
-    tracing::info!(%local_addr, node = %args.node_id, "backend-node serving http+grpc");
+    tracing::info!(
+        %local_addr,
+        node = %args.node_id,
+        tls = matches!(args.transport, TransportSecurity::Tls { .. }),
+        "backend-node serving http+grpc"
+    );
     {
-        let app = app.clone();
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
+            if let Err(e) = ingress.serve(app).await {
                 tracing::error!(%e, "ingress server failed");
             }
         });
@@ -387,6 +411,68 @@ pub async fn run_backend_node<S: Storage + 'static>(
     spawn_gossip(&args, &ontology.fingerprint).await?;
 
     Ok(BackendNode { health, local_addr })
+}
+
+enum BoundIngress {
+    Plaintext(tokio::net::TcpListener),
+    Tls {
+        listener: std::net::TcpListener,
+        config: axum_server::tls_rustls::RustlsConfig,
+    },
+}
+
+impl BoundIngress {
+    async fn bind(bind: &str, transport: &TransportSecurity) -> anyhow::Result<Self> {
+        match transport {
+            TransportSecurity::PlaintextLoopback => {
+                let address: SocketAddr = bind.parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "plaintext loopback bind must be a literal socket address, got {bind:?}"
+                    )
+                })?;
+                anyhow::ensure!(
+                    address.ip().is_loopback(),
+                    "plaintext transport is restricted to loopback; {address} is shared"
+                );
+                Ok(Self::Plaintext(
+                    tokio::net::TcpListener::bind(address).await?,
+                ))
+            }
+            TransportSecurity::Tls {
+                certificate,
+                private_key,
+            } => {
+                // Other workspace consumers enable a second provider, so
+                // rustls cannot infer one from the unified feature set.
+                let _ = rustls::crypto::ring::default_provider().install_default();
+                let config =
+                    axum_server::tls_rustls::RustlsConfig::from_pem_file(certificate, private_key)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("load TLS certificate/private key: {e}"))?;
+                let listener = std::net::TcpListener::bind(bind)?;
+                listener.set_nonblocking(true)?;
+                Ok(Self::Tls { listener, config })
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Plaintext(listener) => listener.local_addr(),
+            Self::Tls { listener, .. } => listener.local_addr(),
+        }
+    }
+
+    async fn serve(self, app: axum::Router) -> std::io::Result<()> {
+        match self {
+            Self::Plaintext(listener) => axum::serve(listener, app).await,
+            Self::Tls { listener, config } => {
+                axum_server::from_tcp_rustls(listener, config)
+                    .serve(app.into_make_service())
+                    .await
+            }
+        }
+    }
 }
 
 /// Chitchat membership: `wire_version` and `ontology_fingerprint` ride the

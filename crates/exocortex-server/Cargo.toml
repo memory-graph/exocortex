@@ -30,6 +30,8 @@ exocortex-dreams = { workspace = true }
 exocortex-wire = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
 axum = { workspace = true }
+axum-server = { workspace = true }
+rustls = { workspace = true }
 rmcp = { workspace = true }
 prost = { workspace = true }
 async-stream = { workspace = true }

@@ -32,6 +32,7 @@ async fn boot() -> (
         onto.clone(),
         exocortex_server::backend::BackendNodeArgs {
             bind: "127.0.0.1:0".into(),
+            transport: exocortex_server::backend::TransportSecurity::PlaintextLoopback,
             node_id: "e2e-node".into(),
             cluster_secret: HMAC_KEY,
             bearer_token: "e2e-bearer".into(),

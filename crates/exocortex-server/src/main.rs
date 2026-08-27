@@ -39,9 +39,28 @@ struct Args {
     /// backend for tests and throwaway dev topologies.
     #[arg(long, default_value = "falkordb-embedded")]
     storage: String,
-    /// Bind address for networked modes.
-    #[arg(long, default_value = ":8080")]
+    /// Bind address for networked modes. Non-loopback/shared binds require
+    /// `--tls-cert` and `--tls-key`.
+    #[arg(long, default_value = "0.0.0.0:8080")]
     bind: String,
+    /// PEM certificate chain for the shared HTTP/SSE/gRPC listener.
+    #[arg(
+        long,
+        requires = "tls_key",
+        conflicts_with = "allow_plaintext_loopback"
+    )]
+    tls_cert: Option<std::path::PathBuf>,
+    /// PEM private key matching `--tls-cert`.
+    #[arg(
+        long,
+        requires = "tls_cert",
+        conflicts_with = "allow_plaintext_loopback"
+    )]
+    tls_key: Option<std::path::PathBuf>,
+    /// Explicit local-development exception: allow plaintext only when
+    /// `--bind` is an IP loopback address. Never valid for 0.0.0.0 or a LAN.
+    #[arg(long)]
+    allow_plaintext_loopback: bool,
     /// Cluster seed endpoints (backend-node).
     #[arg(long)]
     cluster_endpoints: Option<String>,
@@ -231,12 +250,19 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
         let cluster_secret = resolve_cluster_secret(args.cluster_secret.as_deref())?;
         let bearer_token = resolve_bearer(args.bearer_token.as_deref())?;
         let admin_ceilings = load_source_policy(args.source_policy.as_deref())?;
+        let transport = resolve_transport(
+            &args.bind,
+            args.tls_cert.as_deref(),
+            args.tls_key.as_deref(),
+            args.allow_plaintext_loopback,
+        )?;
         let node_id = args
             .node_id
             .clone()
             .unwrap_or_else(|| format!("node-{}", std::process::id()));
         let node_args = backend::BackendNodeArgs {
             bind: args.bind.clone(),
+            transport,
             node_id,
             cluster_secret,
             bearer_token,
@@ -315,6 +341,41 @@ fn resolve_bearer(token: Option<&str>) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("--bearer-token must be non-empty for backend-node"))
 }
 
+fn resolve_transport(
+    bind: &str,
+    certificate: Option<&std::path::Path>,
+    private_key: Option<&std::path::Path>,
+    allow_plaintext_loopback: bool,
+) -> anyhow::Result<backend::TransportSecurity> {
+    match (certificate, private_key, allow_plaintext_loopback) {
+        (Some(certificate), Some(private_key), false) => {
+            Ok(backend::TransportSecurity::Tls {
+                certificate: certificate.to_owned(),
+                private_key: private_key.to_owned(),
+            })
+        }
+        (None, None, true) => {
+            let addr: SocketAddr = bind.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "--allow-plaintext-loopback requires an explicit IP loopback bind"
+                )
+            })?;
+            if !addr.ip().is_loopback() {
+                anyhow::bail!(
+                    "--allow-plaintext-loopback refuses non-loopback bind {bind}; configure --tls-cert and --tls-key"
+                );
+            }
+            Ok(backend::TransportSecurity::PlaintextLoopback)
+        }
+        (None, None, false) => anyhow::bail!(
+            "backend-node requires --tls-cert and --tls-key; local plaintext requires --allow-plaintext-loopback with a loopback bind"
+        ),
+        _ => anyhow::bail!(
+            "configure both --tls-cert and --tls-key, or neither with --allow-plaintext-loopback"
+        ),
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourcePolicyRow {
@@ -380,7 +441,7 @@ fn data_home() -> anyhow::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_source_policy, resolve_bearer, resolve_cluster_secret};
+    use super::{load_source_policy, resolve_bearer, resolve_cluster_secret, resolve_transport};
 
     #[test]
     fn backend_credentials_fail_closed_when_missing_empty_or_malformed() {
@@ -415,5 +476,32 @@ mod tests {
         )
         .unwrap();
         assert!(load_source_policy(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn shared_transport_requires_tls_and_plaintext_is_loopback_only() {
+        use std::path::Path;
+
+        assert!(resolve_transport("0.0.0.0:8080", None, None, false).is_err());
+        assert!(resolve_transport("0.0.0.0:8080", None, None, true).is_err());
+        assert!(resolve_transport("192.0.2.10:8080", None, None, true).is_err());
+        assert!(resolve_transport("localhost:8080", None, None, true).is_err());
+        assert!(matches!(
+            resolve_transport("127.0.0.1:0", None, None, true).unwrap(),
+            exocortex_server::backend::TransportSecurity::PlaintextLoopback
+        ));
+        assert!(matches!(
+            resolve_transport(
+                "0.0.0.0:8080",
+                Some(Path::new("cert.pem")),
+                Some(Path::new("key.pem")),
+                false,
+            )
+            .unwrap(),
+            exocortex_server::backend::TransportSecurity::Tls { .. }
+        ));
+        assert!(
+            resolve_transport("0.0.0.0:8080", Some(Path::new("cert.pem")), None, false,).is_err()
+        );
     }
 }
