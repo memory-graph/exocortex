@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use exocortex_server::backend::{run_backend_node, BackendNodeArgs};
 use exocortex_storage::InMemoryStorage;
+use exocortex_storage::Storage;
 
 fn args(bind: &str, gossip: u16, seeds: Vec<String>) -> BackendNodeArgs {
     BackendNodeArgs {
@@ -136,6 +137,209 @@ async fn backend_nodes_serve_http_grpc_and_gossip_converges() {
         );
         assert!(text.contains("exocortex"), "initial anchor comment");
     }
+}
+
+fn acceptance_memory(seed: u8, embedding: bool) -> exocortex_kernel::Memory {
+    use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
+    Memory {
+        id: MemoryId([seed; 16]),
+        memory_type: 3,
+        title: format!("cluster-{seed}").into(),
+        content: format!("cluster acceptance {seed}"),
+        summary: None,
+        tags: Default::default(),
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "acceptance".into(),
+            producer_kind: None,
+        },
+        context: MemoryContext {
+            timestamp: chrono::Utc::now(),
+            project_id: Some("p".into()),
+            project_path: None,
+            team_id: None,
+            tenant_id: Some("org".into()),
+            session_id: None,
+            user_id: None,
+            created_by: None,
+            files_involved: Default::default(),
+            languages: Default::default(),
+            frameworks: Default::default(),
+            technologies: Default::default(),
+            git_commit: None,
+            git_branch: None,
+            working_directory: None,
+            entities: Default::default(),
+            additional_metadata: serde_json::Value::Null,
+        },
+        importance: exocortex_kernel::memory::F01::new(0.5).unwrap(),
+        confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
+        effectiveness: None,
+        usage_count: 0,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        embedding: embedding.then(|| vec![1.0; 64]),
+        lsn: LSN::new_local(0),
+    }
+}
+
+/// §23 #15 direct three-node acceptance: measured cache convergence, actual
+/// leader-task loss and takeover, one consolidation owner, and stale fencing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_node_p95_handoff_no_duplicate_and_stale_fence() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let mut nodes = Vec::new();
+    for offset in 0..3u16 {
+        nodes.push(
+            run_backend_node(
+                storage.clone(),
+                onto.clone(),
+                args("127.0.0.1:0", 44001 + offset, vec![]),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while nodes
+            .iter()
+            .filter(|node| node.leader_gate.load(std::sync::atomic::Ordering::SeqCst))
+            .count()
+            != 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("exactly one initial owner");
+
+    let visibility =
+        exocortex_ops::operations::ops_vc("org", "test", exocortex_kernel::Visibility::Org);
+    let mut samples = Vec::new();
+    for seed in 20..52u8 {
+        let memory = acceptance_memory(seed, false);
+        let started = tokio::time::Instant::now();
+        let commit = storage.upsert_memory(&memory).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let ready = nodes.iter().all(|node| {
+                    node.health.load().sync_lsn >= commit.lsn
+                        && node
+                            .cache
+                            .get_memory("org", &memory.id, &visibility)
+                            .is_some()
+                });
+                if ready {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all three node-local caches converge within 500ms");
+        samples.push(started.elapsed());
+    }
+    samples.sort_unstable();
+    let p95 = samples[(samples.len() * 95).div_ceil(100) - 1];
+    assert!(p95 < Duration::from_millis(500), "p95={p95:?}");
+
+    let old_owner = nodes
+        .iter()
+        .position(|node| node.leader_gate.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap();
+    let old_epoch = nodes[old_owner].health.load().lease_epoch;
+    nodes[old_owner].stop_leader_election();
+    let new_owner = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let owners: Vec<_> = nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.leader_gate.load(std::sync::atomic::Ordering::SeqCst))
+                .map(|(index, _)| index)
+                .collect();
+            if owners.len() == 1
+                && owners[0] != old_owner
+                && nodes[owners[0]].health.load().lease_epoch > old_epoch
+            {
+                break owners[0];
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a surviving node takes ownership after leader loss");
+    assert!(nodes[new_owner].health.load().lease_epoch > old_epoch);
+
+    storage
+        .upsert_memory(&acceptance_memory(70, true))
+        .await
+        .unwrap();
+    storage
+        .upsert_memory(&acceptance_memory(71, true))
+        .await
+        .unwrap();
+    let region = exocortex_storage::RegionKey {
+        org: "org".into(),
+        project: "p".into(),
+        memory_type: 3,
+    };
+    let engines: Vec<_> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            exocortex_dreams::DreamsEngine::new(
+                storage.clone(),
+                exocortex_dreams::trigger::DreamsTrigger::default(),
+                0.01,
+                0.05,
+                false,
+                format!("acceptance-{index}").into(),
+            )
+            .with_leader_gate(node.leader_gate.clone())
+        })
+        .collect();
+    let (a, b, c) = tokio::join!(
+        engines[0].try_consolidate(&region),
+        engines[1].try_consolidate(&region),
+        engines[2].try_consolidate(&region),
+    );
+    let outcomes = [a, b, c];
+    let successes: Vec<_> = outcomes.into_iter().filter_map(Result::ok).collect();
+    assert_eq!(successes.len(), 1, "only the elected owner consolidates");
+    assert!(
+        !successes[0].merged.is_empty(),
+        "the elected owner performs a real consolidation"
+    );
+    let merged: std::collections::HashSet<_> = successes[0].merged.iter().collect();
+    assert_eq!(
+        merged.len(),
+        successes[0].merged.len(),
+        "no duplicate consolidation"
+    );
+
+    let key = exocortex_storage::LeaseKey::Dreams {
+        org: "org".into(),
+        region: "stale-proof".into(),
+    };
+    let stale = storage.acquire_lease(&key, Duration::ZERO).await.unwrap();
+    let current = storage
+        .acquire_lease(&key, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(current.epoch > stale.epoch);
+    let rejected = storage
+        .upsert_batch_fenced(&[acceptance_memory(90, false)], &[], &stale)
+        .await;
+    assert!(matches!(
+        rejected,
+        Err(exocortex_storage::StorageError::FencedWriteRejected { .. })
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]

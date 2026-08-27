@@ -13,8 +13,9 @@ use futures::stream::BoxStream;
 use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId};
 use exocortex_storage::{
     types::{
-        CommitRecord, CypherQuery, Embedding, GraphSnapshot, Invalidation, LeaseKey, MemoryFilter,
-        OwnerLease, RegionKey, ResultSet, StorageBackendId, StorageCapabilities, TraversalSpec,
+        CommitRecord, CypherQuery, Embedding, FencedRestore, GraphSnapshot, Invalidation, LeaseKey,
+        MemoryFilter, OwnerLease, RegionKey, ResultSet, StorageBackendId, StorageCapabilities,
+        TraversalSpec,
     },
     Storage, StorageError, VisibilityContext,
 };
@@ -102,6 +103,13 @@ impl Storage for NoBackendStorage {
         no_backend()
     }
     async fn delete_memory_fenced(&self, _id: &MemoryId, _lease: &OwnerLease) -> R<CommitRecord> {
+        no_backend()
+    }
+    async fn restore_fenced(
+        &self,
+        _restore: &FencedRestore,
+        _lease: &OwnerLease,
+    ) -> R<Vec<CommitRecord>> {
         no_backend()
     }
     async fn subscribe_invalidations(&self, _r: &RegionKey) -> R<BoxStream<'_, R<Invalidation>>> {

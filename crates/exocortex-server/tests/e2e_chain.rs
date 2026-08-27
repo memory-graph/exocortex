@@ -7,6 +7,61 @@
 
 use std::sync::Arc;
 
+struct McpProcess {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    output: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl McpProcess {
+    fn spawn(data_dir: &std::path::Path) -> Self {
+        use std::process::Stdio;
+        let test_exe = std::env::current_exe().unwrap();
+        let debug_dir = test_exe.parent().unwrap().parent().unwrap();
+        let mut child = std::process::Command::new(debug_dir.join("exocortex-mcp-client"))
+            .args([
+                "--org",
+                "org",
+                "--user",
+                "e2e",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("the acceptance gate builds exocortex-mcp-client");
+        Self {
+            input: child.stdin.take().unwrap(),
+            output: std::io::BufReader::new(child.stdout.take().unwrap()),
+            child,
+        }
+    }
+
+    fn send(&mut self, messages: &[serde_json::Value]) {
+        use std::io::Write;
+        for message in messages {
+            writeln!(self.input, "{message}").unwrap();
+        }
+        self.input.flush().unwrap();
+    }
+
+    fn read(&mut self) -> serde_json::Value {
+        use std::io::BufRead;
+        let mut line = String::new();
+        self.output.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+}
+
+impl Drop for McpProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 use exocortex_kernel::Ontology;
 use exocortex_storage::{InMemoryStorage, Storage};
 use exocortex_wire::ingest::v1::{
@@ -282,6 +337,134 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
         cache.version("org"),
         keepalive.health.load().sync_lsn,
     );
+}
+
+/// §23 #18 literal chain: an MCP protocol request writes the local cache and
+/// durable WAL, the synchronizer drains that exact entry, and a different
+/// SSE-backed client observes the backend commit inside the 500ms budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_wal_sync_backend_sse_sibling_is_one_chain_under_500ms() {
+    let (node, storage, onto, addr) = boot().await;
+    let _keepalive = node;
+
+    let (sibling, writer) = LocalCache::new(64 * 1024 * 1024);
+    let sibling = Arc::new(sibling);
+    {
+        let cache = sibling.clone();
+        let storage = storage.clone();
+        tokio::spawn(async move { cache.run(storage, writer).await });
+    }
+    sibling.reseed_from_storage(&*storage, &"org".into()).await;
+    sibling.flush().await;
+
+    let mut sync_cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+    sync_cfg.bearer = Some("e2e-bearer".into());
+    sync_cfg.client_token = Some("e2e-bearer".into());
+    sync_cfg.client_key = Some(exocortex_server::sse::derive_client_sse_key(
+        &HMAC_KEY,
+        "e2e-bearer",
+    ));
+    let live = Arc::new(tokio::sync::Notify::new());
+    sync_cfg.connection_ready = Some(live.clone());
+    let sync = tokio::spawn(run_sse_sync(sync_cfg, sibling.clone(), 0, None));
+    tokio::time::timeout(std::time::Duration::from_secs(2), live.notified())
+        .await
+        .expect("sibling SSE is live before the harness write");
+
+    let data = tempfile::tempdir().unwrap();
+    let mut mcp = McpProcess::spawn(data.path());
+    mcp.send(&[
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "acceptance", "version": "1"}}
+        }),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "exocortex.end_session", "arguments": {
+                "session_id": "e2e", "project_id": "p", "memories": [{
+                    "draft_key": "m", "memory_type": "General", "title": "Literal MCP WAL SSE chain",
+                    "content": "one continuous acceptance path", "visibility": "org"
+                }], "edges": []
+            }}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "exocortex.search_memories", "arguments": {"query": "Literal MCP WAL SSE chain", "limit": 5}}
+        }),
+    ]);
+    assert!(mcp.read().get("result").is_some(), "MCP initialize");
+    let ack = mcp.read();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            ack["result"]["content"][0]["text"].as_str().unwrap()
+        )
+        .unwrap()["sync_pending"],
+        true,
+        "harness request durably enters the WAL"
+    );
+    let local = mcp.read();
+    let local_payload: serde_json::Value =
+        serde_json::from_str(local["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        local_payload["memories"].as_array().unwrap().len(),
+        1,
+        "same-process local cache sees the write"
+    );
+    drop(mcp);
+
+    let wal = Arc::new(exocortex_client::wal::Wal::open(&data.path().join("wal")).unwrap());
+    let entry = wal
+        .pending_entries()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("durable pending entry");
+    let local_id = entry.memory_ids[0];
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap();
+    let mut ingest = IngestServiceClient::new(endpoint.connect().await.unwrap());
+    let started = tokio::time::Instant::now();
+    let report = exocortex_client::drain::drain_once(
+        &wal,
+        &mut ingest,
+        &HMAC_KEY,
+        onto.fingerprint.0,
+        "org",
+        Some("e2e-bearer"),
+        &onto,
+        "literal-chain-client",
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.synced, 1, "the exact WAL entry reaches the backend");
+    assert_eq!(
+        entry.memory_ids,
+        vec![local_id],
+        "the drained WAL row is stable"
+    );
+
+    let committed_id = {
+        use futures::StreamExt;
+        let mut rows = storage.stream_all_memories().await;
+        let mut found = None;
+        while let Some(Ok(memory)) = rows.next().await {
+            if memory.title == "Literal MCP WAL SSE chain" {
+                found = Some(memory.id);
+            }
+        }
+        found.expect("the drained WAL row is committed under its server identity")
+    };
+
+    let vc = exocortex_ops::operations::ops_vc("org", "e2e", exocortex_kernel::Visibility::Org);
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while sibling.get_memory("org", &committed_id, &vc).is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("distinct sibling observes the synced WAL entry within 500ms");
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    sync.abort();
 }
 
 /// R-T16a under the shipped identity contract (B8/B9: external identity

@@ -61,12 +61,13 @@ pub struct BackendNodeArgs {
     pub admin_ceilings: Vec<((String, String, String), exocortex_kernel::Visibility)>,
 }
 
-/// Dreams-lease TTL for the backend re-election loop. 1.5s + a 400ms
+/// Dreams-lease TTL for the backend re-election loop. 1.2s + a 250ms
 /// retry cadence bounds worst-case takeover after a leader-kill at
-/// ~1.9s — inside the M5 acceptance bound (§3: converge within 2s).
-const LEASE_TTL: Duration = Duration::from_millis(1500);
+/// ~1.45s, leaving scheduler headroom inside the M5 acceptance bound
+/// (§3: converge within 2s).
+const LEASE_TTL: Duration = Duration::from_millis(1200);
 /// Renewal cadence: a healthy holder extends well before expiry.
-const LEASE_RENEW: Duration = Duration::from_millis(400);
+const LEASE_RENEW: Duration = Duration::from_millis(250);
 
 /// The Dreams lease every backend node re-elects for (§9.2).
 fn dreams_lease_key(org: &str) -> LeaseKey {
@@ -82,6 +83,22 @@ pub struct BackendNode {
     pub health: Arc<arc_swap::ArcSwap<HealthSnapshot>>,
     /// The ingress listener's local address.
     pub local_addr: SocketAddr,
+    /// Node-local cache, exposed for deterministic acceptance/readiness probes.
+    pub cache: Arc<LocalCache>,
+    /// True only while this node owns the cluster Dreams lease.
+    pub leader_gate: Arc<std::sync::atomic::AtomicBool>,
+    leader_election: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl BackendNode {
+    /// Simulate leader process loss while leaving peer runtimes alive.
+    pub fn stop_leader_election(&mut self) {
+        self.leader_gate
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(task) = self.leader_election.take() {
+            task.abort();
+        }
+    }
 }
 
 /// Run a backend node over any storage until the runtime shuts the task
@@ -345,11 +362,12 @@ pub async fn run_backend_node<S: Storage + 'static>(
 
     // Lease re-election (§9.2): acquire, renew, re-acquire on loss. The
     // epoch check rides storage-side fencing (R-C3).
-    {
+    let leader_election = {
         let storage = storage.clone();
         let health = health.clone();
         let node_id = args.node_id.clone();
         let org = org.to_string();
+        let elected = leader_gate.clone();
         tokio::spawn(async move {
             let key = dreams_lease_key(&org);
             // §3 M5 AC: leader election converges within 2s of a
@@ -362,7 +380,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
                         let mut epoch = lease.epoch;
                         // CS4: the Dreams engine consolidates only while
                         // this node is the elected leader.
-                        leader_gate.store(true, std::sync::atomic::Ordering::SeqCst);
+                        elected.store(true, std::sync::atomic::Ordering::SeqCst);
                         metrics::counter!(
                             "exocortex_cluster_owner_lease_transitions_total",
                             "role" => "dreams"
@@ -389,7 +407,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
                                 }
                                 Err(e) => {
                                     tracing::warn!(%e, "dreams lease lost; re-electing");
-                                    leader_gate.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    elected.store(false, std::sync::atomic::Ordering::SeqCst);
                                     break;
                                 }
                             }
@@ -398,7 +416,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
                     Err(_) => {
                         // Another node holds it; this node is a follower —
                         // no Dreams work (CS4).
-                        leader_gate.store(false, std::sync::atomic::Ordering::SeqCst);
+                        elected.store(false, std::sync::atomic::Ordering::SeqCst);
                         health.rcu(|h| {
                             let mut next = (**h).clone();
                             next.last_lease_tick = Some(chrono::Utc::now());
@@ -408,14 +426,20 @@ pub async fn run_backend_node<S: Storage + 'static>(
                     }
                 }
             }
-        });
-    }
+        })
+    };
 
     // Chitchat gossip (§9.1): member discovery carrying wire-version +
     // fingerprint so admission composes with failure detection (R-W2/R-W3).
     spawn_gossip(&args, &ontology.fingerprint).await?;
 
-    Ok(BackendNode { health, local_addr })
+    Ok(BackendNode {
+        health,
+        local_addr,
+        cache,
+        leader_gate,
+        leader_election: Some(leader_election),
+    })
 }
 
 enum BoundIngress {
