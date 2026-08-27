@@ -291,7 +291,9 @@ fn reject_code_protocol_catalogue_is_exhaustive() {
         }
     }
 
-    let codes: Vec<_> = (0..=14).filter_map(|value| RejectCode::try_from(value).ok()).collect();
+    let codes: Vec<_> = (0..=14)
+        .filter_map(|value| RejectCode::try_from(value).ok())
+        .collect();
     assert_eq!(
         codes.len(),
         15,

@@ -1,4 +1,3 @@
-// crates/exocortex-storage/src/cypher.rs
 //! Every Cypher template the FalkorDB adapter can execute. Registered at
 //! compile time; the trait method `query_cypher` refuses templates not listed
 //! here. This keeps Cypher confined to one file (CR-10).
