@@ -38,6 +38,9 @@ struct Args {
     /// hardcoded `[5u8; 32]` could never authenticate).
     #[arg(long)]
     hmac_key: Option<String>,
+    /// `--adapter fixture`: bearer credential for the backend principal.
+    #[arg(long)]
+    auth_token: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -161,6 +164,11 @@ async fn run_fixture(args: Args) -> anyhow::Result<()> {
         producer_kind: exocortex_wire::ingest::v1::ProducerKind::AnalyticsAdapter,
         ceiling: 3,
         backend_url: args.backend.clone(),
+        auth_token: args
+            .auth_token
+            .clone()
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("--auth-token is required for fixture adapter"))?,
         hmac_key,
         max_batch_bytes: 4 * 1024 * 1024,
         cursor_path,

@@ -7,6 +7,24 @@ mod common;
 
 use exocortex_adapter_sdk::{AdapterSession, SdkError};
 
+#[tokio::test]
+async fn empty_auth_token_fails_before_network_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = common::config(
+        "http://127.0.0.1:1",
+        dir.path().join("never-created.cursor"),
+    );
+    cfg.auth_token.clear();
+    let error = match AdapterSession::connect(cfg).await {
+        Err(error) => error,
+        Ok(_) => panic!("empty credentials must fail closed"),
+    };
+    assert!(
+        matches!(error, SdkError::InvalidUnit { ref detail } if detail.contains("auth_token")),
+        "empty credentials must fail closed before attempting a backend connection: {error:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn handshake_order_is_fingerprint_then_register() {
     let mock = exocortex_adapter_sdk::testing::MockServer::start().await;

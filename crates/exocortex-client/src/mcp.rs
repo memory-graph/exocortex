@@ -214,6 +214,7 @@ impl ExocortexMcp {
         &self,
         #[tool(param)] session_id: Option<String>,
         #[tool(param)] project_id: String,
+        #[tool(param)] team_id: Option<String>,
         #[tool(param)] memories: Vec<MemoryDraftInput>,
         #[tool(param)] edges: Vec<EdgeHintInput>,
     ) -> Result<String, String> {
@@ -223,6 +224,7 @@ impl ExocortexMcp {
             // client process into one backend group.
             session_id: Some(session_id.unwrap_or_else(|| self.process_session_id.clone())),
             project_id,
+            team_id,
             memories,
             edges,
         };
@@ -290,8 +292,12 @@ impl ExocortexMcp {
                 timestamp: now,
                 project_id: Some(args.project_id.clone().into()),
                 project_path: None,
-                team_id: None,
-                tenant_id: None,
+                team_id: args
+                    .team_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .map(Into::into),
+                tenant_id: Some(self.vc.org_id.clone()),
                 session_id: Some(session_id.clone().into()),
                 user_id: Some(self.vc.user_id.clone()),
                 created_by: None,

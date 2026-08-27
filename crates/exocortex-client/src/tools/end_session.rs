@@ -35,6 +35,9 @@ pub struct EndSessionArgs {
     pub session_id: Option<String>,
     /// Project identifier.
     pub project_id: String,
+    /// Team identifier when writing team-visible memories.
+    #[serde(default)]
+    pub team_id: Option<String>,
     /// 1..=5 memory drafts. Anything else is rejected client-side before the wire.
     pub memories: Vec<MemoryDraftInput>,
     /// Optional edges between the memories in this batch, linked by draft_key.
@@ -167,7 +170,20 @@ impl EndSessionTool {
         // before any wire work. Invalid batches never leave the process.
         let cache = self.cache.clone();
         let org = self.org_id.clone();
-        let vc = self.vc.clone();
+        let mut vc = self.vc.clone();
+        if !args.project_id.is_empty()
+            && !vc
+                .project_ids
+                .iter()
+                .any(|id| id.as_str() == args.project_id)
+        {
+            vc.project_ids.push(args.project_id.clone().into());
+        }
+        if let Some(team_id) = args.team_id.as_deref().filter(|id| !id.is_empty()) {
+            if !vc.team_ids.iter().any(|id| id.as_str() == team_id) {
+                vc.team_ids.push(team_id.into());
+            }
+        }
         let pre =
             crate::preflight::validate_batch(&self.ontology, &args.memories, &args.edges, |id| {
                 cache.as_ref().and_then(|c| {
@@ -303,6 +319,8 @@ impl EndSessionTool {
                     playbook_version: crate::playbook::PLAYBOOK_VERSION.into(),
                     client_version: env!("CARGO_PKG_VERSION").into(),
                     harness_hint: String::new(),
+                    project_id: args.project_id,
+                    team_id: args.team_id.unwrap_or_default(),
                 }),
             }),
         };

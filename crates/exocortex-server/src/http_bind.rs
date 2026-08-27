@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
+use axum::extract::Extension;
 use axum::http::{Request, Response, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
@@ -19,6 +20,9 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use exocortex_ops::{entries, OpContext, OpError, OperationEntry};
+use exocortex_storage::VisibilityContext;
+
+use crate::principal::PrincipalRegistry;
 
 /// Shared runtime health snapshot (R-O5/R-O6/R-M5), updated by the node
 /// loops and rendered by the health endpoints.
@@ -49,19 +53,26 @@ pub struct HealthSnapshot {
 /// The HTTP binding: operation routes + auth + observability.
 pub struct HttpBind {
     ctx: Arc<OpContext>,
-    bearer: String,
+    principals: Arc<PrincipalRegistry>,
     health: Arc<arc_swap::ArcSwap<HealthSnapshot>>,
     prometheus: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 impl HttpBind {
-    /// Build the binding. `bearer` is enforced on every operation route
-    /// (R-Sec7); the health and metrics endpoints stay unauthenticated so
-    /// load balancers and scrapers can probe them.
+    /// Build an embedded single-principal binding. The bearer protects every
+    /// operation, SSE, and metrics route; identity-free health probes remain
+    /// unauthenticated.
     pub fn new(ctx: Arc<OpContext>, bearer: String) -> Self {
+        let principals = PrincipalRegistry::single(bearer, ctx.visibility_ctx.clone())
+            .expect("HttpBind bearer must be non-empty");
+        Self::with_principals(ctx, Arc::new(principals))
+    }
+
+    /// Build a binding backed by an immutable administrator principal policy.
+    pub fn with_principals(ctx: Arc<OpContext>, principals: Arc<PrincipalRegistry>) -> Self {
         Self {
             ctx,
-            bearer,
+            principals,
             // Readiness defaults are optimistic for standalone mounts
             // (embedded/library use); `run_backend_node` installs the
             // maintainers that make these fields observational (R-O4).
@@ -119,9 +130,9 @@ impl HttpBind {
                 }
             }),
         );
-        let bearer = self.bearer.clone();
+        let principals = self.principals.clone();
         let protected = protected.layer(middleware::from_fn(move |req, next| {
-            auth(req, next, bearer.clone())
+            auth(req, next, principals.clone())
         }));
 
         let _health = self.health.clone();
@@ -212,29 +223,23 @@ impl HttpBind {
 
 /// Bearer-token check (R-Sec7): `Authorization: Bearer <token>` must match
 /// exactly; anything else is a 401 with no detail.
-async fn auth(req: Request<Body>, next: Next, bearer: String) -> Response<Body> {
-    let ok = req
+async fn auth(
+    mut req: Request<Body>,
+    next: Next,
+    principals: Arc<PrincipalRegistry>,
+) -> Response<Body> {
+    let principal = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| constant_time_eq(t.as_bytes(), bearer.as_bytes()));
-    if !ok {
+        .and_then(|token| principals.authenticate(token.as_bytes()));
+    let Some(principal) = principal else {
         metrics::counter!("exocortex_http_auth_failures_total").increment(1);
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
+    req.extensions_mut().insert(principal);
     next.run(req).await
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Build the route handler for one operation entry: JSON body in (POST) or
@@ -245,16 +250,20 @@ fn op_route(
     ctx: Arc<OpContext>,
 ) -> impl Clone
        + Fn(
+    Extension<VisibilityContext>,
     axum::extract::RawQuery,
     axum::body::Bytes,
 ) -> futures::future::BoxFuture<'static, Response<Body>>
        + Send
        + 'static {
-    move |query: axum::extract::RawQuery, body: axum::body::Bytes| {
+    move |Extension(visibility_ctx): Extension<VisibilityContext>,
+          query: axum::extract::RawQuery,
+          body: axum::body::Bytes| {
         // IN11 (audit): every request gets its OWN budget. The shared
         // startup context gave request #2 an already-expired deadline (and
         // nothing read it, so the REQUEST_TIMEOUT mapping was unreachable).
         let ctx = Arc::new(OpContext {
+            visibility_ctx,
             deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
             ..(*ctx).clone()
         });
@@ -360,4 +369,66 @@ fn install_prometheus() -> metrics_exporter_prometheus::PrometheusHandle {
                 .expect("install prometheus recorder")
         })
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn bearer_auth_injects_credential_specific_principal() {
+        let ontology = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = Arc::new(exocortex_storage::InMemoryStorage::new(ontology));
+        let (cache, _writer) = exocortex_cache::LocalCache::new(1024 * 1024);
+        let startup = VisibilityContext {
+            user_id: "startup-admin".into(),
+            org_id: "org".into(),
+            project_ids: Default::default(),
+            team_ids: Default::default(),
+            max_visibility: exocortex_kernel::Visibility::Org,
+        };
+        let ctx = Arc::new(OpContext::per_request(
+            startup,
+            storage,
+            Arc::new(cache),
+            chrono::Duration::seconds(30),
+        ));
+        let bob = VisibilityContext {
+            user_id: "bob".into(),
+            org_id: "org".into(),
+            project_ids: ["project-b".into()].into_iter().collect(),
+            team_ids: Default::default(),
+            max_visibility: exocortex_kernel::Visibility::Project,
+        };
+        let principals = Arc::new(PrincipalRegistry::single("bob-token".into(), bob).unwrap());
+        let who = Router::new().route(
+            "/who",
+            get(
+                |Extension(principal): Extension<VisibilityContext>| async move {
+                    principal.user_id.to_string()
+                },
+            ),
+        );
+        let app = HttpBind::with_principals(ctx, principals).router(Some(who));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/who")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer bob-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"bob");
+    }
 }

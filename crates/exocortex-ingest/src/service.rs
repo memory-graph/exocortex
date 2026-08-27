@@ -11,7 +11,7 @@ use exocortex_kernel::{
     Memory, MemoryContext, MemoryId, Ontology, Provenance, Relationship, RelationshipId,
     Visibility, LSN,
 };
-use exocortex_storage::{RegionKey, Storage};
+use exocortex_storage::{RegionKey, Storage, VisibilityContext};
 use exocortex_wire::ingest::v1::{
     ingest_service_server::IngestService, FingerprintRequest, FingerprintResponse, IngestAck,
     IngestBatch, RegisterSourceRequest, RegisterSourceResponse, RejectCode, RejectRow, SubmitAck,
@@ -99,6 +99,9 @@ pub struct IngestServer<S: Storage> {
     pub admin_ceilings: HashMap<(String, String, String), Visibility>,
     /// Production policy mode: an unknown source cannot self-register.
     pub require_admin_ceiling: bool,
+    /// Production transport mode: every RPC must carry the authenticated
+    /// principal installed by the ingress authorization layer.
+    pub require_request_principal: bool,
     /// D10c (§4.10b): bounded recent-acceptance ring for near-duplicate
     /// hints — (org, id, type, title, content-hash, embedding) for the
     /// last [`RECENT_RING_LEN`] committed memories. Hints compare each
@@ -153,6 +156,7 @@ impl<S: Storage> Clone for IngestServer<S> {
             dreams: self.dreams.clone(),
             admin_ceilings: self.admin_ceilings.clone(),
             require_admin_ceiling: self.require_admin_ceiling,
+            require_request_principal: self.require_request_principal,
             recent: self.recent.clone(),
         }
     }
@@ -186,6 +190,7 @@ impl<S: Storage> IngestServer<S> {
             dreams: None,
             admin_ceilings: HashMap::new(),
             require_admin_ceiling: false,
+            require_request_principal: false,
             recent: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }
     }
@@ -241,6 +246,12 @@ impl<S: Storage> IngestServer<S> {
     /// Fail closed for registrations not provisioned by an administrator.
     pub fn require_admin_ceilings(mut self) -> Self {
         self.require_admin_ceiling = true;
+        self
+    }
+
+    /// Require an ingress-authenticated principal on every gRPC request.
+    pub fn require_request_principal(mut self) -> Self {
+        self.require_request_principal = true;
         self
     }
 
@@ -342,6 +353,19 @@ impl<S: Storage> IngestServer<S> {
         b.ontology_fingerprint.as_slice() == self.ontology.fingerprint.0.as_slice()
     }
 
+    fn request_principal<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<VisibilityContext>, Status> {
+        let principal = request.extensions().get::<VisibilityContext>().cloned();
+        if self.require_request_principal && principal.is_none() {
+            return Err(Status::unauthenticated(
+                "request has no authenticated principal",
+            ));
+        }
+        Ok(principal)
+    }
+
     /// WS5 (audit): every discriminant outside 0..=4 is REJECTED — the old
     /// fall-through coerced unknown values (5, 99, -1) to PUBLIC, the
     /// widest scope, entirely silently. Fail closed, never open.
@@ -364,6 +388,7 @@ impl<S: Storage> IngestServer<S> {
         ceiling: Visibility,
         snapshot: bool,
         producer_kind: exocortex_kernel::ProducerKind,
+        principal: Option<&VisibilityContext>,
     ) -> Result<Memory, RejectCode> {
         let Some(mt) = self
             .ontology
@@ -375,6 +400,49 @@ impl<S: Storage> IngestServer<S> {
         // W2 (audit): the KERNEL owns the rulebook — one validator for
         // the online path, the offline path, and any future producer.
         let vis = Self::vis_from_i32(m.visibility)?;
+        let (tenant_id, user_id, project_id, team_id) = if let Some(principal) = principal {
+            if vis > principal.max_visibility {
+                return Err(RejectCode::VisibilityWidening);
+            }
+            let metadata = batch
+                .producer
+                .as_ref()
+                .and_then(|producer| producer.client_metadata.as_ref());
+            let requested_project = metadata
+                .map(|metadata| metadata.project_id.as_str())
+                .filter(|id| !id.is_empty());
+            let requested_team = metadata
+                .map(|metadata| metadata.team_id.as_str())
+                .filter(|id| !id.is_empty());
+            if vis == Visibility::Project
+                && !requested_project.is_some_and(|id| {
+                    principal
+                        .project_ids
+                        .iter()
+                        .any(|allowed| allowed.as_str() == id)
+                })
+            {
+                return Err(RejectCode::VisibilityWidening);
+            }
+            if vis == Visibility::Team
+                && !requested_team.is_some_and(|id| {
+                    principal
+                        .team_ids
+                        .iter()
+                        .any(|allowed| allowed.as_str() == id)
+                })
+            {
+                return Err(RejectCode::VisibilityWidening);
+            }
+            (
+                Some(principal.org_id.clone()),
+                Some(principal.user_id.clone()),
+                requested_project.map(Into::into),
+                requested_team.map(Into::into),
+            )
+        } else {
+            (None, None, None, None)
+        };
         let kernel_draft = exocortex_kernel::MemoryDraft {
             memory_type: *mt,
             title: m.title.clone().into(),
@@ -383,12 +451,12 @@ impl<S: Storage> IngestServer<S> {
             visibility: vis,
             context: exocortex_kernel::MemoryContext {
                 timestamp: chrono::Utc::now(),
-                project_id: None,
+                project_id: project_id.clone(),
                 project_path: None,
-                team_id: None,
-                tenant_id: None,
+                team_id: team_id.clone(),
+                tenant_id: tenant_id.clone(),
                 session_id: None,
-                user_id: None,
+                user_id: user_id.clone(),
                 created_by: None,
                 files_involved: Default::default(),
                 languages: Default::default(),
@@ -497,11 +565,11 @@ impl<S: Storage> IngestServer<S> {
                 // conversation was split by transport — offline-written
                 // memories carried context online ones did not.
                 session_id: session_id_of(&batch.source_uri, &batch.producer_id),
-                project_id: None,
+                project_id,
                 project_path: None,
-                team_id: None,
-                tenant_id: None,
-                user_id: None,
+                team_id,
+                tenant_id,
+                user_id,
                 created_by: None,
                 files_involved: Default::default(),
                 languages: Default::default(),
@@ -784,7 +852,17 @@ fn ack_reject_all(batch: &IngestBatch, code: RejectCode, detail: &str) -> Ingest
 #[tonic::async_trait]
 impl<S: Storage + 'static> IngestService for IngestServer<S> {
     async fn submit(&self, req: Request<IngestBatch>) -> Result<Response<IngestAck>, Status> {
+        let principal = self.request_principal(&req)?;
         let batch = req.into_inner();
+
+        if principal
+            .as_ref()
+            .is_some_and(|principal| principal.org_id.as_str() != batch.org_id)
+        {
+            return Err(Status::permission_denied(
+                "authenticated principal cannot write another org",
+            ));
+        }
 
         // R-I8: HMAC before any validation.
         if let Err(e) = self.verify_hmac(&batch) {
@@ -880,7 +958,14 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         let mut rejections: Vec<RejectRow> = Vec::new();
         let mut draft_ids: HashMap<String, Memory> = HashMap::new();
         for m in &batch.memories {
-            match self.validate_memory(&batch, m, ceiling, snapshot, source.kind) {
+            match self.validate_memory(
+                &batch,
+                m,
+                ceiling,
+                snapshot,
+                source.kind,
+                principal.as_ref(),
+            ) {
                 Ok(mem) => {
                     draft_ids.insert(m.draft_key.clone(), mem.clone());
                     ok_mem.push(mem);
@@ -969,9 +1054,20 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         let mut grouping_nodes_created = 0u32;
         if let Some((rule, key)) = crate::grouping::grouping_key(&batch) {
             let now = chrono::Utc::now();
-            if let Some(node) =
+            if let Some(mut node) =
                 crate::grouping::grouping_node(&self.ontology, &batch.org_id, rule, &key, now)
             {
+                if let Some(scope) = committed_memories.first() {
+                    node.visibility = committed_memories
+                        .iter()
+                        .map(|memory| memory.visibility)
+                        .min()
+                        .unwrap_or(scope.visibility);
+                    node.context.tenant_id = scope.context.tenant_id.clone();
+                    node.context.user_id = scope.context.user_id.clone();
+                    node.context.project_id = scope.context.project_id.clone();
+                    node.context.team_id = scope.context.team_id.clone();
+                }
                 let mut edges = Vec::with_capacity(ok_mem.len());
                 for m in &ok_mem {
                     if let Some(e) =
@@ -1120,6 +1216,7 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         &self,
         req: Request<Streaming<SubmitOne>>,
     ) -> Result<Response<Self::SubmitStreamStream>, Status> {
+        let principal = self.request_principal(&req)?;
         // Fan-in to `submit`, one row at a time, streaming acks back.
         // The stream forwards each body through the batched path.
         use futures::StreamExt;
@@ -1155,8 +1252,12 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                                 continue;
                             }
                         };
+                        let mut request = Request::new(b);
+                        if let Some(principal) = principal.clone() {
+                            request.extensions_mut().insert(principal);
+                        }
                         if tx
-                            .send(self_arc.submit(Request::new(b)).await.map(|r| SubmitAck {
+                            .send(self_arc.submit(request).await.map(|r| SubmitAck {
                                 ack: Some(r.into_inner()),
                             }))
                             .await
@@ -1180,8 +1281,9 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
 
     async fn fingerprint(
         &self,
-        _req: Request<FingerprintRequest>,
+        req: Request<FingerprintRequest>,
     ) -> Result<Response<FingerprintResponse>, Status> {
+        self.request_principal(&req)?;
         Ok(Response::new(FingerprintResponse {
             fingerprint: self.ontology.fingerprint.0.to_vec(),
             kernel_version: env!("CARGO_PKG_VERSION").into(),
@@ -1198,6 +1300,7 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         &self,
         req: Request<RegisterSourceRequest>,
     ) -> Result<Response<RegisterSourceResponse>, Status> {
+        let principal = self.request_principal(&req)?;
         let r = req.into_inner();
         // Audit WS1: RegisterSource mutates the registry Submit authorizes
         // against, so it carries the same producer identity + HMAC (R-I8).
@@ -1213,7 +1316,23 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                 return Err(Status::invalid_argument("org does not match this node"));
             }
         }
+        if principal
+            .as_ref()
+            .is_some_and(|principal| principal.org_id.as_str() != r.org_id)
+        {
+            return Err(Status::permission_denied(
+                "authenticated principal cannot register another org",
+            ));
+        }
         let requested = Self::vis_from_i32(r.ceiling).unwrap_or(Visibility::Public);
+        if principal
+            .as_ref()
+            .is_some_and(|principal| requested > principal.max_visibility)
+        {
+            return Err(Status::permission_denied(
+                "requested source ceiling exceeds authenticated principal",
+            ));
+        }
         // D8: the closed enum, enforced at the boundary. A free string
         // would persist typos into append-only provenance forever;
         // UNSPECIFIED is a refusal to declare, and a typo'd discriminant

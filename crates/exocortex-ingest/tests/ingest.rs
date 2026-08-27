@@ -177,6 +177,81 @@ async fn resource_ceiling_rejects_before_ontology_or_storage_work() {
 }
 
 #[tokio::test]
+async fn authenticated_principal_is_required_and_authoritatively_scopes_writes() {
+    use futures::StreamExt;
+    use tonic::Code;
+
+    let srv = server().require_request_principal();
+    let principal = exocortex_storage::VisibilityContext {
+        user_id: "alice".into(),
+        org_id: "org".into(),
+        project_ids: ["allowed".into()].into_iter().collect(),
+        team_ids: ["team-a".into()].into_iter().collect(),
+        max_visibility: exocortex_kernel::Visibility::Org,
+    };
+
+    let unauthenticated = srv
+        .fingerprint(tonic::Request::new(
+            exocortex_wire::ingest::v1::FingerprintRequest {},
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(unauthenticated.code(), Code::Unauthenticated);
+
+    let mut registration = tonic::Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://s1",
+        "session-wrapup",
+        3,
+        "session",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    ));
+    registration.extensions_mut().insert(principal.clone());
+    srv.register_source(registration).await.unwrap();
+
+    let scoped_batch = |project_id: &str, batch_id: &str| {
+        let mut b = batch(vec![draft("scoped", "Fix", 1)]);
+        b.batch_id = batch_id.into();
+        b.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+        b.producer.as_mut().unwrap().client_metadata =
+            Some(exocortex_wire::ingest::v1::ClientMetadata {
+                playbook_version: String::new(),
+                client_version: String::new(),
+                harness_hint: String::new(),
+                project_id: project_id.into(),
+                team_id: String::new(),
+            });
+        sign(b, [5u8; 32])
+    };
+
+    let mut forbidden = tonic::Request::new(scoped_batch("forbidden", "scope-forbidden"));
+    forbidden.extensions_mut().insert(principal.clone());
+    let denied = srv.submit(forbidden).await.unwrap().into_inner();
+    assert!(denied
+        .rejections
+        .iter()
+        .any(|row| row.code == RejectCode::VisibilityWidening as i32));
+
+    let mut allowed = tonic::Request::new(scoped_batch("allowed", "scope-allowed"));
+    allowed.extensions_mut().insert(principal);
+    let accepted = srv.submit(allowed).await.unwrap().into_inner();
+    assert!(accepted.accepted > 0, "{:?}", accepted.rejections);
+
+    let mut memories = srv.storage.stream_all_memories().await;
+    let scoped = loop {
+        let memory = memories.next().await.unwrap().unwrap();
+        if memory.title.as_str() == "title scoped" {
+            break memory;
+        }
+    };
+    assert_eq!(scoped.context.tenant_id.as_deref(), Some("org"));
+    assert_eq!(scoped.context.user_id.as_deref(), Some("alice"));
+    assert_eq!(scoped.context.project_id.as_deref(), Some("allowed"));
+}
+
+#[tokio::test]
 async fn fingerprint_mismatch_rejects_whole_batch() {
     let srv = server();
     registered(&srv, 3).await;

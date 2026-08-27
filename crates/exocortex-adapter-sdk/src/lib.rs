@@ -41,6 +41,17 @@ use exocortex_wire::ingest::v1::{
 };
 pub use retry::{instant_sleep, real_sleep, SleepFn};
 
+fn authenticated_request<T>(token: &str, message: T) -> Result<tonic::Request<T>, SdkError> {
+    let value = format!("Bearer {token}")
+        .parse()
+        .map_err(|_| SdkError::InvalidUnit {
+            detail: "adapter auth_token contains invalid metadata bytes".into(),
+        })?;
+    let mut request = tonic::Request::new(message);
+    request.metadata_mut().insert("authorization", value);
+    Ok(request)
+}
+
 /// Adapter configuration (§18.2 obligations 1, 6, 7).
 #[derive(Clone, Debug)]
 pub struct AdapterConfig {
@@ -64,6 +75,8 @@ pub struct AdapterConfig {
     pub ceiling: i32,
     /// Backend IngestService endpoint (`http://host:port`).
     pub backend_url: String,
+    /// Bearer credential mapped to this adapter's server-side principal.
+    pub auth_token: String,
     /// Shared producer HMAC key (R-I8 as implemented; per-producer keys
     /// are a recorded deviation, not this crate's concern).
     pub hmac_key: [u8; 32],
@@ -90,6 +103,7 @@ impl AdapterConfig {
             producer_kind: exocortex_wire::ingest::v1::ProducerKind::Custom,
             ceiling: 3,
             backend_url: backend_url.into(),
+            auth_token: String::new(),
             hmac_key: [0u8; 32],
             max_batch_bytes: 4 * 1024 * 1024,
             cursor_path: std::env::temp_dir().join(format!("{producer_id}.cursor")),
@@ -243,11 +257,19 @@ impl AdapterSession {
 
     /// `connect` with an injected sleep function (tests; R14).
     pub async fn connect_with(config: AdapterConfig, sleep: SleepFn) -> Result<Self, SdkError> {
+        if config.auth_token.is_empty() {
+            return Err(SdkError::InvalidUnit {
+                detail: "adapter auth_token must be non-empty".into(),
+            });
+        }
         let mut client = IngestServiceClient::connect(config.backend_url.clone())
             .await
             .map_err(|e| SdkError::TransportConnect(e.to_string()))?;
         let fp = client
-            .fingerprint(exocortex_wire::ingest::v1::FingerprintRequest {})
+            .fingerprint(authenticated_request(
+                &config.auth_token,
+                exocortex_wire::ingest::v1::FingerprintRequest {},
+            )?)
             .await?
             .into_inner()
             .fingerprint;
@@ -271,7 +293,7 @@ impl AdapterSession {
         };
         exocortex_wire::signing::sign_registration(&config.hmac_key, &mut registration);
         let registered = client
-            .register_source(registration)
+            .register_source(authenticated_request(&config.auth_token, registration)?)
             .await?
             .into_inner()
             .ceiling;
@@ -384,7 +406,13 @@ impl AdapterSession {
                 let mut attempt: u32 = 0;
                 loop {
                     attempt += 1;
-                    let ack = match client.submit(batch.clone()).await {
+                    let ack = match client
+                        .submit(authenticated_request(
+                            &self.config.auth_token,
+                            batch.clone(),
+                        )?)
+                        .await
+                    {
                         Ok(ack) => ack.into_inner(),
                         Err(status) => {
                             let disp = classify_status(&status);
@@ -475,7 +503,10 @@ impl AdapterSession {
                     if code == exocortex_wire::ingest::v1::RejectCode::IncompatibleOntology {
                         // R8: re-negotiate to name both fingerprints.
                         let got = client
-                            .fingerprint(exocortex_wire::ingest::v1::FingerprintRequest {})
+                            .fingerprint(authenticated_request(
+                                &self.config.auth_token,
+                                exocortex_wire::ingest::v1::FingerprintRequest {},
+                            )?)
                             .await?
                             .into_inner()
                             .fingerprint;

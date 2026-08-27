@@ -660,7 +660,7 @@ async fn omitted_session_id_gets_process_minted_default() {
     };
     // Omitted session id: the process default is stamped.
     server
-        .end_session(None, "p".into(), vec![draft("a")], vec![])
+        .end_session(None, "p".into(), None, vec![draft("a")], vec![])
         .await
         .expect("offline write");
     // Explicit id: rides through untouched (deliberate sharing).
@@ -668,6 +668,7 @@ async fn omitted_session_id_gets_process_minted_default() {
         .end_session(
             Some("shared-conv".into()),
             "p".into(),
+            None,
             vec![draft("b")],
             vec![],
         )

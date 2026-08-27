@@ -17,6 +17,7 @@ use exocortex_ops::OpContext;
 use exocortex_storage::{LeaseKey, Storage};
 
 use crate::http_bind::{HealthSnapshot, HttpBind};
+use crate::principal::PrincipalRegistry;
 
 /// Network transport accepted by the shared HTTP/SSE/gRPC listener.
 #[derive(Clone, Debug)]
@@ -44,8 +45,8 @@ pub struct BackendNodeArgs {
     pub node_id: String,
     /// Cluster-shared HMAC key (R-Sec4).
     pub cluster_secret: [u8; 32],
-    /// Bearer token for the HTTP op surface (R-Sec7).
-    pub bearer_token: String,
+    /// Immutable administrator credential-to-principal policy.
+    pub principals: Arc<PrincipalRegistry>,
     /// Chitchat gossip listen address.
     pub gossip_listen: SocketAddr,
     /// Chitchat seed nodes (`host:port`).
@@ -135,7 +136,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
         // is the same ontology the ingest path validates against.
         ontology: Some(ontology.clone()),
     });
-    let bind = HttpBind::new(ctx, args.bearer_token.clone());
+    let bind = HttpBind::with_principals(ctx, args.principals.clone());
     let health = bind.health_handle();
     health.store(Arc::new(HealthSnapshot {
         node_id: args.node_id.clone(),
@@ -285,7 +286,8 @@ pub async fn run_backend_node<S: Storage + 'static>(
         .with_dreams(dreams.clone())
         .with_org(&org)
         .with_admin_ceilings(args.admin_ceilings.clone())
-        .require_admin_ceilings();
+        .require_admin_ceilings()
+        .require_request_principal();
     #[cfg(feature = "fastembed")]
     let ingest = ingest.with_embedder(Arc::new(
         exocortex_ingest::embedding::FastEmbedder::bge_small()?,
@@ -322,7 +324,10 @@ pub async fn run_backend_node<S: Storage + 'static>(
     )
     .into_axum_router();
     let sse = crate::sse::sse_router(cluster.clone(), crate::sse::SseAuth::RequiredToken);
-    let app = bind.router(Some(sse)).merge(grpc);
+    // HTTP operations, SSE, metrics, and every gRPC method share the same
+    // credential-to-principal middleware. Merging gRPC after `router` would
+    // silently bypass authentication.
+    let app = bind.router(Some(sse.merge(grpc)));
 
     tracing::info!(
         %local_addr,

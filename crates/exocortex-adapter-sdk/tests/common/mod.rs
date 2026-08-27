@@ -31,6 +31,7 @@ pub fn unit(seed: &str, keys: &[&str]) -> BatchUnit {
 #[allow(dead_code)]
 pub fn config(url: &str, cursor_path: std::path::PathBuf) -> AdapterConfig {
     let mut c = AdapterConfig::new("org", "custom://test", "test-adapter", url);
+    c.auth_token = "test-bearer".into();
     c.cursor_path = cursor_path;
     c
 }

@@ -164,6 +164,7 @@ async fn client_side_batch_size_gate() {
     let args = |n: usize| EndSessionArgs {
         session_id: Some("s".into()),
         project_id: "p".into(),
+        team_id: None,
         memories: (0..n)
             .map(|i| exocortex_client::tools::end_session::MemoryDraftInput {
                 draft_key: format!("k{i}"),

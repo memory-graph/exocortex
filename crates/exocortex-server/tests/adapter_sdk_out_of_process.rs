@@ -44,6 +44,12 @@ fn spawn_node() -> Node {
         r#"[{"org_id":"org","source_uri":"fixture://oop","producer_id":"oop-fixture","ceiling":3}]"#,
     )
     .unwrap();
+    let principals = policy_dir.path().join("principals.json");
+    std::fs::write(
+        &principals,
+        r#"[{"bearer_token":"oop-test-bearer","org_id":"org","user_id":"oop","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
+    )
+    .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_exocortex-node"))
         .args([
             "--mode",
@@ -55,8 +61,8 @@ fn spawn_node() -> Node {
             "--allow-plaintext-loopback",
             "--gossip-addr",
             &format!("127.0.0.1:{gossip}"),
-            "--bearer-token",
-            "oop-test-bearer",
+            "--principal-policy",
+            principals.to_str().unwrap(),
             "--cluster-secret",
             "4242424242424242424242424242424242424242424242424242424242424242",
             "--source-policy",
@@ -114,6 +120,7 @@ async fn fixture_adapter_completes_the_protocol_out_of_process() {
         producer_kind: exocortex_wire::ingest::v1::ProducerKind::Custom,
         ceiling: 3,
         backend_url: format!("http://{}", node.addr),
+        auth_token: "oop-test-bearer".into(),
         hmac_key: [0x42u8; 32],
         max_batch_bytes: 4 * 1024 * 1024,
         cursor_path: dir.path().join("oop.cursor"),

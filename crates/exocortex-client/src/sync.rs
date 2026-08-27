@@ -61,6 +61,9 @@ pub struct SseSyncConfig {
     pub gap_timeout: Duration,
     /// Reconnect backoff (capped at 10s).
     pub backoff: Duration,
+    /// Optional first-connection signal for supervisors and deterministic
+    /// integration tests. A permit is emitted after the SSE handshake.
+    pub connection_ready: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl SseSyncConfig {
@@ -76,6 +79,7 @@ impl SseSyncConfig {
             stall_timeout: Duration::from_secs(15),
             gap_timeout: Duration::from_secs(2),
             backoff: Duration::from_secs(1),
+            connection_ready: None,
         }
     }
 }
@@ -311,7 +315,12 @@ pub async fn run_sse_sync(
                 match item {
                     // R-C5: heartbeats/connect anchors arrive as comments;
                     // transport-level silence trips `read_timeout` below.
-                    Ok(es::SSE::Connected(_)) | Ok(es::SSE::Comment(_)) => {}
+                    Ok(es::SSE::Connected(_)) => {
+                        if let Some(ready) = &cfg.connection_ready {
+                            ready.notify_one();
+                        }
+                    }
+                    Ok(es::SSE::Comment(_)) => {}
                     Ok(es::SSE::Event(ev)) => {
                         if ev.event_type == "inv" {
                             let verify_key = cfg.client_key.unwrap_or(cfg.hmac_key);

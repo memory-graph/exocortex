@@ -74,12 +74,10 @@ struct Args {
     /// Chitchat gossip listen address (backend-node).
     #[arg(long, default_value = "0.0.0.0:8100")]
     gossip_addr: String,
-    /// Bearer token guarding the HTTP op surface (R-Sec7). No default in
-    /// release builds: backend-node refuses to start without it (a shipped
-    /// credential is worse than a startup error). Debug builds keep the
-    /// loopback dev token for local iteration.
+    /// Administrator-owned JSON mapping bearer credentials to org/user,
+    /// project/team memberships, and maximum visibility.
     #[arg(long)]
-    bearer_token: Option<String>,
+    principal_policy: Option<std::path::PathBuf>,
     /// Cluster-shared HMAC secret (exactly 64 hex chars). Required for every
     /// backend node; tests inject an explicit known key.
     #[arg(long)]
@@ -248,7 +246,12 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
         // Storage arms stay concrete (run_backend_node is generic over the
         // backend); a shared tail serves whichever arm won.
         let cluster_secret = resolve_cluster_secret(args.cluster_secret.as_deref())?;
-        let bearer_token = resolve_bearer(args.bearer_token.as_deref())?;
+        let principal_policy = args.principal_policy.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--principal-policy is required for backend-node")
+        })?;
+        let principals = std::sync::Arc::new(
+            exocortex_server::principal::PrincipalRegistry::load(principal_policy)?,
+        );
         let admin_ceilings = load_source_policy(args.source_policy.as_deref())?;
         let transport = resolve_transport(
             &args.bind,
@@ -265,7 +268,7 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
             transport,
             node_id,
             cluster_secret,
-            bearer_token,
+            principals,
             gossip_listen: SocketAddr::from_str(&args.gossip_addr)
                 .map_err(|e| anyhow::anyhow!("bad --gossip-addr: {e}"))?,
             seed_nodes: args
@@ -329,16 +332,6 @@ fn resolve_cluster_secret(secret: Option<&str>) -> anyhow::Result<[u8; 32]> {
     })?;
     exocortex_wire::signing::decode_hex32(secret)
         .map_err(|e| anyhow::anyhow!("--cluster-secret: {e}"))
-}
-
-/// R-Sec7: every shared transport starts with a non-empty bearer. There is no
-/// debug-build exception because debug binaries are routinely used in shared
-/// integration environments.
-fn resolve_bearer(token: Option<&str>) -> anyhow::Result<String> {
-    token
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("--bearer-token must be non-empty for backend-node"))
 }
 
 fn resolve_transport(
@@ -441,7 +434,7 @@ fn data_home() -> anyhow::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_source_policy, resolve_bearer, resolve_cluster_secret, resolve_transport};
+    use super::{load_source_policy, resolve_cluster_secret, resolve_transport};
 
     #[test]
     fn backend_credentials_fail_closed_when_missing_empty_or_malformed() {
@@ -452,10 +445,6 @@ mod tests {
             resolve_cluster_secret(Some(&"42".repeat(32))).unwrap(),
             [0x42; 32]
         );
-
-        assert!(resolve_bearer(None).is_err());
-        assert!(resolve_bearer(Some("")).is_err());
-        assert_eq!(resolve_bearer(Some("test-token")).unwrap(), "test-token");
     }
 
     #[test]

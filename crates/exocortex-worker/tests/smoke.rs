@@ -60,6 +60,12 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
         r#"[{"org_id":"org","source_uri":"fixture://fixture-e2e","producer_id":"fixture-e2e","ceiling":3}]"#,
     )
     .unwrap();
+    let principal_policy = policy_dir.path().join("principals.json");
+    std::fs::write(
+        &principal_policy,
+        r#"[{"bearer_token":"fixture-e2e","org_id":"org","user_id":"fixture","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
+    )
+    .unwrap();
     let mut node = Command::new(&node_bin)
         .args([
             "--mode",
@@ -71,8 +77,8 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
             "--allow-plaintext-loopback",
             "--gossip-addr",
             &format!("127.0.0.1:{gossip_port}"),
-            "--bearer-token",
-            "fixture-e2e",
+            "--principal-policy",
+            principal_policy.to_str().unwrap(),
             "--cluster-secret",
             "4242424242424242424242424242424242424242424242424242424242424242",
             "--source-policy",
@@ -125,6 +131,8 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
             dir.path().join("fx.cursor").to_str().unwrap(),
             "--hmac-key",
             "4242424242424242424242424242424242424242424242424242424242424242",
+            "--auth-token",
+            "fixture-e2e",
         ])
         .output()
         .expect("run exocortex-worker fixture");

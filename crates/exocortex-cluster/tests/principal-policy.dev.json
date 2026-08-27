@@ -1,0 +1,10 @@
+[
+  {
+    "bearer_token": "dev-bearer",
+    "org_id": "org",
+    "user_id": "chaos-harness",
+    "project_ids": ["default"],
+    "team_ids": [],
+    "max_visibility": 3
+  }
+]

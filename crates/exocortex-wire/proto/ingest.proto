@@ -111,6 +111,8 @@ message ClientMetadata {
   string playbook_version = 1;  // D3 version string, e.g. "1.0.0"
   string client_version   = 2;  // exocortex-client semver
   string harness_hint     = 3;  // "claude-code" | "codex" | "cursor" | free
+  string project_id       = 4;  // requested scope; server verifies principal membership
+  string team_id          = 5;  // requested scope; server verifies principal membership
 }
 
 // D8: closed enum. UNSPECIFIED is rejected at registration; CUSTOM is the

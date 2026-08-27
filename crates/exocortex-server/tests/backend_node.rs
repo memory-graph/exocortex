@@ -16,7 +16,13 @@ fn args(bind: &str, gossip: u16, seeds: Vec<String>) -> BackendNodeArgs {
         transport: exocortex_server::backend::TransportSecurity::PlaintextLoopback,
         node_id: format!("node-{gossip}"),
         cluster_secret: [7u8; 32],
-        bearer_token: "test-bearer".into(),
+        principals: Arc::new(
+            exocortex_server::principal::PrincipalRegistry::single(
+                "test-bearer".into(),
+                exocortex_ops::operations::ops_vc("org", "test", exocortex_kernel::Visibility::Org),
+            )
+            .unwrap(),
+        ),
         gossip_listen: format!("127.0.0.1:{gossip}").parse().unwrap(),
         seed_nodes: seeds,
         redis_url: None,
@@ -215,8 +221,19 @@ async fn shared_listener_uses_tls_and_refuses_plaintext() {
         )
         .unwrap();
     let channel = endpoint.connect().await.expect("trusted TLS handshake");
-    let response = IngestServiceClient::new(channel)
+    let mut client = IngestServiceClient::new(channel);
+    let unauthenticated = client
         .fingerprint(FingerprintRequest {})
+        .await
+        .expect_err("gRPC cannot bypass bearer principal middleware");
+    assert_eq!(unauthenticated.code(), tonic::Code::Unauthenticated);
+
+    let mut request = tonic::Request::new(FingerprintRequest {});
+    request
+        .metadata_mut()
+        .insert("authorization", "Bearer test-bearer".parse().unwrap());
+    let response = client
+        .fingerprint(request)
         .await
         .expect("gRPC shares the TLS listener");
     assert_eq!(response.into_inner().fingerprint.len(), 32);

@@ -19,6 +19,14 @@ use exocortex_client::sync::{run_sse_sync, SseSyncConfig};
 
 const HMAC_KEY: [u8; 32] = [7u8; 32];
 
+fn authed<T>(message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request
+        .metadata_mut()
+        .insert("authorization", "Bearer e2e-bearer".parse().unwrap());
+    request
+}
+
 async fn boot() -> (
     exocortex_server::backend::BackendNode,
     Arc<InMemoryStorage>,
@@ -35,19 +43,39 @@ async fn boot() -> (
             transport: exocortex_server::backend::TransportSecurity::PlaintextLoopback,
             node_id: "e2e-node".into(),
             cluster_secret: HMAC_KEY,
-            bearer_token: "e2e-bearer".into(),
+            principals: Arc::new(
+                exocortex_server::principal::PrincipalRegistry::single(
+                    "e2e-bearer".into(),
+                    exocortex_ops::operations::ops_vc(
+                        "org",
+                        "e2e",
+                        exocortex_kernel::Visibility::Org,
+                    ),
+                )
+                .unwrap(),
+            ),
             gossip_listen: "127.0.0.1:0".parse().unwrap(),
             seed_nodes: vec![],
             redis_url: None,
             quiet_hours: exocortex_dreams::fire::QuietHours::none(),
-            admin_ceilings: vec![(
+            admin_ceilings: vec![
                 (
-                    "org".into(),
-                    "iceberg://warehouse/orders".into(),
-                    "external-sync".into(),
+                    (
+                        "org".into(),
+                        "iceberg://warehouse/orders".into(),
+                        "external-sync".into(),
+                    ),
+                    exocortex_kernel::Visibility::Org,
                 ),
-                exocortex_kernel::Visibility::Org,
-            )],
+                (
+                    (
+                        "org".into(),
+                        "session://e2e".into(),
+                        "session-wrapup".into(),
+                    ),
+                    exocortex_kernel::Visibility::Org,
+                ),
+            ],
         },
     )
     .await
@@ -109,7 +137,7 @@ fn ext_batch(fp: [u8; 32], snapshot: &str, key: &str, title: &str) -> IngestBatc
 #[tokio::test(flavor = "multi_thread")]
 async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
     let (node, storage, onto, addr) = boot().await;
-    let _keepalive = node;
+    let keepalive = node;
 
     // Sibling client: cache + writer over the same storage (visibility of
     // the committed rows), SSE subscriber against the node's HTTP surface.
@@ -134,16 +162,22 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
         &HMAC_KEY,
         "e2e-bearer",
     ));
+    let connection_ready = Arc::new(tokio::sync::Notify::new());
+    cfg.connection_ready = Some(connection_ready.clone());
     let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 0, None));
-    // Let the subscriber establish its live stream first.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        connection_ready.notified(),
+    )
+    .await
+    .expect("SSE subscriber establishes its live stream");
 
     // Producer: register + submit over real gRPC.
     let mut client = IngestServiceClient::connect(format!("http://{addr}"))
         .await
         .unwrap();
     client
-        .register_source(exocortex_wire::signing::registration(
+        .register_source(authed(exocortex_wire::signing::registration(
             &HMAC_KEY,
             "org",
             "session://e2e",
@@ -152,7 +186,7 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
             "session",
             "n",
             exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
-        ))
+        )))
         .await
         .unwrap();
 
@@ -191,7 +225,11 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
             client_metadata: None,
         }),
     };
-    let ack = client.submit(signed(b.clone())).await.unwrap().into_inner();
+    let ack = client
+        .submit(authed(signed(b.clone())))
+        .await
+        .unwrap()
+        .into_inner();
     // D6: memory + InSession + companion.
     assert_eq!(ack.accepted, 3, "batch accepted over gRPC: {ack:?}");
 
@@ -207,6 +245,21 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
         }
         found.expect("committed row present")
     };
+
+    let subscriber_visibility = exocortex_ops::operations::ops_vc(
+        "org",
+        "e2e",
+        exocortex_kernel::Visibility::Org,
+    );
+    let stored = storage
+        .get_memory(&committed)
+        .await
+        .unwrap()
+        .expect("committed row remains readable");
+    assert!(
+        exocortex_storage::memory_visible(&stored, &subscriber_visibility),
+        "the authenticated subscriber principal can see the committed row"
+    );
 
     // §23 #18: the sibling observes it through the feed within 500ms.
     let vc = exocortex_ops::VisibilityContext {
@@ -228,7 +281,9 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
     sync.abort();
     assert!(
         seen,
-        "sibling client observed the commit via SSE within 500ms"
+        "sibling client observed the commit via SSE within 500ms (version={:?}, node_sync_lsn={})",
+        cache.version("org"),
+        keepalive.health.load().sync_lsn,
     );
 }
 
@@ -248,7 +303,7 @@ async fn two_sync_snapshot_bump_upserts_same_row_new_pk_appends() {
         .await
         .unwrap();
     client
-        .register_source(exocortex_wire::signing::registration(
+        .register_source(authed(exocortex_wire::signing::registration(
             &HMAC_KEY,
             "org",
             "iceberg://warehouse/orders",
@@ -257,7 +312,7 @@ async fn two_sync_snapshot_bump_upserts_same_row_new_pk_appends() {
             "external",
             "n",
             exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
-        ))
+        )))
         .await
         .unwrap();
 
@@ -267,7 +322,7 @@ async fn two_sync_snapshot_bump_upserts_same_row_new_pk_appends() {
         "order-7",
         "payments owned by team-payments",
     );
-    let ack1 = client.submit(s1).await.unwrap().into_inner();
+    let ack1 = client.submit(authed(s1)).await.unwrap().into_inner();
     assert_eq!(ack1.accepted, 1, "first sync lands: {ack1:?}");
 
     let s2 = ext_batch(
@@ -276,7 +331,7 @@ async fn two_sync_snapshot_bump_upserts_same_row_new_pk_appends() {
         "order-7",
         "payments owned by team-platform",
     );
-    let ack2 = client.submit(s2).await.unwrap().into_inner();
+    let ack2 = client.submit(authed(s2)).await.unwrap().into_inner();
     assert_eq!(ack2.accepted, 1, "second sync lands: {ack2:?}");
 
     // A different row is a genuinely new assertion.
@@ -286,7 +341,7 @@ async fn two_sync_snapshot_bump_upserts_same_row_new_pk_appends() {
         "order-8",
         "payments owned by team-platform",
     );
-    let ack3 = client.submit(s3).await.unwrap().into_inner();
+    let ack3 = client.submit(authed(s3)).await.unwrap().into_inner();
     assert_eq!(ack3.accepted, 1, "new logical_pk appends: {ack3:?}");
 
     use futures::StreamExt;

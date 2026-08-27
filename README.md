@@ -340,13 +340,20 @@ Run the node:
 ```sh
 exocortex-node --mode backend-node --storage falkor://falkordb:6379 \
   --bind 0.0.0.0:8080 --tls-cert /run/secrets/exocortex/tls.crt \
-  --tls-key /run/secrets/exocortex/tls.key --bearer-token <token>
+  --tls-key /run/secrets/exocortex/tls.key \
+  --principal-policy /run/secrets/exocortex/principals.json
 ```
 
 Shared/LAN binds require an operator-provided TLS certificate and key.
 For local development only, plaintext must be explicitly enabled with
 `--bind 127.0.0.1:8080 --allow-plaintext-loopback`; the node rejects that
 mode for every non-loopback address.
+
+`principals.json` is administrator-owned and fail-closed. Each row maps one
+non-empty `bearer_token` to `org_id`, `user_id`, explicit `project_ids` and
+`team_ids`, plus `max_visibility` (`0` private through `4` public). The same
+principal protects HTTP operations, SSE, metrics, and every gRPC method; a
+caller-supplied org or project/team scope never overrides this policy.
 
 Back up and restore the org's durable graph (disaster recovery —
 byte-faithful rows modulo storage-assigned LSNs, fingerprint-gated):
