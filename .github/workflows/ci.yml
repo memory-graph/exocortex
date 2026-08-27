@@ -53,6 +53,8 @@ jobs:
         run: cargo xtask wire-standalone
       - name: Signing hygiene (single batch-signing impl)
         run: cargo xtask signing-hygiene
+      - name: Metrics hygiene (bounded labels)
+        run: cargo xtask metrics-hygiene
       - name: SLO benches (R-Lat1; fail on regression)
         # Shared runners steal CPU; the budgets assume dedicated hardware.
         # x2 keeps the gate meaningful (a 2x regression still fails) while

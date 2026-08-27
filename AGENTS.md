@@ -105,6 +105,7 @@ cargo xtask gen-playbook    # playbook facts drift vs pack + RejectCode; block <
 cargo xtask no-llm
 cargo xtask proto-sync      # vendored wire protos match proto/
 cargo xtask signing-hygiene # one batch-signing impl; no unsigned submitters
+cargo xtask metrics-hygiene # authenticated metrics; bounded literal labels only
 cargo xtask wire-standalone # packaged wire builds standalone
 cargo xtask bench           # SLO gates (search, k-hop)
 cargo xtask storage-conformance   # §2.1 one suite, double + live Falkor (FALKOR_URL)

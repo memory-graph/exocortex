@@ -46,6 +46,8 @@ enum Cmd {
     ProtoSync,
     WireStandalone,
     SigningHygiene,
+    /// Metrics expose no identity labels or caller-controlled cardinality.
+    MetricsHygiene,
     /// GATE1 (audit §2.1): one storage suite, both backends — the double
     /// always, live Falkor when FALKOR_URL is set — asserting identical
     /// results.
@@ -75,6 +77,7 @@ fn main() -> Result<()> {
         Cmd::ProtoSync => proto_sync(),
         Cmd::WireStandalone => wire_standalone(),
         Cmd::SigningHygiene => signing_hygiene(),
+        Cmd::MetricsHygiene => metrics_hygiene(),
         Cmd::StorageConformance => storage_conformance(),
         Cmd::WritePathParity => write_path_parity(),
         Cmd::DeadEnforcement => dead_enforcement(),
@@ -677,6 +680,100 @@ fn signing_hygiene() -> anyhow::Result<()> {
     }
     println!("signing-hygiene ok: single batch-signing implementation; no unsigning blank-checksum submitters");
     Ok(())
+}
+
+fn metrics_hygiene() -> anyhow::Result<()> {
+    let mut offenders = Vec::new();
+    for entry in walk_rss(std::path::Path::new("crates"))? {
+        let src = std::fs::read_to_string(&entry)?;
+        for issue in metrics_hygiene_issues(&src) {
+            offenders.push(format!("{}: {issue}", entry.display()));
+        }
+    }
+    anyhow::ensure!(
+        offenders.is_empty(),
+        "metrics-hygiene FAILED:\n{}",
+        offenders.join("\n")
+    );
+    println!("metrics-hygiene ok: authenticated surface; literal bounded labels only");
+    Ok(())
+}
+
+fn metrics_hygiene_issues(src: &str) -> Vec<String> {
+    const MACROS: &[&str] = &[
+        "metrics::counter!(",
+        "metrics::gauge!(",
+        "metrics::histogram!(",
+    ];
+    const FORBIDDEN: &[&str] = &[
+        "graph",
+        "org",
+        "org_id",
+        "user",
+        "user_id",
+        "producer",
+        "producer_id",
+        "client_version",
+        "playbook_version",
+    ];
+    let mut issues = Vec::new();
+    for marker in MACROS {
+        let mut rest = src;
+        while let Some(start) = rest.find(marker) {
+            rest = &rest[start + marker.len()..];
+            let mut depth = 1usize;
+            let mut end = rest.len();
+            for (index, ch) in rest.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = index;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let invocation = &rest[..end];
+            for segment in invocation.split(',').filter(|part| part.contains("=>")) {
+                let Some((key, value)) = segment.split_once("=>") else {
+                    continue;
+                };
+                let key = key.trim().trim_matches('"');
+                if FORBIDDEN.contains(&key) {
+                    issues.push(format!("forbidden identity label `{key}`"));
+                }
+                let value = value.trim();
+                if !value.starts_with('"') && value != "entry.name" {
+                    issues.push(format!("label `{key}` has a non-literal value"));
+                }
+            }
+            if end == rest.len() {
+                break;
+            }
+            rest = &rest[end + 1..];
+        }
+    }
+    issues
+}
+
+#[cfg(test)]
+mod metrics_hygiene_tests {
+    use super::metrics_hygiene_issues;
+
+    #[test]
+    fn rejects_identity_and_dynamic_metric_labels() {
+        let bad = r#"metrics::counter!("requests", "producer_id" => producer.clone(), "outcome" => "ok");"#;
+        let issues = metrics_hygiene_issues(bad);
+        assert!(issues.iter().any(|issue| issue.contains("identity")));
+        assert!(issues.iter().any(|issue| issue.contains("non-literal")));
+        assert!(
+            metrics_hygiene_issues(r#"metrics::counter!("requests", "outcome" => "ok");"#)
+                .is_empty()
+        );
+    }
 }
 
 fn walk_rss(dir: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {

@@ -384,9 +384,9 @@ impl LocalCache {
                     // R-O2 families: rebuild counts + graph size levels.
                     metrics::counter!("exocortex_cache_rebuild_total", "reason" => "reseed")
                         .increment(1);
-                    metrics::gauge!("exocortex_memories_total", "graph" => org.to_string())
+                    metrics::gauge!("exocortex_memories_total")
                         .set(snapshot.petgraph.node_count() as f64);
-                    metrics::gauge!("exocortex_relationships_total", "graph" => org.to_string(), "provenance" => "all")
+                    metrics::gauge!("exocortex_relationships_total", "provenance" => "all")
                         .set(snapshot.petgraph.edge_count() as f64);
                     let bytes = snapshot.est_bytes;
                     {

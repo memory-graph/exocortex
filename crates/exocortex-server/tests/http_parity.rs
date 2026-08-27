@@ -225,7 +225,7 @@ async fn every_operation_answers_over_http_with_auth() {
     assert_eq!(status, 401, "wrong bearer rejected");
 
     // H4: observability endpoints.
-    let (status, body, text) = http(addr, "GET", "/metrics", None, None).await;
+    let (status, body, text) = http(addr, "GET", "/metrics", Some("secret-token"), None).await;
     assert_eq!(status, 200);
     assert!(body.is_null(), "metrics is text, not JSON");
     assert!(text.contains("exocortex"), "prometheus text format: {text}");

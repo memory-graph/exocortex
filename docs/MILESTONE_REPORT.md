@@ -357,3 +357,21 @@ per window, not per submit. release.toml returned to the workspace root
 (cargo-release only reads it there); every crate inherits
 repository.workspace; the wire tarball now ships the LICENSE (with a
 proto-sync-guarded copy).
+
+### Round 6 contract clarifications (2026-08-27)
+
+- **Metrics privacy overrides R-MT5 label identity.** Round 6 B26 requires
+  bounded-cardinality metrics without raw org, user, producer, or free-form
+  version labels. Shared-mode `/metrics` is authenticated; graph/user identity
+  is no longer emitted as a Prometheus label. The older R-MT5 wording that
+  required graph and caller identifiers would leak tenant identity and permit
+  caller-controlled cardinality, so the stricter security contract governs.
+- **Bounded MCP content clarifies R-T5.** R-T5's non-empty-content rule did not
+  state an upper bound. Round 6 B25 adds explicit request/content/tag/edge
+  ceilings before expensive decode and work; this is a security/resource
+  clarification, not an ontology change.
+- **Discovery authorization metadata extends the v1 proposal shape.** Round 6
+  B05 requires immutable org/region/visibility scope on server-issued
+  proposals so acceptance can be authorized and replay-safe. The prior
+  Discovery shape omitted those fields; they are enforcement metadata rather
+  than a silent change to discovery semantics.

@@ -102,6 +102,11 @@ async fn every_endpoint_rejects_unauthenticated_calls() {
         let status = unauth(addr, "GET", path, None).await;
         assert_eq!(status, 401, "GET {path} must reject unauthenticated");
     }
+    assert_eq!(
+        unauth(addr, "GET", "/metrics", None).await,
+        401,
+        "metrics must not expose deployment data without authentication"
+    );
 }
 
 /// The registry's own method declaration (http crate re-exported via axum).

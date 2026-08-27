@@ -97,13 +97,28 @@ impl HttpBind {
                 ops.route(entry.http_path, post(handler))
             };
         }
-        // The bearer layer must cover every mounted route — ops and the
-        // SSE feed alike — before the merge with the unauthenticated
-        // observability endpoints.
+        // The bearer layer covers operations, SSE, and metrics. Health is
+        // deliberately identity-free and remains probeable without secrets.
         let mut protected = ops;
         if let Some(extra) = extra {
             protected = protected.merge(extra);
         }
+        let prom = self.prometheus.clone();
+        protected = protected.route(
+            "/metrics",
+            get(move || {
+                let text = prom.render();
+                async move {
+                    (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4",
+                        )],
+                        text,
+                    )
+                }
+            }),
+        );
         let bearer = self.bearer.clone();
         let protected = protected.layer(middleware::from_fn(move |req, next| {
             auth(req, next, bearer.clone())
@@ -114,24 +129,8 @@ impl HttpBind {
         let health_cluster = self.health.clone();
         let health_sync = self.health.clone();
         let health_hydration = self.health.clone();
-        let prom = self.prometheus.clone();
         let ctx = self.ctx.clone();
         let obs = Router::new()
-            .route(
-                "/metrics",
-                get(move || {
-                    let text = prom.render();
-                    async move {
-                        (
-                            [(
-                                axum::http::header::CONTENT_TYPE,
-                                "text/plain; version=0.0.4",
-                            )],
-                            text,
-                        )
-                    }
-                }),
-            )
             .route(
                 "/health/ready",
                 get(move || {

@@ -547,9 +547,7 @@ impl<S: Storage> IngestServer<S> {
         // rejects on embedder health.
         if let Some(embedder) = &self.embedder {
             if let Ok(v) = embedder.embed(&format!("{}\n{}", m.title, m.content)) {
-                metrics::counter!("exocortex_ingest_embeddings_total",
-                    "model" => embedder.model_id())
-                .increment(1);
+                metrics::counter!("exocortex_ingest_embeddings_total").increment(1);
                 mem.embedding = Some(v);
             }
         }
@@ -1084,23 +1082,9 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         // registered source and the signed client metadata (§4.4);
         // unknown/absent telemetry degrades to "unknown", never drops the
         // row.
-        let meta = batch
-            .producer
-            .as_ref()
-            .and_then(|p| p.client_metadata.as_ref());
-        metrics::counter!(
-            "exocortex_ingest_batches_total",
-            "producer_id" => batch.producer_id.clone(),
-            "producer_kind" => format!("{:?}", source.kind),
-            "playbook_version" => meta.map(|m| m.playbook_version.clone()).unwrap_or_else(|| "unknown".into()),
-            "client_version" => meta.map(|m| m.client_version.clone()).unwrap_or_else(|| "unknown".into()),
-        )
-        .increment(1);
-        metrics::counter!(
-            "exocortex_ingest_memories_accepted_total",
-            "producer_id" => batch.producer_id.clone(),
-        )
-        .increment(committed_memories.len() as u64);
+        metrics::counter!("exocortex_ingest_batches_total").increment(1);
+        metrics::counter!("exocortex_ingest_memories_accepted_total")
+            .increment(committed_memories.len() as u64);
         if grouping_nodes_created > 0 {
             metrics::counter!("exocortex_grouping_nodes_created_total").increment(1);
         }
