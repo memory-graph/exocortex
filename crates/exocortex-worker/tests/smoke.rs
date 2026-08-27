@@ -65,6 +65,8 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
             &format!("127.0.0.1:{gossip_port}"),
             "--bearer-token",
             "fixture-e2e",
+            "--cluster-secret",
+            "4242424242424242424242424242424242424242424242424242424242424242",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

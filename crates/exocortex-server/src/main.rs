@@ -61,7 +61,8 @@ struct Args {
     /// loopback dev token for local iteration.
     #[arg(long)]
     bearer_token: Option<String>,
-    /// Cluster-shared HMAC secret (64 hex chars; defaults to a dev key).
+    /// Cluster-shared HMAC secret (exactly 64 hex chars). Required for every
+    /// backend node; tests inject an explicit known key.
     #[arg(long)]
     cluster_secret: Option<String>,
     /// redis-server binary for the embedded supervisor.
@@ -223,14 +224,8 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
             std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
         // Storage arms stay concrete (run_backend_node is generic over the
         // backend); a shared tail serves whichever arm won.
-        // M2: a PROVIDED secret must parse — silently falling back to the
-        // public dev key on a typo would ship a known-key node.
-        let cluster_secret = match args.cluster_secret.as_deref() {
-            None => [0x42u8; 32],
-            Some(hex) => exocortex_wire::signing::decode_hex32(hex)
-                .map_err(|e| anyhow::anyhow!("--cluster-secret: {e}"))?,
-        };
-        let bearer_token = resolve_bearer(&args)?;
+        let cluster_secret = resolve_cluster_secret(args.cluster_secret.as_deref())?;
+        let bearer_token = resolve_bearer(args.bearer_token.as_deref())?;
         let node_id = args
             .node_id
             .clone()
@@ -294,28 +289,24 @@ async fn serve_forever<S: exocortex_storage::Storage + 'static>(
     }
 }
 
-/// R-Sec7: the op surface never ships a default credential. Release
-/// builds fail fast when `--bearer-token` is absent; debug builds fall
-/// back to the loopback dev token with a loud warning.
-fn resolve_bearer(args: &Args) -> anyhow::Result<String> {
-    match &args.bearer_token {
-        Some(t) => Ok(t.clone()),
-        None => {
-            #[cfg(debug_assertions)]
-            {
-                tracing::warn!(
-                    "--bearer-token absent; using the DEBUG-ONLY dev token (never in release)"
-                );
-                Ok("exocortex-dev-bearer".to_string())
-            }
-            #[cfg(not(debug_assertions))]
-            {
-                anyhow::bail!(
-                    "--bearer-token is required in release builds (R-Sec7: no default credential)"
-                )
-            }
-        }
-    }
+/// Shared/backend mode never derives authentication material from a public
+/// fallback. Local tests and fixtures pass explicit known values.
+fn resolve_cluster_secret(secret: Option<&str>) -> anyhow::Result<[u8; 32]> {
+    let secret = secret.filter(|value| !value.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!("--cluster-secret is required for backend-node (64 hex chars)")
+    })?;
+    exocortex_wire::signing::decode_hex32(secret)
+        .map_err(|e| anyhow::anyhow!("--cluster-secret: {e}"))
+}
+
+/// R-Sec7: every shared transport starts with a non-empty bearer. There is no
+/// debug-build exception because debug binaries are routinely used in shared
+/// integration environments.
+fn resolve_bearer(token: Option<&str>) -> anyhow::Result<String> {
+    token
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("--bearer-token must be non-empty for backend-node"))
 }
 
 /// Data dir under the user's data home (§4.3).
@@ -334,4 +325,24 @@ fn data_home() -> anyhow::Result<std::path::PathBuf> {
     };
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_bearer, resolve_cluster_secret};
+
+    #[test]
+    fn backend_credentials_fail_closed_when_missing_empty_or_malformed() {
+        assert!(resolve_cluster_secret(None).is_err());
+        assert!(resolve_cluster_secret(Some("")).is_err());
+        assert!(resolve_cluster_secret(Some("42")).is_err());
+        assert_eq!(
+            resolve_cluster_secret(Some(&"42".repeat(32))).unwrap(),
+            [0x42; 32]
+        );
+
+        assert!(resolve_bearer(None).is_err());
+        assert!(resolve_bearer(Some("")).is_err());
+        assert_eq!(resolve_bearer(Some("test-token")).unwrap(), "test-token");
+    }
 }

@@ -48,6 +48,8 @@ fn spawn_node() -> Node {
             &format!("127.0.0.1:{gossip}"),
             "--bearer-token",
             "oop-test-bearer",
+            "--cluster-secret",
+            "4242424242424242424242424242424242424242424242424242424242424242",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

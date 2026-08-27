@@ -167,6 +167,13 @@ each step (88 tests at completion).
 | R6-A1 | Advisory test quality and cleanup (A01-A08) | Codex | Round 6 remediation in progress |
 | R6-Q1 | Evidence R6-U01 through R6-U04 and promote confirmed defects | Codex | Investigation in progress |
 
+### Round 6 item evidence
+
+| ID | Disposition | Evidence |
+|----|-------------|----------|
+| R6-B01 | **Done** — backend-node and backend clients fail closed without explicit signing/authentication material; no public release key remains | `exocortex-server` unit `backend_credentials_fail_closed_when_missing_empty_or_malformed`; `exocortex-client/tests/stdio_smoke.rs::backend_mode_requires_nonempty_authentication_material`; real-node `adapter_sdk_out_of_process` passes only with an explicit fixture secret |
+| R6-U01 | **Promoted — fix in progress** — empty bearer is rejected at startup; executable inspection found gRPC still outside bearer middleware | Startup regression above; transport-wide principal/auth fix remains under R6-B02 |
+
 ## Done
 
 All 70 audit defects were fixed with per-defect tests (fail-without-fix)

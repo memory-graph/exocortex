@@ -465,6 +465,46 @@ fn malformed_hmac_key_fails_startup() {
     }
 }
 
+#[test]
+fn backend_mode_requires_nonempty_authentication_material() {
+    let bin = env!("CARGO_BIN_EXE_exocortex-mcp-client");
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["--backend", "http://127.0.0.1:1", "--auth-token", "token"],
+            "hmac-key",
+        ),
+        (
+            &[
+                "--backend",
+                "http://127.0.0.1:1",
+                "--hmac-key",
+                "4242424242424242424242424242424242424242424242424242424242424242",
+            ],
+            "auth-token",
+        ),
+        (
+            &[
+                "--backend",
+                "http://127.0.0.1:1",
+                "--hmac-key",
+                "4242424242424242424242424242424242424242424242424242424242424242",
+                "--auth-token",
+                "",
+            ],
+            "auth-token",
+        ),
+    ];
+    for (args, expected) in cases {
+        let out = std::process::Command::new(bin)
+            .args(*args)
+            .output()
+            .expect("run client");
+        assert!(!out.status.success(), "backend mode must fail closed");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(expected), "{expected} diagnostic: {stderr}");
+    }
+}
+
 /// IN10 (audit): the MCP read tools and the HTTP surface serve the SAME
 /// registry implementation — running one input through `entry.handler`
 /// and through the MCP server's typed method yields identical JSON for

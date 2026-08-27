@@ -113,6 +113,12 @@ fn main() -> anyhow::Result<()> {
         ),
         None => None,
     };
+    if args.backend.is_some() && hmac_key.is_none() {
+        anyhow::bail!("--hmac-key is required when --backend is configured");
+    }
+    if args.backend.is_some() && args.auth_token.as_deref().is_none_or(str::is_empty) {
+        anyhow::bail!("--auth-token must be non-empty when --backend is configured");
+    }
 
     // Ontology: fail fast if the linked pack set does not assemble. The
     // black_box reference force-links the pack so its inventory registration
@@ -216,6 +222,7 @@ fn main() -> anyhow::Result<()> {
     // producer HMAC key. Connect lazily at first call when unreachable. The
     // channel is built INSIDE the runtime (connect_lazy needs a reactor).
     let backend = args.backend.clone();
+    // Backend mode was validated above; standalone never submits this value.
     let hmac_key = hmac_key.unwrap_or([0u8; 32]);
     let org = args.org.clone();
     let user = args.user.clone();
