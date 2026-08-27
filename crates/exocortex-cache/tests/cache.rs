@@ -482,3 +482,40 @@ async fn relationship_reupsert_does_not_duplicate() {
     assert_eq!(count, 1, "CR5: exactly one edge for the RelationshipId");
     writer.abort();
 }
+
+/// BR-PRD regression (found by the idempotent-import test): repeated
+/// upserts of one id must leave exactly ONE live search-arena key.
+/// StableGraph reuses freed node indices, so `search_nodes` can hold
+/// several slots pointing at the same index (prior incarnations);
+/// blanking only the first leaked the later incarnations' keys and
+/// served the same memory twice in one search.
+#[test]
+fn repeated_upsert_does_not_leak_arena_keys() {
+    let id = MemoryId::new_v7();
+    let mut snap = GraphSnapshot::empty();
+    let mut m = mem("leak-check", Visibility::Org, None);
+    m.id = id;
+    for round in 0..5 {
+        m.title = format!("leak-check r{round}").into();
+        snap.push_test_memory(m.clone()); // push_test_memory == insert_memory (upsert)
+    }
+    let vc = VisibilityContext {
+        user_id: "u".into(),
+        org_id: "org".into(),
+        project_ids: Default::default(),
+        team_ids: Default::default(),
+        max_visibility: Visibility::Org,
+    };
+    let hits = snap.view(&vc).filter(|x| x.id == id).count();
+    assert_eq!(hits, 1, "one row, not one per upsert");
+    // And the arena itself: only the LAST incarnation's key is live.
+    for round in 0..5 {
+        let needle = format!("leak-check r{round}");
+        let n = snap.search_arena.matches(&needle).count();
+        let expected = usize::from(round == 4);
+        assert_eq!(
+            n, expected,
+            "round {round} key occurrences (want {expected})"
+        );
+    }
+}

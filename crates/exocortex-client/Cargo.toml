@@ -1,7 +1,7 @@
 # crates/exocortex-client/Cargo.toml
 [package]
 name    = "exocortex-client"
-version = "0.2.1" # SR-PRD: standalone read-back (write→read loop in the zero-setup mode)
+version = "0.2.2" # BR-PRD: memory backup/restore (portable WAL export/import)
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

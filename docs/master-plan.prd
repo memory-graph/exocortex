@@ -1,5 +1,22 @@
 # Exocortex — Master Plan
 
+**Status:** BR-PRD shipped. **[2026-08-27]** Memory backup/restore
+landed as `exocortex-client 0.2.2`: `--export`/`--import` one-shot
+modes over a versioned, fingerprint-stamped file in the WAL's own row
+shape — all-or-nothing restore (fingerprint gate fails closed, drafts
+revalidated against the one rulebook, ids/batch-ids/states preserved
+so `Synced` never re-drains), idempotent by construction. All five
+acceptance criteria in `client/tests/backup_restore.rs`; the
+idempotent-import test additionally caught a real cache defect
+(stale search-arena keys on repeated upserts — StableGraph index
+reuse vs first-slot-only blanking) — fixed in the same release with
+its own regression test. Also this session: the README was
+repositioned (structure-over-prose hook, MCR² explainer, feed paths
+named, memory-graph lineage section), generated hero images landed
+(README + ontology guide), and `docs/ONTOLOGY_GUIDE.md` (the pack
+authoring guide) shipped. Remote moved to
+`github.com/memory-graph/exocortex`; install URLs now resolve.
+
 **Status:** SR-PRD shipped. **[2026-08-26, night]** Standalone
 read-back (F1-F5) landed as `exocortex-client 0.2.1` (see the Done
 table's SR-PRD rows). The zero-setup mode's write→read loop is closed:
@@ -44,19 +61,24 @@ items are promoted into this file, tracked to done, and never silently
 dropped. Anything not listed here is either shipped or explicitly deferred
 to v2 in the PRD's own terms.
 
-**Current baseline (2026-08-26, post-SR-PRD):** 223 tests / 1 flaky
-across 72 suites (`cargo test --workspace --features
-exocortex-adapter-sdk/testing` — the feature is mandatory: a lib canary
-fails any run that would leave the SDK's mock-driven suites dark; count
-with `--no-fail-fast` — fail-fast stops at the first flaky binary). The one failure is the known
-`sse_feed_observed_by_client_cache_within_500ms` 500ms window under
-full parallel load (pre-existing; passes on clean serial runs —
-`e2e_chain` shows the same class occasionally). Full gate pipeline
-green: fmt, clippy, deny, tests, kernel-purity, fingerprint
-(`e1f7d17b…ddc9b2`, unchanged through SR-PRD), gen-schemas (7
-operations), gen-playbook (48 kinds / 47 assertable), no-llm,
-proto-sync, signing-hygiene, wire-standalone, plus the five seam
-gates. `exocortex-client` at 0.2.1; the other 13 crates at 0.1.0.
+**Current baseline (2026-08-27, post-BR-PRD):** 229 tests / 0 failed
+across 73 suites (`cargo test --workspace --features
+exocortex-adapter-sdk/testing --no-fail-fast` — the feature is
+mandatory: a lib canary fails any run that would leave the SDK's
+mock-driven suites dark). The known 500ms SSE-window flake
+(`sync.rs::sse_feed_observed_by_client_cache_within_500ms` and
+`e2e_chain`'s same-class window) remains: pre-existing, green on clean
+runs, noisier under heavy parallel builds — observed pass rate varies
+with machine load. Full gate pipeline green: fmt, clippy, deny, tests,
+kernel-purity, fingerprint (`e1f7d17b…ddc9b2`, unchanged through
+SR-PRD and BR-PRD), gen-schemas (7 operations), gen-playbook (48 kinds
+/ 47 assertable), no-llm, proto-sync, signing-hygiene, wire-standalone,
+plus the five seam gates. `exocortex-client` at 0.2.2; the other 13
+crates at 0.1.0.
+
+**Prior baseline (2026-08-26, post-SR-PRD):** 223 tests / 1 flaky
+across 72 suites; fingerprint `e1f7d17b…ddc9b2`; `exocortex-client`
+at 0.2.1.
 
 **Prior baseline (2026-08-26, post-A-PRD):** 213 tests / 1 flaky
 across 71 suites. Full gate pipeline green as above; fingerprint
@@ -118,6 +140,8 @@ each step (88 tests at completion).
 | WS3-WS5 | Wire: NaN strength persisted, `confidence == 0.0` silently rewritten, unknown `Visibility` discriminants coerced to the widest value | audit §5 | **Done** — WS3 (admit_and_publish, above); WS4 non-finite/out-of-range rejected (`nan_strength_rejected`); WS5 unknown discriminants rejected fail-closed (`unknown_visibility_discriminant_rejected`) |
 | GATE1 | Five proposed seam gates: `storage-conformance`, `write-path-parity`, `dead-enforcement`, `auth-coverage`, `artifact-equivalence` | audit §9 | **Done** — all five wired as `cargo xtask` commands (AGENTS.md gate list updated); each fails when its underlying suite fails |
 | A-PRD | Agent instructions & onboarding (playbook, preflight, grouping, producer kind, telemetry, maintenance loop) | `agent-instructions-prd.md` rev 5 | **Done** — D1-D10 shipped as `exocortex-client 0.2.0`; see the Done table's A-PRD row for the worklist-to-code map |
+| BR-PRD | Memory backup/restore (standalone WAL): `--export`/`--import` one-shot modes, deterministic fingerprint-gated format, idempotent state-preserving restore | `docs/prd/backup-restore-prd.md` | **Done** — shipped as `exocortex-client 0.2.2`; all five acceptance criteria in `client/tests/backup_restore.rs`; found+fixed a real cache defect on the way (see the Done table's BR-PRD rows) |
+| DF1 | Dogfood: install exocortex as the MCP memory server for Charm Crush (crushrc `mcp add`, instruction block into Crush's global context, `--verify` green, first end-to-end writes) | this session | Proposed — install was blocked mid-flight by a sandboxed `cargo install`; retry in the foreground
 | SR-PRD | Standalone read-back (F1-F5): materializer, live write-back, boot seeding, synthetic-seed removal, local D6 parity — the zero-setup mode write→read loop | `docs/bug-prd-standalone-readback.md` | **Done** — shipped as `exocortex-client 0.2.1`; one commit per fix (F3+F4 combined — replacing the boot seed left the synth path dead code); all seven acceptance criteria covered by `client/tests/standalone_readback.rs` (AC5 additionally by `e2e_chain` + the CL5 stdio test) |
 
 
@@ -153,6 +177,14 @@ are recorded in the "Rounds 4-5" section below.
 | F3+F4 boot seeding + synth removal | standalone boot seeds from ALL WAL entries (`Pending`/`Synced`/`Failed` — nothing else ever delivers them) via `materialize_all` + `seed_local`; backend seeds nothing (server ids differ); `synth_snapshot` deleted; honest-empty fresh installs; README gap note retired | `client/src/main.rs`; `standalone_readback.rs::cross_restart_read_back_with_stable_ids`, `boot_seeds_pending_synced_and_failed_entries`; `stdio_smoke.rs::serves_mcp_over_stdio_honestly_empty_on_fresh_dir` |
 | F5 grouping parity | client-side `grouping_node_local`/`grouping_edge_local` (ingest dev-deps client — a src-dep would cycle) minted per session entry; pinned byte-identical to `exocortex-ingest`'s builders | `client/src/materialize.rs`; `standalone_readback.rs::grouping_parity_with_backend_commit_path`, `edges_and_grouping_readable_dangling_edge_harmless`, lib `grouping_rows_minted_per_session` |
 | P-release | `exocortex-client` 0.2.1 | `Cargo.toml` |
+| **BR-PRD (memory backup/restore, 0.2.2)** | | |
+| B1-B3 export/import | `backup.rs` (versioned fingerprint-stamped JSON over the WAL's own row shape); one-shot `--export`/`--import` CLI modes; `Wal::append_imported` (re-keyed LSN, ids/batch-id/state preserved); all-or-nothing import with fingerprint gate + per-draft revalidation | `client/src/backup.rs`, `client/src/wal.rs`, `client/src/main.rs`; `backup_restore.rs` (all five ACs: round trip, idempotent import, fingerprint abort, empty round trip, states ride verbatim) |
+| Cache defect (found by BR-PRD's idempotent-import test) | repeated upserts of one id leaked stale search-arena keys: `remove_memory` blanked only the FIRST slot matching the node index, but StableGraph reuses freed indices, so prior incarnations' keys stayed live — one memory served twice in a single search. Blank every slot pointing at the removed node | `cache/src/lib.rs::remove_memory`; `cache.rs::repeated_upsert_does_not_leak_arena_keys` |
+| **Docs & positioning (2026-08-27)** | | |
+| README repositioning | structure-over-prose hook aimed at context engineering; MCR² plain-language explainer + illustration; feed paths named (agents, `exocortex-adapter-mintlify`, planned S3 Tables/Iceberg); "Not our first memory system" lineage section; six-item checklist fix; "Memories are the nodes" | `README.md` |
+| Ontology guide | `docs/ONTOLOGY_GUIDE.md` — what an ontology is, design methodology, dev-v1 walkthrough, three worked domain packs (legal, clinical, secops), authoring workflow; linked from README + AGENTS.md index | `docs/ONTOLOGY_GUIDE.md`, `images/ontology-guide.jpeg` |
+| Hero images | generated blueprint-style heroes for README and the ontology guide | `images/hero.jpeg`, `images/ontology-guide.jpeg` |
+| Remote | origin moved to `github.com/memory-graph/exocortex` — README install URLs now resolve | `git remote` |
 | **A-PRD (agent instructions, PRD rev 5)** | | |
 | D1 playbook | Versioned playbook compiled into the client, installed to `~/.exocortex/`, generated kind/reject tables + `xtask gen-playbook` drift gate (authored-only filter: 48 kinds / 47 assertable, companions excluded) | `client/src/playbook.rs` + `playbook/v1_0_0.md`; `xtask gen-playbook` (CI) |
 | D2 preflight | `preflight_wrapup` registered in OPS (one handler, MCP+HTTP+goldens), `end_session` self-preflights (r4), correction hints from the merged wire guidance table, `unverified` boundary list | `ops/src/preflight.rs` + `operations.rs`; `client/src/tools/end_session.rs`; `wire/src/corrections.rs` (adapter-sdk classify now thin); `ingest/tests/grouping.rs`, `client/tests/stdio_smoke.rs` |

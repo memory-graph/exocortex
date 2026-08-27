@@ -182,9 +182,18 @@ impl GraphSnapshot {
                 }
             }
             // Blank the removed key in place (arena stays append-only). The
-            // slot is found through the CR3 parallel array — the node index
-            // it holds may not equal the slot index.
-            if let Some(slot) = self.search_nodes.iter().position(|n| *n == ix) {
+            // CR3 parallel array may hold MORE THAN ONE slot pointing at
+            // this node index: StableGraph reuses freed indices, so an
+            // upsert-heavy build (boot seeding over a WAL with duplicate
+            // ids, e.g. a re-imported backup) can leave slots from prior
+            // incarnations of the same index. All of them are stale once
+            // the node is removed — blank every match, not just the first
+            // (found by BR-PRD's idempotent-import test: a leaked stale
+            // key served the same memory twice in one search).
+            for (slot, n) in self.search_nodes.iter().enumerate() {
+                if *n != ix {
+                    continue;
+                }
                 let from = self.search_offsets.get(slot).copied().unwrap_or(0) as usize;
                 let to = self
                     .search_offsets

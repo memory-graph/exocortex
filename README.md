@@ -237,6 +237,8 @@ authenticated HTTP.
 | `--dump-block` | — | Print the CLAUDE.md/AGENTS.md instruction block and exit. |
 | `--verify` | — | Green/red checklist of every client-checkable write precondition; exit code = red count. |
 | `--tail-audit [--last N]` | 5 | Print the N most recent local writes (WAL), newest first. |
+| `--export <file>` | — | One-shot backup: dump every WAL entry (all states, LSN order) to a versioned, fingerprint-stamped JSON file. |
+| `--import <file>` | — | One-shot restore: import a backup into this data-dir's WAL — all-or-nothing, fingerprint-gated, idempotent (same ids upsert; `Synced` entries never re-drain). |
 
 ## The ontology
 

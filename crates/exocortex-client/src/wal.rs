@@ -154,7 +154,31 @@ impl Wal {
         draft_keys: Vec<String>,
         tags: Vec<Vec<String>>,
     ) -> Result<u64, WalError> {
-        let local_lsn = self
+        let entry = WalEntry {
+            local_lsn: 0,
+            session_id: session_id.to_string(),
+            memories,
+            memory_ids,
+            state: WalState::Pending,
+            batch_id,
+            draft_keys,
+            tags,
+        };
+        self.insert_entry(entry)
+    }
+
+    /// BR-PRD: append one IMPORTED entry, preserving its ids, batch id,
+    /// rebuild inputs, and state verbatim; only the local LSN is re-keyed
+    /// to this WAL's next slot. State preservation is load-bearing — a
+    /// `Synced` entry must not re-drain, a `Failed` one keeps its history.
+    pub fn append_imported(&self, mut entry: WalEntry) -> Result<u64, WalError> {
+        entry.local_lsn = 0;
+        self.insert_entry(entry)
+    }
+
+    /// Assign the next local LSN, run the byte budget (R-Sc8), persist.
+    fn insert_entry(&self, mut entry: WalEntry) -> Result<u64, WalError> {
+        entry.local_lsn = self
             .tree
             .last()
             .map_err(|e| WalError::Io(e.to_string()))?
@@ -164,16 +188,7 @@ impl Wal {
                 u64::from_be_bytes(b) + 1
             })
             .unwrap_or(1);
-        let entry = WalEntry {
-            local_lsn,
-            session_id: session_id.to_string(),
-            memories,
-            memory_ids,
-            state: WalState::Pending,
-            batch_id,
-            draft_keys,
-            tags,
-        };
+        let local_lsn = entry.local_lsn;
         let bytes = encode_entry(&entry).map_err(WalError::Io)?;
         if self.used_bytes() + bytes.len() as u64 > self.max_bytes {
             return Err(WalError::Full(self.used_bytes(), self.max_bytes));

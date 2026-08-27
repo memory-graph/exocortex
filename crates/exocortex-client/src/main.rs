@@ -64,6 +64,15 @@ struct Args {
     /// `--tail-audit` row count (default 5).
     #[arg(long, default_value = "5")]
     last: usize,
+    /// BR-PRD: one-shot backup — dump every WAL entry (all states, LSN
+    /// order) to a versioned, fingerprint-stamped JSON file, then exit.
+    #[arg(long)]
+    export: Option<std::path::PathBuf>,
+    /// BR-PRD: one-shot restore — import a backup file into this
+    /// data-dir's WAL (all-or-nothing; fingerprint-gated; idempotent),
+    /// then exit.
+    #[arg(long)]
+    import: Option<std::path::PathBuf>,
 }
 
 fn org_visibility(org: &str, user: &str) -> VisibilityContext {
@@ -118,6 +127,31 @@ fn main() -> anyhow::Result<()> {
 
     if args.tail_audit {
         return tail_audit(&data_dir.join("wal"), args.last);
+    }
+
+    // BR-PRD one-shot modes (no server, no cache, exit immediately).
+    let fingerprint_hex = {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(64);
+        for b in ontology.fingerprint.0 {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    };
+    if let Some(path) = &args.export {
+        let wal = wal::Wal::open(&data_dir.join("wal"))?;
+        let n = exocortex_client::backup::export(&wal, &fingerprint_hex, path)?;
+        println!("{n} entries -> {}", path.display());
+        return Ok(());
+    }
+    if let Some(path) = &args.import {
+        let wal = wal::Wal::open(&data_dir.join("wal"))?;
+        let report = exocortex_client::backup::import(&wal, &ontology, path)?;
+        println!(
+            "{} entries restored (first local_lsn {})",
+            report.imported, report.first_local_lsn
+        );
+        return Ok(());
     }
 
     // D5: install the playbook on first run / upgrade; notify on stderr
