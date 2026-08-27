@@ -113,6 +113,7 @@ cargo xtask write-path-parity     # W2  offline + ingest validators agree (golde
 cargo xtask dead-enforcement      # §2.2 invariant/security fns have live callers
 cargo xtask auth-coverage         # §2.3 every endpoint rejects unauthenticated calls
 cargo xtask artifact-equivalence  # §2.4 pack rules == engine; MCP result == registry
+cargo xtask acceptance-coverage   # §23 requirement-to-test/gate matrix is complete and current
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these on push; the toolchain

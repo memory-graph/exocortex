@@ -375,3 +375,12 @@ proto-sync-guarded copy).
   proposals so acceptance can be authorized and replay-safe. The prior
   Discovery shape omitted those fields; they are enforcement metadata rather
   than a silent change to discovery semantics.
+- **External snapshot history conflicts with the ST7/ST8 current-row model.**
+  PRD §23.27 and R-T16a require a snapshot bump to preserve an additional
+  temporal assertion. The current ingestion identity correctly excludes the
+  snapshot id, while both storage backends currently replace the one row for
+  that stable id (`MERGE` in Falkor; `insert(id, vec![row])` in the double).
+  The existing two-sync test therefore proves only the latest current row and
+  cannot close §23.27. R6-B30-27 remains open to add versioned temporal
+  assertions while preserving current-row reads; this conflict is recorded
+  rather than weakening the PRD or falsely treating overwrite as append.

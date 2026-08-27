@@ -114,8 +114,6 @@ pub(crate) fn dependency_tree_violations(crate_name: &str, tree: &str) -> Vec<St
         "iceberg".into(),
         "delta_kernel".into(),
         "deltalake".into(),
-        "aws-sdk-s3".into(),
-        "aws-sdk-glue".into(),
         ["async-", "openai"].concat(),
         ["anthropic", "-sdk"].concat(),
         "reqwest".into(),
@@ -126,6 +124,11 @@ pub(crate) fn dependency_tree_violations(crate_name: &str, tree: &str) -> Vec<St
         for banned in kernel_banned {
             if packages.iter().any(|line| package_line_is(line, &banned)) {
                 violations.push(format!("banned dependency `{banned}` is reachable"));
+            }
+        }
+        for package in packages.iter().filter_map(|line| package_name(line)) {
+            if package.starts_with("aws-sdk-") {
+                violations.push(format!("banned dependency `{package}` is reachable"));
             }
         }
     }
@@ -150,6 +153,104 @@ pub(crate) fn dependency_tree_violations(crate_name: &str, tree: &str) -> Vec<St
         }
     }
     violations
+}
+
+pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
+    const HEADER: &str = "criterion\tstatus\trequirement\texecutable_evidence\tcommand\ttracking";
+    let path = root.join("docs/acceptance/section-23.tsv");
+    let matrix = std::fs::read_to_string(&path)?;
+    let mut lines = matrix.lines();
+    anyhow::ensure!(
+        lines.next() == Some(HEADER),
+        "acceptance matrix header is malformed"
+    );
+    let plan = std::fs::read_to_string(root.join("docs/master-plan.prd"))?;
+    let mut seen = std::collections::BTreeSet::new();
+
+    for (offset, line) in lines.enumerate() {
+        let line_number = offset + 2;
+        anyhow::ensure!(
+            !line.trim().is_empty(),
+            "blank matrix row at line {line_number}"
+        );
+        let columns: Vec<_> = line.split('\t').collect();
+        anyhow::ensure!(
+            columns.len() == 6,
+            "matrix line {line_number} must have six tab-separated columns"
+        );
+        let criterion: u8 = columns[0].parse().map_err(|_| {
+            anyhow::anyhow!("matrix line {line_number} has a non-numeric criterion")
+        })?;
+        anyhow::ensure!(
+            (1..=30).contains(&criterion),
+            "criterion {criterion} is outside §23"
+        );
+        anyhow::ensure!(
+            seen.insert(criterion),
+            "criterion {criterion} is duplicated"
+        );
+        anyhow::ensure!(
+            !columns[2].trim().is_empty(),
+            "criterion {criterion} has no requirement text"
+        );
+
+        match columns[1] {
+            "verified" => {
+                anyhow::ensure!(
+                    columns[5] == "-",
+                    "verified criterion {criterion} must not carry tracking"
+                );
+                anyhow::ensure!(
+                    columns[3] != "-" && columns[4] != "-",
+                    "verified criterion {criterion} needs executable evidence and a command"
+                );
+            }
+            "partial-deferred" | "deferred" | "partial-gap" | "gap" => {
+                anyhow::ensure!(
+                    columns[5] != "-",
+                    "{} criterion {criterion} needs a tracked plan row",
+                    columns[1]
+                );
+                let tracking_id = columns[5].split_whitespace().next().unwrap_or_default();
+                anyhow::ensure!(plan.contains(&format!("| {tracking_id} |")), "criterion {criterion} tracking id {tracking_id} is absent from the master plan");
+                if columns[1] == "gap" {
+                    anyhow::ensure!(
+                        columns[3] == "-" && columns[4] == "-",
+                        "gap criterion {criterion} must not claim executable evidence"
+                    );
+                } else if matches!(columns[1], "partial-deferred" | "partial-gap") {
+                    anyhow::ensure!(
+                        columns[3] != "-" && columns[4] != "-",
+                        "partial criterion {criterion} needs evidence for its completed portion"
+                    );
+                }
+            }
+            other => anyhow::bail!("criterion {criterion} has unknown status `{other}`"),
+        }
+
+        if columns[3] != "-" {
+            for locator in columns[3].split(';') {
+                let (relative, needle) = locator.split_once("::").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "criterion {criterion} evidence `{locator}` is not path::symbol"
+                    )
+                })?;
+                let source = std::fs::read_to_string(root.join(relative)).map_err(|_| {
+                    anyhow::anyhow!("criterion {criterion} evidence file `{relative}` is missing")
+                })?;
+                anyhow::ensure!(
+                    source.contains(needle),
+                    "criterion {criterion} evidence symbol `{needle}` is absent from {relative}"
+                );
+            }
+        }
+    }
+    anyhow::ensure!(
+        seen.len() == 30,
+        "acceptance matrix covers {} of 30 criteria",
+        seen.len()
+    );
+    Ok(())
 }
 
 fn package_line_is(line: &str, expected: &str) -> bool {
@@ -406,6 +507,28 @@ mod tests {
     }
 
     #[test]
+    fn kernel_purity_rejects_every_aws_sdk_crate_but_allows_worker_readers() {
+        let kernel_tree = [
+            "exocortex-kernel v0.1.0",
+            "└── renamed-table-reader v1.0.0",
+            "    └── aws-sdk-athena v1.2.3",
+        ]
+        .join("\n");
+        assert_eq!(
+            dependency_tree_violations("exocortex-kernel", &kernel_tree),
+            ["banned dependency `aws-sdk-athena` is reachable"]
+        );
+
+        let worker_tree = [
+            "exocortex-worker v0.1.0",
+            "├── duckdb v1.0.0",
+            "└── aws-sdk-athena v1.2.3",
+        ]
+        .join("\n");
+        assert!(dependency_tree_violations("exocortex-worker", &worker_tree).is_empty());
+    }
+
+    #[test]
     fn signing_hygiene_rejects_aliased_local_hmac_fixture() {
         let root = fixture("signing");
         write(
@@ -414,5 +537,36 @@ mod tests {
             "use hmac::Hmac as OtherMac; use wire::IngestBatch; fn forge(_: IngestBatch) { let _: Option<OtherMac<sha2::Sha256>> = None; }",
         );
         assert_eq!(signing_hygiene_violations(&root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn acceptance_coverage_rejects_missing_and_stale_evidence() {
+        let root = fixture("acceptance");
+        write(
+            &root,
+            "docs/master-plan.prd",
+            "| R6-B30-14 | missing stamp |\n",
+        );
+        write(&root, "tests/direct.rs", "fn direct_case() {}\n");
+        let header = "criterion\tstatus\trequirement\texecutable_evidence\tcommand\ttracking\n";
+        let mut rows = String::from(header);
+        for criterion in 1..=30 {
+            rows.push_str(&format!(
+                "{criterion}\tverified\trequirement {criterion}\ttests/direct.rs::direct_case\tcargo test direct_case\t-\n"
+            ));
+        }
+        write(&root, "docs/acceptance/section-23.tsv", &rows);
+        assert!(validate_acceptance_matrix(&root).is_ok());
+
+        let missing = rows.replace("30\tverified", "29\tverified");
+        write(&root, "docs/acceptance/section-23.tsv", &missing);
+        assert!(validate_acceptance_matrix(&root).is_err());
+
+        let stale = rows.replace(
+            "tests/direct.rs::direct_case",
+            "tests/direct.rs::removed_case",
+        );
+        write(&root, "docs/acceptance/section-23.tsv", &stale);
+        assert!(validate_acceptance_matrix(&root).is_err());
     }
 }

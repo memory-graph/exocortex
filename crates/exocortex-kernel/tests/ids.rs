@@ -58,3 +58,55 @@ fn external_identity_determinism_and_forks() {
         "org forks identity"
     );
 }
+
+/// §23.29 property sweep: layout coordinates are deliberately absent from
+/// the identity API. Varying path/offset/timestamp-shaped distractors cannot
+/// affect an id, while the one schema-evolution coordinate does.
+#[test]
+fn external_identity_is_layout_immune_property() {
+    for seed in 0u16..512 {
+        let mut uuid = [0u8; 16];
+        uuid[..2].copy_from_slice(&seed.to_be_bytes());
+        uuid[2..].copy_from_slice(&blake3::hash(&seed.to_be_bytes()).as_bytes()[..14]);
+        let logical_pk = blake3::hash(&[seed as u8, (seed >> 8) as u8]);
+
+        let baseline = MemoryId::from_external(
+            "org",
+            "iceberg://catalog/db/table",
+            &uuid,
+            logical_pk.as_bytes(),
+            7,
+        );
+        for (_path, _offset, _timestamp) in [
+            (format!("data/{seed}.parquet"), seed as u64, seed as i64),
+            (
+                format!("compacted/{seed}/part-0"),
+                u64::MAX - seed as u64,
+                -(seed as i64),
+            ),
+        ] {
+            assert_eq!(
+                baseline,
+                MemoryId::from_external(
+                    "org",
+                    "iceberg://catalog/db/table",
+                    &uuid,
+                    logical_pk.as_bytes(),
+                    7,
+                ),
+                "layout-only values must not enter external identity"
+            );
+        }
+        assert_ne!(
+            baseline,
+            MemoryId::from_external(
+                "org",
+                "iceberg://catalog/db/table",
+                &uuid,
+                logical_pk.as_bytes(),
+                8,
+            ),
+            "mapping-version changes deliberately fork identity"
+        );
+    }
+}

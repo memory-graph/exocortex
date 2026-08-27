@@ -66,6 +66,8 @@ enum Cmd {
     /// GATE1 (audit §2.4): pack rule ids vs engine outputs; MCP result vs
     /// the registry handler.
     ArtifactEquivalence,
+    /// PRD §23: validate the authoritative 30-row requirement-to-evidence matrix.
+    AcceptanceCoverage,
 }
 
 fn main() -> Result<()> {
@@ -85,7 +87,14 @@ fn main() -> Result<()> {
         Cmd::DeadEnforcement => dead_enforcement(),
         Cmd::AuthCoverage => auth_coverage(),
         Cmd::ArtifactEquivalence => artifact_equivalence(),
+        Cmd::AcceptanceCoverage => acceptance_coverage(),
     }
+}
+
+fn acceptance_coverage() -> Result<()> {
+    gates::validate_acceptance_matrix(std::path::Path::new("."))?;
+    println!("acceptance-coverage ok: every PRD §23 criterion has executable evidence or explicit plan tracking");
+    Ok(())
 }
 
 fn cargo() -> String {

@@ -21,3 +21,4 @@ cargo xtask write-path-parity
 cargo xtask dead-enforcement
 cargo xtask auth-coverage
 cargo xtask artifact-equivalence
+cargo xtask acceptance-coverage
