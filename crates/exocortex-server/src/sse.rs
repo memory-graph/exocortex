@@ -2,13 +2,12 @@
 //! subscription; events carry protobuf-encoded envelopes as base64 payloads
 //! with heartbeats so clients detect stalls (R-C5).
 //!
-//! R-Sec5: per-client SSE HMAC. When a subscriber connects with
-//! `?token=<t>`, the handler derives a per-client key
+//! R-Sec5: per-client SSE HMAC. For an authenticated subscriber the handler
+//! derives a per-client key from its Authorization bearer
 //! `HMAC(cluster_key, "sse-client:" || token)` and re-signs every envelope
-//! with it — token-less connections keep the cluster-key HMAC. Compromised
-//! tokens revoke one subscriber, not the fleet.
+//! with it. Compromised credentials revoke one subscriber, not the fleet.
 
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
@@ -32,32 +31,11 @@ struct ClientGraphSnapshot {
     relationships: Vec<Relationship>,
 }
 
-/// Whether `/v1/changes` demands a per-client token (R-Sec5).
-/// `backend-node` requires one; `mcp-standalone` (loopback-only) keeps
-/// the cluster-key default.
-///
-/// The token is a per-client KEY SELECTOR, not an authentication
-/// mechanism: when this router is mounted through `HttpBind::router` the
-/// bearer middleware authenticates the subscriber first (R-Sec7 / audit
-/// CS1). The `RequiredToken` presence check below only guards mounts that
-/// carry no auth layer of their own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SseAuth {
-    /// Token-less subscribers still receive cluster-key-signed envelopes.
-    OptionalToken,
-    /// No token, no stream: the handler answers 401 (R-Sec7 posture —
-    /// the change feed is an authenticated surface).
-    RequiredToken,
-}
-
 /// The `/v1/changes` SSE router over a cluster node's local hub.
-pub fn sse_router<S: Storage + 'static>(
-    cluster: Arc<ClusterNode<S>>,
-    auth: SseAuth,
-) -> axum::Router {
+pub fn sse_router<S: Storage + 'static>(cluster: Arc<ClusterNode<S>>) -> axum::Router {
     axum::Router::new()
         .route("/v1/changes", axum::routing::get(handler))
-        .with_state((cluster, auth))
+        .with_state(cluster)
 }
 
 /// Derive the per-client SSE key (R-Sec5): provisioned clients receive this
@@ -67,23 +45,17 @@ pub fn derive_client_sse_key(cluster_key: &[u8; 32], token: &str) -> [u8; 32] {
 }
 
 async fn handler<S: Storage + 'static>(
-    State((cluster, auth)): State<(Arc<ClusterNode<S>>, SseAuth)>,
-    axum::extract::RawQuery(q): axum::extract::RawQuery,
+    State(cluster): State<Arc<ClusterNode<S>>>,
+    RawQuery(q): RawQuery,
+    headers: http::HeaderMap,
     principal: Option<Extension<VisibilityContext>>,
 ) -> Response {
-    let mut token = None;
     let mut since_lsn = None;
     let mut seed = false;
     if let Some(qs) = q.as_deref() {
         for pair in qs.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
                 match k {
-                    "token" => {
-                        // Fail closed: an empty value (`?token=`) is no token.
-                        if !v.is_empty() {
-                            token = Some(v.to_string());
-                        }
-                    }
                     "since_lsn" => since_lsn = v.parse::<u64>().ok(),
                     "seed" => seed = v == "true",
                     _ => {}
@@ -92,7 +64,12 @@ async fn handler<S: Storage + 'static>(
         }
     }
     // R-Sec7 posture: on the backend op surface the feed is authenticated.
-    if auth == SseAuth::RequiredToken && (token.is_none() || principal.is_none()) {
+    let bearer = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty());
+    if principal.is_none() {
         return (http::StatusCode::UNAUTHORIZED, "missing SSE credentials").into_response();
     }
     // Subscribe before building an initial image so commits concurrent with
@@ -134,7 +111,7 @@ async fn handler<S: Storage + 'static>(
 
     let node_id = cluster.node_id.to_string();
     // R-Sec5: token → per-client key; envelopes re-sign with it.
-    let client_key = token.map(|t| derive_client_sse_key(&cluster.hmac_key, &t));
+    let client_key = bearer.map(|token| derive_client_sse_key(&cluster.hmac_key, token));
     let stream = async_stream::stream! {
         let mut rx = tokio_stream::wrappers::BroadcastStream::new(rx);
         // Initial comment anchors the connection before the first delta.

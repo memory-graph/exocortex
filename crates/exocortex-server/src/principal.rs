@@ -93,6 +93,19 @@ impl PrincipalRegistry {
             .find(|(candidate, _)| constant_time_eq(token, candidate))
             .map(|(_, principal)| principal.clone())
     }
+
+    /// Fail startup when a single-org node is provisioned with credentials
+    /// for another tenant. Storage graph selection and authorization policy
+    /// must name the same organization.
+    pub fn ensure_org(&self, expected: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.entries
+                .iter()
+                .all(|(_, principal)| principal.org_id.as_str() == expected),
+            "principal policy contains an org other than node org {expected}"
+        );
+        Ok(())
+    }
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -126,6 +139,8 @@ mod tests {
         assert_eq!(principal.team_ids[0].as_str(), "t");
         assert_eq!(principal.max_visibility, Visibility::Team);
         assert!(registry.authenticate(b"wrong").is_none());
+        assert!(registry.ensure_org("o").is_ok());
+        assert!(registry.ensure_org("another-org").is_err());
 
         std::fs::write(&path, "[]").unwrap();
         assert!(PrincipalRegistry::load(&path).is_err());

@@ -35,9 +35,18 @@ fn envelope(node: &ClusterNode<InMemoryStorage>, _id: u8, lsn: u64) -> Invalidat
 
 async fn serve(
     node: Arc<ClusterNode<InMemoryStorage>>,
-    auth: exocortex_server::sse::SseAuth,
+    authenticated: bool,
 ) -> std::net::SocketAddr {
-    let app = exocortex_server::sse::sse_router(node, auth);
+    let app = exocortex_server::sse::sse_router(node);
+    let app = if authenticated {
+        app.layer(axum::Extension(exocortex_ops::operations::ops_vc(
+            "org",
+            "test-reader",
+            Visibility::Org,
+        )))
+    } else {
+        app
+    };
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -50,9 +59,7 @@ async fn serve_for(
     node: Arc<ClusterNode<InMemoryStorage>>,
     visibility: VisibilityContext,
 ) -> std::net::SocketAddr {
-    let app =
-        exocortex_server::sse::sse_router(node, exocortex_server::sse::SseAuth::RequiredToken)
-            .layer(axum::Extension(visibility));
+    let app = exocortex_server::sse::sse_router(node).layer(axum::Extension(visibility));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -207,7 +214,7 @@ async fn since_lsn_replays_buffered_deltas_in_order() {
     for lsn in 1..=3u64 {
         let _ = node.admit_and_publish(envelope(&node, lsn as u8, lsn));
     }
-    let addr = serve(node.clone(), exocortex_server::sse::SseAuth::OptionalToken).await;
+    let addr = serve(node.clone(), true).await;
 
     let (status, body) = get_status_and_body(addr, "/v1/changes?since_lsn=1").await;
     assert_eq!(status, "200");
@@ -230,7 +237,7 @@ async fn since_lsn_older_than_buffer_answers_409() {
     for lsn in 1..=5u64 {
         let _ = node.admit_and_publish(envelope(&node, lsn as u8, lsn));
     }
-    let addr = serve(node.clone(), exocortex_server::sse::SseAuth::OptionalToken).await;
+    let addr = serve(node.clone(), true).await;
 
     let (status, body) = get_status_and_body(addr, "/v1/changes?since_lsn=0").await;
     assert_eq!(status, "409", "R-C6: {body}");
@@ -249,7 +256,7 @@ async fn since_lsn_older_than_buffer_answers_409() {
 async fn required_token_mode_answers_401_without_token() {
     let node = cluster(4);
     let _ = node.admit_and_publish(envelope(&node, 1, 1));
-    let addr = serve(node.clone(), exocortex_server::sse::SseAuth::RequiredToken).await;
+    let addr = serve(node.clone(), false).await;
 
     let (status, body) = get_status_and_body(addr, "/v1/changes?since_lsn=0").await;
     assert_eq!(status, "401", "R-Sec7: {body}");
@@ -489,10 +496,7 @@ async fn backend_router_rejects_token_query_without_bearer() {
         ontology: None,
     });
     let bind = exocortex_server::http_bind::HttpBind::new(ctx, "secret-bearer".into());
-    let sse = exocortex_server::sse::sse_router(
-        cluster.clone(),
-        exocortex_server::sse::SseAuth::RequiredToken,
-    );
+    let sse = exocortex_server::sse::sse_router(cluster.clone());
     let app = bind.router(Some(sse));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await

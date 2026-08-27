@@ -8,7 +8,8 @@ use exocortex_kernel::{
 };
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{
-    InMemoryStorage, IngestBatchKey, IngestCommitOutcome, MemoryFilter, Storage, VisibilityContext,
+    memory_visible, InMemoryStorage, IngestBatchKey, IngestCommitOutcome, MemoryFilter, Storage,
+    VisibilityContext,
 };
 use proptest::prelude::*;
 use std::sync::Arc;
@@ -70,6 +71,22 @@ fn base_memory(title: String, content: String, mt: u8, vis: u8) -> Memory {
         embedding: None,
         lsn: LSN::new_local(0),
     }
+}
+
+#[test]
+fn tenantless_and_foreign_rows_fail_closed() {
+    let mut row = base_memory("row".into(), "content".into(), 1, 3);
+    let vc = VisibilityContext {
+        org_id: "org".into(),
+        user_id: "user".into(),
+        max_visibility: Visibility::Org,
+        ..Default::default()
+    };
+    assert!(!memory_visible(&row, &vc));
+    row.context.tenant_id = Some("foreign".into());
+    assert!(!memory_visible(&row, &vc));
+    row.context.tenant_id = Some("org".into());
+    assert!(memory_visible(&row, &vc));
 }
 
 /// Strip the storage-assigned LSN so caller-supplied rows compare equal to

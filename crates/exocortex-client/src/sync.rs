@@ -57,10 +57,8 @@ pub struct SseSyncConfig {
     pub bearer: Option<String>,
     /// Cluster-shared HMAC key (R-Sec4).
     pub hmac_key: [u8; 32],
-    /// Per-client SSE token + provisioned derived key (R-Sec5). When set,
-    /// the subscribe URL carries `?token=` and envelope verification uses
-    /// the derived key instead of the cluster key.
-    pub client_token: Option<String>,
+    /// Per-client SSE key derived from the Authorization bearer (R-Sec5).
+    /// The credential itself is carried only in the header, never in a URL.
     pub client_key: Option<[u8; 32]>,
     /// Expected ontology fingerprint (R-W3 peer admission).
     pub fingerprint: [u8; 32],
@@ -87,7 +85,6 @@ impl SseSyncConfig {
             backend: backend.into(),
             bearer: None,
             hmac_key,
-            client_token: None,
             client_key: None,
             fingerprint,
             stall_timeout: Duration::from_secs(15),
@@ -350,18 +347,8 @@ pub async fn run_sse_sync(
     let mut needs_seed = next_lsn == 0;
     loop {
         let since = next_lsn.saturating_sub(1);
-        let mut url = format!(
-            "{}/v1/changes?since_lsn={since}",
-            cfg.backend.trim_end_matches('/')
-        );
-        if let Some(token) = &cfg.client_token {
-            url.push_str("&token=");
-            url.push_str(token);
-        }
-        if needs_seed {
-            url.push_str("&seed=true");
-        }
-        tracing::info!(%url, "sse subscribe");
+        let url = subscription_url(&cfg.backend, since, needs_seed);
+        tracing::info!(backend = %cfg.backend, since_lsn = since, seed = needs_seed, "sse subscribe");
         let mut gate = LsnGate::new(next_lsn);
         let mut reconnect_reason = "stream ended";
         {
@@ -402,6 +389,8 @@ pub async fn run_sse_sync(
                             let verify_key = cfg.client_key.unwrap_or(cfg.hmac_key);
                             match decode_event(&verify_key, &cfg.fingerprint, &ev.data) {
                                 Ok(DecodedEvent::Change(inv, lsn)) => {
+                                    let visibility_changed =
+                                        matches!(&inv, Invalidation::VisibilityAdvance { .. });
                                     for released in gate.push(lsn, inv) {
                                         next_lsn = next_lsn.max(lsn + 1);
                                         metrics::counter!("exocortex_sync_envelopes_applied_total")
@@ -409,6 +398,15 @@ pub async fn run_sse_sync(
                                         cache.submit(CacheWrite::Apply(released)).await;
                                     }
                                     next_lsn = next_lsn.max(gate.next_lsn());
+                                    if visibility_changed {
+                                        // An identifier-free advance may represent a row that
+                                        // became invisible. Only an authenticated replacement
+                                        // image can evict a previously cached wider version
+                                        // without disclosing the hidden row id.
+                                        needs_seed = true;
+                                        reconnect_reason = "visibility changed";
+                                        break;
+                                    }
                                 }
                                 Ok(DecodedEvent::Reseed(snapshot, lsn)) => {
                                     cache
@@ -471,6 +469,17 @@ pub async fn run_sse_sync(
     }
 }
 
+fn subscription_url(backend: &str, since: u64, seed: bool) -> String {
+    let mut url = format!(
+        "{}/v1/changes?since_lsn={since}",
+        backend.trim_end_matches('/')
+    );
+    if seed {
+        url.push_str("&seed=true");
+    }
+    url
+}
+
 /// Base64 (standard alphabet) decode; rejects padding errors.
 pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -505,4 +514,20 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::subscription_url;
+
+    #[test]
+    fn subscription_url_never_contains_credentials() {
+        let url = subscription_url("https://backend.example", 41, true);
+        assert_eq!(
+            url,
+            "https://backend.example/v1/changes?since_lsn=41&seed=true"
+        );
+        assert!(!url.contains("token"));
+        assert!(!url.contains("bearer"));
+    }
 }

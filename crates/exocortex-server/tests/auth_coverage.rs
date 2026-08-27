@@ -33,8 +33,7 @@ fn boot_router() -> (axum::Router, Arc<InMemoryStorage>) {
         ontology: None,
     });
     let bind = exocortex_server::http_bind::HttpBind::new(ctx, "secret-bearer".into());
-    let sse =
-        exocortex_server::sse::sse_router(cluster, exocortex_server::sse::SseAuth::RequiredToken);
+    let sse = exocortex_server::sse::sse_router(cluster);
     (bind.router(Some(sse)), storage)
 }
 

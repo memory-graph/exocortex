@@ -212,7 +212,6 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
     cfg.backoff = std::time::Duration::from_millis(50);
     // CS1: /v1/changes sits behind the same bearer layer as the op surface.
     cfg.bearer = Some("e2e-bearer".into());
-    cfg.client_token = Some("e2e-bearer".into());
     cfg.client_key = Some(exocortex_server::sse::derive_client_sse_key(
         &HMAC_KEY,
         "e2e-bearer",
@@ -359,7 +358,6 @@ async fn mcp_wal_sync_backend_sse_sibling_is_one_chain_under_500ms() {
 
     let mut sync_cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
     sync_cfg.bearer = Some("e2e-bearer".into());
-    sync_cfg.client_token = Some("e2e-bearer".into());
     sync_cfg.client_key = Some(exocortex_server::sse::derive_client_sse_key(
         &HMAC_KEY,
         "e2e-bearer",

@@ -341,7 +341,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
             .max_decoding_message_size(exocortex_wire::limits::MAX_MCP_REQUEST_BYTES),
     )
     .into_axum_router();
-    let sse = crate::sse::sse_router(cluster.clone(), crate::sse::SseAuth::RequiredToken);
+    let sse = crate::sse::sse_router(cluster.clone());
     // HTTP operations, SSE, metrics, and every gRPC method share the same
     // credential-to-principal middleware. Merging gRPC after `router` would
     // silently bypass authentication.

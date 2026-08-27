@@ -194,12 +194,7 @@ pub struct DiscoveryAcceptance {
 /// cache. Project/team rows require an explicit row scope and membership;
 /// missing scope never widens access.
 pub fn memory_visible(memory: &exocortex_kernel::Memory, vc: &VisibilityContext) -> bool {
-    if memory
-        .context
-        .tenant_id
-        .as_deref()
-        .is_some_and(|tenant| tenant != vc.org_id.as_str())
-    {
+    if memory.context.tenant_id.as_deref() != Some(vc.org_id.as_str()) {
         return false;
     }
     let effective = match memory.visibility {

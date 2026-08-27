@@ -259,7 +259,6 @@ fn main() -> anyhow::Result<()> {
             let mut sync_config =
                 exocortex_client::sync::SseSyncConfig::new(backend.clone(), hmac_key, fingerprint);
             sync_config.bearer = Some(bearer.clone());
-            sync_config.client_token = Some(bearer.clone());
             sync_config.client_key = Some(exocortex_wire::signing::derive_sse_client_key(
                 &hmac_key, &bearer,
             ));

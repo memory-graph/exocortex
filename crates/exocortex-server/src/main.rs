@@ -276,7 +276,9 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
         let principals = std::sync::Arc::new(
             exocortex_server::principal::PrincipalRegistry::load(principal_policy)?,
         );
+        principals.ensure_org("org")?;
         let admin_ceilings = load_source_policy(args.source_policy.as_deref())?;
+        ensure_source_policy_org(&admin_ceilings, "org")?;
         let transport = resolve_transport(
             &args.bind,
             args.tls_cert.as_deref(),
@@ -438,6 +440,14 @@ fn load_source_policy(path: Option<&std::path::Path>) -> anyhow::Result<Vec<Sour
         .collect()
 }
 
+fn ensure_source_policy_org(rows: &[SourcePolicyEntry], expected: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        rows.iter().all(|((org_id, _, _), _)| org_id == expected),
+        "source policy contains an org other than node org {expected}"
+    );
+    Ok(())
+}
+
 /// Data dir under the user's data home (§4.3).
 fn data_home() -> anyhow::Result<std::path::PathBuf> {
     let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("no HOME"))?;
@@ -458,7 +468,9 @@ fn data_home() -> anyhow::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_source_policy, resolve_cluster_secret, resolve_transport};
+    use super::{
+        ensure_source_policy_org, load_source_policy, resolve_cluster_secret, resolve_transport,
+    };
 
     #[test]
     fn backend_credentials_fail_closed_when_missing_empty_or_malformed() {
@@ -483,6 +495,8 @@ mod tests {
         .unwrap();
         let rows = load_source_policy(Some(&path)).unwrap();
         assert_eq!(rows.len(), 1);
+        assert!(ensure_source_policy_org(&rows, "org").is_ok());
+        assert!(ensure_source_policy_org(&rows, "foreign").is_err());
         std::fs::write(
             &path,
             r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":9}]"#,

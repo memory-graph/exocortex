@@ -210,10 +210,7 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
         ontology: Some(onto.clone()),
     });
     let bind = exocortex_server::http_bind::HttpBind::new(ctx, "feed-bearer".into());
-    let app = bind.router(Some(exocortex_server::sse::sse_router(
-        cluster.clone(),
-        exocortex_server::sse::SseAuth::RequiredToken,
-    )));
+    let app = bind.router(Some(exocortex_server::sse::sse_router(cluster.clone())));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -230,7 +227,6 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
         let mut c = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
         c.backoff = Duration::from_millis(50);
         c.bearer = Some("feed-bearer".into());
-        c.client_token = Some("feed-bearer".into());
         c.client_key = Some(exocortex_wire::signing::derive_sse_client_key(
             &HMAC_KEY,
             "feed-bearer",
@@ -286,10 +282,9 @@ async fn per_client_sse_hmac_verifies_with_derived_key() {
         onto.fingerprint,
         HMAC_KEY,
     ));
-    let app = exocortex_server::sse::sse_router(
-        cluster.clone(),
-        exocortex_server::sse::SseAuth::OptionalToken,
-    );
+    let app = exocortex_server::sse::sse_router(cluster.clone()).layer(axum::Extension(
+        exocortex_ops::operations::ops_vc("org", "test-reader", exocortex_kernel::Visibility::Org),
+    ));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -313,7 +308,7 @@ async fn per_client_sse_hmac_verifies_with_derived_key() {
     let derived = derive_client_sse_key(&HMAC_KEY, token);
     let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
     cfg.backoff = Duration::from_millis(50);
-    cfg.client_token = Some(token.into());
+    cfg.bearer = Some(token.into());
     cfg.client_key = Some(derived);
     let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 0, None));
     // Head start so the run exercises the live path (see sse_feed test).
@@ -392,7 +387,7 @@ fn test_memory(title: &str, n: u8) -> exocortex_kernel::Memory {
             project_id: None,
             project_path: None,
             team_id: None,
-            tenant_id: None,
+            tenant_id: Some("org".into()),
             session_id: None,
             user_id: None,
             created_by: None,
@@ -448,10 +443,7 @@ async fn production_backend_sync_hydrates_before_ready_and_stays_live() {
         ontology: Some(onto.clone()),
     });
     let bind = exocortex_server::http_bind::HttpBind::new(ctx, "sync-bearer".into());
-    let app = bind.router(Some(exocortex_server::sse::sse_router(
-        cluster.clone(),
-        exocortex_server::sse::SseAuth::RequiredToken,
-    )));
+    let app = bind.router(Some(exocortex_server::sse::sse_router(cluster.clone())));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -462,7 +454,6 @@ async fn production_backend_sync_hydrates_before_ready_and_stays_live() {
     let cache = Arc::new(cache);
     let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
     cfg.bearer = Some("sync-bearer".into());
-    cfg.client_token = Some("sync-bearer".into());
     cfg.client_key = Some(exocortex_wire::signing::derive_sse_client_key(
         &HMAC_KEY,
         "sync-bearer",
@@ -493,10 +484,29 @@ async fn production_backend_sync_hydrates_before_ready_and_stays_live() {
     {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    sync.abort();
     assert!(
         cache.get_memory("org", &live.id, &principal).is_some(),
         "retained writer and SSE task continuously apply later commits"
+    );
+
+    let mut narrowed = live.clone();
+    narrowed.visibility = exocortex_kernel::Visibility::Project;
+    narrowed.context.project_id = Some("hidden-project".into());
+    let narrowed_commit = storage.upsert_memory(&narrowed).await.unwrap();
+    let _ = cluster.admit_and_publish(cluster.envelope(Invalidation::MemoryUpserted {
+        id: narrowed.id,
+        lsn: narrowed_commit.lsn,
+    }));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while cache.get_memory("org", &live.id, &principal).is_some()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sync.abort();
+    assert!(
+        cache.get_memory("org", &live.id, &principal).is_none(),
+        "identifier-free visibility advance forces a reseed that evicts the stale wider row"
     );
 }
 
@@ -560,10 +570,9 @@ async fn deterministic_replay_probe() {
         }));
     }
 
-    let app = exocortex_server::sse::sse_router(
-        cluster.clone(),
-        exocortex_server::sse::SseAuth::OptionalToken,
-    );
+    let app = exocortex_server::sse::sse_router(cluster.clone()).layer(axum::Extension(
+        exocortex_ops::operations::ops_vc("org", "test-reader", exocortex_kernel::Visibility::Org),
+    ));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();

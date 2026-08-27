@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use exocortex_cluster::ClusterNode;
 use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
 use exocortex_pack_dev_v1::pack_def;
-use exocortex_server::sse::{sse_router, SseAuth};
+use exocortex_server::sse::sse_router;
 use exocortex_storage::{FalkorConfig, FalkorStorage, Invalidation, Storage};
 
 fn falkor_url() -> Option<String> {
@@ -93,7 +93,13 @@ async fn sse_client_observes_upsert_within_200ms() {
     let runner = cluster.clone();
     tokio::spawn(async move { runner.run().await });
 
-    let app = sse_router(cluster.clone(), SseAuth::OptionalToken);
+    let app =
+        sse_router(cluster.clone()).layer(axum::Extension(exocortex_storage::VisibilityContext {
+            org_id: "org".into(),
+            user_id: "test-reader".into(),
+            max_visibility: exocortex_kernel::Visibility::Org,
+            ..Default::default()
+        }));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();

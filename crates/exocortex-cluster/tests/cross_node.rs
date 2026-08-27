@@ -138,7 +138,7 @@ async fn cross_node_commit_reaches_peer_hub() {
 /// window replay — the ring is fed by the real storage pub-sub loop.
 #[tokio::test(flavor = "multi_thread")]
 async fn cross_node_replay_window_serves_reconnects() {
-    use exocortex_server::sse::{sse_router, SseAuth};
+    use exocortex_server::sse::sse_router;
     if falkor_url().is_none() {
         eprintln!("skipping cross_node_replay_window_serves_reconnects: FALKOR_URL not set");
         return;
@@ -187,7 +187,14 @@ async fn cross_node_replay_window_serves_reconnects() {
     assert!(lsns.contains(&c1.lsn) && lsns.contains(&c2.lsn));
 
     // And the router serves the same window over SSE.
-    let app = sse_router(cluster_b.clone(), SseAuth::OptionalToken);
+    let app = sse_router(cluster_b.clone()).layer(axum::Extension(
+        exocortex_storage::VisibilityContext {
+            org_id: "org".into(),
+            user_id: "test-reader".into(),
+            max_visibility: exocortex_kernel::Visibility::Org,
+            ..Default::default()
+        },
+    ));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
