@@ -1,6 +1,40 @@
 # Exocortex
 
-**The open-source Palantir: the ontology, in-house.**
+```
+              ____________________________________________________
+           .-"                                                    "-.
+         .'                                                        '.
+        /                                                            \
+       |                                                              |
+       |     o------o       o------o       o------o       o------o    |
+       |                                                              |
+       |    .---------. --Fixes-> .---------. <-Solves- .---------.   |
+       |    |   FIX   |           | PROBLEM |           | SOLUTION |   |
+       |    '---------'           '---------'           '---------'   |
+       |                                                              |
+       |     o------o       o------o       o------o       o------o    |
+       |                                                              |
+        \                                                            /
+         '.                                                        .'
+           '-.                                                    .-'
+              '--______________________________________________--'
+                              ^       ||||       |
+               end_session    |       ||||       |   search_memories
+                              |       ||||       v
+                           [ MCP over stdio ]
+                Claude Code  ·  Codex  ·  Cursor  ·  any agent
+```
+
+**The open-source Palantir: the ontology, in-house.** By
+[MemoryGraph](https://github.com/memory-graph).
+
+Your coding agent starts every session from nothing. What you taught it
+yesterday — the fix that worked, the decision and why, the command that
+unblocked the build — is gone today, for you and for everyone else on
+the team. Exocortex is where that knowledge lives instead: your agents
+write the distilled outcome of every session into a typed,
+provenance-stamped graph, and every later session reads it back in
+microseconds.
 
 Palantir Foundry's core product is not a data lake or a set of dashboards.
 It is the *Ontology* — a governed, typed, versioned semantic layer over an
@@ -12,7 +46,10 @@ single query.
 Exocortex is that ontology as a single Rust binary, under an OSS license,
 fed by your coding agents instead of a data team. Claude Code, Codex,
 Cursor, any MCP client writes to it and reads from it — so what your org
-learns in one session is what it knows in the next.
+learns in one session is what it knows in the next. The ontology's shape
+(type-tagged memories + a typed edge vocabulary, not per-type payload
+schemas) was validated by our prior memory-graph deployment; Exocortex
+is that idea as one fast, governed binary.
 
 | Foundry | Exocortex |
 |---|---|
@@ -51,6 +88,11 @@ session ends ──▶ agent calls end_session ──▶ typed nodes + edges sto
                                                     │
 next session ◀── agent queries search/find_related ◀┘
 ```
+
+The questions this answers concretely: *"What have we learned about
+`payment-service`?"* · *"What's blocking `feature-X`?"* · *"What did we
+try last time that didn't work?"* — answered from the graph your team
+built, not from transcripts stuffed into context.
 
 Three hard properties:
 
@@ -130,13 +172,14 @@ exocortex-mcp-client --verify                    # green/red install checklist
 
 On first run the client also installs the full Agent Playbook at
 `~/.exocortex/playbook.md` — the reference for the 47 assertable edge
-kinds, the reject-code table, and supersession rules. Harness-specific
+kinds (the 48th, `SimilarTo`, is computed by Dreams and can never be
+written), the reject-code table, and supersession rules. Harness-specific
 setup (what "accepted edit" means, where the config lives, failure
 modes) is in `docs/agents/claude-code.md`, `docs/agents/codex.md`, and
 `docs/agents/cursor.md`.
 
 The short version of what the block teaches: at end of every turn, run
-a five-item checklist (accepted edit / non-obvious command / why-how
+a six-item checklist (accepted edit / non-obvious command / why-how
 claim / decision-against / "remember this" / identified problem); if
 anything fired, call `exocortex.end_session` with 1-5 typed drafts —
 it validates locally and tells you exactly what to fix. Sessions now
@@ -230,6 +273,10 @@ This is the product. Everything else exists to serve it.
   invariant, not a scoping decision.
 - **Not a black box.** Every read can be traced to the facts and rules
   that produced it, and every write is audited.
+- **Not a general-purpose knowledge graph (v1).** v1 ships the
+  dev-domain pack; a legal, medical, or sales ontology is a v2 pack —
+  a crate registering against the same kernel, not a schema
+  migration.
 
 ## Team mode (optional backend)
 
