@@ -1367,7 +1367,7 @@ impl Storage for FalkorStorage {
         let rows = self
             .run_template(
                 "get_relationship_by_id",
-                &serde_json::json!({ "id": hex(&id.0) }),
+                &serde_json::json!({ "rel_id": hex(&id.0) }),
                 true,
             )
             .await?;

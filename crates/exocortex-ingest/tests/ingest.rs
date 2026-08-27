@@ -422,6 +422,133 @@ async fn authenticated_principal_is_required_and_authoritatively_scopes_writes()
 }
 
 #[tokio::test]
+async fn authenticated_relationship_target_must_be_in_caller_membership() {
+    use futures::StreamExt;
+
+    let srv = server().require_request_principal();
+    let broad = exocortex_storage::VisibilityContext {
+        user_id: "alice".into(),
+        org_id: "org".into(),
+        project_ids: ["allowed".into(), "forbidden".into()].into_iter().collect(),
+        team_ids: Default::default(),
+        max_visibility: exocortex_kernel::Visibility::Org,
+    };
+    let mut registration = tonic::Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://s1",
+        "session-wrapup",
+        3,
+        "session",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    ));
+    registration.extensions_mut().insert(broad.clone());
+    srv.register_source(registration).await.unwrap();
+
+    let mut seed = batch(vec![draft("target", "Problem", 1)]);
+    seed.batch_id = "membership-target".into();
+    seed.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    seed.producer.as_mut().unwrap().client_metadata =
+        Some(exocortex_wire::ingest::v1::ClientMetadata {
+            project_id: "forbidden".into(),
+            ..Default::default()
+        });
+    let mut seed = tonic::Request::new(sign(seed, [5u8; 32]));
+    seed.extensions_mut().insert(broad);
+    assert!(srv
+        .submit(seed)
+        .await
+        .unwrap()
+        .into_inner()
+        .rejections
+        .is_empty());
+
+    let mut rows = srv.storage.stream_all_memories().await;
+    let target = loop {
+        let row = rows.next().await.unwrap().unwrap();
+        if row.title.as_str() == "title target" {
+            break row.id;
+        }
+    };
+    use std::fmt::Write as _;
+    let target_id = target.0.iter().fold(String::new(), |mut encoded, byte| {
+        write!(encoded, "{byte:02x}").expect("writing to String is infallible");
+        encoded
+    });
+
+    let mut link = batch(vec![draft("fix", "Fix", 1)]);
+    link.batch_id = "membership-link".into();
+    link.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    link.producer.as_mut().unwrap().client_metadata =
+        Some(exocortex_wire::ingest::v1::ClientMetadata {
+            project_id: "allowed".into(),
+            ..Default::default()
+        });
+    link.relationships = vec![exocortex_wire::ingest::v1::RelationshipDraft {
+        from_draft_key: "fix".into(),
+        to_memory_id: target_id,
+        kind: "Fixes".into(),
+        strength: 0.8,
+        confidence: 0.8,
+        visibility: 1,
+        ..Default::default()
+    }];
+    let allowed = exocortex_storage::VisibilityContext {
+        user_id: "alice".into(),
+        org_id: "org".into(),
+        project_ids: ["allowed".into()].into_iter().collect(),
+        team_ids: Default::default(),
+        max_visibility: exocortex_kernel::Visibility::Org,
+    };
+    let mut link = tonic::Request::new(sign(link, [5u8; 32]));
+    link.extensions_mut().insert(allowed);
+    let ack = srv.submit(link).await.unwrap().into_inner();
+    assert_eq!(ack.accepted, 0);
+    assert!(ack.rejections.iter().any(|row| {
+        row.code == RejectCode::VisibilityWidening as i32
+            && row.detail.contains("outside the authenticated membership")
+    }));
+}
+
+#[tokio::test]
+async fn unknown_source_ceiling_discriminants_fail_closed() {
+    use tonic::Code;
+
+    let srv = server();
+    let registration = exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://s1",
+        "session-wrapup",
+        99,
+        "session",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    );
+    let error = srv
+        .register_source(tonic::Request::new(registration))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+
+    registered(&srv, 3).await;
+    let mut submitted = signed_batch(&srv, vec![draft("k", "Fix", 1)]);
+    submitted.ceiling = 99;
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut submitted);
+    let ack = srv
+        .submit(tonic::Request::new(submitted))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ack.accepted, 0);
+    assert!(ack.rejections.iter().all(|row| {
+        row.code == RejectCode::UnknownSource as i32
+            && row.detail.contains("unknown source ceiling")
+    }));
+}
+
+#[tokio::test]
 async fn fingerprint_mismatch_rejects_whole_batch() {
     let srv = server();
     registered(&srv, 3).await;

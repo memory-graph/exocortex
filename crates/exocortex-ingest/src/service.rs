@@ -926,7 +926,17 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             )));
         };
         let ceiling = source.ceiling;
-        if Self::vis_from_i32(batch.ceiling).unwrap_or(Visibility::Public) != ceiling {
+        let requested_ceiling = match Self::vis_from_i32(batch.ceiling) {
+            Ok(visibility) => visibility,
+            Err(_) => {
+                return Ok(Response::new(ack_reject_all(
+                    &batch,
+                    RejectCode::UnknownSource,
+                    "unknown source ceiling discriminant",
+                )))
+            }
+        };
+        if requested_ceiling != ceiling {
             return Ok(Response::new(ack_reject_all(
                 &batch,
                 RejectCode::UnknownSource,
@@ -1007,7 +1017,20 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             .collect();
         for (from_draft_key, encoded_id, id) in external_targets {
             if let Some(target) = loaded.get(&id) {
-                draft_ids.insert(encoded_id, target.clone());
+                if principal
+                    .as_ref()
+                    .is_some_and(|vc| !exocortex_storage::memory_visible(target, vc))
+                {
+                    rejections.push(RejectRow {
+                        draft_key: format!("{from_draft_key}->#{encoded_id}"),
+                        code: RejectCode::VisibilityWidening as i32,
+                        detail: format!(
+                            "to_memory_id `{encoded_id}` is outside the authenticated membership"
+                        ),
+                    });
+                } else {
+                    draft_ids.insert(encoded_id, target.clone());
+                }
             } else {
                 rejections.push(RejectRow {
                     draft_key: format!("{from_draft_key}->#{encoded_id}"),
@@ -1367,7 +1390,8 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                 "authenticated principal cannot register another org",
             ));
         }
-        let requested = Self::vis_from_i32(r.ceiling).unwrap_or(Visibility::Public);
+        let requested = Self::vis_from_i32(r.ceiling)
+            .map_err(|_| Status::invalid_argument("unknown source ceiling discriminant"))?;
         if principal
             .as_ref()
             .is_some_and(|principal| requested > principal.max_visibility)

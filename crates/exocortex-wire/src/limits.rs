@@ -12,6 +12,8 @@ pub const MAX_TAGS_PER_MEMORY: usize = 32;
 pub const MAX_TAG_BYTES: usize = 128;
 /// Maximum aggregate tag bytes on one memory.
 pub const MAX_TAG_BYTES_PER_MEMORY: usize = 2048;
+/// Maximum memories in one request/batch.
+pub const MAX_MEMORIES_PER_BATCH: usize = 256;
 /// Maximum relationships in one request/batch.
 pub const MAX_EDGES_PER_BATCH: usize = 64;
 
@@ -37,6 +39,9 @@ pub fn validate_batch_resources(
     memories: &[MemoryDraft],
     edges: &[RelationshipDraft],
 ) -> Result<(), &'static str> {
+    if memories.len() > MAX_MEMORIES_PER_BATCH {
+        return Err("batch has more than 256 memories");
+    }
     if edges.len() > MAX_EDGES_PER_BATCH {
         return Err("batch has more than 64 relationships");
     }
@@ -77,6 +82,21 @@ mod tests {
         assert!(validate_memory_fields("x", &aggregate_plus_one).is_err());
 
         let memories = [MemoryDraft::default()];
+        assert!(validate_batch_resources(
+            &vec![MemoryDraft::default(); MAX_MEMORIES_PER_BATCH - 1],
+            &[]
+        )
+        .is_ok());
+        assert!(validate_batch_resources(
+            &vec![MemoryDraft::default(); MAX_MEMORIES_PER_BATCH],
+            &[]
+        )
+        .is_ok());
+        assert!(validate_batch_resources(
+            &vec![MemoryDraft::default(); MAX_MEMORIES_PER_BATCH + 1],
+            &[]
+        )
+        .is_err());
         assert!(validate_batch_resources(
             &memories,
             &vec![RelationshipDraft::default(); MAX_EDGES_PER_BATCH - 1]

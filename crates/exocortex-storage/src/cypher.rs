@@ -23,7 +23,10 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     let mut m = HashMap::new();
     macro_rules! reg {
         ($t:expr) => {
-            m.insert($t.id, $t);
+            assert!(
+                m.insert($t.id, $t).is_none(),
+                "duplicate Cypher template id"
+            );
         };
     }
 
@@ -370,16 +373,6 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (m:Memory {id: $id})
             WHERE m.visibility <= $max_visibility
             RETURN m LIMIT 1
-        "#,
-    });
-
-    reg!(Template {
-        id: "get_relationship_by_id",
-        read_only: true,
-        required_params: &["id"],
-        cypher: r#"
-            MATCH ()-[r]->() WHERE r.id = $id
-            RETURN r LIMIT 1
         "#,
     });
 
