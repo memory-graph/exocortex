@@ -72,7 +72,7 @@ fn mem(title: &str, mt: u8, vis: Visibility) -> Memory {
             project_id: Some("proj".into()),
             project_path: None,
             team_id: None,
-            tenant_id: None,
+            tenant_id: Some("test-org".into()),
             session_id: Some("sess".into()),
             user_id: Some("user-1".into()),
             created_by: None,
@@ -173,6 +173,28 @@ itest!(roundtrip_memory, {
     assert_eq!(got.provenance, m.provenance);
 });
 
+itest!(
+    soft_delete_serializes_the_new_recorded_time_for_both_row_kinds,
+    {
+        let s = connect("delete-recorded-at").await;
+        let from = mem("delete-from", 3, Visibility::Org);
+        let to = mem("delete-to", 3, Visibility::Org);
+        let relationship = rel(from.id, to.id, exocortex_kernel::kinds::FIXES.0);
+        s.upsert_batch(&[from.clone(), to], std::slice::from_ref(&relationship))
+            .await
+            .unwrap();
+        s.delete_memory(&from.id).await.unwrap();
+        s.delete_relationship(&relationship.id).await.unwrap();
+
+        let closed_memory = s.get_memory(&from.id).await.unwrap().unwrap();
+        let closed_relationship = s.get_relationship(&relationship.id).await.unwrap().unwrap();
+        assert!(closed_memory.valid_until.is_some());
+        assert!(closed_memory.recorded_at > from.recorded_at);
+        assert!(closed_relationship.valid_until.is_some());
+        assert!(closed_relationship.recorded_at > relationship.recorded_at);
+    }
+);
+
 itest!(find_by_entity_reads_persisted_memory_entity_ids, {
     let s = connect("entity-query").await;
     let entity = EntityId([9; 16]);
@@ -203,6 +225,68 @@ itest!(find_by_entity_reads_persisted_memory_entity_ids, {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, matching.id);
 });
+
+itest!(
+    startup_migrates_legacy_entity_index_and_temporal_assertions,
+    {
+        let first = connect("legacy-schema-a").await;
+        let graph = first.graph_name_clone();
+        let entity = EntityId([11; 16]);
+        let mut from = mem("legacy-from", 3, Visibility::Org);
+        from.context.entities.push(entity);
+        let to = mem("legacy-to", 3, Visibility::Org);
+        let relationship = rel(from.id, to.id, exocortex_kernel::kinds::FIXES.0);
+        first
+            .upsert_batch(&[from.clone(), to.clone()], &[relationship])
+            .await
+            .expect("seed current rows and v1 assertions");
+        first
+            .make_legacy_schema_for_testing()
+            .await
+            .expect("downgrade graph to the pre-v1 shape");
+        drop(first);
+
+        let url = falkor_url().unwrap();
+        let restarted = FalkorStorage::connect(
+            FalkorConfig {
+                falkor_url: url.clone(),
+                redis_url: std::env::var("REDIS_URL")
+                    .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+                graph_name: graph,
+                org_id: "test-org".into(),
+                node_id: "legacy-schema-b".into(),
+            },
+            ontology(),
+        )
+        .await
+        .expect("startup migration succeeds");
+
+        let rows = restarted
+            .find_by_entity(
+                &entity,
+                &MemoryFilter {
+                    limit: 10,
+                    visibility_ctx: VisibilityContext {
+                        user_id: "user-1".into(),
+                        org_id: "test-org".into(),
+                        project_ids: ["proj".into()].into_iter().collect(),
+                        max_visibility: Visibility::Org,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("legacy entity ids are denormalized at startup");
+        assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), [from.id]);
+        let state = restarted
+            .get_state_at(Utc::now() + Duration::seconds(1))
+            .await
+            .expect("bootstrapped temporal state");
+        assert_eq!(state.memory_count, 2);
+        assert_eq!(state.relationship_count, 2, "edge plus required inverse");
+    }
+);
 
 itest!(ingest_settlement_survives_backend_reconnect, {
     let first = connect("ingest-restart-a").await;

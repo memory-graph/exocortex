@@ -149,6 +149,30 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "batch_purge_memory_assertions_after",
+        read_only: false,
+        required_params: &["id", "preimage_lsn"],
+        cypher: r#"
+            OPTIONAL MATCH (h:_MemoryAssertion {id: $id})
+            WHERE h.lsn > $preimage_lsn
+            WITH collect(h) AS doomed
+            FOREACH (row IN doomed | DELETE row)
+        "#,
+    });
+
+    reg!(Template {
+        id: "batch_purge_relationship_assertions_after",
+        read_only: false,
+        required_params: &["rel_id", "preimage_lsn"],
+        cypher: r#"
+            OPTIONAL MATCH (h:_RelationshipAssertion {id: $rel_id})
+            WHERE h.lsn > $preimage_lsn
+            WITH collect(h) AS doomed
+            FOREACH (row IN doomed | DELETE row)
+        "#,
+    });
+
+    reg!(Template {
         id: "upsert_relationship",
         read_only: false,
         // Note: no MERGE on the relationship (R-S2). We DELETE-then-CREATE so
@@ -537,6 +561,77 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         "#,
     });
 
+    reg!(Template {
+        id: "read_schema_version",
+        read_only: true,
+        required_params: &[],
+        cypher: r#"
+            MATCH (m:_ExocortexMeta {key: 'schema_version'})
+            RETURN m.value AS version LIMIT 1
+        "#,
+    });
+
+    reg!(Template {
+        id: "write_schema_version",
+        read_only: false,
+        required_params: &["version"],
+        cypher: r#"
+            MERGE (m:_ExocortexMeta {key: 'schema_version'})
+            SET m.value = $version
+            RETURN m.value
+        "#,
+    });
+
+    reg!(Template {
+        id: "migrate_memory_schema_v1",
+        read_only: false,
+        required_params: &["id", "entity_ids"],
+        cypher: r#"
+            MATCH (m:Memory {id: $id})
+            SET m.entity_ids = $entity_ids
+            MERGE (h:_MemoryAssertion {id: m.id, lsn: m.lsn})
+            ON CREATE SET h.visibility = m.visibility,
+                          h.valid_from = m.valid_from,
+                          h.valid_until = m.valid_until,
+                          h.recorded_at = m.recorded_at,
+                          h.props_json = m.props_json
+            RETURN m.id
+        "#,
+    });
+
+    reg!(Template {
+        id: "migrate_relationship_schema_v1",
+        read_only: false,
+        required_params: &["rel_id"],
+        cypher: r#"
+            MATCH ()-[r]->() WHERE r.id = $rel_id
+            MERGE (h:_RelationshipAssertion {id: r.id, lsn: r.lsn})
+            ON CREATE SET h.visibility = r.visibility,
+                          h.valid_from = r.valid_from,
+                          h.valid_until = r.valid_until,
+                          h.recorded_at = r.recorded_at,
+                          h.props_json = r.props_json
+            RETURN r.id
+        "#,
+    });
+
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_make_legacy_schema",
+        read_only: false,
+        required_params: &[],
+        cypher: r#"
+            MATCH (m:Memory) REMOVE m.entity_ids
+            WITH count(m) AS memory_count
+            MATCH (mh:_MemoryAssertion) DELETE mh
+            WITH memory_count, count(mh) AS memory_history_count
+            MATCH (rh:_RelationshipAssertion) DELETE rh
+            WITH memory_count, memory_history_count, count(rh) AS relationship_history_count
+            MATCH (v:_ExocortexMeta {key: 'schema_version'}) DELETE v
+            RETURN memory_count, memory_history_count, relationship_history_count
+        "#,
+    });
+
     // ---- M2 additions: soft deletes + snapshot counts (§6.5 todo! sites) ----
 
     reg!(Template {
@@ -549,7 +644,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MATCH (m:Memory {id: $id})
             WHERE m.valid_until IS NULL
-            SET m.valid_until = $now, m.lsn = $lsn, m.props_json = $props_json
+            SET m.valid_until = $now, m.recorded_at = $now,
+                m.lsn = $lsn, m.props_json = $props_json
             CREATE (h:_MemoryAssertion {id: $id, visibility: m.visibility,
                 valid_from: m.valid_from, valid_until: $now,
                 recorded_at: $now, props_json: $props_json, lsn: $lsn})
@@ -564,6 +660,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MATCH (m:Memory {id: $id})
             SET m.valid_until = $now,
+                m.recorded_at = $now,
                 m.lsn = $lsn,
                 m.props_json = $props_json
             CREATE (h:_MemoryAssertion {id: $id, visibility: m.visibility,
@@ -582,7 +679,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         required_params: &["rel_id", "now", "lsn", "props_json"],
         cypher: r#"
             MATCH ()-[r]->() WHERE r.id = $rel_id AND r.valid_until IS NULL
-            SET r.valid_until = $now, r.lsn = $lsn, r.props_json = $props_json
+            SET r.valid_until = $now, r.recorded_at = $now,
+                r.lsn = $lsn, r.props_json = $props_json
             CREATE (h:_RelationshipAssertion {id: $rel_id,
                 visibility: r.visibility, valid_from: r.valid_from,
                 valid_until: $now, recorded_at: $now,

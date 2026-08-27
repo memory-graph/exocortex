@@ -258,6 +258,11 @@ async fn fenced_restore_is_one_live_atomic_preimage_swap() {
     created_edge.kind = exocortex_kernel::RelKindId(0x8000_0024);
     created_edge.id =
         RelationshipId::derive(created_edge.from, created_edge.kind, created_edge.to, None);
+    let ontology = exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap();
+    let mut created_relationships = vec![created_edge.id];
+    if let Some(inverse) = exocortex_kernel::materialize_inverse(&ontology, &created_edge) {
+        created_relationships.push(inverse.id);
+    }
     s.upsert_batch_fenced(
         &[reopened, changed, created.clone()],
         &[changed_edge, created_edge.clone()],
@@ -270,7 +275,7 @@ async fn fenced_restore_is_one_live_atomic_preimage_swap() {
             memories: vec![preclosed.clone(), existing.clone()],
             relationships: vec![preclosed_edge.clone(), existing_edge.clone()],
             created_memories: vec![created.id],
-            created_relationships: vec![created_edge.id],
+            created_relationships,
         },
         &lease,
     )
@@ -304,4 +309,13 @@ async fn fenced_restore_is_one_live_atomic_preimage_swap() {
         existing_edge.properties.evidence_count
     );
     assert!(!by_id.contains_key(&created_edge.id));
+    let state = s
+        .get_state_at(Utc::now() + chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+    assert_eq!(state.memory_count, 2, "only existing and target are live");
+    assert_eq!(
+        state.relationship_count, 2,
+        "only existing edge and its required inverse are live"
+    );
 }

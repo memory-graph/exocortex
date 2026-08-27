@@ -150,6 +150,20 @@ fn memory_from_value(v: &FalkorValue) -> Result<Memory, StorageError> {
     serde_json::from_str(json).map_err(|e| StorageError::Backend(format!("bad props_json: {e}")))
 }
 
+fn memories_by_id(
+    rows: &[Vec<FalkorValue>],
+) -> Result<std::collections::HashMap<MemoryId, Memory>, StorageError> {
+    let mut by_id = std::collections::HashMap::new();
+    for value in rows.iter().filter_map(|row| row.first()) {
+        if matches!(value, FalkorValue::None) {
+            continue;
+        }
+        let memory = memory_from_value(value)?;
+        by_id.insert(memory.id, memory);
+    }
+    Ok(by_id)
+}
+
 fn relationship_from_value(v: &FalkorValue) -> Result<Relationship, StorageError> {
     let FalkorValue::Edge(edge) = v else {
         return Err(StorageError::Backend(format!(
@@ -265,6 +279,7 @@ impl FalkorStorage {
             channel: format!("exocortex:{}:inv", cfg.org_id),
         };
         this.pin_fingerprint().await?;
+        this.migrate_schema().await?;
         Ok(this)
     }
 
@@ -309,6 +324,79 @@ impl FalkorStorage {
             Some(storage) if storage == runtime => Ok(()),
             Some(storage) => Err(StorageError::FingerprintMismatch { storage, runtime }),
         }
+    }
+
+    async fn migrate_schema(&self) -> Result<(), StorageError> {
+        let rows = self
+            .run_template("read_schema_version", &serde_json::json!({}), true)
+            .await?;
+        match rows.first().and_then(|row| row.first()) {
+            Some(FalkorValue::I64(version)) if *version >= 1 => return Ok(()),
+            Some(FalkorValue::I64(_)) | None | Some(FalkorValue::None) => {}
+            Some(other) => {
+                return Err(StorageError::CorruptMetadata {
+                    key: "schema_version",
+                    detail: format!("expected integer, found {other:?}"),
+                });
+            }
+        }
+
+        let mut memories = <Self as Storage>::stream_all_memories(self).await;
+        let mut current_memories = Vec::new();
+        while let Some(memory) = memories.next().await {
+            current_memories.push(memory?);
+        }
+        drop(memories);
+        for memory in current_memories {
+            self.run_template(
+                "migrate_memory_schema_v1",
+                &serde_json::json!({
+                    "id": hex(&memory.id.0),
+                    "entity_ids": memory.context.entities.iter()
+                        .map(|entity| hex(&entity.0))
+                        .collect::<Vec<_>>(),
+                }),
+                false,
+            )
+            .await?;
+        }
+
+        let mut relationships = <Self as Storage>::stream_all_relationships(self).await;
+        let mut current_relationships = Vec::new();
+        while let Some(relationship) = relationships.next().await {
+            current_relationships.push(relationship?);
+        }
+        drop(relationships);
+        for relationship in current_relationships {
+            self.run_template(
+                "migrate_relationship_schema_v1",
+                &serde_json::json!({ "rel_id": hex(&relationship.id.0) }),
+                false,
+            )
+            .await?;
+        }
+
+        self.run_template(
+            "write_schema_version",
+            &serde_json::json!({ "version": 1 }),
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Integration-only downgrade fixture for proving startup migration from
+    /// a pre-v1 graph. The executable Cypher remains catalogue-confined.
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    pub async fn make_legacy_schema_for_testing(&self) -> Result<(), StorageError> {
+        self.run_template(
+            "integration_make_legacy_schema",
+            &serde_json::json!({}),
+            false,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Assign the next monotonic backend LSN via Redis INCR (R-S3).
@@ -1019,6 +1107,7 @@ impl Storage for FalkorStorage {
         let props_json = match self.get_memory(id).await? {
             Some(mut m) => {
                 m.valid_until = Some(now);
+                m.recorded_at = now;
                 FalkorStorage::props_json(&m, lsn)
             }
             None => String::new(),
@@ -1088,6 +1177,7 @@ impl Storage for FalkorStorage {
             )));
         }
         r.valid_until = Some(now);
+        r.recorded_at = now;
         let params = serde_json::json!({
             "rel_id": hex(&id.0), "now": now.to_rfc3339(), "lsn": lsn,
             "props_json": FalkorStorage::props_json(&r, lsn),
@@ -1351,12 +1441,7 @@ impl Storage for FalkorStorage {
                 true,
             )
             .await?;
-        let by_id: std::collections::HashMap<MemoryId, Memory> = rows
-            .iter()
-            .filter_map(|row| row.first())
-            .filter_map(|value| memory_from_value(value).ok())
-            .map(|memory| (memory.id, memory))
-            .collect();
+        let by_id = memories_by_id(&rows)?;
         Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
     }
 
@@ -1450,10 +1535,9 @@ impl Storage for FalkorStorage {
         let mut seen = std::collections::HashSet::new();
         for row in &rows {
             if let Some(v) = row.first() {
-                if let Ok(m) = memory_from_value(v) {
-                    if seen.insert(m.id) && out.len() < spec.max_nodes as usize {
-                        out.push(m);
-                    }
+                let m = memory_from_value(v)?;
+                if seen.insert(m.id) && out.len() < spec.max_nodes as usize {
+                    out.push(m);
                 }
             }
         }
@@ -1487,20 +1571,18 @@ impl Storage for FalkorStorage {
         let mut out = Vec::new();
         for row in &rows {
             if let Some(v) = row.first() {
-                if let Ok(m) = memory_from_value(v) {
-                    if (filter.memory_types.is_empty()
-                        || filter.memory_types.contains(&m.memory_type))
-                        && filter
-                            .project_id
-                            .as_ref()
-                            .is_none_or(|project| m.context.project_id.as_ref() == Some(project))
-                        && filter.valid_at.is_none_or(|at| {
-                            m.valid_from <= at && m.valid_until.is_none_or(|until| until > at)
-                        })
-                        && crate::memory_visible(&m, &filter.visibility_ctx)
-                    {
-                        out.push(m);
-                    }
+                let m = memory_from_value(v)?;
+                if (filter.memory_types.is_empty() || filter.memory_types.contains(&m.memory_type))
+                    && filter
+                        .project_id
+                        .as_ref()
+                        .is_none_or(|project| m.context.project_id.as_ref() == Some(project))
+                    && filter.valid_at.is_none_or(|at| {
+                        m.valid_from <= at && m.valid_until.is_none_or(|until| until > at)
+                    })
+                    && crate::memory_visible(&m, &filter.visibility_ctx)
+                {
+                    out.push(m);
                 }
             }
         }
@@ -1911,6 +1993,13 @@ impl Storage for FalkorStorage {
                     StorageError::Backend(format!("bad memory_type {}", memory.memory_type))
                 })?;
             parts.push((
+                "batch_purge_memory_assertions_after",
+                serde_json::json!({
+                    "id": hex(&memory.id.0),
+                    "preimage_lsn": memory.lsn.value,
+                }),
+            ));
+            parts.push((
                 "batch_upsert_memory",
                 self.memory_params(memory, next, label),
             ));
@@ -1922,6 +2011,13 @@ impl Storage for FalkorStorage {
             next += 1;
         }
         for relationship in &restore.relationships {
+            parts.push((
+                "batch_purge_relationship_assertions_after",
+                serde_json::json!({
+                    "rel_id": hex(&relationship.id.0),
+                    "preimage_lsn": relationship.lsn.value,
+                }),
+            ));
             parts.push((
                 "batch_upsert_relationship",
                 serde_json::json!({
@@ -2081,5 +2177,16 @@ mod fingerprint_decode_tests {
                 })
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod row_decode_tests {
+    use super::*;
+
+    #[test]
+    fn batched_memory_decode_propagates_corrupt_rows() {
+        let rows = vec![vec![FalkorValue::String("not-a-node".into())]];
+        assert!(memories_by_id(&rows).is_err());
     }
 }

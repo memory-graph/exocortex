@@ -8,8 +8,8 @@ use exocortex_kernel::{
 };
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{
-    memory_visible, InMemoryStorage, IngestBatchKey, IngestCommitOutcome, MemoryFilter, Storage,
-    VisibilityContext,
+    memory_visible, FencedRestore, InMemoryStorage, IngestBatchKey, IngestCommitOutcome, LeaseKey,
+    MemoryFilter, Storage, VisibilityContext,
 };
 use proptest::prelude::*;
 use std::sync::Arc;
@@ -46,7 +46,7 @@ fn base_memory(title: String, content: String, mt: u8, vis: u8) -> Memory {
             project_id: None,
             project_path: None,
             team_id: None,
-            tenant_id: None,
+            tenant_id: Some("org".into()),
             session_id: None,
             user_id: None,
             created_by: None,
@@ -73,9 +73,42 @@ fn base_memory(title: String, content: String, mt: u8, vis: u8) -> Memory {
     }
 }
 
+fn base_relationship(from: MemoryId, to: MemoryId) -> Relationship {
+    let now = Utc::now();
+    Relationship {
+        id: RelationshipId::derive(from, RelKindId(1), to, None),
+        kind: RelKindId(1),
+        from,
+        to,
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "prop".into(),
+            producer_kind: None,
+        },
+        properties: RelationshipProperties {
+            strength: 0.8,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: now,
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: now,
+        valid_until: None,
+        recorded_at: now,
+        invalidated_by: None,
+        lsn: LSN::new_local(0),
+    }
+}
+
 #[test]
 fn tenantless_and_foreign_rows_fail_closed() {
     let mut row = base_memory("row".into(), "content".into(), 1, 3);
+    row.context.tenant_id = None;
     let vc = VisibilityContext {
         org_id: "org".into(),
         user_id: "user".into(),
@@ -87,6 +120,86 @@ fn tenantless_and_foreign_rows_fail_closed() {
     assert!(!memory_visible(&row, &vc));
     row.context.tenant_id = Some("org".into());
     assert!(memory_visible(&row, &vc));
+}
+
+#[tokio::test]
+async fn fenced_restore_preserves_precycle_history_and_removes_failed_versions() {
+    let storage = InMemoryStorage::new(ontology());
+    let original = base_memory("original".into(), "content".into(), 3, 3);
+    storage.upsert_memory(&original).await.unwrap();
+    let preimage = storage.get_memory(&original.id).await.unwrap().unwrap();
+    let lease = storage
+        .acquire_lease(
+            &LeaseKey::Dreams {
+                org: "org".into(),
+                region: "*:*".into(),
+            },
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let mut failed_cycle = preimage.clone();
+    failed_cycle.title = "failed-cycle".into();
+    storage
+        .upsert_batch_fenced(&[failed_cycle], &[], &lease)
+        .await
+        .unwrap();
+    storage
+        .restore_fenced(
+            &FencedRestore {
+                memories: vec![preimage.clone()],
+                ..Default::default()
+            },
+            &lease,
+        )
+        .await
+        .unwrap();
+
+    let history = storage.memory_history(&preimage.id);
+    assert_eq!(
+        history.len(),
+        2,
+        "original assertion plus restore assertion"
+    );
+    assert!(history.iter().all(|row| row.title.as_str() == "original"));
+    assert!(history[0].lsn.value < history[1].lsn.value);
+}
+
+#[tokio::test]
+async fn relationship_assertion_history_is_bitemporal() {
+    let storage = InMemoryStorage::new(ontology());
+    let from = base_memory("from".into(), "content".into(), 3, 3);
+    let to = base_memory("to".into(), "content".into(), 3, 3);
+    storage
+        .upsert_batch(&[from.clone(), to.clone()], &[])
+        .await
+        .unwrap();
+    let t0 = Utc::now() - Duration::hours(2);
+    let t1 = Utc::now() - Duration::hours(1);
+    let mut first = base_relationship(from.id, to.id);
+    first.valid_from = t0;
+    first.valid_until = Some(t1);
+    first.recorded_at = t0;
+    storage.upsert_relationship(&first).await.unwrap();
+    let mut second = first.clone();
+    second.valid_from = t1;
+    second.valid_until = None;
+    second.recorded_at = t1;
+    second.properties.evidence_count = 2;
+    storage.upsert_relationship(&second).await.unwrap();
+
+    assert_eq!(
+        storage.get_state_at(t0).await.unwrap().relationship_count,
+        2
+    );
+    assert_eq!(
+        storage.get_state_at(t1).await.unwrap().relationship_count,
+        2
+    );
+    let history = storage.relationship_history(&first.id);
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].properties.evidence_count, 1);
+    assert_eq!(history[1].properties.evidence_count, 2);
 }
 
 /// Strip the storage-assigned LSN so caller-supplied rows compare equal to
@@ -111,7 +224,7 @@ proptest! {
             .enable_all().build().unwrap();
         let store = InMemoryStorage::new(ontology());
         let m = base_memory(title, content, mt, vis);
-        let _ = rt.block_on(async {
+        rt.block_on(async {
             let commit = store.upsert_memory(&m).await.unwrap();
             prop_assert!(commit.lsn > 0);
             let got = store.get_memory(&m.id).await.unwrap().expect("row present");
@@ -120,7 +233,7 @@ proptest! {
                 serde_json::to_string(&strip_lsn(m.clone())).unwrap()
             );
             Ok::<(), proptest::test_runner::TestCaseError>(())
-        });
+        })?;
     }
 
     /// LSNs are strictly monotonic across mixed writes (R-S3 / CR-15).
@@ -129,7 +242,7 @@ proptest! {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         let store = InMemoryStorage::new(ontology());
-        let _ = rt.block_on(async {
+        rt.block_on(async {
             let mut last = 0u64;
             for (i, (mt, vis)) in writes.iter().enumerate() {
                 let m = base_memory(format!("m{i}"), "c".into(), *mt, *vis);
@@ -138,7 +251,7 @@ proptest! {
                 last = c.lsn;
             }
             Ok::<(), proptest::test_runner::TestCaseError>(())
-        });
+        })?;
     }
 
     /// Re-syncing a stable external identity appends an assertion version
@@ -152,7 +265,7 @@ proptest! {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all().build().unwrap();
         let store = InMemoryStorage::new(ontology());
-        let _ = rt.block_on(async {
+        rt.block_on(async {
             let t0 = Utc::now() - Duration::hours(hours_back);
             let t1 = Utc::now() - Duration::hours(hours_back.max(1) / 2);
             let mut v1 = base_memory("p".into(), content_a.clone(), 2, 1);
@@ -200,7 +313,7 @@ proptest! {
             prop_assert_eq!(rows, 1);
             prop_assert_eq!(store.memory_history(&v1.id).len(), 3);
             Ok::<(), proptest::test_runner::TestCaseError>(())
-        });
+        })?;
     }
 }
 

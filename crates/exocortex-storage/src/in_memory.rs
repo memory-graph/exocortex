@@ -1106,14 +1106,18 @@ impl Storage for InMemoryStorage {
                 let lsn = record();
                 let mut memory = preimage.clone();
                 memory.lsn = exocortex_kernel::LSN::new_backend(lsn);
-                memories.insert(memory.id, vec![memory.clone()]);
+                let history = memories.entry(memory.id).or_default();
+                history.retain(|version| version.lsn.value <= preimage.lsn.value);
+                history.push(memory.clone());
                 invalidations.push(Invalidation::MemoryUpserted { id: memory.id, lsn });
             }
             for preimage in &restore.relationships {
                 let lsn = record();
                 let mut relationship = preimage.clone();
                 relationship.lsn = exocortex_kernel::LSN::new_backend(lsn);
-                relationships.insert(relationship.id, vec![relationship.clone()]);
+                let history = relationships.entry(relationship.id).or_default();
+                history.retain(|version| version.lsn.value <= preimage.lsn.value);
+                history.push(relationship.clone());
                 invalidations.push(Invalidation::RelationshipUpserted {
                     id: relationship.id,
                     from: relationship.from,
