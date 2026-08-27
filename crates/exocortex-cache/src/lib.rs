@@ -2,10 +2,11 @@
 //! petgraph::StableGraph wrapped in ArcSwap so the read side never blocks.
 //!
 //! §8: `LocalCache` holds one `GraphSnapshot` per org behind
-//! `Arc<ArcSwap<GraphSnapshot>>`; readers `load_full()` (a refcount bump) and
-//! scan a consistent view; the single writer applies invalidations by
-//! copy-on-write and publishes a fresh `Arc`. 2Q admission governs which org
-//! graphs stay resident under the byte budget (R-M12/R-M13).
+//! an `ArcSwap<GraphSnapshot>`; readers `load_full()` (a refcount bump) and
+//! scan a consistent view. The single writer reuses reader-released snapshot
+//! buffers, catches them up from a bounded delta journal, and publishes a fresh
+//! immutable generation. 2Q admission governs which org graphs stay resident
+//! under the byte budget (R-M12/R-M13).
 
 #![deny(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
@@ -144,76 +145,88 @@ impl GraphSnapshot {
     /// node instead of adding a parallel one, so stale versions never stay
     /// searchable and a later delete actually removes the row.
     fn insert_memory(&mut self, m: Memory) -> NodeIndex {
-        if self.by_id.contains_key(&m.id) {
-            self.remove_memory(&m.id);
+        if let Some(ix) = self.by_id.get(&m.id).map(|entry| *entry) {
+            if let Some(prior) = self.petgraph.node_weight(ix).cloned() {
+                self.remove_memory_indexes(&prior, ix);
+                self.est_bytes = self.est_bytes.saturating_sub(Self::estimate(&prior));
+            }
+            self.est_bytes += Self::estimate(&m);
+            self.index_memory(&m, ix);
+            *self
+                .petgraph
+                .node_weight_mut(ix)
+                .expect("by_id points at a live node") = m;
+            self.compact_search_index_if_needed();
+            return ix;
         }
         self.est_bytes += Self::estimate(&m);
-        for e in &m.context.entities {
-            self.by_entity.entry(*e).or_default().push(m.id);
-        }
-        self.by_type
-            .entry(m.memory_type)
-            .or_default()
-            .union_with_lsb(&m);
-        for tag in &m.tags {
-            let spur = self.interner.get_or_intern(tag.as_str());
-            self.by_tag.entry(spur).or_default().union_with_lsb(&m);
-        }
-        // CR3: the arena slot records the node it belongs to; StableGraph
-        // may reuse freed node indices, so the slot index is never assumed
-        // to equal the node index.
-        let search_key = Self::search_key(&m);
-        self.search_offsets.push(self.search_arena.len() as u32);
-        self.search_arena.push_str(&search_key);
-        self.search_arena.push(NL);
-        self.search_live_bytes += search_key.len() + NL.len_utf8();
         let ix = self.petgraph.add_node(m.clone());
-        self.search_nodes.push(ix);
+        self.index_memory(&m, ix);
         self.by_id.insert(m.id, ix);
         self.compact_search_index_if_needed();
         ix
+    }
+
+    fn index_memory(&mut self, memory: &Memory, ix: NodeIndex) {
+        for entity in &memory.context.entities {
+            self.by_entity.entry(*entity).or_default().push(memory.id);
+        }
+        self.by_type
+            .entry(memory.memory_type)
+            .or_default()
+            .union_with_lsb(memory);
+        for tag in &memory.tags {
+            let spur = self.interner.get_or_intern(tag.as_str());
+            self.by_tag.entry(spur).or_default().union_with_lsb(memory);
+        }
+        let search_key = Self::search_key(memory);
+        self.search_offsets.push(self.search_arena.len() as u32);
+        self.search_arena.push_str(&search_key);
+        self.search_arena.push(NL);
+        self.search_nodes.push(ix);
+        self.search_live_bytes += search_key.len() + NL.len_utf8();
+    }
+
+    fn remove_memory_indexes(&mut self, memory: &Memory, ix: NodeIndex) {
+        for entity in &memory.context.entities {
+            if let Some(mut ids) = self.by_entity.get_mut(entity) {
+                ids.retain(|id| id != &memory.id);
+            }
+        }
+        if let Some(mut bitmap) = self.by_type.get_mut(&memory.memory_type) {
+            bitmap.remove_lsb(memory);
+        }
+        for tag in &memory.tags {
+            if let Some(spur) = self.interner.get(tag.as_str()) {
+                if let Some(mut bitmap) = self.by_tag.get_mut(&spur) {
+                    bitmap.remove_lsb(memory);
+                }
+            }
+        }
+        self.search_live_bytes = self
+            .search_live_bytes
+            .saturating_sub(Self::search_key(memory).len() + NL.len_utf8());
+        for (slot, node) in self.search_nodes.iter().enumerate() {
+            if *node != ix {
+                continue;
+            }
+            let from = self.search_offsets.get(slot).copied().unwrap_or(0) as usize;
+            let to = self
+                .search_offsets
+                .get(slot + 1)
+                .copied()
+                .unwrap_or(self.search_arena.len() as u32) as usize;
+            if from < to && to <= self.search_arena.len() {
+                let _ = unsafe_blank(&mut self.search_arena, from, to);
+            }
+        }
     }
 
     fn remove_memory(&mut self, id: &MemoryId) {
         if let Some((_, ix)) = self.by_id.remove(id) {
             if let Some(m) = self.petgraph.node_weight(ix).cloned() {
                 self.est_bytes = self.est_bytes.saturating_sub(Self::estimate(&m));
-                if let Some(mut bitmap) = self.by_type.get_mut(&m.memory_type) {
-                    bitmap.remove_lsb(&m);
-                }
-                for tag in &m.tags {
-                    if let Some(spur) = self.interner.get(tag.as_str()) {
-                        if let Some(mut bitmap) = self.by_tag.get_mut(&spur) {
-                            bitmap.remove_lsb(&m);
-                        }
-                    }
-                }
-                self.search_live_bytes = self
-                    .search_live_bytes
-                    .saturating_sub(Self::search_key(&m).len() + NL.len_utf8());
-            }
-            // Blank the removed key in place (arena stays append-only). The
-            // CR3 parallel array may hold MORE THAN ONE slot pointing at
-            // this node index: StableGraph reuses freed indices, so an
-            // upsert-heavy build (boot seeding over a WAL with duplicate
-            // ids, e.g. a re-imported backup) can leave slots from prior
-            // incarnations of the same index. All of them are stale once
-            // the node is removed — blank every match, not just the first
-            // (found by BR-PRD's idempotent-import test: a leaked stale
-            // key served the same memory twice in one search).
-            for (slot, n) in self.search_nodes.iter().enumerate() {
-                if *n != ix {
-                    continue;
-                }
-                let from = self.search_offsets.get(slot).copied().unwrap_or(0) as usize;
-                let to = self
-                    .search_offsets
-                    .get(slot + 1)
-                    .copied()
-                    .unwrap_or(self.search_arena.len() as u32) as usize;
-                if from < to && to <= self.search_arena.len() {
-                    let _ = unsafe_blank(&mut self.search_arena, from, to);
-                }
+                self.remove_memory_indexes(&m, ix);
             }
             self.petgraph.remove_node(ix);
         }
@@ -348,11 +361,148 @@ pub struct CacheVersion {
 /// The local cache: one snapshot per org, 2Q admission, single-writer
 /// channel.
 pub struct LocalCache {
-    graphs: DashMap<SmolStr, Arc<ArcSwap<GraphSnapshot>>>,
+    graphs: DashMap<SmolStr, Arc<GraphSlot>>,
     tq: Mutex<TwoQState>,
     writer: mpsc::Sender<CacheWrite>,
     budget: usize,
     snapshot_publications: AtomicU64,
+    full_snapshot_clones: AtomicU64,
+}
+
+#[derive(Clone)]
+enum SnapshotDelta {
+    UpsertMemory(Box<Memory>),
+    DeleteMemory(MemoryId),
+    UpsertRelationship(Box<Relationship>),
+    DeleteRelationship(RelationshipId),
+    AdvanceBackendLsn(u64),
+}
+
+impl SnapshotDelta {
+    fn apply(&self, snapshot: &mut GraphSnapshot) {
+        match self {
+            Self::UpsertMemory(memory) => {
+                snapshot.insert_memory((**memory).clone());
+            }
+            Self::DeleteMemory(id) => snapshot.remove_memory(id),
+            Self::UpsertRelationship(relationship) => {
+                snapshot.insert_relationship((**relationship).clone());
+            }
+            Self::DeleteRelationship(id) => snapshot.remove_relationship(id),
+            Self::AdvanceBackendLsn(lsn) => {
+                snapshot.last_backend_lsn = snapshot.last_backend_lsn.max(*lsn);
+            }
+        }
+    }
+}
+
+struct RetiredSnapshot {
+    generation: u64,
+    snapshot: Arc<GraphSnapshot>,
+}
+
+struct SnapshotJournalEntry {
+    generation: u64,
+    delta: Vec<SnapshotDelta>,
+}
+
+struct SnapshotReuseState {
+    generation: u64,
+    retired: std::collections::VecDeque<RetiredSnapshot>,
+    journal: std::collections::VecDeque<SnapshotJournalEntry>,
+}
+
+/// One atomically published graph plus writer-only RCU reuse state. A retired
+/// snapshot is mutated only after its Arc becomes unique, so readers retain
+/// immutable generation isolation while the writer catches the buffer up from
+/// the bounded delta journal instead of cloning the resident graph.
+struct GraphSlot {
+    current: ArcSwap<GraphSnapshot>,
+    reuse: Mutex<SnapshotReuseState>,
+}
+
+impl GraphSlot {
+    fn new(snapshot: Arc<GraphSnapshot>) -> Self {
+        Self {
+            current: ArcSwap::from(snapshot),
+            reuse: Mutex::new(SnapshotReuseState {
+                generation: 0,
+                retired: Default::default(),
+                journal: Default::default(),
+            }),
+        }
+    }
+
+    fn load_full(&self) -> Arc<GraphSnapshot> {
+        self.current.load_full()
+    }
+
+    fn store(&self, snapshot: Arc<GraphSnapshot>) {
+        let mut state = self.reuse.lock();
+        state.generation = state.generation.saturating_add(1);
+        state.retired.clear();
+        state.journal.clear();
+        self.current.store(snapshot);
+    }
+
+    fn publish_delta(&self, delta: Vec<SnapshotDelta>, clone_count: &AtomicU64) -> (usize, usize) {
+        const RETIRED_BUFFERS: usize = 4;
+        let mut state = self.reuse.lock();
+        let current = self.current.load_full();
+        let old_bytes = current.est_bytes;
+        let reusable = state
+            .retired
+            .iter()
+            .position(|retired| Arc::strong_count(&retired.snapshot) == 1)
+            .and_then(|index| state.retired.remove(index));
+        let mut next = if let Some(retired) = reusable {
+            let mut snapshot = Arc::try_unwrap(retired.snapshot)
+                .unwrap_or_else(|_| unreachable!("unique retired snapshot became shared"));
+            for entry in state
+                .journal
+                .iter()
+                .filter(|entry| entry.generation > retired.generation)
+            {
+                for operation in &entry.delta {
+                    operation.apply(&mut snapshot);
+                }
+            }
+            snapshot
+        } else {
+            clone_count.fetch_add(1, Ordering::Relaxed);
+            clone_snapshot(&current)
+        };
+        for operation in &delta {
+            operation.apply(&mut next);
+        }
+        next.built_at = chrono::Utc::now();
+        state.generation = state.generation.saturating_add(1);
+        let generation = state.generation;
+        let published = Arc::new(next);
+        let old = self.current.swap(published.clone());
+        state.retired.push_back(RetiredSnapshot {
+            generation: generation - 1,
+            snapshot: old,
+        });
+        while state.retired.len() > RETIRED_BUFFERS {
+            state.retired.pop_front();
+        }
+        state
+            .journal
+            .push_back(SnapshotJournalEntry { generation, delta });
+        if let Some(oldest) = state.retired.iter().map(|retired| retired.generation).min() {
+            while state
+                .journal
+                .front()
+                .is_some_and(|entry| entry.generation <= oldest)
+            {
+                state.journal.pop_front();
+            }
+        } else {
+            state.journal.clear();
+        }
+        (old_bytes, published.est_bytes)
+    }
 }
 
 struct TwoQState {
@@ -373,7 +523,7 @@ impl TwoQState {
 
 /// Single-writer cache operations.
 pub enum CacheWrite {
-    /// Apply one change-feed invalidation (copy-on-write).
+    /// Apply one change-feed invalidation (RCU delta publication).
     Apply(
         /// The change-feed event to apply.
         Invalidation,
@@ -415,6 +565,7 @@ impl LocalCache {
                 writer: tx,
                 budget: budget_bytes,
                 snapshot_publications: AtomicU64::new(0),
+                full_snapshot_clones: AtomicU64::new(0),
             },
             rx,
         )
@@ -464,7 +615,7 @@ impl LocalCache {
                         self.graphs
                             .entry(org.clone())
                             .or_insert_with(|| {
-                                Arc::new(ArcSwap::from(Arc::new(GraphSnapshot::empty())))
+                                Arc::new(GraphSlot::new(Arc::new(GraphSnapshot::empty())))
                             })
                             .store(snapshot);
                         self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
@@ -503,39 +654,32 @@ impl LocalCache {
         let Some(g) = self.graphs.get(&org) else {
             return;
         };
-        let current = g.load_full();
-        let old_bytes = current.est_bytes;
-        let mut next = clone_snapshot(&current);
-        let mut changed = false;
+        let mut delta = Vec::new();
         for inv in invalidations {
             match inv {
                 Invalidation::MemoryUpserted { id, lsn } => {
                     match storage.get_memory(&id).await {
                         Ok(Some(m)) => {
-                            next.insert_memory(m);
-                            changed = true;
+                            delta.push(SnapshotDelta::UpsertMemory(Box::new(m)));
                         }
                         Ok(None) => {
-                            next.remove_memory(&id);
-                            changed = true;
+                            delta.push(SnapshotDelta::DeleteMemory(id));
                         }
                         Err(e) => {
                             tracing::warn!(?e, "invalidation fetch failed");
                             continue;
                         }
                     }
-                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+                    delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
                 }
                 Invalidation::MemoryDeleted { id, lsn } => {
-                    next.remove_memory(&id);
-                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
-                    changed = true;
+                    delta.push(SnapshotDelta::DeleteMemory(id));
+                    delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
                 }
                 Invalidation::RelationshipUpserted { id, lsn, .. } => {
                     match storage.get_relationship(&id).await {
                         Ok(Some(r)) => {
-                            next.insert_relationship(r);
-                            changed = true;
+                            delta.push(SnapshotDelta::UpsertRelationship(Box::new(r)));
                         }
                         Ok(None) => {
                             tracing::warn!(
@@ -548,26 +692,22 @@ impl LocalCache {
                             continue;
                         }
                     }
-                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+                    delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
                 }
                 Invalidation::RelationshipDeleted { id, lsn } => {
-                    next.remove_relationship(&id);
-                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
-                    changed = true;
+                    delta.push(SnapshotDelta::DeleteRelationship(id));
+                    delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
                 }
                 Invalidation::VisibilityAdvance { lsn } => {
-                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
-                    changed = true;
+                    delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
                 }
                 Invalidation::MemorySnapshotUpserted { memory, lsn } => {
-                    next.insert_memory(*memory);
-                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
-                    changed = true;
+                    delta.push(SnapshotDelta::UpsertMemory(memory));
+                    delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
                 }
                 Invalidation::RelationshipSnapshotUpserted { relationship, lsn } => {
-                    next.insert_relationship(*relationship);
-                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
-                    changed = true;
+                    delta.push(SnapshotDelta::UpsertRelationship(relationship));
+                    delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
                 }
                 Invalidation::GraphReseed { .. } => {
                     tracing::warn!("graph reseed reached cache apply path; LSN not advanced");
@@ -575,11 +715,10 @@ impl LocalCache {
                 }
             }
         }
-        if !changed {
+        if delta.is_empty() {
             return;
         }
-        let new_bytes = next.est_bytes;
-        g.store(Arc::new(next));
+        let (old_bytes, new_bytes) = g.publish_delta(delta, &self.full_snapshot_clones);
         self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
         // CR13 (audit): the invalidation path reconciles the 2Q byte
         // accounting exactly like Reseed does, and re-runs admission so
@@ -935,7 +1074,7 @@ impl LocalCache {
         let g = self
             .graphs
             .entry(org.into())
-            .or_insert_with(|| Arc::new(ArcSwap::from_pointee(GraphSnapshot::empty())))
+            .or_insert_with(|| Arc::new(GraphSlot::new(Arc::new(GraphSnapshot::empty()))))
             .clone();
         let cur = g.load_full();
         if local_lsn <= cur.last_local_lsn {
@@ -1020,7 +1159,7 @@ impl LocalCache {
         }
         self.graphs
             .entry(org.into())
-            .or_insert_with(|| Arc::new(ArcSwap::from(Arc::new(GraphSnapshot::empty()))))
+            .or_insert_with(|| Arc::new(GraphSlot::new(Arc::new(GraphSnapshot::empty()))))
             .store(snapshot);
         self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
         self.admit(&org.into());
@@ -1030,6 +1169,13 @@ impl LocalCache {
     #[doc(hidden)]
     pub fn snapshot_publications(&self) -> u64 {
         self.snapshot_publications.load(Ordering::Relaxed)
+    }
+
+    /// Number of full resident-graph clones used because no retired snapshot
+    /// buffer was reader-free. Steady-state invalidations should reuse buffers.
+    #[doc(hidden)]
+    pub fn full_snapshot_clones(&self) -> u64 {
+        self.full_snapshot_clones.load(Ordering::Relaxed)
     }
 
     /// Stream all memories + relationships from storage and rebuild the

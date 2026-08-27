@@ -315,6 +315,90 @@ async fn snapshot_swap_isolation() {
     writer.abort();
 }
 
+#[tokio::test]
+async fn memory_upsert_preserves_incident_relationships() {
+    let (cache, rx) = LocalCache::new(64 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    let store = Arc::new(InMemoryStorage::new(ontology()));
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let store = store.clone();
+        async move { cache.run(store, rx).await }
+    });
+    let mut first = mem("first", Visibility::Org, None);
+    let second = mem("second", Visibility::Org, None);
+    let relationship = rel(first.id, second.id, 41);
+    cache
+        .reseed_rows(
+            "org".into(),
+            vec![first.clone(), second],
+            vec![relationship.clone()],
+            1,
+        )
+        .await;
+
+    first.title = "updated first".into();
+    cache
+        .submit(CacheWrite::Apply(
+            exocortex_storage::Invalidation::MemorySnapshotUpserted {
+                memory: Box::new(first),
+                lsn: 2,
+            },
+        ))
+        .await;
+    cache.flush().await;
+
+    let snapshot = cache.graphs_snapshot("org").expect("resident");
+    assert!(snapshot.by_rel_id.contains_key(&relationship.id));
+    assert_eq!(snapshot.petgraph.edge_count(), 1);
+    writer.abort();
+}
+
+#[tokio::test]
+async fn released_snapshot_buffer_makes_isolated_update_delta_only() {
+    let (cache, rx) = LocalCache::new(64 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    let store = Arc::new(InMemoryStorage::new(ontology()));
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let store = store.clone();
+        async move { cache.run(store, rx).await }
+    });
+    let residents = (0..2_000)
+        .map(|index| mem(&format!("resident-{index}"), Visibility::Org, None))
+        .collect();
+    cache.reseed_rows("org".into(), residents, vec![], 1).await;
+
+    cache
+        .submit(CacheWrite::Apply(
+            exocortex_storage::Invalidation::MemorySnapshotUpserted {
+                memory: Box::new(mem("first delta", Visibility::Org, None)),
+                lsn: 2,
+            },
+        ))
+        .await;
+    cache.flush().await;
+    let clones_after_warmup = cache.full_snapshot_clones();
+    assert_eq!(clones_after_warmup, 1, "the first delta seeds the RCU pool");
+
+    cache
+        .submit(CacheWrite::Apply(
+            exocortex_storage::Invalidation::MemorySnapshotUpserted {
+                memory: Box::new(mem("second delta", Visibility::Org, None)),
+                lsn: 3,
+            },
+        ))
+        .await;
+    cache.flush().await;
+    assert_eq!(
+        cache.full_snapshot_clones(),
+        clones_after_warmup,
+        "reader-free steady-state updates reuse a retired graph and apply only journal deltas"
+    );
+    assert_eq!(cache.version("org").unwrap().backend_lsn, 3);
+    writer.abort();
+}
+
 #[test]
 fn visibility_view_filters_private_by_author() {
     let mut snap = GraphSnapshot::empty();

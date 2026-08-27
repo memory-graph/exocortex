@@ -114,6 +114,20 @@ fn main() {
     rt.block_on(cache.reseed_rows("bench-org".into(), rows, vec![], RESIDENT as u64));
     let hydration = hydration_started.elapsed();
 
+    // Seed the two-generation RCU pool. All measured publications below must
+    // catch up a reader-released buffer from journal deltas, never clone the
+    // 20k-row resident graph.
+    rt.block_on(async {
+        cache
+            .submit(CacheWrite::Apply(Invalidation::MemorySnapshotUpserted {
+                memory: Box::new(memory(RESIDENT)),
+                lsn: RESIDENT as u64 + 1,
+            }))
+            .await;
+        cache.flush().await;
+    });
+    let baseline_clones = cache.full_snapshot_clones();
+
     let baseline_publications = cache.snapshot_publications();
     let update_started = Instant::now();
     rt.block_on(async {
@@ -129,6 +143,7 @@ fn main() {
     });
     let update = update_started.elapsed();
     let publications = cache.snapshot_publications() - baseline_publications;
+    let update_clones = cache.full_snapshot_clones() - baseline_clones;
 
     const RELATIONSHIPS: usize = 10_000;
     const POINT_READS: usize = 1_000;
@@ -179,7 +194,7 @@ fn main() {
     let edge_fetch_budget = Duration::from_millis(100).mul_f64(multiplier);
     let point_invalidation_budget = Duration::from_millis(100).mul_f64(multiplier);
     println!(
-        "cache update gate: hydrate {RESIDENT}={hydration:?}; {DELTAS} invalidations={update:?}; publications={publications}"
+        "cache update gate: hydrate {RESIDENT}={hydration:?}; {DELTAS} invalidations={update:?}; publications={publications}; full_clones={update_clones}"
     );
     println!(
         "indexed relationship gate: point invalidation over {RELATIONSHIPS} rows={point_invalidation:?}; {POINT_READS} reads={edge_fetch:?}"
@@ -187,6 +202,7 @@ fn main() {
     let ok = hydration < hydration_budget
         && update < update_budget
         && publications == 1
+        && update_clones == 0
         && edge_fetch < edge_fetch_budget
         && point_invalidation < point_invalidation_budget;
     println!(
