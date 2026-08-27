@@ -183,6 +183,14 @@ each step (88 tests at completion).
 | R6-R10 | Strict-review cleanup: split ingest orchestration, cfg-gate fault seams, remove dead wrappers, and consolidate duplicate gate walkers | Codex | Done — submit is staged by responsibility, production Dreams builds omit the injected-failure seam, dead wrappers are removed, and xtask uses one filtered source walker |
 | R6-R11 | Mandatory-gate repair: keep the search SLO corpus inside the fail-closed tenant/project visibility contract | Codex | Done — the benchmark rows and caller now share explicit org/project membership, so the gate measures search rather than an intentionally invisible corpus |
 | R6-R12 | Strict-review cache repair: clear incident relationship indexes when a memory deletion removes petgraph edges | Codex | Done — deletion retires every incident relationship ID and its byte accounting before StableGraph may reuse an edge index |
+| R6-R13 | Strict-review discovery repair: stamp quality once and expose durable production discoveries through issuance and acceptance | Codex | In progress — verified that production cycles discard candidates after logging and metrics independently hardcode quality |
+| R6-R14 | Strict-review SSE ordering repair: install coherent snapshot frontiers and preserve out-of-order first events without losing real holes | Codex | In progress — verified hydrate/replay and first-event ordering races |
+| R6-R15 | Strict-review cache recovery repair: make failed microbatches atomic and concurrent standalone publications lossless | Codex | In progress — verified later successes can advance past failed fetches and blind local stores can overwrite generations |
+| R6-R16 | Strict-review owner-lifecycle repair: renew Dreams leases through all fenced mutation and rollback phases | Codex | In progress — verified a fixed 60-second lease can expire mid-cycle and fence both completion and rollback |
+| R6-R17 | Strict-review change-feed durability repair: reconcile graph commits whose invalidation publication fails | Codex | In progress — verified committed rows can remain indefinitely absent from already-live caches |
+| R6-R18 | Strict-review authorization repair: derive all relationship visibility, enforce promotion ceilings, and restrict audit reads to administrators | Codex | In progress — verified producer-declared within-batch widening, over-ceiling promotion, and org-wide audit enumeration by any bearer |
+| R6-R19 | Strict-review release hardening: least-privilege workflows, immutable action pins, non-root containers, and loopback-only test services | Codex | In progress — verified global write permission, mutable action refs, root daemon, and publicly bound development services |
+| R6-R20 | Strict-review backup hardening: bound or stream standalone and organization backup import/export memory use | Codex | In progress — verified whole-file and whole-org allocation occurs before existing commit budgets |
 
 ### Round 6 item evidence
 
