@@ -213,7 +213,11 @@ impl<S: Storage + 'static> ClusterNode<S> {
                 }
             };
             let env = self.envelope(inv);
-            self.publish_envelope(env);
+            // Keep local storage events on the same admission path as peer
+            // envelopes. This makes the public security control a live
+            // production boundary and prevents a future caller from adding a
+            // second, unchecked fan-out path.
+            self.admit_and_publish(env)?;
             // Peer fan-out over Redis pub-sub is wired at M5 server start
             // (same instance as FalkorDB, §9.1); the storage subscribe
             // already crosses nodes through FalkorDB replication in the

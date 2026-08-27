@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Canonical local/CI prerequisite for any publish or tagged release.
+set -euo pipefail
+
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --features exocortex-adapter-sdk/testing --no-fail-fast
+cargo deny check
+cargo xtask kernel-purity
+cargo xtask fingerprint
+cargo xtask gen-schemas
+cargo xtask gen-playbook
+cargo xtask no-llm
+cargo xtask proto-sync
+cargo xtask signing-hygiene
+cargo xtask metrics-hygiene
+cargo xtask wire-standalone
+cargo xtask bench
+cargo xtask storage-conformance
+cargo xtask write-path-parity
+cargo xtask dead-enforcement
+cargo xtask auth-coverage
+cargo xtask artifact-equivalence

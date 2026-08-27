@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-sdk"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "axum",
  "exocortex-wire",
@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-cache"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-cluster"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1126,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-dreams"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-ingest"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-kernel"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "bincode",
  "blake3",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-ops"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1238,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-pack-dev-v1"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "exocortex-kernel",
  "inventory",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-reasoning"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "crepe",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-server"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-storage"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-wire"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "blake3",
  "bytes",
@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-worker"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -4846,7 +4846,7 @@ checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",

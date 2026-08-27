@@ -1,7 +1,7 @@
 # crates/exocortex-client/Cargo.toml
 [package]
 name    = "exocortex-client"
-version = "0.2.2" # BR-PRD: memory backup/restore (portable WAL export/import)
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -2,6 +2,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod gates;
+
 #[derive(Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -106,6 +108,7 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> Result<()> {
 /// §2.1: the storage suite against the double, plus the live Falkor
 /// integration suite when FALKOR_URL is present.
 fn storage_conformance() -> Result<()> {
+    gates::validate_storage_targets(std::path::Path::new("."))?;
     run(&["test", "-p", "exocortex-storage"], &[])?;
     println!("storage-conformance: in-memory suite PASS");
     if std::env::var("FALKOR_URL").is_ok_and(|url| !url.is_empty()) {
@@ -153,33 +156,13 @@ fn write_path_parity() -> Result<()> {
 /// §2.2: the listed enforcement functions must appear in production (non
 /// test, non-definition) sources.
 fn dead_enforcement() -> Result<()> {
-    let checks: &[(&str, &str)] = &[
-        // (fn name, file that must reference it outside its definition crate's tests)
-        ("admit_and_publish", "crates/exocortex-cluster/src/node.rs"),
-        ("check_deadline", "crates/exocortex-ops/src/operations.rs"),
-        ("on_write", "crates/exocortex-ingest/src/service.rs"),
-        (
-            "with_admin_ceilings",
-            "crates/exocortex-ingest/tests/ingest.rs",
-        ),
-        ("drain_all", "crates/exocortex-client/src/main.rs"),
-        ("advance_local_lsn", "crates/exocortex-client/src/mcp.rs"),
-        // SR-PRD F2: the offline write path must publish into the served
-        // snapshot (advance_local_lsn is only the LSN-only degrade path).
-        ("apply_local", "crates/exocortex-client/src/mcp.rs"),
-    ];
-    for (name, witness) in checks {
-        anyhow::ensure!(
-            std::path::Path::new(witness).exists(),
-            "dead-enforcement: witness file {witness} for `{name}` is gone — update the gate"
-        );
-        // The witness must actually mention the fn.
-        let text = std::fs::read_to_string(witness)?;
-        anyhow::ensure!(
-            text.contains(name),
-            "dead-enforcement: `{name}` has no reference in {witness}"
-        );
-    }
+    let violations =
+        gates::dead_enforcement_violations(std::path::Path::new("."), gates::DEAD_CONTROLS)?;
+    anyhow::ensure!(
+        violations.is_empty(),
+        "dead-enforcement FAILED:\n{}",
+        violations.join("\n")
+    );
     println!("dead-enforcement ok: every listed control has a live caller");
     Ok(())
 }
@@ -310,48 +293,29 @@ fn gen_schemas(write: bool) -> Result<()> {
 /// appears in the kernel's dependency graph. HTTP clients (`reqwest`) are
 /// legitimate in server/client crates but must never reach the kernel.
 fn kernel_purity() -> Result<()> {
-    const BANNED: &[&str] = &[
-        "duckdb",
-        "iceberg",
-        "delta_kernel",
-        "deltalake",
-        "aws-sdk-s3",
-        "aws-sdk-glue",
-        "async-openai",
-        "anthropic-sdk",
-        "reqwest",
-    ];
-
-    let out = std::process::Command::new(std::env::var("CARGO")?.trim())
-        .args(["tree", "-p", "exocortex-kernel", "-e", "no-dev"])
-        .output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "cargo tree failed: {}",
+    for crate_name in [
+        "exocortex-kernel",
+        "exocortex-adapter-sdk",
+        "exocortex-worker",
+    ] {
+        let out = std::process::Command::new(cargo())
+            .args(["tree", "-p", crate_name, "-e", "no-dev"])
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "cargo tree for {crate_name} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        let tree = String::from_utf8_lossy(&out.stdout);
+        let violations = gates::dependency_tree_violations(crate_name, &tree);
+        anyhow::ensure!(
+            violations.is_empty(),
+            "kernel-purity FAILED for {crate_name}: {}",
+            violations.join("; ")
+        );
     }
-    let tree = String::from_utf8_lossy(&out.stdout);
-    let mut found: Vec<&str> = Vec::new();
-    for line in tree.lines() {
-        for banned in BANNED {
-            let hit = line
-                .split([' ', '\t'])
-                .any(|tok| tok.starts_with(&format!("{banned} v")));
-            if hit && !found.contains(banned) {
-                found.push(banned);
-            }
-        }
-    }
-    if found.is_empty() {
-        println!("kernel-purity ok: no banned crate in exocortex-kernel dependency tree");
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "kernel-purity FAILED: banned crates reachable from exocortex-kernel: {}",
-            found.join(", ")
-        )
-    }
+    println!("kernel-purity ok: kernel pure; SDK wire-only; worker kernel-free");
+    Ok(())
 }
 
 /// `cargo xtask bench` — R-Lat1 SLO gate. Runs both bench binaries
@@ -373,38 +337,6 @@ fn bench() -> Result<()> {
         );
     }
     println!("bench ok: both SLO gates green (R-Lat1)");
-    // Round-3 G1 / PRD R15: the adapter SDK resolves exactly ONE
-    // exocortex-* dependency (exocortex-wire), and BOTH the SDK and the
-    // worker never link exocortex-kernel (R-I1/R-I4). This assertion was
-    // claimed by a prior commit message but never landed.
-    for crate_name in ["exocortex-adapter-sdk", "exocortex-worker"] {
-        let out = std::process::Command::new("cargo")
-            .args(["tree", "-p", crate_name, "-e", "no-dev"])
-            .output()?;
-        if !out.status.success() {
-            anyhow::bail!("cargo tree for {crate_name} failed");
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        if text.lines().any(|l| l.contains("exocortex-kernel")) {
-            anyhow::bail!("{crate_name} must never link exocortex-kernel (R-I1/R-I4): {text}");
-        }
-        if crate_name == "exocortex-adapter-sdk" {
-            // The first line is the crate's own root, not a dependency —
-            // counting it double-charged every run (the tree prefixes are
-            // box-drawing glyphs, not whitespace).
-            let count = text
-                .lines()
-                .skip(1)
-                .filter(|l| l.contains("exocortex-"))
-                .count();
-            if count != 1 {
-                anyhow::bail!(
-                    "exocortex-adapter-sdk must resolve exactly one exocortex-* dependency, found {count}: {text}"
-                );
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -414,49 +346,14 @@ fn bench() -> Result<()> {
 /// gate matches dependency identifiers and wire endpoints. Scans `crates/`
 /// only (this file's own banned list must not self-match).
 fn no_llm() -> Result<()> {
-    const BANNED: &[&str] = &[
-        "async-openai",
-        "openai_api",
-        "api.openai.com",
-        "anthropic.com",
-        "api.anthropic",
-        "generativelanguage.googleapis.com",
-        "mistral.ai",
-        "cohere.ai",
-        "llm_client",
-    ];
-    let mut hits: Vec<String> = Vec::new();
-    // `crates/` only — this file's own banned list must not self-match.
-    let mut stack: Vec<std::path::PathBuf> = vec!["crates".into()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|n| n == "target") {
-                    continue;
-                }
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs" || e == "toml") {
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                for banned in BANNED {
-                    if text.contains(banned) {
-                        hits.push(format!("{}: contains `{banned}`", path.display()));
-                    }
-                }
-            }
-        }
-    }
-    if hits.is_empty() {
-        println!("no-llm ok: no LLM client crate or endpoint in workspace sources (CR-19)");
-        Ok(())
-    } else {
-        anyhow::bail!("no-llm FAILED (CR-19):\n{}", hits.join("\n"))
-    }
+    let violations = gates::no_llm_violations(std::path::Path::new("."))?;
+    anyhow::ensure!(
+        violations.is_empty(),
+        "no-llm FAILED (CR-19):\n{}",
+        violations.join("\n")
+    );
+    println!("no-llm ok: no LLM client crate or endpoint in executable workspace sources");
+    Ok(())
 }
 
 /// Wire vendors the protos for publishable tarballs (B8-era fix); the
@@ -591,8 +488,6 @@ fn unpack_gzip_tar(gz: &[u8], dst: &std::path::Path) -> anyhow::Result<()> {
     archive.unpack(dst)?;
     Ok(())
 }
-// sentinel-9182
-
 /// The workspace version of exocortex-wire via cargo metadata.
 fn wire_version() -> anyhow::Result<String> {
     let out = std::process::Command::new("cargo")
@@ -622,58 +517,12 @@ fn wire_version() -> anyhow::Result<String> {
 ///     construction site with `checksum: String::new()` must be
 ///     followed by prepare_batch/canonical_checksum before submit.
 fn signing_hygiene() -> anyhow::Result<()> {
-    // Gate 1: function-level single implementation.
-    let mut offenders = Vec::new();
-    for entry in walk_rss(std::path::Path::new("crates"))? {
-        let src = std::fs::read_to_string(&entry)?;
-        let rel = entry.display().to_string();
-        if rel.ends_with("exocortex-wire/src/signing.rs") {
-            continue;
-        }
-        for marker in [
-            "fn sign_batch(",
-            "fn compute_checksum(",
-            "fn canonical_checksum(",
-        ] {
-            if src.contains(marker) {
-                offenders.push(format!("{rel}: local `{marker}`"));
-            }
-        }
-    }
-    if !offenders.is_empty() {
-        anyhow::bail!(
-            "batch signing implemented outside exocortex-wire:
-{}",
-            offenders.join(
-                "
-"
-            )
-        );
-    }
-
-    // Gate 2: every blank-checksum constructor is followed (within the
-    // enclosing function) by prepare_batch or canonical_checksum.
-    let mut blanks = Vec::new();
-    for entry in walk_rss(std::path::Path::new("crates"))? {
-        let src = std::fs::read_to_string(&entry)?;
-        if !src.contains("checksum: String::new()") {
-            continue;
-        }
-        let rel = entry.display().to_string();
-        // Crude but effective: the file must reference the canonical
-        // helper at least once after construction.
-        if !src.contains("prepare_batch") && !src.contains("canonical_checksum") {
-            blanks.push(rel);
-        }
-    }
-    if !blanks.is_empty() {
-        anyhow::bail!(
-            "files construct batches with blank checksums and never call prepare_batch/canonical_checksum:
-{}",
-            blanks.join("
-")
-        );
-    }
+    let violations = gates::signing_hygiene_violations(std::path::Path::new("."))?;
+    anyhow::ensure!(
+        violations.is_empty(),
+        "signing-hygiene FAILED:\n{}",
+        violations.join("\n")
+    );
     println!("signing-hygiene ok: single batch-signing implementation; no unsigning blank-checksum submitters");
     Ok(())
 }
@@ -753,23 +602,6 @@ fn metrics_hygiene_issues(src: &str) -> Vec<String> {
         }
     }
     issues
-}
-
-#[cfg(test)]
-mod metrics_hygiene_tests {
-    use super::metrics_hygiene_issues;
-
-    #[test]
-    fn rejects_identity_and_dynamic_metric_labels() {
-        let bad = r#"metrics::counter!("requests", "producer_id" => producer.clone(), "outcome" => "ok");"#;
-        let issues = metrics_hygiene_issues(bad);
-        assert!(issues.iter().any(|issue| issue.contains("identity")));
-        assert!(issues.iter().any(|issue| issue.contains("non-literal")));
-        assert!(
-            metrics_hygiene_issues(r#"metrics::counter!("requests", "outcome" => "ok");"#)
-                .is_empty()
-        );
-    }
 }
 
 fn walk_rss(dir: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
@@ -975,5 +807,22 @@ fn gen_playbook(write: bool) -> Result<()> {
         );
         println!("gen-playbook ok ({total} kinds, {assertable} assertable; {words}-word block)");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod metrics_hygiene_tests {
+    use super::metrics_hygiene_issues;
+
+    #[test]
+    fn rejects_identity_and_dynamic_metric_labels() {
+        let bad = r#"metrics::counter!("requests", "producer_id" => producer.clone(), "outcome" => "ok");"#;
+        let issues = metrics_hygiene_issues(bad);
+        assert!(issues.iter().any(|issue| issue.contains("identity")));
+        assert!(issues.iter().any(|issue| issue.contains("non-literal")));
+        assert!(
+            metrics_hygiene_issues(r#"metrics::counter!("requests", "outcome" => "ok");"#)
+                .is_empty()
+        );
     }
 }

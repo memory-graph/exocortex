@@ -6,15 +6,21 @@ planned for `ghcr.io`).
 
 ## crates.io
 
-All 14 crate names were verified available (2026-08-25; exocortex-adapter-sdk joined with A1). Crates share one
-workspace version and must publish in dependency order — `cargo release`
-derives the order from the graph:
+All 14 crate names were verified available (2026-08-25;
+exocortex-adapter-sdk joined with A1). Crates share one workspace version and
+must publish in dependency order. The supported entry point is the fail-closed
+repository script:
 
 ```sh
-cargo install cargo-release
-cargo release 0.1.0 --dry-run     # verify the plan
-cargo release 0.1.0 --execute     # bump, publish in order, tag, push
+PUBLISH_VERSION=0.2.2 scripts/publish.sh
 ```
+
+It refuses dirty manifests/lockfiles and mixed package versions, runs the full
+mandatory correctness prerequisite before changing a manifest or contacting
+crates.io, publishes without `--no-verify`, and restores temporary
+dev-dependency edits byte-for-byte. Unrelated worktree changes are neither
+rejected nor touched. Its disposable regression is
+`bash scripts/tests/publish.sh`.
 
 Manual equivalent (order matters — same-batch path deps are fine, but a
 crate must exist on crates.io before its dependents verify):
@@ -48,8 +54,8 @@ workspace license/repository metadata applies).
 
 ## Binaries
 
-- **Installer (primary)**: tag push (`git tag v0.1.0 && git push
-  memory-graph v0.1.0`) triggers `.github/workflows/release.yml` —
+- **Installer (primary)**: tag push (`git tag v0.2.2 && git push
+  memory-graph v0.2.2`) triggers `.github/workflows/release.yml` —
   cross-platform release builds (macOS arm64 via macos-14, Intel via
   macos-13, Linux x64) for all three binaries, sha256 checksums, and an
   auto-generated `install.sh` attached to the GitHub Release:
@@ -61,6 +67,8 @@ workspace license/repository metadata applies).
   The script resolves `latest` (or honors `$INSTALL_VERSION`), picks the
   platform archive, and installs into `$CARGO_HOME/bin`. No Rust
   toolchain or protoc required — that was the point.
+  The build and release jobs cannot start until `scripts/verify-release.sh`
+  and the disposable publish regression pass on the tagged commit.
 - **git install**: `cargo install --git
   https://github.com/memory-graph/exocortex --bin exocortex-node` (needs
   `protoc`)
