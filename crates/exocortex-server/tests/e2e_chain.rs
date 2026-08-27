@@ -39,6 +39,14 @@ async fn boot() -> (
             seed_nodes: vec![],
             redis_url: None,
             quiet_hours: exocortex_dreams::fire::QuietHours::none(),
+            admin_ceilings: vec![(
+                (
+                    "org".into(),
+                    "iceberg://warehouse/orders".into(),
+                    "external-sync".into(),
+                ),
+                exocortex_kernel::Visibility::Org,
+            )],
         },
     )
     .await

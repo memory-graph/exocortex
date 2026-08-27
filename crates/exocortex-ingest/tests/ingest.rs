@@ -585,6 +585,34 @@ async fn admin_ceiling_caps_self_registration() {
     );
 }
 
+#[tokio::test]
+async fn production_policy_rejects_unknown_source_without_registration() {
+    let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
+    let srv = IngestServer::new(
+        Arc::new(InMemoryStorage::new(onto.clone())),
+        onto,
+        [5u8; 32],
+    )
+    .with_admin_ceilings(std::iter::empty())
+    .require_admin_ceilings();
+    let request = exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://unknown",
+        "unknown",
+        3,
+        "session",
+        "node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    );
+    let err = srv
+        .register_source(tonic::Request::new(request))
+        .await
+        .expect_err("unknown source must be denied");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(srv.sources.lock().unwrap().is_empty());
+}
+
 /// WS5 (audit): unknown Visibility discriminants are rejected — the old
 /// fail-open coercion mapped 5, 99, -1 to PUBLIC silently.
 #[tokio::test]

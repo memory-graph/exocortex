@@ -53,6 +53,13 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
             .unwrap()
             .port()
     };
+    let policy_dir = tempfile::TempDir::new().unwrap();
+    let source_policy = policy_dir.path().join("sources.json");
+    std::fs::write(
+        &source_policy,
+        r#"[{"org_id":"org","source_uri":"fixture://fixture-e2e","producer_id":"fixture-e2e","ceiling":3}]"#,
+    )
+    .unwrap();
     let mut node = Command::new(&node_bin)
         .args([
             "--mode",
@@ -67,6 +74,8 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
             "fixture-e2e",
             "--cluster-secret",
             "4242424242424242424242424242424242424242424242424242424242424242",
+            "--source-policy",
+            source_policy.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -113,6 +122,8 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
             fixture.to_str().unwrap(),
             "--cursor",
             dir.path().join("fx.cursor").to_str().unwrap(),
+            "--hmac-key",
+            "4242424242424242424242424242424242424242424242424242424242424242",
         ])
         .output()
         .expect("run exocortex-worker fixture");
@@ -154,4 +165,25 @@ fn malformed_hmac_key_fails_loudly() {
         stderr.contains("64 hex chars"),
         "names the problem (shared decode_hex32): {stderr}"
     );
+}
+
+#[test]
+fn fixture_adapter_requires_explicit_hmac_key() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fixture = dir.path().join("fixture.json");
+    std::fs::write(&fixture, r#"{"producer_id":"p","memories":[]}"#).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-worker"))
+        .args([
+            "--adapter",
+            "fixture",
+            "--backend",
+            "http://127.0.0.1:1",
+            "--fixture",
+            fixture.to_str().unwrap(),
+        ])
+        .env_remove("EXOCORTEX_HMAC_KEY")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "missing key must fail closed");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("hmac-key"));
 }

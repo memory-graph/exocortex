@@ -65,6 +65,10 @@ struct Args {
     /// backend node; tests inject an explicit known key.
     #[arg(long)]
     cluster_secret: Option<String>,
+    /// Administrator-owned JSON source policy. Required in backend-node
+    /// mode, including when the policy is intentionally empty (`[]`).
+    #[arg(long)]
+    source_policy: Option<std::path::PathBuf>,
     /// redis-server binary for the embedded supervisor.
     #[arg(long)]
     redis_server_bin: Option<std::path::PathBuf>,
@@ -226,6 +230,7 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
         // backend); a shared tail serves whichever arm won.
         let cluster_secret = resolve_cluster_secret(args.cluster_secret.as_deref())?;
         let bearer_token = resolve_bearer(args.bearer_token.as_deref())?;
+        let admin_ceilings = load_source_policy(args.source_policy.as_deref())?;
         let node_id = args
             .node_id
             .clone()
@@ -246,6 +251,7 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
                 Some(_) => exocortex_dreams::fire::QuietHours::nightly(),
                 None => exocortex_dreams::fire::QuietHours::none(),
             },
+            admin_ceilings,
         };
         if let Some(url) = args.storage.strip_prefix("falkor://") {
             let storage = std::sync::Arc::new(
@@ -309,6 +315,50 @@ fn resolve_bearer(token: Option<&str>) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("--bearer-token must be non-empty for backend-node"))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourcePolicyRow {
+    org_id: String,
+    source_uri: String,
+    producer_id: String,
+    ceiling: u8,
+}
+
+fn load_source_policy(
+    path: Option<&std::path::Path>,
+) -> anyhow::Result<Vec<((String, String, String), exocortex_kernel::Visibility)>> {
+    let path = path.ok_or_else(|| {
+        anyhow::anyhow!("--source-policy is required for backend-node (use [] for no producers)")
+    })?;
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read --source-policy {}: {e}", path.display()))?;
+    let rows: Vec<SourcePolicyRow> = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("parse --source-policy {}: {e}", path.display()))?;
+    let mut seen = std::collections::HashSet::new();
+    rows.into_iter()
+        .map(|row| {
+            anyhow::ensure!(
+                !row.org_id.is_empty() && !row.source_uri.is_empty() && !row.producer_id.is_empty(),
+                "source policy identities must be non-empty"
+            );
+            let visibility = match row.ceiling {
+                0 => exocortex_kernel::Visibility::Private,
+                1 => exocortex_kernel::Visibility::Project,
+                2 => exocortex_kernel::Visibility::Team,
+                3 => exocortex_kernel::Visibility::Org,
+                4 => exocortex_kernel::Visibility::Public,
+                other => anyhow::bail!("source policy ceiling {other} is outside 0..=4"),
+            };
+            let key = (row.org_id, row.source_uri, row.producer_id);
+            anyhow::ensure!(
+                seen.insert(key.clone()),
+                "duplicate source policy entry: {key:?}"
+            );
+            Ok((key, visibility))
+        })
+        .collect()
+}
+
 /// Data dir under the user's data home (§4.3).
 fn data_home() -> anyhow::Result<std::path::PathBuf> {
     let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("no HOME"))?;
@@ -329,7 +379,7 @@ fn data_home() -> anyhow::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_bearer, resolve_cluster_secret};
+    use super::{load_source_policy, resolve_bearer, resolve_cluster_secret};
 
     #[test]
     fn backend_credentials_fail_closed_when_missing_empty_or_malformed() {
@@ -344,5 +394,25 @@ mod tests {
         assert!(resolve_bearer(None).is_err());
         assert!(resolve_bearer(Some("")).is_err());
         assert_eq!(resolve_bearer(Some("test-token")).unwrap(), "test-token");
+    }
+
+    #[test]
+    fn source_policy_is_required_and_validated_before_startup() {
+        assert!(load_source_policy(None).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        std::fs::write(
+            &path,
+            r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":3}]"#,
+        )
+        .unwrap();
+        let rows = load_source_policy(Some(&path)).unwrap();
+        assert_eq!(rows.len(), 1);
+        std::fs::write(
+            &path,
+            r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":9}]"#,
+        )
+        .unwrap();
+        assert!(load_source_policy(Some(&path)).is_err());
     }
 }

@@ -20,6 +20,7 @@ fn args(bind: &str, gossip: u16, seeds: Vec<String>) -> BackendNodeArgs {
         seed_nodes: seeds,
         redis_url: None,
         quiet_hours: exocortex_dreams::fire::QuietHours::none(),
+        admin_ceilings: vec![],
     }
 }
 

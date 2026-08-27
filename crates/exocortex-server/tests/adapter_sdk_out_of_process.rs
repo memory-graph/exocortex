@@ -16,6 +16,7 @@ use exocortex_wire::ingest::v1::MemoryDraft;
 struct Node {
     child: Child,
     addr: std::net::SocketAddr,
+    _policy_dir: tempfile::TempDir,
 }
 
 impl Drop for Node {
@@ -36,6 +37,13 @@ fn free_port() -> u16 {
 fn spawn_node() -> Node {
     let port = free_port();
     let gossip = free_port();
+    let policy_dir = tempfile::tempdir().unwrap();
+    let policy = policy_dir.path().join("sources.json");
+    std::fs::write(
+        &policy,
+        r#"[{"org_id":"org","source_uri":"fixture://oop","producer_id":"oop-fixture","ceiling":3}]"#,
+    )
+    .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_exocortex-node"))
         .args([
             "--mode",
@@ -50,6 +58,8 @@ fn spawn_node() -> Node {
             "oop-test-bearer",
             "--cluster-secret",
             "4242424242424242424242424242424242424242424242424242424242424242",
+            "--source-policy",
+            policy.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -58,6 +68,7 @@ fn spawn_node() -> Node {
     Node {
         child,
         addr: format!("127.0.0.1:{port}").parse().unwrap(),
+        _policy_dir: policy_dir,
     }
 }
 

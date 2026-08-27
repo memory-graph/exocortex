@@ -94,16 +94,15 @@ async fn run_fixture(args: Args) -> anyhow::Result<()> {
     use exocortex_adapter_sdk::{AdapterConfig, AdapterSession, BatchUnit};
     use exocortex_wire::ingest::v1::{MemoryDraft, RelationshipDraft};
 
-    // Key resolution order: --hmac-key > $EXOCORTEX_HMAC_KEY > the
-    // backend's default dev key. A bad hex string is a hard error —
-    // silently falling back to a known key would ship a credential bug.
-    let hmac_key = args
+    // Key resolution order: --hmac-key > $EXOCORTEX_HMAC_KEY. Shared-mode
+    // producers never fall back to a published key.
+    let hmac_key_hex = args
         .hmac_key
         .clone()
         .or_else(|| std::env::var("EXOCORTEX_HMAC_KEY").ok())
-        .map(|hex| exocortex_wire::signing::decode_hex32(&hex).map_err(anyhow::Error::msg))
-        .transpose()?
-        .unwrap_or([0x42u8; 32]);
+        .ok_or_else(|| anyhow::anyhow!("--hmac-key or EXOCORTEX_HMAC_KEY is required"))?;
+    let hmac_key =
+        exocortex_wire::signing::decode_hex32(&hmac_key_hex).map_err(anyhow::Error::msg)?;
     let path = args
         .fixture
         .as_deref()

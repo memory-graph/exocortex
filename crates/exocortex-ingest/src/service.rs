@@ -97,6 +97,8 @@ pub struct IngestServer<S: Storage> {
     /// Admin-configured ceilings (§18.2 / audit WS2): out-of-band, immutable
     /// through the RPC surface. Empty = self-registration stands (dev/tests).
     pub admin_ceilings: HashMap<(String, String, String), Visibility>,
+    /// Production policy mode: an unknown source cannot self-register.
+    pub require_admin_ceiling: bool,
     /// D10c (§4.10b): bounded recent-acceptance ring for near-duplicate
     /// hints — (org, id, type, title, content-hash, embedding) for the
     /// last [`RECENT_RING_LEN`] committed memories. Hints compare each
@@ -150,6 +152,7 @@ impl<S: Storage> Clone for IngestServer<S> {
             reasoning: self.reasoning.clone(),
             dreams: self.dreams.clone(),
             admin_ceilings: self.admin_ceilings.clone(),
+            require_admin_ceiling: self.require_admin_ceiling,
             recent: self.recent.clone(),
         }
     }
@@ -182,6 +185,7 @@ impl<S: Storage> IngestServer<S> {
             reasoning: None,
             dreams: None,
             admin_ceilings: HashMap::new(),
+            require_admin_ceiling: false,
             recent: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         }
     }
@@ -231,6 +235,12 @@ impl<S: Storage> IngestServer<S> {
         ceilings: impl IntoIterator<Item = ((String, String, String), Visibility)>,
     ) -> Self {
         self.admin_ceilings = ceilings.into_iter().collect();
+        self
+    }
+
+    /// Fail closed for registrations not provisioned by an administrator.
+    pub fn require_admin_ceilings(mut self) -> Self {
+        self.require_admin_ceiling = true;
         self
     }
 
@@ -1244,8 +1254,14 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                     }
                     a
                 }
-                (None, Some(e)) => e.ceiling,
-                (None, None) => requested,
+                (None, existing) => {
+                    if self.require_admin_ceiling {
+                        return Err(Status::permission_denied(
+                            "source has no administrator-provisioned ceiling (R-I3)",
+                        ));
+                    }
+                    existing.map(|entry| entry.ceiling).unwrap_or(requested)
+                }
             };
             let kind = existing.map(|e| e.kind).unwrap_or(declared_kind);
             let entry = SourceEntry { ceiling, kind };
