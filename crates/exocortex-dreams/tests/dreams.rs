@@ -527,3 +527,142 @@ async fn transitive_finder_proposes_only_open_indirect_pairs() {
     };
     assert!(!open.contains(&(a, c)), "proposal did not write an edge");
 }
+
+fn discovery_test_relationship(from: MemoryId, to: MemoryId) -> exocortex_kernel::Relationship {
+    use exocortex_kernel::{RelKindId, RelationshipProperties};
+    let kind = RelKindId(5);
+    exocortex_kernel::Relationship {
+        id: exocortex_kernel::RelationshipId::derive(from, kind, to, None),
+        kind,
+        from,
+        to,
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "production-cycle-test".into(),
+            producer_kind: None,
+        },
+        properties: RelationshipProperties {
+            strength: 0.5,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: chrono::Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        lsn: LSN::new_local(0),
+    }
+}
+
+#[tokio::test]
+async fn production_cycle_runs_discovery_after_consolidation() {
+    let storage = InMemoryStorage::new(ontology());
+    let [a, b, c] = [MemoryId([11; 16]), MemoryId([12; 16]), MemoryId([13; 16])];
+    for (i, id) in [a, b, c].into_iter().enumerate() {
+        let mut memory = mem_with_embedding(i + 200, None, unit(i));
+        memory.id = id;
+        memory.embedding = None;
+        storage.upsert_memory(&memory).await.unwrap();
+    }
+    storage
+        .upsert_relationship(&discovery_test_relationship(a, b))
+        .await
+        .unwrap();
+    storage
+        .upsert_relationship(&discovery_test_relationship(b, c))
+        .await
+        .unwrap();
+
+    let engine = Arc::new(DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        false,
+        "production-discovery".into(),
+    ));
+    let runner = tokio::spawn(engine.clone().run());
+    engine.notify(RegionKey {
+        org: "o".into(),
+        project: "p".into(),
+        memory_type: 3,
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if engine
+                .pending_discoveries()
+                .iter()
+                .any(|discovery| discovery.endpoints == (a, c))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the production run loop must execute discovery after consolidation");
+    runner.abort();
+}
+
+#[tokio::test]
+async fn discovery_budget_selects_the_same_bounded_pairs() {
+    let storage = InMemoryStorage::new(ontology());
+    for chain in 0..20u8 {
+        let a = MemoryId([chain * 3 + 1; 16]);
+        let b = MemoryId([chain * 3 + 2; 16]);
+        let c = MemoryId([chain * 3 + 3; 16]);
+        for (i, id) in [a, b, c].into_iter().enumerate() {
+            let mut memory = mem_with_embedding(chain as usize * 3 + i, None, unit(i));
+            memory.id = id;
+            storage.upsert_memory(&memory).await.unwrap();
+        }
+        storage
+            .upsert_relationship(&discovery_test_relationship(a, b))
+            .await
+            .unwrap();
+        storage
+            .upsert_relationship(&discovery_test_relationship(b, c))
+            .await
+            .unwrap();
+    }
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        false,
+        "bounded-discovery".into(),
+    );
+    let region = RegionKey {
+        org: "o".into(),
+        project: "p".into(),
+        memory_type: 3,
+    };
+    let first: Vec<_> = engine
+        .run_discovery(&region)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|proposal| proposal.endpoints)
+        .collect();
+    let second: Vec<_> = engine
+        .run_discovery(&region)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|proposal| proposal.endpoints)
+        .collect();
+    assert_eq!(first.len(), exocortex_dreams::MAX_DISCOVERIES_PER_CYCLE);
+    assert_eq!(
+        first, second,
+        "the capped proposal set must be reproducible"
+    );
+}

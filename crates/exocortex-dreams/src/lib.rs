@@ -29,6 +29,8 @@ use trigger::{DreamsTrigger, RegionWriteCounters};
 
 /// §12.1 step 5: SimilarTo creation threshold.
 pub const SIMILAR_TO_THRESHOLD: f32 = 0.85;
+/// Maximum structured discovery proposals emitted by one production cycle.
+pub const MAX_DISCOVERIES_PER_CYCLE: usize = 16;
 
 /// The audit record stamped per cycle — every field R-Dr4 mandates.
 #[derive(Clone, Debug)]
@@ -190,12 +192,22 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let _ = self.tx_fire.try_send((region, snap));
     }
 
-    /// The consolidation loop.
+    /// The production Dreams loop: consolidation followed by discovery.
     pub async fn run(self: Arc<Self>) {
         while let Some((region, fired_at)) = { self.rx_fire.lock().await.recv().await } {
             match self.try_consolidate(&region).await {
                 Ok(res) => info!(?res, "consolidation ok"),
-                Err(e) => warn!(?e, "consolidation failed"),
+                Err(e) => {
+                    warn!(?e, "consolidation failed");
+                    continue;
+                }
+            }
+            match self.run_discovery(&region).await {
+                Ok(proposals) => info!(count = proposals.len(), "discovery ok"),
+                Err(e) => {
+                    warn!(?e, "discovery failed");
+                    continue;
+                }
             }
             // R-Dr13: reset only when nothing new landed during the cycle;
             // otherwise the surviving counts roll into the next fire.
@@ -692,6 +704,10 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             }
         }
         drop(rs);
+        // Storage iteration order is intentionally unspecified. Stable input
+        // ordering makes the capped proposal set reproducible across adapters
+        // and process restarts.
+        edges.sort_by_key(|(from, to, kind, derived)| (*from, *to, *kind, *derived));
         let direct: std::collections::HashSet<(MemoryId, MemoryId)> =
             edges.iter().map(|(f, t, _, _)| (*f, *t)).collect();
 
@@ -717,7 +733,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                     .increment(1);
                     self.discoveries.insert(d.id, d.clone());
                     out.push(d);
-                    if out.len() >= 16 {
+                    if out.len() >= MAX_DISCOVERIES_PER_CYCLE {
                         break 'outer;
                     }
                 }
