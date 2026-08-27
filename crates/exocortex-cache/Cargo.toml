@@ -33,3 +33,7 @@ stats_alloc = "0.1"  # §8.5 step 1: no-allocation assertion on the read hot pat
 [[bench]]
 name = "search"
 harness = false
+
+[[bench]]
+name = "updates"
+harness = false

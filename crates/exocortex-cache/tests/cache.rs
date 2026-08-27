@@ -539,6 +539,41 @@ fn repeated_replacements_keep_search_index_bounded() {
     );
 }
 
+#[tokio::test]
+async fn queued_invalidations_publish_one_delta_snapshot() {
+    let onto = ontology();
+    let (cache, rx) = LocalCache::new(64 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    cache.publish("org", Arc::new(GraphSnapshot::empty()));
+    let baseline = cache.snapshot_publications();
+    let mut ids = Vec::new();
+    for lsn in 1..=128 {
+        let row = mem(&format!("delta-{lsn}"), Visibility::Org, None);
+        ids.push(row.id);
+        cache
+            .submit(CacheWrite::Apply(
+                exocortex_storage::Invalidation::MemorySnapshotUpserted {
+                    memory: Box::new(row),
+                    lsn,
+                },
+            ))
+            .await;
+    }
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let storage = InMemoryStorage::new(onto);
+        async move { cache.run(Arc::new(storage), rx).await }
+    });
+    cache.flush().await;
+
+    assert_eq!(cache.snapshot_publications() - baseline, 1);
+    let context = vc(Visibility::Org, "alice");
+    assert!(ids
+        .iter()
+        .all(|id| cache.get_memory("org", id, &context).is_some()));
+    writer.abort();
+}
+
 /// CR5 (audit): re-upserting the same RelationshipId replaces the edge —
 /// no parallel duplicates.
 #[tokio::test]

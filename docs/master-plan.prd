@@ -161,6 +161,7 @@ each step (88 tests at completion).
 |----|------|-------|-------|
 | R6-S1 | Fail-closed secrets and authorization (B01-B05, B19, B25-B26) | Codex | Round 6 remediation in progress; release blocker |
 | R6-S2 | Cache and reasoning correctness (B06-B07, B13, B21-B23) | Codex | Round 6 remediation in progress; release blocker |
+| R6-B22 | Cache invalidation delta application and indexed edge fetch | Codex | Queued invalidations now microbatch into one lock-free snapshot publication; indexed storage point lookup remains in progress |
 | R6-S3 | Atomicity and durability (B08-B10, B15-B18, B20) | Codex | Round 6 remediation in progress; release blocker |
 | R6-S4 | Backend/runtime completeness (B11-B12, B14, B24) | Codex | Round 6 remediation in progress; release blocker |
 | R6-S5 | Delivery truth (B27-B30) | Codex | Round 6 remediation in progress; release blocker |
@@ -216,6 +217,7 @@ each step (88 tests at completion).
 | R6-A07 | **Done** — removed the client drain state-witness no-op and its otherwise-unused import; no enforcement or runtime behavior depended on the placeholder | client targeted clippy and workspace validation |
 | R6-A01 | **Done** — cache correctness tests synchronize on writer acknowledgements instead of fixed sleeps; the production reseed readiness boundary uses the same deterministic acknowledgement | `cargo test -p exocortex-cache --test cache` 14/14; `LocalCache::flush`; zero `sleep(` calls remain in `crates/exocortex-cache/tests/cache.rs` |
 | R6-A03 | **Done** — the backend-client integration waits for deterministic authenticated hydration readiness, then starts its 500 ms acceptance deadline immediately after the committed live write | `cargo test -p exocortex-client --test sync -- --test-threads=1`; `production_backend_sync_hydrates_before_ready_and_stays_live` |
+| R6-A04 | **Done** — the mandatory benchmark aggregate now gates release-mode cache hydration and invalidation bursts in addition to steady-state search/reasoning; a 20k-row hydrate and 256-row burst have explicit time ceilings and the burst must publish exactly one immutable snapshot | `cargo bench -p exocortex-cache --bench updates`: hydrate 20,000 in 108.96 ms, apply 256 in 9.91 ms, one publication; `cargo xtask bench` includes `updates` |
 | R6-U04 | **Verified public contract and Done without breaking change** — `intern_name` is an exported function from the published `exocortex-ingest` library and may be used downstream even though the internal extractor field was dead; the public function/signature remains intact while only the unused owned interner was removed | public API inspection plus successful `cargo doc --no-deps -p exocortex-ingest`; R6-A06 entity regressions |
 | R6-A02 | **Done** — organization-backup verification treats relationship iteration order as unspecified and asserts restoration by stable relationship identity after deliberately reversing the returned rows | server `org_round_trip_is_byte_faithful_across_storage_instances` |
 

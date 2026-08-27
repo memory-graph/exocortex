@@ -17,6 +17,7 @@ use parking_lot::Mutex;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
 use petgraph::visit::EdgeRef;
 use smol_str::SmolStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -352,6 +353,7 @@ pub struct LocalCache {
     tq: Mutex<TwoQState>,
     writer: mpsc::Sender<CacheWrite>,
     budget: usize,
+    snapshot_publications: AtomicU64,
 }
 
 struct TwoQState {
@@ -413,6 +415,7 @@ impl LocalCache {
                 }),
                 writer: tx,
                 budget: budget_bytes,
+                snapshot_publications: AtomicU64::new(0),
             },
             rx,
         )
@@ -421,52 +424,79 @@ impl LocalCache {
     /// The single writer loop. Applies invalidations and reseeds serially so
     /// snapshots swap atomically (§8.2).
     pub async fn run<S: Storage>(&self, storage: Arc<S>, mut rx: mpsc::Receiver<CacheWrite>) {
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                CacheWrite::Apply(inv) => self.apply(&*storage, inv).await,
-                CacheWrite::Reseed { org, snapshot, ack } => {
-                    // R-O2 families: rebuild counts + graph size levels.
-                    metrics::counter!("exocortex_cache_rebuild_total", "reason" => "reseed")
-                        .increment(1);
-                    metrics::gauge!("exocortex_memories_total")
-                        .set(snapshot.petgraph.node_count() as f64);
-                    metrics::gauge!("exocortex_relationships_total", "provenance" => "all")
-                        .set(snapshot.petgraph.edge_count() as f64);
-                    let bytes = snapshot.est_bytes;
-                    {
-                        let mut tq = self.tq.lock();
-                        tq.bytes = tq.bytes.saturating_sub(
-                            self.graphs
-                                .get(&org)
-                                .map(|g| g.load_full().est_bytes)
-                                .unwrap_or(0),
-                        );
-                        tq.bytes += bytes;
+        while let Some(first) = rx.recv().await {
+            // Give same-tick producers one scheduling turn to finish their
+            // burst before draining it into a single copy-on-write publish.
+            tokio::task::yield_now().await;
+            let mut messages = vec![first];
+            while messages.len() < 256 {
+                match rx.try_recv() {
+                    Ok(message) => messages.push(message),
+                    Err(_) => break,
+                }
+            }
+            let mut pending = Vec::new();
+            for msg in messages {
+                match msg {
+                    CacheWrite::Apply(inv) => {
+                        pending.push(inv);
+                        continue;
                     }
-                    self.graphs
-                        .entry(org.clone())
-                        .or_insert_with(|| {
-                            Arc::new(ArcSwap::from(Arc::new(GraphSnapshot::empty())))
-                        })
-                        .store(snapshot);
-                    self.admit(&org);
-                    if let Some(ack) = ack {
+                    CacheWrite::Reseed { org, snapshot, ack } => {
+                        self.apply_pending(&*storage, &mut pending).await;
+                        // R-O2 families: rebuild counts + graph size levels.
+                        metrics::counter!("exocortex_cache_rebuild_total", "reason" => "reseed")
+                            .increment(1);
+                        metrics::gauge!("exocortex_memories_total")
+                            .set(snapshot.petgraph.node_count() as f64);
+                        metrics::gauge!("exocortex_relationships_total", "provenance" => "all")
+                            .set(snapshot.petgraph.edge_count() as f64);
+                        let bytes = snapshot.est_bytes;
+                        {
+                            let mut tq = self.tq.lock();
+                            tq.bytes = tq.bytes.saturating_sub(
+                                self.graphs
+                                    .get(&org)
+                                    .map(|g| g.load_full().est_bytes)
+                                    .unwrap_or(0),
+                            );
+                            tq.bytes += bytes;
+                        }
+                        self.graphs
+                            .entry(org.clone())
+                            .or_insert_with(|| {
+                                Arc::new(ArcSwap::from(Arc::new(GraphSnapshot::empty())))
+                            })
+                            .store(snapshot);
+                        self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
+                        self.admit(&org);
+                        if let Some(ack) = ack {
+                            let _ = ack.send(());
+                        }
+                    }
+                    CacheWrite::Evict(org) => {
+                        self.apply_pending(&*storage, &mut pending).await;
+                        self.graphs.remove(&org);
+                    }
+                    CacheWrite::Barrier(ack) => {
+                        self.apply_pending(&*storage, &mut pending).await;
                         let _ = ack.send(());
                     }
                 }
-                CacheWrite::Evict(org) => {
-                    self.graphs.remove(&org);
-                }
-                CacheWrite::Barrier(ack) => {
-                    let _ = ack.send(());
-                }
             }
+            self.apply_pending(&*storage, &mut pending).await;
+        }
+    }
+
+    async fn apply_pending<S: Storage>(&self, storage: &S, pending: &mut Vec<Invalidation>) {
+        if !pending.is_empty() {
+            self.apply_batch(storage, std::mem::take(pending)).await;
         }
     }
 
     /// Copy-on-write apply of one invalidation. Readers holding the old
     /// snapshot continue to see it until they release their Arc.
-    async fn apply<S: Storage>(&self, storage: &S, inv: Invalidation) {
+    async fn apply_batch<S: Storage>(&self, storage: &S, invalidations: Vec<Invalidation>) {
         // v1 caches exactly one org per client (§17); invalidations target it.
         let Some(org) = self.org_of_write() else {
             return;
@@ -474,64 +504,84 @@ impl LocalCache {
         let Some(g) = self.graphs.get(&org) else {
             return;
         };
-        let old_bytes = g.load_full().est_bytes;
-        let mut next = clone_snapshot(&g.load_full());
-        match inv {
-            Invalidation::MemoryUpserted { id, lsn } => {
-                match storage.get_memory(&id).await {
-                    Ok(Some(m)) => {
-                        next.insert_memory(m);
+        let current = g.load_full();
+        let old_bytes = current.est_bytes;
+        let mut next = clone_snapshot(&current);
+        let mut changed = false;
+        for inv in invalidations {
+            match inv {
+                Invalidation::MemoryUpserted { id, lsn } => {
+                    match storage.get_memory(&id).await {
+                        Ok(Some(m)) => {
+                            next.insert_memory(m);
+                            changed = true;
+                        }
+                        Ok(None) => {
+                            next.remove_memory(&id);
+                            changed = true;
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, "invalidation fetch failed");
+                            continue;
+                        }
                     }
-                    Ok(None) => {
-                        next.remove_memory(&id);
-                    }
-                    Err(e) => {
-                        tracing::warn!(?e, "invalidation fetch failed");
-                        return;
-                    }
+                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
                 }
-                next.last_backend_lsn = next.last_backend_lsn.max(lsn);
-            }
-            Invalidation::MemoryDeleted { id, lsn } => {
-                next.remove_memory(&id);
-                next.last_backend_lsn = next.last_backend_lsn.max(lsn);
-            }
-            Invalidation::RelationshipUpserted { id, lsn, .. } => {
-                match fetch_relationship(storage, &id).await {
-                    Ok(Some(r)) => next.insert_relationship(r),
-                    Ok(None) => {
-                        tracing::warn!("relationship invalidation row missing; LSN not advanced");
-                        return;
-                    }
-                    Err(error) => {
-                        tracing::warn!(?error, "relationship invalidation fetch failed");
-                        return;
-                    }
+                Invalidation::MemoryDeleted { id, lsn } => {
+                    next.remove_memory(&id);
+                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+                    changed = true;
                 }
-                next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+                Invalidation::RelationshipUpserted { id, lsn, .. } => {
+                    match fetch_relationship(storage, &id).await {
+                        Ok(Some(r)) => {
+                            next.insert_relationship(r);
+                            changed = true;
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                "relationship invalidation row missing; LSN not advanced"
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::warn!(?error, "relationship invalidation fetch failed");
+                            continue;
+                        }
+                    }
+                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+                }
+                Invalidation::RelationshipDeleted { id, lsn } => {
+                    next.remove_relationship(&id);
+                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+                    changed = true;
+                }
+                Invalidation::VisibilityAdvance { lsn } => {
+                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+                    changed = true;
+                }
+                Invalidation::MemorySnapshotUpserted { memory, lsn } => {
+                    next.insert_memory(*memory);
+                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+                    changed = true;
+                }
+                Invalidation::RelationshipSnapshotUpserted { relationship, lsn } => {
+                    next.insert_relationship(*relationship);
+                    next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+                    changed = true;
+                }
+                Invalidation::GraphReseed { .. } => {
+                    tracing::warn!("graph reseed reached cache apply path; LSN not advanced");
+                    continue;
+                }
             }
-            Invalidation::RelationshipDeleted { id, lsn } => {
-                next.remove_relationship(&id);
-                next.last_backend_lsn = next.last_backend_lsn.max(lsn);
-            }
-            Invalidation::VisibilityAdvance { lsn } => {
-                next.last_backend_lsn = next.last_backend_lsn.max(lsn);
-            }
-            Invalidation::MemorySnapshotUpserted { memory, lsn } => {
-                next.insert_memory(*memory);
-                next.last_backend_lsn = next.last_backend_lsn.max(lsn);
-            }
-            Invalidation::RelationshipSnapshotUpserted { relationship, lsn } => {
-                next.insert_relationship(*relationship);
-                next.last_backend_lsn = next.last_backend_lsn.max(lsn);
-            }
-            Invalidation::GraphReseed { .. } => {
-                tracing::warn!("graph reseed reached cache apply path; LSN not advanced");
-                return;
-            }
+        }
+        if !changed {
+            return;
         }
         let new_bytes = next.est_bytes;
         g.store(Arc::new(next));
+        self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
         // CR13 (audit): the invalidation path reconciles the 2Q byte
         // accounting exactly like Reseed does, and re-runs admission so
         // the budget is enforced on a long-running node (the early returns
@@ -863,6 +913,7 @@ impl LocalCache {
                 let mut next = clone_snapshot(&cur);
                 next.last_local_lsn = local_lsn;
                 g.store(Arc::new(next));
+                self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -909,6 +960,7 @@ impl LocalCache {
             }
         }
         g.store(Arc::new(next));
+        self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
         self.admit(&org.into());
     }
 
@@ -971,7 +1023,14 @@ impl LocalCache {
             .entry(org.into())
             .or_insert_with(|| Arc::new(ArcSwap::from(Arc::new(GraphSnapshot::empty()))))
             .store(snapshot);
+        self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
         self.admit(&org.into());
+    }
+
+    /// Number of atomic graph publications (update-scaling test support).
+    #[doc(hidden)]
+    pub fn snapshot_publications(&self) -> u64 {
+        self.snapshot_publications.load(Ordering::Relaxed)
     }
 
     /// Stream all memories + relationships from storage and rebuild the
