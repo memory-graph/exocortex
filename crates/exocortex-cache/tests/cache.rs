@@ -31,7 +31,7 @@ fn mem(title: &str, vis: Visibility, author: Option<&str>) -> Memory {
             project_id: None,
             project_path: None,
             team_id: None,
-            tenant_id: None,
+            tenant_id: Some("org".into()),
             session_id: None,
             user_id: author.map(Into::into),
             created_by: None,

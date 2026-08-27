@@ -34,7 +34,7 @@ fn mem(title: &str) -> Memory {
             project_id: None,
             project_path: None,
             team_id: None,
-            tenant_id: None,
+            tenant_id: Some("org".into()),
             session_id: None,
             user_id: None,
             created_by: None,
@@ -354,7 +354,8 @@ async fn audit_ledger_is_org_scoped() {
     let ctx_b = ctx_for("org-b");
 
     for (ctx, org) in [(&ctx_a, "org-a"), (&ctx_b, "org-b")] {
-        let m = mem("isolation-probe");
+        let mut m = mem("isolation-probe");
+        m.context.tenant_id = Some(org.into());
         ctx.storage.upsert_memory(&m).await.unwrap();
         let out = exocortex_ops::operations::PromoteVisibilityOp
             .handle(

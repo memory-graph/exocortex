@@ -632,8 +632,8 @@ async fn shared_listener_uses_tls_and_refuses_plaintext() {
     let mut bytes = Vec::new();
     let _ = tokio::time::timeout(Duration::from_secs(1), plaintext.read_to_end(&mut bytes)).await;
     assert!(
-        !bytes.starts_with(b"HTTP/1.1 200"),
-        "shared listener must not answer plaintext HTTP"
+        !bytes.starts_with(b"HTTP/"),
+        "TLS listener must not emit any plaintext HTTP response, including an auth rejection: {bytes:?}"
     );
 }
 

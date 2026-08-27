@@ -539,7 +539,7 @@ async fn mcp_get_memory_shape_matches_registry() {
             project_id: None,
             project_path: None,
             team_id: None,
-            tenant_id: None,
+            tenant_id: Some("org".into()),
             session_id: None,
             user_id: None,
             created_by: None,

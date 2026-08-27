@@ -126,6 +126,9 @@ async fn saturated_submit_capacity_emits_rate_limited_without_storage_work() {
         .await
         .unwrap()
         .into_inner();
+    assert_eq!(ack.accepted, 0);
+    assert_eq!(ack.rejected, 1);
+    assert!(!ack.rejections.is_empty());
     assert!(ack
         .rejections
         .iter()
@@ -260,34 +263,47 @@ async fn empty_content_emits_unknown_reject_code() {
 }
 
 #[test]
-fn reject_code_protocol_catalogue_is_exhaustive() {
+fn reject_code_target_manifest_is_exhaustive_and_executable() {
     // §23 #27: each entry is exercised by a targeted Submit batch in this
     // integration-test target or the adjacent e2e/external-key targets. Keep
     // this match wildcard-free so adding a protocol code cannot silently
     // escape the executable rejection matrix.
-    fn targeted_test(code: RejectCode) -> &'static str {
+    fn targeted_test(code: RejectCode) -> (&'static str, &'static str) {
         match code {
-            RejectCode::Unknown => "empty_content_emits_unknown_reject_code",
-            RejectCode::IncompatibleOntology => "fingerprint_mismatch_rejected",
-            RejectCode::UnknownSource => "unknown_source_rejected_after_hmac",
-            RejectCode::UnknownMemoryType => "unknown_memory_type_rejected",
-            RejectCode::UnknownKind => "unknown_relationship_kind_rejected",
-            RejectCode::InvalidTypeTriple => "bad_triple_rejects_whole_batch_naming_the_key",
-            RejectCode::VisibilityWidening => "visibility_widening_rejected_under_lowered_ceiling",
-            RejectCode::MissingExternalKey => {
-                "external_batch_without_key_rejected_and_with_key_deterministic"
+            RejectCode::Unknown => ("ingest", "empty_content_emits_unknown_reject_code"),
+            RejectCode::IncompatibleOntology => {
+                ("ingest", "fingerprint_mismatch_rejects_whole_batch")
             }
-            RejectCode::DuplicateBatch => "same_batch_id_different_payload_is_rejected",
-            RejectCode::BadChecksum => "tampered_external_coordinates_fail_checksum",
-            RejectCode::Unauthorized => "missing_hmac_rejected_before_anything",
-            RejectCode::RateLimited => {
-                "saturated_submit_capacity_emits_rate_limited_without_storage_work"
+            RejectCode::UnknownSource => ("ingest", "unregistered_source_rejected"),
+            RejectCode::UnknownMemoryType => ("ingest", "unknown_memory_type_rejected"),
+            RejectCode::UnknownKind => ("e2e", "inverse_materialized_on_write"),
+            RejectCode::InvalidTypeTriple => {
+                ("e2e", "bad_triple_rejects_whole_batch_naming_the_key")
             }
-            RejectCode::ComputedKindRejected => "computed_kind_rejected_at_ingest_boundary",
-            RejectCode::InvalidExternalKey => "malformed_external_coordinates_are_rejected",
-            RejectCode::ResourceLimitExceeded => {
-                "resource_ceiling_rejects_before_ontology_or_storage_work"
-            }
+            RejectCode::VisibilityWidening => (
+                "ingest",
+                "visibility_widening_rejected_under_lowered_ceiling",
+            ),
+            RejectCode::MissingExternalKey => (
+                "ingest",
+                "external_batch_without_key_rejected_and_with_key_deterministic",
+            ),
+            RejectCode::DuplicateBatch => ("ingest", "duplicate_batch_is_idempotent_replay"),
+            RejectCode::BadChecksum => ("external_key", "bad_checksum_is_rejected"),
+            RejectCode::Unauthorized => ("ingest", "missing_hmac_rejected_before_anything"),
+            RejectCode::RateLimited => (
+                "ingest",
+                "saturated_submit_capacity_emits_rate_limited_without_storage_work",
+            ),
+            RejectCode::ComputedKindRejected => ("e2e", "computed_only_kind_rejected_at_ingest"),
+            RejectCode::InvalidExternalKey => (
+                "external_key",
+                "malformed_external_coordinates_are_rejected",
+            ),
+            RejectCode::ResourceLimitExceeded => (
+                "ingest",
+                "resource_ceiling_rejects_before_ontology_or_storage_work",
+            ),
         }
     }
 
@@ -299,8 +315,31 @@ fn reject_code_protocol_catalogue_is_exhaustive() {
         15,
         "wire RejectCode discriminants must stay dense"
     );
+    let sources = [
+        ("ingest", include_str!("ingest.rs")),
+        ("e2e", include_str!("e2e.rs")),
+        ("external_key", include_str!("external_key.rs")),
+    ];
     for code in codes {
-        assert!(!targeted_test(code).is_empty());
+        let (target, test) = targeted_test(code);
+        let source = sources
+            .iter()
+            .find_map(|(name, source)| (*name == target).then_some(*source))
+            .unwrap();
+        let marker = format!("async fn {test}");
+        let tail = source
+            .split_once(&marker)
+            .unwrap_or_else(|| panic!("{code:?} target {target}::{test} is missing"))
+            .1;
+        let body = tail.split("\n#[tokio::test]").next().unwrap();
+        assert!(
+            body.contains("submit("),
+            "{code:?} target {target}::{test} does not execute Submit"
+        );
+        assert!(
+            body.contains(&format!("RejectCode::{code:?}")),
+            "{code:?} target {target}::{test} does not assert the exact code"
+        );
     }
 }
 

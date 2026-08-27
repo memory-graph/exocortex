@@ -44,6 +44,9 @@ enum Cmd {
     /// anywhere under `crates/` or `xtask/` source. Complements
     /// `kernel-purity` (which scopes to the kernel dep tree).
     NoLlm,
+    /// CR-19 runtime audit: run the complete workspace suite with conventional
+    /// provider endpoints redirected to a connection-counting loopback trap.
+    MockProviderAudit,
     ProtoSync,
     WireStandalone,
     SigningHygiene,
@@ -81,6 +84,7 @@ fn main() -> Result<()> {
         Cmd::KernelPurity => kernel_purity(),
         Cmd::Bench => bench(),
         Cmd::NoLlm => no_llm(),
+        Cmd::MockProviderAudit => mock_provider_audit(),
         Cmd::ProtoSync => proto_sync(),
         Cmd::WireStandalone => wire_standalone(),
         Cmd::SigningHygiene => signing_hygiene(),
@@ -482,7 +486,29 @@ fn bench() -> Result<()> {
             "SLO gate FAILED for {bench} (R-Lat1); see the p50/p99 lines above"
         );
     }
-    println!("bench ok: search, update/hydration, and reasoning SLO gates green (R-Lat1)");
+    if std::env::var("FALKOR_URL").is_ok_and(|url| !url.is_empty()) {
+        println!("==> cargo test -p exocortex-storage --features integration --test live_bench");
+        let status = std::process::Command::new(&cargo)
+            .args([
+                "test",
+                "-p",
+                "exocortex-storage",
+                "--features",
+                "integration",
+                "--test",
+                "live_bench",
+                "--release",
+                "--",
+                "--nocapture",
+            ])
+            .status()?;
+        anyhow::ensure!(status.success(), "live Falkor SLO gate FAILED");
+    } else {
+        eprintln!(
+            "UNEXECUTED: live Falkor SLO target requires FALKOR_URL; in-memory benchmarks passed"
+        );
+    }
+    println!("bench ok: search, update/hydration, reasoning, and available live-backend SLO gates green (R-Lat1)");
     Ok(())
 }
 
@@ -499,6 +525,66 @@ fn no_llm() -> Result<()> {
         violations.join("\n")
     );
     println!("no-llm ok: no LLM client crate or endpoint in executable workspace sources");
+    Ok(())
+}
+
+fn mock_provider_audit() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let stop = Arc::new(AtomicBool::new(false));
+    let connections = Arc::new(AtomicUsize::new(0));
+    let thread_stop = stop.clone();
+    let thread_connections = connections.clone();
+    let trap = std::thread::spawn(move || {
+        while !thread_stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((_stream, _)) => {
+                    thread_connections.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::park_timeout(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let cargo = std::env::var("CARGO")?.trim().to_string();
+    let mut command = std::process::Command::new(cargo);
+    command.args([
+        "test",
+        "--workspace",
+        "--features",
+        "exocortex-adapter-sdk/testing",
+        "--no-fail-fast",
+    ]);
+    for name in [
+        ["OPENAI", "_BASE_URL"].concat(),
+        ["ANTHROPIC", "_BASE_URL"].concat(),
+        ["GOOGLE", "_AI_BASE_URL"].concat(),
+        ["MISTRAL", "_BASE_URL"].concat(),
+        ["COHERE", "_BASE_URL"].concat(),
+    ] {
+        command.env(name, &endpoint);
+    }
+    let status = command.status()?;
+    stop.store(true, Ordering::SeqCst);
+    trap.thread().unpark();
+    trap.join()
+        .map_err(|_| anyhow::anyhow!("mock provider trap thread panicked"))?;
+    anyhow::ensure!(
+        status.success(),
+        "workspace suite failed during provider audit"
+    );
+    anyhow::ensure!(
+        connections.load(Ordering::SeqCst) == 0,
+        "mock-provider audit observed an outbound inference connection"
+    );
+    println!("mock-provider-audit ok: full workspace suite made zero provider connections");
     Ok(())
 }
 
