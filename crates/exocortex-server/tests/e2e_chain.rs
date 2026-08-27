@@ -246,11 +246,8 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
         found.expect("committed row present")
     };
 
-    let subscriber_visibility = exocortex_ops::operations::ops_vc(
-        "org",
-        "e2e",
-        exocortex_kernel::Visibility::Org,
-    );
+    let subscriber_visibility =
+        exocortex_ops::operations::ops_vc("org", "e2e", exocortex_kernel::Visibility::Org);
     let stored = storage
         .get_memory(&committed)
         .await
