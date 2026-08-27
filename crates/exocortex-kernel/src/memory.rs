@@ -51,12 +51,40 @@ pub struct EmbeddingModel {
 }
 
 /// A vector inseparably paired with its producing model revision (R-Dr5).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Embedding {
     /// Producing model identity.
     pub model: EmbeddingModel,
     /// Dense vector values.
     pub vector: Vec<f32>,
+}
+
+impl<'de> Deserialize<'de> for Embedding {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum PersistedEmbedding {
+            Stamped {
+                model: EmbeddingModel,
+                vector: Vec<f32>,
+            },
+            // Before R6-B30-14 production had exactly one configured model:
+            // bge-small v1. Accept that durable shape during rolling upgrade;
+            // every subsequent serialization emits the stamped form.
+            LegacyBgeSmallV1(Vec<f32>),
+        }
+
+        Ok(match PersistedEmbedding::deserialize(deserializer)? {
+            PersistedEmbedding::Stamped { model, vector } => Self { model, vector },
+            PersistedEmbedding::LegacyBgeSmallV1(vector) => Self {
+                model: EmbeddingModel {
+                    name: "bge-small".into(),
+                    version: "v1".into(),
+                },
+                vector,
+            },
+        })
+    }
 }
 
 /// The canonical memory: heavy envelope, single-string content (§7.5).
