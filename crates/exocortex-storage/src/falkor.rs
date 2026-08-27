@@ -229,14 +229,6 @@ fn hex_digest(bytes: &[u8; 32]) -> String {
     out
 }
 
-fn unhex(s: &str) -> Option<[u8; 16]> {
-    let mut out = [0u8; 16];
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
-}
-
 /// R-T11 (audit ST3): v1 read paths treat `Public` as `Org`, so an
 /// Org-or-wider caller fetches at the widest internal ceiling; narrower
 /// callers fetch at their own scope.
@@ -2145,15 +2137,6 @@ impl FalkorStorage {
     /// Current backend LSN frontier (Redis GET).
     async fn last_backend_lsn(&self) -> u64 {
         self.redis.clone().get(&self.lsn_key).await.unwrap_or(0)
-    }
-
-    /// Hex helper exposed for tests.
-    pub fn id_hex(id: &MemoryId) -> String {
-        hex(&id.0)
-    }
-    /// Reverse hex helper exposed for tests.
-    pub fn id_unhex(s: &str) -> Option<MemoryId> {
-        unhex(s).map(MemoryId)
     }
 }
 

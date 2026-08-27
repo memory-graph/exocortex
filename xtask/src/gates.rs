@@ -85,7 +85,11 @@ pub(crate) fn no_llm_violations(root: &Path) -> Result<Vec<String>> {
     for entry in ["crates", "xtask", "scripts", "proto", ".github"] {
         let path = root.join(entry);
         if path.exists() {
-            walk_source_files(&path, &mut files)?;
+            walk_files(
+                &path,
+                &mut files,
+                &["rs", "toml", "proto", "sh", "yml", "yaml"],
+            )?;
         }
     }
     for name in ["Cargo.toml", "Dockerfile"] {
@@ -201,7 +205,7 @@ pub(crate) fn kernel_boundary_violations(root: &Path) -> Result<Vec<String>> {
         }
     }
     let mut files = Vec::new();
-    walk_rust_files(&kernel.join("src"), &mut files)?;
+    walk_files(&kernel.join("src"), &mut files, &["rs"])?;
     for path in files {
         let source = strip_comments_and_strings(&std::fs::read_to_string(&path)?);
         for marker in [
@@ -226,7 +230,7 @@ pub(crate) fn kernel_boundary_violations(root: &Path) -> Result<Vec<String>> {
 pub(crate) fn kernel_pack_coupling_violations(root: &Path) -> Result<Vec<String>> {
     let kernel = root.join("crates/exocortex-kernel");
     let mut files = vec![kernel.join("Cargo.toml")];
-    walk_rust_files(&kernel.join("src"), &mut files)?;
+    walk_files(&kernel.join("src"), &mut files, &["rs"])?;
     let mut violations = Vec::new();
     for path in files {
         let source = std::fs::read_to_string(&path)?;
@@ -351,7 +355,7 @@ fn package_name(line: &str) -> Option<&str> {
 
 pub(crate) fn signing_hygiene_violations(root: &Path) -> Result<Vec<String>> {
     let mut files = Vec::new();
-    walk_rust_files(&root.join("crates"), &mut files)?;
+    walk_files(&root.join("crates"), &mut files, &["rs"])?;
     let mut violations = Vec::new();
     for path in files {
         let rel = path
@@ -386,7 +390,10 @@ pub(crate) fn signing_hygiene_violations(root: &Path) -> Result<Vec<String>> {
     Ok(violations)
 }
 
-fn walk_source_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn walk_files(dir: &Path, out: &mut Vec<PathBuf>, extensions: &[&str]) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -397,30 +404,12 @@ fn walk_source_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             ) {
                 continue;
             }
-            walk_source_files(&path, out)?;
-        } else if matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("rs" | "toml" | "proto" | "sh" | "yml" | "yaml")
-        ) {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn walk_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            if path.file_name().is_some_and(|name| name == "target") {
-                continue;
-            }
-            walk_rust_files(&path, out)?;
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            walk_files(&path, out, extensions)?;
+        } else if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| extensions.contains(&ext))
+        {
             out.push(path);
         }
     }

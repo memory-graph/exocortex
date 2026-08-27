@@ -164,11 +164,6 @@ impl<S: Storage> Clone for IngestServer<S> {
 }
 
 impl<S: Storage> IngestServer<S> {
-    /// Clone handle (streaming handlers run on owned copies).
-    pub fn clone_via_arc(&self) -> IngestServer<S> {
-        self.clone()
-    }
-
     /// Build the server (unpinned org — tests, library embedding).
     pub fn new(storage: Arc<S>, ontology: Arc<Ontology>, hmac_key: [u8; 32]) -> Self {
         let org = "org".to_string();
@@ -818,208 +813,214 @@ fn ack_reject_all(batch: &IngestBatch, code: RejectCode, detail: &str) -> Ingest
     }
 }
 
-#[tonic::async_trait]
-impl<S: Storage + 'static> IngestService for IngestServer<S> {
-    async fn submit(&self, req: Request<IngestBatch>) -> Result<Response<IngestAck>, Status> {
-        let principal = self.request_principal(&req)?;
-        let batch = req.into_inner();
+struct ValidatedBatch {
+    memories: Vec<Memory>,
+    relationships: Vec<Relationship>,
+    loaded: HashMap<MemoryId, Memory>,
+}
 
-        if principal
-            .as_ref()
-            .is_some_and(|principal| principal.org_id.as_str() != batch.org_id)
-        {
-            return Err(Status::permission_denied(
-                "authenticated principal cannot write another org",
+struct CommitRows {
+    memories: Vec<Memory>,
+    relationships: Vec<Relationship>,
+    producer_memories: Vec<Memory>,
+    grouping_nodes_created: u32,
+}
+
+impl<S: Storage + 'static> IngestServer<S> {
+    fn reject_rows(batch: &IngestBatch, rejections: Vec<RejectRow>) -> IngestAck {
+        let mut ack = ack_reject_all(batch, RejectCode::Unknown, "atomic batch rejected");
+        ack.rejections = rejections;
+        ack
+    }
+
+    fn admit_batch(
+        &self,
+        batch: &IngestBatch,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, IngestAck> {
+        if let Err(error) = self.verify_hmac(batch) {
+            return Err(ack_reject_all(
+                batch,
+                RejectCode::Unauthorized,
+                error.message(),
             ));
         }
-
-        // R-I8: HMAC before any validation.
-        if let Err(e) = self.verify_hmac(&batch) {
-            return Ok(Response::new(ack_reject_all(
-                &batch,
-                RejectCode::Unauthorized,
-                e.message(),
-            )));
-        }
-        // Step 1a (R-I8.5 / PRD R5): canonical checksum. An empty or
-        // wrong checksum is a mismatch, never a bypass — the field is a
-        // §18.1 integrity obligation, not decoration.
-        if batch.checksum != exocortex_wire::signing::canonical_checksum(&batch) {
-            return Ok(Response::new(ack_reject_all(
-                &batch,
+        if batch.checksum != exocortex_wire::signing::canonical_checksum(batch) {
+            return Err(ack_reject_all(
+                batch,
                 RejectCode::BadChecksum,
                 "checksum mismatch",
-            )));
+            ));
         }
         if let Err(detail) =
             exocortex_wire::limits::validate_batch_resources(&batch.memories, &batch.relationships)
         {
-            return Ok(Response::new(ack_reject_all(
-                &batch,
+            return Err(ack_reject_all(
+                batch,
                 RejectCode::ResourceLimitExceeded,
                 detail,
-            )));
+            ));
         }
-        let _submit_permit = match self.submit_permits.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                return Ok(Response::new(ack_reject_all(
-                    &batch,
+        let permit = self
+            .submit_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                ack_reject_all(
+                    batch,
                     RejectCode::RateLimited,
                     "concurrent ingestion limit reached",
-                )))
-            }
-        };
-        // Step 1: ontology fingerprint.
-        if !self.ontology_matches(&batch) {
-            return Ok(Response::new(ack_reject_all(
-                &batch,
+                )
+            })?;
+        if !self.ontology_matches(batch) {
+            return Err(ack_reject_all(
+                batch,
                 RejectCode::IncompatibleOntology,
                 "ontology fingerprint mismatch",
-            )));
+            ));
         }
-        // C4: single-org node — foreign orgs are rejected outright.
-        if let Some(guard) = &self.org_guard {
-            if batch.org_id != guard.as_str() {
-                return Ok(Response::new(ack_reject_all(
-                    &batch,
-                    RejectCode::UnknownSource,
-                    "org does not match this node",
-                )));
-            }
-        }
-        // Idempotency: replay returns the original ack.
+        if self
+            .org_guard
+            .as_ref()
+            .is_some_and(|guard| batch.org_id != guard.as_str())
         {
-            let mut seen = self.seen_batches.lock().unwrap();
-            if let Some(original) = seen.get(&(
+            return Err(ack_reject_all(
+                batch,
+                RejectCode::UnknownSource,
+                "org does not match this node",
+            ));
+        }
+        Ok(permit)
+    }
+
+    fn registered_source(&self, batch: &IngestBatch) -> Result<SourceEntry, IngestAck> {
+        let source = self
+            .sources
+            .lock()
+            .unwrap()
+            .get(&(
+                batch.org_id.clone(),
+                batch.source_uri.clone(),
+                batch.producer_id.clone(),
+            ))
+            .copied()
+            .ok_or_else(|| {
+                ack_reject_all(batch, RejectCode::UnknownSource, "producer not registered")
+            })?;
+        let requested_ceiling = Self::vis_from_i32(batch.ceiling).map_err(|_| {
+            ack_reject_all(
+                batch,
+                RejectCode::UnknownSource,
+                "unknown source ceiling discriminant",
+            )
+        })?;
+        if requested_ceiling != source.ceiling {
+            return Err(ack_reject_all(
+                batch,
+                RejectCode::UnknownSource,
+                "ceiling mismatch (R-I3)",
+            ));
+        }
+        Ok(source)
+    }
+
+    fn replay_ack(&self, batch: &IngestBatch) -> Option<IngestAck> {
+        self.seen_batches
+            .lock()
+            .unwrap()
+            .get(&(
                 batch.org_id.clone(),
                 batch.producer_id.clone(),
                 batch.batch_id.clone(),
-            )) {
-                let mut replay = original.clone();
+            ))
+            .cloned()
+            .map(|mut replay| {
                 replay.rejections = vec![RejectRow {
                     draft_key: String::new(),
                     code: RejectCode::DuplicateBatch as i32,
                     detail: "idempotent replay".into(),
                 }];
-                return Ok(Response::new(replay));
-            }
-        }
-        // Step 2: source admission + ceiling equality (R-I3). D8: the
-        // registered producer kind rides the entry and stamps every
-        // provenance row below.
-        let registered = {
-            let mut sources = self.sources.lock().unwrap();
-            sources
-                .get(&(
-                    batch.org_id.clone(),
-                    batch.source_uri.clone(),
-                    batch.producer_id.clone(),
-                ))
-                .copied()
-        };
-        let Some(source) = registered else {
-            return Ok(Response::new(ack_reject_all(
-                &batch,
-                RejectCode::UnknownSource,
-                "producer not registered",
-            )));
-        };
-        let ceiling = source.ceiling;
-        let requested_ceiling = match Self::vis_from_i32(batch.ceiling) {
-            Ok(visibility) => visibility,
-            Err(_) => {
-                return Ok(Response::new(ack_reject_all(
-                    &batch,
-                    RejectCode::UnknownSource,
-                    "unknown source ceiling discriminant",
-                )))
-            }
-        };
-        if requested_ceiling != ceiling {
-            return Ok(Response::new(ack_reject_all(
-                &batch,
-                RejectCode::UnknownSource,
-                "ceiling mismatch (R-I3)",
-            )));
-        }
+                replay
+            })
+    }
 
-        // Step 3-4: validate every draft; the first row-level violation
-        // rejects the whole batch (atomic, R-T17).
-        let snapshot = batch.snapshot.is_some();
-        let mut ok_mem = Vec::with_capacity(batch.memories.len());
-        let mut rejections: Vec<RejectRow> = Vec::new();
-        let mut draft_ids: HashMap<String, Memory> = HashMap::new();
-        for m in &batch.memories {
+    async fn validate_batch(
+        &self,
+        batch: &IngestBatch,
+        source: SourceEntry,
+        principal: Option<&VisibilityContext>,
+    ) -> Result<Result<ValidatedBatch, IngestAck>, Status> {
+        let mut memories = Vec::with_capacity(batch.memories.len());
+        let mut rejections = Vec::new();
+        let mut draft_ids = HashMap::new();
+        for draft in &batch.memories {
             match self.validate_memory(
-                &batch,
-                m,
-                ceiling,
-                snapshot,
+                batch,
+                draft,
+                source.ceiling,
+                batch.snapshot.is_some(),
                 source.kind,
-                principal.as_ref(),
+                principal,
             ) {
-                Ok(mem) => {
-                    draft_ids.insert(m.draft_key.clone(), mem.clone());
-                    ok_mem.push(mem);
+                Ok(memory) => {
+                    draft_ids.insert(draft.draft_key.clone(), memory.clone());
+                    memories.push(memory);
                 }
                 Err(code) => rejections.push(RejectRow {
-                    draft_key: m.draft_key.clone(),
+                    draft_key: draft.draft_key.clone(),
                     code: code as i32,
                     detail: format!("{code:?}"),
                 }),
             }
         }
         if !rejections.is_empty() {
-            let mut ack = ack_reject_all(&batch, RejectCode::Unknown, "atomic batch rejected");
-            ack.rejections = rejections;
-            return Ok(Response::new(ack));
+            return Ok(Err(Self::reject_rows(batch, rejections)));
         }
 
-        // §4.5: resolve cross-batch edge targets BEFORE relationship
-        // validation — the stored type is needed for the same R-T17 check
-        // a within-batch edge gets, and a missing/malformed id rejects
-        // with the id named in the detail (no new code).
         let mut external_targets = Vec::new();
-        for r in &batch.relationships {
-            if !r.to_memory_id.is_empty() {
-                let id = match parse_hex_id(&r.to_memory_id) {
-                    Some(id) => id,
-                    None => {
-                        rejections.push(RejectRow {
-                            draft_key: format!("{}->#{}", r.from_draft_key, r.to_memory_id),
-                            code: RejectCode::InvalidTypeTriple as i32,
-                            detail: format!(
-                                "to_memory_id `{}` is not a 32-hex memory id",
-                                r.to_memory_id
-                            ),
-                        });
-                        continue;
-                    }
-                };
-                external_targets.push((r.from_draft_key.clone(), r.to_memory_id.clone(), id));
+        for relationship in &batch.relationships {
+            if relationship.to_memory_id.is_empty() {
+                continue;
+            }
+            if let Some(id) = parse_hex_id(&relationship.to_memory_id) {
+                external_targets.push((
+                    relationship.from_draft_key.clone(),
+                    relationship.to_memory_id.clone(),
+                    id,
+                ));
+            } else {
+                rejections.push(RejectRow {
+                    draft_key: format!(
+                        "{}->#{}",
+                        relationship.from_draft_key, relationship.to_memory_id
+                    ),
+                    code: RejectCode::InvalidTypeTriple as i32,
+                    detail: format!(
+                        "to_memory_id `{}` is not a 32-hex memory id",
+                        relationship.to_memory_id
+                    ),
+                });
             }
         }
-        let unique_external: Vec<MemoryId> = external_targets
+        let unique_external = external_targets
             .iter()
             .map(|(_, _, id)| *id)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .collect();
+            .collect::<Vec<_>>();
         let loaded = self
             .storage
             .get_memories(&unique_external)
             .await
-            .map_err(|e| Status::internal(format!("storage: {e}")))?;
-        let loaded: HashMap<MemoryId, Memory> = loaded
+            .map_err(|error| Status::internal(format!("storage: {error}")))?
             .into_iter()
             .map(|memory| (memory.id, memory))
-            .collect();
+            .collect::<HashMap<_, _>>();
         for (from_draft_key, encoded_id, id) in external_targets {
-            if let Some(target) = loaded.get(&id) {
-                if principal
-                    .as_ref()
-                    .is_some_and(|vc| !exocortex_storage::memory_visible(target, vc))
+            match loaded.get(&id) {
+                Some(target)
+                    if principal.is_some_and(|context| {
+                        !exocortex_storage::memory_visible(target, context)
+                    }) =>
                 {
                     rejections.push(RejectRow {
                         draft_key: format!("{from_draft_key}->#{encoded_id}"),
@@ -1028,32 +1029,30 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                             "to_memory_id `{encoded_id}` is outside the authenticated membership"
                         ),
                     });
-                } else {
+                }
+                Some(target) => {
                     draft_ids.insert(encoded_id, target.clone());
                 }
-            } else {
-                rejections.push(RejectRow {
+                None => rejections.push(RejectRow {
                     draft_key: format!("{from_draft_key}->#{encoded_id}"),
                     code: RejectCode::InvalidTypeTriple as i32,
                     detail: format!("to_memory_id `{encoded_id}` does not exist"),
-                });
+                }),
             }
         }
         if !rejections.is_empty() {
-            let mut ack = ack_reject_all(&batch, RejectCode::Unknown, "atomic batch rejected");
-            ack.rejections = rejections;
-            return Ok(Response::new(ack));
+            return Ok(Err(Self::reject_rows(batch, rejections)));
         }
 
-        let mut ok_rel = Vec::with_capacity(batch.relationships.len());
-        for r in &batch.relationships {
-            match self.validate_relationship(r, &draft_ids, ceiling) {
-                Ok(rel) => ok_rel.push(rel),
+        let mut relationships = Vec::with_capacity(batch.relationships.len());
+        for draft in &batch.relationships {
+            match self.validate_relationship(draft, &draft_ids, source.ceiling) {
+                Ok(relationship) => relationships.push(relationship),
                 Err(code) => rejections.push(RejectRow {
-                    draft_key: if r.to_memory_id.is_empty() {
-                        format!("{}->{}", r.from_draft_key, r.to_draft_key)
+                    draft_key: if draft.to_memory_id.is_empty() {
+                        format!("{}->{}", draft.from_draft_key, draft.to_draft_key)
                     } else {
-                        format!("{}->#{}", r.from_draft_key, r.to_memory_id)
+                        format!("{}->#{}", draft.from_draft_key, draft.to_memory_id)
                     },
                     code: code as i32,
                     detail: format!("{code:?}"),
@@ -1061,16 +1060,22 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             }
         }
         if !rejections.is_empty() {
-            let mut ack = ack_reject_all(&batch, RejectCode::Unknown, "atomic batch rejected");
-            ack.rejections = rejections;
-            return Ok(Response::new(ack));
+            return Ok(Err(Self::reject_rows(batch, rejections)));
         }
+        Ok(Ok(ValidatedBatch {
+            memories,
+            relationships,
+            loaded,
+        }))
+    }
 
-        // D10a (§4.9/§4.10): fold supersession confidence changes into this
-        // same atomic commit. External targets were loaded in the single
-        // bounded read above; within-batch targets are already in `ok_mem`.
-        // No accepted edge may land without its confidence consequence.
-        let supersession_targets: std::collections::HashSet<MemoryId> = ok_rel
+    fn materialize_commit_rows(
+        &self,
+        batch: &IngestBatch,
+        mut validated: ValidatedBatch,
+    ) -> CommitRows {
+        let supersession_targets = validated
+            .relationships
             .iter()
             .filter(|relationship| {
                 self.ontology
@@ -1081,10 +1086,10 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                     })
             })
             .map(|relationship| relationship.to)
-            .collect();
+            .collect::<std::collections::HashSet<_>>();
         let confidence_floor = exocortex_kernel::memory::derived_confidence(true, 0, 0);
-        let producer_count = ok_mem.len();
-        for memory in &mut ok_mem {
+        let producer_count = validated.memories.len();
+        for memory in &mut validated.memories {
             if supersession_targets.contains(&memory.id)
                 && memory.confidence.partial_cmp_score(&confidence_floor)
                     == std::cmp::Ordering::Greater
@@ -1093,83 +1098,95 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             }
         }
         for target in supersession_targets {
-            if ok_mem.iter().any(|memory| memory.id == target) {
+            if validated.memories.iter().any(|memory| memory.id == target) {
                 continue;
             }
-            if let Some(mut stale) = loaded.get(&target).cloned() {
+            if let Some(mut stale) = validated.loaded.get(&target).cloned() {
                 if stale.confidence.partial_cmp_score(&confidence_floor)
                     == std::cmp::Ordering::Greater
                 {
                     stale.confidence = confidence_floor;
-                    ok_mem.push(stale);
+                    validated.memories.push(stale);
                 }
             }
         }
 
-        // D6: backend write grouping. One node per (org, flavor, key) under
-        // a deterministic id, one member edge per accepted memory, both
-        // `Derived` provenance. Idempotent across replays and restarts.
-        // `committed_memories` stays PRODUCER rows only — reasoning,
-        // Dreams counters, telemetry, and hints exclude structural rows.
-        let committed_memories = ok_mem[..producer_count].to_vec();
-        let mut grouping_nodes_created = 0u32;
-        if let Some((rule, key)) = crate::grouping::grouping_key(&batch) {
-            let now = chrono::Utc::now();
-            if let Some(mut node) =
-                crate::grouping::grouping_node(&self.ontology, &batch.org_id, rule, &key, now)
+        let producer_memories = validated.memories[..producer_count].to_vec();
+        let grouping_nodes_created = self.materialize_grouping(
+            batch,
+            &producer_memories,
+            &mut validated.memories,
+            &mut validated.relationships,
+        );
+        self.materialize_inverses(&mut validated.relationships);
+        CommitRows {
+            memories: validated.memories,
+            relationships: validated.relationships,
+            producer_memories,
+            grouping_nodes_created,
+        }
+    }
+
+    fn materialize_grouping(
+        &self,
+        batch: &IngestBatch,
+        producer_memories: &[Memory],
+        memories: &mut Vec<Memory>,
+        relationships: &mut Vec<Relationship>,
+    ) -> u32 {
+        let Some((rule, key)) = crate::grouping::grouping_key(batch) else {
+            return 0;
+        };
+        let now = chrono::Utc::now();
+        let Some(mut node) =
+            crate::grouping::grouping_node(&self.ontology, &batch.org_id, rule, &key, now)
+        else {
+            return 0;
+        };
+        if let Some(scope) = producer_memories.first() {
+            node.visibility = producer_memories
+                .iter()
+                .map(|memory| memory.visibility)
+                .min()
+                .unwrap_or(scope.visibility);
+            node.context.tenant_id = scope.context.tenant_id.clone();
+            node.context.user_id = scope.context.user_id.clone();
+            node.context.project_id = scope.context.project_id.clone();
+            node.context.team_id = scope.context.team_id.clone();
+        }
+        for memory in producer_memories {
+            if let Some(edge) =
+                crate::grouping::grouping_edge(&self.ontology, rule, memory, &node, now)
             {
-                if let Some(scope) = committed_memories.first() {
-                    node.visibility = committed_memories
-                        .iter()
-                        .map(|memory| memory.visibility)
-                        .min()
-                        .unwrap_or(scope.visibility);
-                    node.context.tenant_id = scope.context.tenant_id.clone();
-                    node.context.user_id = scope.context.user_id.clone();
-                    node.context.project_id = scope.context.project_id.clone();
-                    node.context.team_id = scope.context.team_id.clone();
-                }
-                let mut edges = Vec::with_capacity(committed_memories.len());
-                for m in &committed_memories {
-                    if let Some(e) =
-                        crate::grouping::grouping_edge(&self.ontology, rule, m, &node, now)
-                    {
-                        edges.push(e);
-                    }
-                }
-                // R-T4 for the structural edge: HasMember rides along.
-                let mut seen_ids: std::collections::HashSet<RelationshipId> =
-                    edges.iter().map(|e| e.id).collect();
-                for e in edges.clone() {
-                    if let Some(inv) = exocortex_kernel::materialize_inverse(&self.ontology, &e) {
-                        if seen_ids.insert(inv.id) {
-                            edges.push(inv);
-                        }
-                    }
-                }
-                ok_rel.extend(edges);
-                ok_mem.push(node);
-                grouping_nodes_created = 1;
+                relationships.push(edge);
             }
         }
+        memories.push(node);
+        1
+    }
 
-        // R-T4: writing `k(a,b)` writes `k'(b,a)` in the same batch. The
-        // companion mirrors provenance/visibility; deterministic ids make
-        // re-materialization idempotent.
-        let mut batch_ids: std::collections::HashSet<RelationshipId> =
-            ok_rel.iter().map(|r| r.id).collect();
-        for r in ok_rel.clone() {
-            if let Some(inv) = exocortex_kernel::materialize_inverse(&self.ontology, &r) {
-                if batch_ids.insert(inv.id) {
-                    ok_rel.push(inv);
+    fn materialize_inverses(&self, relationships: &mut Vec<Relationship>) {
+        let mut ids = relationships
+            .iter()
+            .map(|relationship| relationship.id)
+            .collect::<std::collections::HashSet<_>>();
+        for relationship in relationships.clone() {
+            if let Some(inverse) =
+                exocortex_kernel::materialize_inverse(&self.ontology, &relationship)
+            {
+                if ids.insert(inverse.id) {
+                    relationships.push(inverse);
                 }
             }
         }
+    }
 
-        // Step: atomically claim the durable idempotency key, persist every
-        // accepted row, and settle the exact replay result. Concurrent or
-        // post-restart retries never evaluate a second write.
-        let accepted = (committed_memories.len() + ok_rel.len()) as u32;
+    async fn commit_rows(
+        &self,
+        batch: &IngestBatch,
+        rows: &CommitRows,
+    ) -> Result<Result<(u64, u32), IngestAck>, Status> {
+        let accepted = (rows.producer_memories.len() + rows.relationships.len()) as u32;
         let key = IngestBatchKey {
             org_id: batch.org_id.clone().into(),
             producer_id: batch.producer_id.clone().into(),
@@ -1177,94 +1194,29 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         };
         let outcome = self
             .storage
-            .commit_ingest_batch(&key, &ok_mem, &ok_rel, accepted)
+            .commit_ingest_batch(&key, &rows.memories, &rows.relationships, accepted)
             .await
-            .map_err(|e| Status::internal(format!("storage: {e}")))?;
-        let assigned_lsn = match outcome {
-            IngestCommitOutcome::Committed { settled, .. } => settled.assigned_lsn,
-            IngestCommitOutcome::Duplicate(settled) => {
-                let ack = IngestAck {
-                    batch_id: batch.batch_id.clone(),
-                    accepted: settled.accepted,
-                    rejected: settled.rejected,
-                    rejections: vec![RejectRow {
-                        draft_key: String::new(),
-                        code: RejectCode::DuplicateBatch as i32,
-                        detail: "idempotent replay".into(),
-                    }],
-                    assigned_lsn: settled.assigned_lsn,
-                    similar_to: vec![],
-                };
-                self.seen_batches.lock().unwrap().put(
-                    (
-                        batch.org_id.clone(),
-                        batch.producer_id.clone(),
-                        batch.batch_id.clone(),
-                    ),
-                    ack.clone(),
-                );
-                return Ok(Response::new(ack));
+            .map_err(|error| Status::internal(format!("storage: {error}")))?;
+        match outcome {
+            IngestCommitOutcome::Committed { settled, .. } => {
+                Ok(Ok((settled.assigned_lsn, accepted)))
             }
-        };
-
-        // §10.7 step 8: on every session-wrapup submit, enqueue
-        // `SessionWrapup { memories }` after the storage commit so the
-        // reasoning engine derives edges off the interactive path.
-        if batch.source_uri.starts_with("session://") {
-            if let Some(engine) = &self.reasoning {
-                engine
-                    .enqueue(exocortex_reasoning::ReasoningWork::SessionWrapup {
-                        memories: committed_memories.iter().map(|m| m.id).collect(),
-                    })
-                    .await;
-            }
+            IngestCommitOutcome::Duplicate(settled) => Ok(Err(IngestAck {
+                batch_id: batch.batch_id.clone(),
+                accepted: settled.accepted,
+                rejected: settled.rejected,
+                rejections: vec![RejectRow {
+                    draft_key: String::new(),
+                    code: RejectCode::DuplicateBatch as i32,
+                    detail: "idempotent replay".into(),
+                }],
+                assigned_lsn: settled.assigned_lsn,
+                similar_to: vec![],
+            })),
         }
-        // IN4 (audit): every committed memory feeds its region's
-        // write-counter so the Dreams trigger can fire (§12.2).
-        if let Some(dreams) = &self.dreams {
-            for m in &committed_memories {
-                let region = RegionKey {
-                    org: batch.org_id.clone().into(),
-                    project: m.context.project_id.clone().unwrap_or_else(|| "*".into()),
-                    memory_type: m.memory_type,
-                };
-                dreams.on_write(region).await;
-            }
-        }
-        // D10c (§4.10b): advisory near-duplicate hints. Deterministic
-        // embedding cosine against the bounded recent-acceptance ring —
-        // the same mechanism Dreams uses for merge candidates (0.92), no
-        // LLM, non-blocking. Computed against PRIOR commits, so a batch
-        // never hints against itself.
-        // Producer draft keys parallel the committed producer rows
-        // (validation preserves order).
-        let keyed: Vec<(String, Memory)> = batch
-            .memories
-            .iter()
-            .zip(committed_memories.iter())
-            .map(|(m, mem)| (m.draft_key.clone(), mem.clone()))
-            .collect();
-        let similar_to = self.similar_to_hints(&batch.org_id, &keyed);
+    }
 
-        // D9 (§3.9): write telemetry — S2/S5's counters. Labels from the
-        // registered source and the signed client metadata (§4.4);
-        // unknown/absent telemetry degrades to "unknown", never drops the
-        // row.
-        metrics::counter!("exocortex_ingest_batches_total").increment(1);
-        metrics::counter!("exocortex_ingest_memories_accepted_total")
-            .increment(committed_memories.len() as u64);
-        if grouping_nodes_created > 0 {
-            metrics::counter!("exocortex_grouping_nodes_created_total").increment(1);
-        }
-
-        let ack = IngestAck {
-            batch_id: batch.batch_id.clone(),
-            accepted,
-            rejected: 0,
-            rejections: vec![],
-            assigned_lsn,
-            similar_to,
-        };
+    fn remember_ack(&self, batch: &IngestBatch, ack: IngestAck) -> IngestAck {
         self.seen_batches.lock().unwrap().put(
             (
                 batch.org_id.clone(),
@@ -1273,7 +1225,109 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             ),
             ack.clone(),
         );
-        Ok(Response::new(ack))
+        ack
+    }
+
+    async fn finish_commit(
+        &self,
+        batch: &IngestBatch,
+        rows: &CommitRows,
+        assigned_lsn: u64,
+        accepted: u32,
+    ) -> IngestAck {
+        if batch.source_uri.starts_with("session://") {
+            if let Some(engine) = &self.reasoning {
+                engine
+                    .enqueue(exocortex_reasoning::ReasoningWork::SessionWrapup {
+                        memories: rows
+                            .producer_memories
+                            .iter()
+                            .map(|memory| memory.id)
+                            .collect(),
+                    })
+                    .await;
+            }
+        }
+        if let Some(dreams) = &self.dreams {
+            for memory in &rows.producer_memories {
+                dreams
+                    .on_write(RegionKey {
+                        org: batch.org_id.clone().into(),
+                        project: memory
+                            .context
+                            .project_id
+                            .clone()
+                            .unwrap_or_else(|| "*".into()),
+                        memory_type: memory.memory_type,
+                    })
+                    .await;
+            }
+        }
+        let keyed = batch
+            .memories
+            .iter()
+            .zip(rows.producer_memories.iter())
+            .map(|(draft, memory)| (draft.draft_key.clone(), memory.clone()))
+            .collect::<Vec<_>>();
+        let similar_to = self.similar_to_hints(&batch.org_id, &keyed);
+        metrics::counter!("exocortex_ingest_batches_total").increment(1);
+        metrics::counter!("exocortex_ingest_memories_accepted_total")
+            .increment(rows.producer_memories.len() as u64);
+        if rows.grouping_nodes_created > 0 {
+            metrics::counter!("exocortex_grouping_nodes_created_total").increment(1);
+        }
+        IngestAck {
+            batch_id: batch.batch_id.clone(),
+            accepted,
+            rejected: 0,
+            rejections: vec![],
+            assigned_lsn,
+            similar_to,
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl<S: Storage + 'static> IngestService for IngestServer<S> {
+    async fn submit(&self, req: Request<IngestBatch>) -> Result<Response<IngestAck>, Status> {
+        let principal = self.request_principal(&req)?;
+        let batch = req.into_inner();
+        if principal
+            .as_ref()
+            .is_some_and(|context| context.org_id.as_str() != batch.org_id)
+        {
+            return Err(Status::permission_denied(
+                "authenticated principal cannot write another org",
+            ));
+        }
+
+        let _submit_permit = match self.admit_batch(&batch) {
+            Ok(permit) => permit,
+            Err(ack) => return Ok(Response::new(ack)),
+        };
+        if let Some(replay) = self.replay_ack(&batch) {
+            return Ok(Response::new(replay));
+        }
+        let source = match self.registered_source(&batch) {
+            Ok(source) => source,
+            Err(ack) => return Ok(Response::new(ack)),
+        };
+        let validated = match self
+            .validate_batch(&batch, source, principal.as_ref())
+            .await?
+        {
+            Ok(validated) => validated,
+            Err(ack) => return Ok(Response::new(ack)),
+        };
+        let rows = self.materialize_commit_rows(&batch, validated);
+        let (assigned_lsn, accepted) = match self.commit_rows(&batch, &rows).await? {
+            Ok(commit) => commit,
+            Err(ack) => return Ok(Response::new(self.remember_ack(&batch, ack))),
+        };
+        let ack = self
+            .finish_commit(&batch, &rows, assigned_lsn, accepted)
+            .await;
+        Ok(Response::new(self.remember_ack(&batch, ack)))
     }
 
     type SubmitStreamStream = futures::stream::BoxStream<'static, Result<SubmitAck, Status>>;
@@ -1288,7 +1342,7 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         use futures::StreamExt;
         let mut inbound = req.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<SubmitAck, Status>>(32);
-        let self_arc = self.clone_via_arc();
+        let self_arc = self.clone();
         tokio::spawn(async move {
             while let Some(item) = inbound.next().await {
                 // IN13 (audit): every submitted row is accounted for in

@@ -181,6 +181,7 @@ pub struct DreamsEngine<S: Storage> {
     /// Last successfully consolidated cycle, retained for health/acceptance
     /// observation without scraping logs or metrics.
     pub last_result: tokio::sync::RwLock<Option<ConsolidationResult>>,
+    #[cfg(feature = "testing")]
     cycle_fault_after: Option<usize>,
 }
 
@@ -216,6 +217,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             node_id,
             discoveries: DashMap::new(),
             last_result: tokio::sync::RwLock::new(None),
+            #[cfg(feature = "testing")]
             cycle_fault_after: None,
         }
     }
@@ -223,6 +225,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     /// Inject a failure after the specified owner mutation. This exercises
     /// crash compensation against both the double and live backend.
     #[doc(hidden)]
+    #[cfg(feature = "testing")]
     pub fn with_cycle_fault_after(mut self, mutation: usize) -> Self {
         self.cycle_fault_after = Some(mutation);
         self
@@ -491,6 +494,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
 
     fn mutation_checkpoint(&self, mutations: &mut usize) -> anyhow::Result<()> {
         *mutations += 1;
+        #[cfg(feature = "testing")]
         if self.cycle_fault_after == Some(*mutations) {
             anyhow::bail!("injected cycle failure after mutation {mutations}");
         }

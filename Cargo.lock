@@ -1127,6 +1127,7 @@ dependencies = [
  "dashmap",
  "exocortex-cache",
  "exocortex-cluster",
+ "exocortex-dreams",
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
  "exocortex-reasoning",

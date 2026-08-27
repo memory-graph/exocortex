@@ -36,7 +36,9 @@ serde_json = { workspace = true }
 
 [features]
 integration = []
+testing = []
 
 [dev-dependencies]
+exocortex-dreams = { path = ".", features = ["testing"] }
 exocortex-pack-dev-v1 = { workspace = true }
 futures = { workspace = true }
