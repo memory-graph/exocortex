@@ -412,11 +412,16 @@ impl ExocortexMcp {
         // never failing the ack; the WAL remains the source of truth.
         match wal.entry(local_lsn) {
             Some(entry) => {
-                let rows = crate::materialize::materialize_entry(&self.ontology, &entry, &|id| {
-                    self.cache
-                        .get_memory(&self.org, id, &self.vc)
-                        .map(|m| (m.memory_type, m.visibility))
-                });
+                let rows = crate::materialize::materialize_entry(
+                    &self.ontology,
+                    &self.org,
+                    &entry,
+                    &|id| {
+                        self.cache
+                            .get_memory(&self.org, id, &self.vc)
+                            .map(|m| (m.memory_type, m.visibility))
+                    },
+                );
                 if !rows.dropped_edges.is_empty() {
                     tracing::warn!(?rows.dropped_edges, "offline edges not served");
                 }

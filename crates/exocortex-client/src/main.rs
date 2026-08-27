@@ -150,7 +150,8 @@ fn main() -> anyhow::Result<()> {
         None => {
             let entries = wal.entries();
             let last_lsn = entries.last().map(|e| e.local_lsn).unwrap_or(0);
-            let rows = exocortex_client::materialize::materialize_all(&ontology, &entries);
+            let rows =
+                exocortex_client::materialize::materialize_all(&ontology, &args.org, &entries);
             if !rows.dropped_edges.is_empty() {
                 tracing::warn!(?rows.dropped_edges, "standalone seed dropped edges");
             }

@@ -272,3 +272,113 @@ fn boot_seeds_pending_synced_and_failed_entries() {
         );
     }
 }
+
+/// AC3 + AC7: edges written in the batch are traversable
+/// (`find_related` over the `Fixes` edge), the F5 `Conversation` node
+/// and `InSession` edges exist with D6's shape, and a dangling
+/// cross-batch `to_memory_id` neither fails the write nor the read.
+#[test]
+fn edges_and_grouping_readable_dangling_edge_harmless() {
+    let dir = tempdir();
+    let mut c = Client::spawn(&dir);
+    let mut msgs = Client::init_msgs();
+    msgs.push(Client::end_session(
+        serde_json::json!([
+            one_memory("prob", "Problem", "Oak overflow in parser"),
+            one_memory("fix", "Fix", "Raise the oak ceiling"),
+        ]),
+        serde_json::json!([
+            { "from_draft_key": "fix", "to_draft_key": "prob", "kind": "Fixes", "strength": 0.9 },
+            // AC7: targets an id with no local row — accepted (existence
+            // is drain-time per §4.5) but never materialized.
+            { "from_draft_key": "fix", "to_memory_id": "0123456789abcdef0123456789abcdef", "kind": "Fixes" }
+        ]),
+    ));
+    msgs.push(Client::search("ceiling"));
+    c.send_all(&msgs);
+    let _init = c.read_line();
+    let ack = c.read_line();
+    assert!(
+        ack.get("result").is_some(),
+        "dangling edge must not fail the write: {ack}"
+    );
+    let search = c.read_line();
+    let hits = search_hits(&search);
+    assert_eq!(hits.len(), 1, "the fix is searchable: {hits:?}");
+    let fix_id = hits[0]["id"].as_str().unwrap().to_string();
+
+    // find_related over the Fixes edge + the InSession edge (k=1).
+    let mut q = Vec::new();
+    q.push(serde_json::json!({
+        "jsonrpc": "2.0", "id": 70, "method": "tools/call",
+        "params": {
+            "name": "exocortex.find_related",
+            "arguments": { "anchor": fix_id, "k": 1 }
+        }
+    }));
+    c.send_all(&q);
+    let rel = c.read_line();
+    assert!(
+        rel.get("result").is_some(),
+        "dangling edge must not fail reads: {rel}"
+    );
+    let text = rel["result"]["content"][0]["text"].as_str().unwrap();
+    let inner: serde_json::Value = serde_json::from_str(text).unwrap();
+    let titles: Vec<&str> = inner["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["title"].as_str().unwrap())
+        .collect();
+    assert!(
+        titles.contains(&"Oak overflow in parser"),
+        "Fixes edge traversable: {titles:?}"
+    );
+    assert!(
+        titles.iter().any(|t| t.starts_with("Session ")),
+        "Conversation node reachable via InSession: {titles:?}"
+    );
+}
+
+/// F5 parity: the client-side grouping builders mint byte-identical
+/// rows to the backend commit path's (`exocortex-ingest` grouping.rs)
+/// for the same inputs — the W2 golden-table discipline applied to
+/// builders. An agent that learns "my writes group into conversations"
+/// in standalone must not lose that when a backend appears.
+#[test]
+fn grouping_parity_with_backend_commit_path() {
+    let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
+    let ontology = exocortex_kernel::pack::load_registered_packs().unwrap();
+    let now = chrono::Utc::now();
+    let org = "parity-org";
+    let key = "session-key-1";
+
+    let rule = &exocortex_ingest::grouping::grouping_rules()[0];
+    assert_eq!(rule.flavor, "session", "the rule under parity");
+    assert_eq!(rule.node_type, "Conversation");
+    assert_eq!(rule.edge_kind, "InSession");
+
+    let backend_node = exocortex_ingest::grouping::grouping_node(&ontology, org, rule, key, now)
+        .expect("backend node");
+    let local_node = exocortex_client::materialize::grouping_node_local(&ontology, org, key, now)
+        .expect("local node");
+    assert_eq!(
+        serde_json::to_value(&backend_node).unwrap(),
+        serde_json::to_value(&local_node).unwrap(),
+        "grouping node identical to the backend mint"
+    );
+
+    let member = exocortex_client::materialize::grouping_node_local(&ontology, org, "other", now)
+        .expect("member");
+    let backend_edge =
+        exocortex_ingest::grouping::grouping_edge(&ontology, rule, &member, &backend_node, now)
+            .expect("backend edge");
+    let local_edge =
+        exocortex_client::materialize::grouping_edge_local(&ontology, &member, &local_node, now)
+            .expect("local edge");
+    assert_eq!(
+        serde_json::to_value(&backend_edge).unwrap(),
+        serde_json::to_value(&local_edge).unwrap(),
+        "InSession edge identical to the backend mint (same derivation, same id)"
+    );
+}

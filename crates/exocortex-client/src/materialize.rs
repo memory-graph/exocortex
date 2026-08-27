@@ -59,9 +59,12 @@ pub type TargetResolver<'a> = dyn Fn(&MemoryId) -> Option<(u8, Visibility)> + 'a
 
 /// Materialize one WAL entry into served rows. `resolve_target` answers
 /// cross-batch `to_memory_id` lookups; in-batch targets resolve from the
-/// batch itself regardless of the resolver.
+/// batch itself regardless of the resolver. F5: a non-empty session id
+/// mints the same Conversation node + InSession edges the backend's
+/// commit path would.
 pub fn materialize_entry(
     ontology: &Ontology,
+    org: &str,
     entry: &WalEntry,
     resolve_target: &TargetResolver<'_>,
 ) -> Materialized {
@@ -165,6 +168,31 @@ pub fn materialize_entry(
             ));
         }
     }
+    // F5: session grouping parity — the backend commit path groups
+    // session-flavor batches; the standalone WAL's session id is the
+    // same key the drain renders as `session://<id>`. Deterministic ids
+    // make multi-batch sessions converge on one node (CR1 upsert).
+    if !entry.session_id.is_empty() {
+        if let Some(first_ts) = entry.memories.first().map(|d| d.context.timestamp) {
+            if let Some(node) = grouping_node_local(ontology, org, &entry.session_id, first_ts) {
+                for m in &out.memories {
+                    match grouping_edge_local(ontology, m, &node, first_ts) {
+                        Some(e) => out.edges.push(e),
+                        None => out.dropped_edges.push(format!(
+                            "entry {}: kind `{GROUPING_EDGE_KIND}` missing from ontology",
+                            entry.local_lsn
+                        )),
+                    }
+                }
+                out.memories.push(node);
+            } else {
+                out.dropped_edges.push(format!(
+                    "entry {}: type `{GROUPING_NODE_TYPE}` missing from ontology; no grouping",
+                    entry.local_lsn
+                ));
+            }
+        }
+    }
     out
 }
 
@@ -173,11 +201,11 @@ pub fn materialize_entry(
 /// Entries materialize in local-LSN order, so a later entry's
 /// cross-batch edge resolves against everything written before it;
 /// targets that never existed locally are dropped per the entry rule.
-pub fn materialize_all(ontology: &Ontology, entries: &[WalEntry]) -> Materialized {
+pub fn materialize_all(ontology: &Ontology, org: &str, entries: &[WalEntry]) -> Materialized {
     let mut acc = Materialized::default();
     let mut known: HashMap<MemoryId, (u8, Visibility)> = HashMap::new();
     for entry in entries {
-        let rows = materialize_entry(ontology, entry, &|id| known.get(id).copied());
+        let rows = materialize_entry(ontology, org, entry, &|id| known.get(id).copied());
         acc.dropped_edges.extend(rows.dropped_edges);
         for m in rows.memories {
             known.insert(m.id, (m.memory_type, m.visibility));
@@ -186,6 +214,143 @@ pub fn materialize_all(ontology: &Ontology, entries: &[WalEntry]) -> Materialize
         acc.edges.extend(rows.edges);
     }
     acc
+}
+
+// SR-PRD F5: local grouping parity (D6). The backend commit path mints
+// a `Conversation` node + `InSession` edges for session-flavor batches
+// (`exocortex-ingest/src/grouping.rs`). The client cannot reuse those
+// builders — `exocortex-ingest` dev-depends on this crate (a src-dep
+// would be a cycle) and would drag `exocortex-dreams` into the
+// personal-mode binary — so they are duplicated here as pure kernel
+// construction and pinned field-for-field by
+// `grouping_parity_with_backend_commit_path` (tests/), the W2
+// golden-table discipline applied to builders. Deterministic ids from
+// (org, flavor, key) mean an agent that learns "my writes group into
+// conversations" in standalone keeps exactly that when a backend
+// appears.
+
+/// The session rule the backend registers (grouping.rs): its constants
+/// inlined — one source of truth enforced by the parity test.
+const GROUPING_FLAVOR: &str = "session";
+const GROUPING_NODE_TYPE: &str = "Conversation";
+const GROUPING_EDGE_KIND: &str = "InSession";
+
+/// Client-side mirror of `grouping::grouping_node`: deterministic id
+/// over (org, flavor, key), `Derived` provenance, Project visibility,
+/// 0.8 confidence (the derived base — no evidence events locally).
+pub fn grouping_node_local(
+    ontology: &Ontology,
+    org: &str,
+    key: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Memory> {
+    let memory_type = ontology.memory_type_id(GROUPING_NODE_TYPE)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"exocortex-grouping-v1");
+    hasher_update_str(&mut hasher, org);
+    hasher_update_str(&mut hasher, GROUPING_FLAVOR);
+    hasher_update_str(&mut hasher, key);
+    let hash = hasher.finalize();
+    let mut id_bytes = [0u8; 16];
+    id_bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    let short: String = key.chars().take(8).collect();
+    Some(Memory {
+        id: MemoryId(id_bytes),
+        memory_type,
+        title: format!("Session {short}").into(),
+        content: format!("Backend grouping node ({GROUPING_FLAVOR}) for {key}"),
+        summary: None,
+        tags: Default::default(),
+        visibility: Visibility::Project,
+        provenance: Provenance::Derived {
+            rule_id: format!("grouping:{GROUPING_FLAVOR}").into(),
+            evidence: vec![],
+        },
+        context: grouping_context(key, now),
+        importance: exocortex_kernel::memory::F01::new(0.5).unwrap(),
+        confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
+        effectiveness: None,
+        usage_count: 0,
+        valid_from: now,
+        valid_until: None,
+        recorded_at: now,
+        invalidated_by: None,
+        embedding: None,
+        lsn: LSN::new_local(0),
+    })
+}
+
+/// Client-side mirror of `grouping::grouping_edge`: member ⇒ node,
+/// deterministic relationship id, W5 narrower-endpoint visibility.
+pub fn grouping_edge_local(
+    ontology: &Ontology,
+    member: &Memory,
+    node: &Memory,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Relationship> {
+    let kind = ontology.kind_id(GROUPING_EDGE_KIND)?;
+    Some(Relationship {
+        id: RelationshipId::derive(member.id, kind, node.id, None),
+        kind,
+        from: member.id,
+        to: node.id,
+        visibility: member.visibility.min(node.visibility),
+        provenance: Provenance::Derived {
+            rule_id: format!("grouping:{GROUPING_FLAVOR}").into(),
+            evidence: vec![],
+        },
+        properties: exocortex_kernel::RelationshipProperties {
+            strength: ontology
+                .kinds_by_id
+                .get(&kind)
+                .map(|m| m.default_strength)
+                .unwrap_or(0.8),
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: now,
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: now,
+        valid_until: None,
+        recorded_at: now,
+        invalidated_by: None,
+        lsn: LSN::new_local(0),
+    })
+}
+
+fn grouping_context(
+    key: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> exocortex_kernel::MemoryContext {
+    exocortex_kernel::MemoryContext {
+        timestamp: now,
+        project_id: None,
+        project_path: None,
+        team_id: None,
+        tenant_id: None,
+        session_id: Some(key.into()),
+        user_id: None,
+        created_by: None,
+        files_involved: Default::default(),
+        languages: Default::default(),
+        frameworks: Default::default(),
+        technologies: Default::default(),
+        git_commit: None,
+        git_branch: None,
+        working_directory: None,
+        entities: Default::default(),
+        additional_metadata: serde_json::Value::Null,
+    }
+}
+
+fn hasher_update_str(h: &mut blake3::Hasher, s: &str) {
+    h.update(&(s.len() as u64).to_le_bytes());
+    h.update(s.as_bytes());
 }
 
 /// One hint → one `Relationship`, mirroring the backend mint
@@ -305,9 +470,14 @@ mod tests {
         let e = entry_with(vec![draft(&onto, "Problem", "Flaky test")]);
         let tags: Vec<Vec<String>> = vec![vec!["CI".into(), " ci ".into()]];
         let e = WalEntry { tags, ..e };
-        let m = materialize_entry(&onto, &e, &|_| None);
-        assert_eq!(m.memories.len(), 1);
-        let mem = &m.memories[0];
+        let m = materialize_entry(&onto, "org", &e, &|_| None);
+        // F5: the memory + its session Conversation node.
+        assert_eq!(m.memories.len(), 2);
+        let mem = m
+            .memories
+            .iter()
+            .find(|x| x.id == e.memory_ids[0])
+            .expect("the written memory");
         assert_eq!(mem.id, e.memory_ids[0], "WAL-stored id, not regenerated");
         assert_eq!(
             mem.provenance,
@@ -338,8 +508,11 @@ mod tests {
             confidence: None,
         });
         let e = entry_with(vec![d]);
-        let m = materialize_entry(&onto, &e, &|_| None);
-        assert!(m.edges.is_empty(), "dangling edge dropped");
+        let m = materialize_entry(&onto, "org", &e, &|_| None);
+        assert!(
+            m.edges.iter().all(|r| r.to != e.memories[0].edge_hints[0].to),
+            "dangling edge dropped (only grouping edges remain)"
+        );
         assert_eq!(m.dropped_edges.len(), 1);
         assert!(m.dropped_edges[0].contains("no local row"));
     }
@@ -368,16 +541,23 @@ mod tests {
             ..e
         };
         // Resolver that would FAIL the lookup: in-batch must not need it.
-        let m = materialize_entry(&onto, &e, &|_| None);
-        assert_eq!(m.edges.len(), 1);
-        let rel = &m.edges[0];
+        let m = materialize_entry(&onto, "org", &e, &|_| None);
+        // F5 adds the InSession grouping edge; the asserted Fixes edge is
+        // found by its derived id.
+        let fixes = onto.kind_id("Fixes").unwrap();
+        let expected_id = RelationshipId::derive(fix_id, fixes, problem_id, None);
+        let rel = m
+            .edges
+            .iter()
+            .find(|r| r.id == expected_id)
+            .expect("Fixes edge materialized");
         assert_eq!(rel.from, fix_id);
         assert_eq!(rel.to, problem_id);
-        assert_eq!(
-            rel.id,
-            RelationshipId::derive(fix_id, rel.kind, problem_id, None)
-        );
         assert_eq!(rel.visibility, Visibility::Org);
+        assert!(m
+            .edges
+            .iter()
+            .any(|r| r.kind == onto.kind_id("InSession").unwrap()));
     }
 
     /// F1: an invalid triple is rejected by the same kernel rulebook the
@@ -402,8 +582,41 @@ mod tests {
             memories: drafts,
             ..e
         };
-        let m = materialize_entry(&onto, &e, &|_| None);
-        assert!(m.edges.is_empty(), "invalid triple dropped");
+        let m = materialize_entry(&onto, "org", &e, &|_| None);
+        assert!(
+            m.edges.iter().all(|r| r.to != to_id),
+            "invalid triple dropped (only grouping edges remain)"
+        );
         assert!(m.dropped_edges[0].contains("rejected"));
+    }
+
+    /// F5: every non-empty-session entry mints the Conversation node and
+    /// one InSession edge per memory — same derivation the backend mints
+    /// (pinned field-for-field by the integration parity test).
+    #[test]
+    fn grouping_rows_minted_per_session() {
+        let onto = ontology();
+        let e = entry_with(vec![
+            draft(&onto, "Problem", "Flaky test"),
+            draft(&onto, "Fix", "Retry once"),
+        ]);
+        let m = materialize_entry(&onto, "the-org", &e, &|_| None);
+        let node = grouping_node_local(
+            &onto,
+            "the-org",
+            &e.session_id,
+            e.memories[0].context.timestamp,
+        )
+        .unwrap();
+        assert_eq!(m.memories.last().unwrap().id, node.id, "conversation node minted");
+        let in_session = onto.kind_id("InSession").unwrap();
+        assert_eq!(
+            m.edges
+                .iter()
+                .filter(|r| r.kind == in_session && r.to == node.id)
+                .count(),
+            2,
+            "one InSession edge per memory"
+        );
     }
 }
