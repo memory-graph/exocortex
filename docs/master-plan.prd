@@ -159,15 +159,15 @@ each step (88 tests at completion).
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
-| R6-S1 | Fail-closed secrets and authorization (B01-B05, B19, B25-B26) | Codex | Round 6 remediation in progress; release blocker |
-| R6-S2 | Cache and reasoning correctness (B06-B07, B13, B21-B23) | Codex | Round 6 remediation in progress; release blocker |
-| R6-S3 | Atomicity and durability (B08-B10, B15-B18, B20) | Codex | Round 6 remediation in progress; release blocker |
-| R6-S4 | Backend/runtime completeness (B11-B12, B14, B24) | Codex | Round 6 remediation in progress; release blocker |
-| R6-S5 | Delivery truth (B27-B30) | Codex | Round 6 remediation in progress; release blocker |
+| R6-S1 | Fail-closed secrets and authorization (B01-B05, B19, B25-B26) | Codex | Implementation complete — mandatory gates and strict release review pending |
+| R6-S2 | Cache and reasoning correctness (B06-B07, B13, B21-B23) | Codex | Implementation complete — mandatory gates and strict release review pending |
+| R6-S3 | Atomicity and durability (B08-B10, B15-B18, B20) | Codex | Implementation complete — mandatory gates and strict release review pending |
+| R6-S4 | Backend/runtime completeness (B11-B12, B14, B24) | Codex | Implementation complete — mandatory gates and strict release review pending |
+| R6-S5 | Delivery truth (B27-B30) | Codex | Implementation complete — mandatory gates and strict release review pending |
 | R6-B30-14 | PRD §23 #14: stamp every stored embedding with its model/version, not only the MCR² aggregate | Codex | Done — vectors are inseparable from model name/version; ingest stamps each row and MCR² rejects mixed revisions while stamping the common input revision |
 | R6-B30-25 | PRD §23 #25: executable kernel-name absence and omit-dev-pack link failure | Codex | Done — production entrypoint requires the pack-owned link anchor; kernel purity builds packless and linked fixtures and verifies the former fails on the unresolved anchor |
 | R6-A1 | Advisory test quality and cleanup (A01-A08) | Codex | Done — every advisory has executable or focused-cleanup evidence below |
-| R6-Q1 | Evidence R6-U01 through R6-U04 and promote confirmed defects | Codex | Investigation in progress |
+| R6-Q1 | Evidence R6-U01 through R6-U04 and promote confirmed defects | Codex | Done — U01/U02 were promoted and fixed; U03/U04 have authoritative safe dispositions and executable evidence below |
 
 ### Round 6 item evidence
 
@@ -202,7 +202,7 @@ each step (88 tests at completion).
 | R6-B27 | **Done** — every push and pull request runs the canonical mandatory gate aggregate; tagged release builds depend on the same correctness job and verify the tag against the one workspace version before packaging | `scripts/verify-release.sh`; `.github/workflows/{ci,release}.yml`; release `build.needs: correctness`; disposable publish regression runs in both workflows |
 | R6-B28 | **Done** — storage target presence, executable production callers, all executable source roots, kernel/SDK/worker dependency graphs, and local batch-HMAC behavior are checked semantically instead of by permissive file-wide mentions | xtask deliberate violating fixtures `storage_conformance_rejects_missing_live_target_fixture`, `dead_enforcement_rejects_comment_only_fixture`, `no_llm_rejects_generated_target_fixture`, `kernel_purity_rejects_banned_transitive_fixture`, `signing_hygiene_rejects_aliased_local_hmac_fixture`; strengthened gates pass; cluster production fan-out calls `admit_and_publish` |
 | R6-B29 | **Done** — publishing rejects dirty overlapping manifests and mixed versions before verification/mutation, runs every mandatory gate, never uses `--no-verify`, and restores temporary manifest edits from byte-exact backups without touching unrelated work | coherent workspace version `0.2.2`; disposable `scripts/tests/publish.sh` proves dirty refusal, mixed-version refusal, verification ordering, failure restoration, unrelated-file preservation, and exact publish flags |
-| R6-B30 | **In progress** — the authoritative 30-row §23 matrix and machine gate expose exact executable evidence, PRD-backed deferrals, and every confirmed non-deferred gap without treating prose or component-only tests as closure | `docs/acceptance/section-23.tsv`; `cargo xtask acceptance-coverage`; direct regressions `external_identity_is_layout_immune_property` and `kernel_purity_rejects_every_aws_sdk_crate_but_allows_worker_readers`; tracked R6-B30 subrows remain open |
+| R6-B30 | **Done** — the authoritative 30-row §23 matrix has executable evidence for every v1 criterion and explicit PRD-backed tracking for each deferral; no non-deferred gap remains | `docs/acceptance/section-23.tsv`; `cargo xtask acceptance-coverage`; completed R6-B30 subrows below |
 | R6-B30-24 | **Done** — a real default-tolerance consolidation rewires 34 asserted edges onto one survivor and independently trips the measured hairball guard, while the poison cycle trips ΔR with no hairball; both results stamp before/after sparsity and MCR² | Dreams `merge_rewiring_trips_default_hairball_without_delta_r_regression` and `poison_consolidation_flags_regression_and_rolls_back`; the exact §23 evidence row passes `cargo xtask acceptance-coverage` |
 | R6-B30-01 | **Done** — one installed `exocortex` entrypoint selects mcp-client, mcp-standalone, or backend-node and the release archive/installer ships it beside its implementation binaries | `cargo xtask deployment-acceptance`; `scripts/exocortex`; release package/install workflow |
 | R6-B30-02 | **Done** — the authoritative non-Rust kind catalogue is regenerated and drift-checked from `pack_def`; stable and kind-sensitive fingerprint tests cover the remaining generated identity surface | `cargo xtask ontology-surfaces`; `gen-playbook`; `fingerprint_is_order_independent_and_kind_sensitive`; `golden_fingerprint_is_pinned` |
