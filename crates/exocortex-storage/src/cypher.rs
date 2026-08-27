@@ -36,6 +36,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "memory_type_label",
             "memory_type_id",
             "props_json",
+            "tags",
             "entity_ids",
             "tenant_id",
             "user_id",
@@ -58,6 +59,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                 m.recorded_at       = $recorded_at,
                 m.invalidated_by    = $invalidated_by,
                 m.props_json        = $props_json,
+                m.tags              = $tags,
                 m.entity_ids        = $entity_ids,
                 m.tenant_id         = $tenant_id,
                 m.user_id           = $user_id,
@@ -79,6 +81,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "memory_type_label",
             "memory_type_id",
             "props_json",
+            "tags",
             "entity_ids",
             "tenant_id",
             "user_id",
@@ -101,6 +104,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                 m.recorded_at       = $recorded_at,
                 m.invalidated_by    = $invalidated_by,
                 m.props_json        = $props_json,
+                m.tags              = $tags,
                 m.entity_ids        = $entity_ids,
                 m.tenant_id         = $tenant_id,
                 m.user_id           = $user_id,
@@ -351,6 +355,41 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (m:Memory {id: $id})
             WHERE m.visibility <= $max_visibility
             RETURN m LIMIT 1
+        "#,
+    });
+
+    reg!(Template {
+        id: "get_relationship_by_id",
+        read_only: true,
+        required_params: &["id"],
+        cypher: r#"
+            MATCH ()-[r]->() WHERE r.id = $id
+            RETURN r LIMIT 1
+        "#,
+    });
+
+    reg!(Template {
+        id: "relationships_touching",
+        read_only: true,
+        required_params: &["frontier", "limit"],
+        cypher: r#"
+            MATCH (a:Memory)-[r]->(b:Memory)
+            WHERE (a.id IN $frontier OR b.id IN $frontier)
+              AND r.lsn IS NOT NULL
+              AND r.valid_until IS NULL
+            RETURN r ORDER BY r.lsn ASC LIMIT $limit
+        "#,
+    });
+
+    reg!(Template {
+        id: "memories_sharing_attributes",
+        read_only: true,
+        required_params: &["tags", "entity_ids", "limit"],
+        cypher: r#"
+            MATCH (m:Memory)
+            WHERE any(tag IN $tags WHERE tag IN m.tags)
+               OR any(entity_id IN $entity_ids WHERE entity_id IN m.entity_ids)
+            RETURN DISTINCT m ORDER BY m.lsn ASC LIMIT $limit
         "#,
     });
 

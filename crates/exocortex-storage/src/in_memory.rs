@@ -28,6 +28,7 @@ struct InMemoryInner {
     mutation_gate: Mutex<()>,
     memories: Mutex<HashMap<MemoryId, Vec<Memory>>>, // history stack per id
     rels: Mutex<HashMap<RelationshipId, Vec<Relationship>>>,
+    rels_by_node: Mutex<HashMap<MemoryId, std::collections::HashSet<RelationshipId>>>,
     ontology: std::sync::Arc<exocortex_kernel::Ontology>,
     /// Chubby-style lease table (§9.2): current holder token per key plus
     /// the monotonic epoch counter — same semantics as the Redis path, so
@@ -37,6 +38,10 @@ struct InMemoryInner {
     lease_epochs: Mutex<HashMap<LeaseKey, u64>>,
     proposals: Mutex<HashMap<smol_str::SmolStr, StoredProposal>>,
     audits: Mutex<Vec<serde_json::Value>>,
+    stream_memory_calls: AtomicU64,
+    stream_relationship_calls: AtomicU64,
+    frontier_relationship_calls: AtomicU64,
+    attribute_memory_calls: AtomicU64,
     settled_ingest: Mutex<HashMap<IngestBatchKey, SettledIngestBatch>>,
     point_reads: AtomicU64,
     batch_reads: AtomicU64,
@@ -88,11 +93,16 @@ impl InMemoryStorage {
             inner: std::sync::Arc::new(InMemoryInner {
                 memories: Default::default(),
                 rels: Default::default(),
+                rels_by_node: Default::default(),
                 ontology,
                 leases: Default::default(),
                 lease_epochs: Default::default(),
                 proposals: Default::default(),
                 audits: Default::default(),
+                stream_memory_calls: AtomicU64::new(0),
+                stream_relationship_calls: AtomicU64::new(0),
+                frontier_relationship_calls: AtomicU64::new(0),
+                attribute_memory_calls: AtomicU64::new(0),
                 settled_ingest: Default::default(),
                 point_reads: Default::default(),
                 batch_reads: Default::default(),
@@ -122,6 +132,18 @@ impl InMemoryStorage {
         self.lsn.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    fn index_relationship(&self, id: RelationshipId, from: MemoryId, to: MemoryId) {
+        let mut index = self.inner.rels_by_node.lock().unwrap();
+        index.entry(from).or_default().insert(id);
+        index.entry(to).or_default().insert(id);
+    }
+
+    fn index_invalidation(&self, invalidation: &Invalidation) {
+        if let Invalidation::RelationshipUpserted { id, from, to, .. } = invalidation {
+            self.index_relationship(*id, *from, *to);
+        }
+    }
+
     /// Current (last) version of a memory row, if any.
     pub fn memory_history(&self, id: &MemoryId) -> Vec<Memory> {
         self.inner
@@ -147,6 +169,21 @@ impl InMemoryStorage {
     /// Highest LSN emitted so far.
     pub fn last_lsn(&self) -> u64 {
         self.lsn.load(Ordering::SeqCst)
+    }
+
+    /// Query counters for deterministic bounded-scan tests:
+    /// `(memory streams, relationship streams, frontier relationship reads,
+    /// attribute-posting reads)`.
+    #[doc(hidden)]
+    pub fn reasoning_query_counts(&self) -> (u64, u64, u64, u64) {
+        (
+            self.inner.stream_memory_calls.load(Ordering::Relaxed),
+            self.inner.stream_relationship_calls.load(Ordering::Relaxed),
+            self.inner
+                .frontier_relationship_calls
+                .load(Ordering::Relaxed),
+            self.inner.attribute_memory_calls.load(Ordering::Relaxed),
+        )
     }
 
     #[cfg(test)]
@@ -196,6 +233,7 @@ impl InMemoryStorage {
         // not have.
         store.insert(r.id, vec![r.clone()]);
         drop(store);
+        self.index_relationship(r.id, r.from, r.to);
         let _ = self.feed.send(Invalidation::RelationshipUpserted {
             id: r.id,
             from: r.from,
@@ -388,6 +426,7 @@ impl Storage for InMemoryStorage {
             self.upsert_batch_locked(ms, rs)?
         };
         for inv in invalidations {
+            self.index_invalidation(&inv);
             let _ = self.feed.send(inv);
         }
         Ok(records)
@@ -483,6 +522,7 @@ impl Storage for InMemoryStorage {
             (records, invalidations, settled)
         };
         for invalidation in invalidations {
+            self.index_invalidation(&invalidation);
             let _ = self.feed.send(invalidation);
         }
         Ok(IngestCommitOutcome::Committed { records, settled })
@@ -655,6 +695,7 @@ impl Storage for InMemoryStorage {
             )
         };
         for invalidation in invalidations {
+            self.index_invalidation(&invalidation);
             let _ = self.feed.send(invalidation);
         }
         Ok(record)
@@ -715,6 +756,71 @@ impl Storage for InMemoryStorage {
         Ok(ids
             .iter()
             .filter_map(|id| store.get(id).and_then(|h| h.last().cloned()))
+            .collect())
+    }
+    async fn get_relationship(
+        &self,
+        id: &RelationshipId,
+    ) -> Result<Option<Relationship>, StorageError> {
+        Ok(self
+            .inner
+            .rels
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|history| history.last().cloned()))
+    }
+    async fn relationships_touching(
+        &self,
+        frontier: &[MemoryId],
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        self.inner
+            .frontier_relationship_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let index = self.inner.rels_by_node.lock().unwrap();
+        let ids: std::collections::HashSet<_> = frontier
+            .iter()
+            .filter_map(|node| index.get(node))
+            .flatten()
+            .copied()
+            .collect();
+        drop(index);
+        let relationships = self.inner.rels.lock().unwrap();
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| relationships.get(&id).and_then(|history| history.last()))
+            .filter(|row| row.valid_until.is_none() && row.invalidated_by.is_none())
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+    async fn memories_sharing_attributes(
+        &self,
+        tags: &[smol_str::SmolStr],
+        entities: &[EntityId],
+        limit: u32,
+    ) -> Result<Vec<Memory>, StorageError> {
+        self.inner
+            .attribute_memory_calls
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(self
+            .inner
+            .memories
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|history| history.last())
+            .filter(|memory| {
+                memory.tags.iter().any(|tag| tags.contains(tag))
+                    || memory
+                        .context
+                        .entities
+                        .iter()
+                        .any(|entity| entities.contains(entity))
+            })
+            .take(limit as usize)
+            .cloned()
             .collect())
     }
     async fn traverse(
@@ -806,6 +912,9 @@ impl Storage for InMemoryStorage {
         ))
     }
     async fn stream_all_memories(&self) -> BoxStream<'_, Result<Memory, StorageError>> {
+        self.inner
+            .stream_memory_calls
+            .fetch_add(1, Ordering::Relaxed);
         // ST8 (audit): current versions only — one row per id, matching the
         // FalkorDB pagers and the trait contract.
         let all: Vec<_> = self
@@ -819,6 +928,9 @@ impl Storage for InMemoryStorage {
         Box::pin(futures::stream::iter(all))
     }
     async fn stream_all_relationships(&self) -> BoxStream<'_, Result<Relationship, StorageError>> {
+        self.inner
+            .stream_relationship_calls
+            .fetch_add(1, Ordering::Relaxed);
         let all: Vec<_> = self
             .inner
             .rels
@@ -922,6 +1034,7 @@ impl Storage for InMemoryStorage {
             self.upsert_batch_locked(ms, rs)?
         };
         for inv in invalidations {
+            self.index_invalidation(&inv);
             let _ = self.feed.send(inv);
         }
         Ok(records)
@@ -1003,6 +1116,7 @@ impl Storage for InMemoryStorage {
             (records, invalidations)
         };
         for invalidation in invalidations {
+            self.index_invalidation(&invalidation);
             let _ = self.feed.send(invalidation);
         }
         Ok(records)

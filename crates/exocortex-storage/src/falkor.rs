@@ -150,6 +150,21 @@ fn memory_from_value(v: &FalkorValue) -> Result<Memory, StorageError> {
     serde_json::from_str(json).map_err(|e| StorageError::Backend(format!("bad props_json: {e}")))
 }
 
+fn relationship_from_value(v: &FalkorValue) -> Result<Relationship, StorageError> {
+    let FalkorValue::Edge(edge) = v else {
+        return Err(StorageError::Backend(format!(
+            "expected a relationship edge, got: {v:?}"
+        )));
+    };
+    let Some(FalkorValue::String(json)) = edge.properties.get("props_json") else {
+        return Err(StorageError::Backend(
+            "relationship edge missing props_json".into(),
+        ));
+    };
+    serde_json::from_str(json)
+        .map_err(|error| StorageError::Backend(format!("bad rel props_json: {error}")))
+}
+
 fn decode_persisted_fingerprint(
     rows: &[Vec<FalkorValue>],
 ) -> Result<Option<[u8; 32]>, StorageError> {
@@ -429,6 +444,7 @@ impl FalkorStorage {
             "memory_type_label": mt_label,
             "memory_type_id": m.memory_type,
             "props_json": FalkorStorage::props_json(m, lsn),
+            "tags": m.tags.iter().map(|tag| tag.as_str()).collect::<Vec<_>>(),
             "entity_ids": m.context.entities.iter().map(|entity| hex(&entity.0)).collect::<Vec<_>>(),
             "tenant_id": m.context.tenant_id,
             "user_id": m.context.user_id,
@@ -1342,6 +1358,67 @@ impl Storage for FalkorStorage {
             .map(|memory| (memory.id, memory))
             .collect();
         Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
+    }
+
+    async fn get_relationship(
+        &self,
+        id: &RelationshipId,
+    ) -> Result<Option<Relationship>, StorageError> {
+        let rows = self
+            .run_template(
+                "get_relationship_by_id",
+                &serde_json::json!({ "id": hex(&id.0) }),
+                true,
+            )
+            .await?;
+        match rows.first().and_then(|row| row.first()) {
+            Some(value) if !matches!(value, FalkorValue::None) => {
+                Ok(Some(relationship_from_value(value)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn relationships_touching(
+        &self,
+        frontier: &[MemoryId],
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        let frontier: Vec<_> = frontier.iter().map(|id| hex(&id.0)).collect();
+        let rows = self
+            .run_template(
+                "relationships_touching",
+                &serde_json::json!({ "frontier": frontier, "limit": limit }),
+                true,
+            )
+            .await?;
+        rows.iter()
+            .filter_map(|row| row.first())
+            .map(relationship_from_value)
+            .collect()
+    }
+
+    async fn memories_sharing_attributes(
+        &self,
+        tags: &[smol_str::SmolStr],
+        entities: &[EntityId],
+        limit: u32,
+    ) -> Result<Vec<Memory>, StorageError> {
+        let rows = self
+            .run_template(
+                "memories_sharing_attributes",
+                &serde_json::json!({
+                    "tags": tags.iter().map(|tag| tag.as_str()).collect::<Vec<_>>(),
+                    "entity_ids": entities.iter().map(|id| hex(&id.0)).collect::<Vec<_>>(),
+                    "limit": limit,
+                }),
+                true,
+            )
+            .await?;
+        rows.iter()
+            .filter_map(|row| row.first())
+            .map(memory_from_value)
+            .collect()
     }
 
     async fn traverse(

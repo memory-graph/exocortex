@@ -621,6 +621,7 @@ async fn relationship_reupsert_does_not_duplicate() {
     };
     storage.upsert_relationship(&rel).await.unwrap();
     cache.reseed_from_storage(&storage, &"org".into()).await;
+    let relationship_streams_before = storage.reasoning_query_counts().1;
 
     let inv = exocortex_storage::Invalidation::RelationshipUpserted {
         id: rel.id,
@@ -641,6 +642,11 @@ async fn relationship_reupsert_does_not_duplicate() {
         .filter(|w| w.id == rel.id)
         .count();
     assert_eq!(count, 1, "CR5: exactly one edge for the RelationshipId");
+    assert_eq!(
+        storage.reasoning_query_counts().1,
+        relationship_streams_before,
+        "relationship invalidations use the indexed point read"
+    );
     writer.abort();
 }
 

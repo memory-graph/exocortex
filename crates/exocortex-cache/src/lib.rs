@@ -533,7 +533,7 @@ impl LocalCache {
                     changed = true;
                 }
                 Invalidation::RelationshipUpserted { id, lsn, .. } => {
-                    match fetch_relationship(storage, &id).await {
+                    match storage.get_relationship(&id).await {
                         Ok(Some(r)) => {
                             next.insert_relationship(r);
                             changed = true;
@@ -1097,21 +1097,4 @@ fn clone_snapshot(src: &GraphSnapshot) -> GraphSnapshot {
         built_at: chrono::Utc::now(),
         est_bytes: src.est_bytes,
     }
-}
-
-/// Storage has no point edge-read in the v1 trait; scan current rows.
-async fn fetch_relationship<S: Storage>(
-    storage: &S,
-    id: &RelationshipId,
-) -> exocortex_storage::Result<Option<Relationship>> {
-    use futures::StreamExt;
-    let mut rs = storage.stream_all_relationships().await;
-    while let Some(r) = rs.next().await {
-        if let Ok(r) = r {
-            if r.id == *id {
-                return Ok(Some(r));
-            }
-        }
-    }
-    Ok(None)
 }

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use exocortex_kernel::{MemoryId, Provenance, Relationship, RelationshipId};
+use exocortex_kernel::{Memory, MemoryId, Provenance, Relationship, RelationshipId};
 use exocortex_storage::Storage;
 use tokio::sync::mpsc;
 use tracing::{instrument, warn};
@@ -84,41 +84,43 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         let tags: Vec<TagFact>;
         let mut evidence: Vec<RelationshipId> = Vec::new();
 
-        // Single scan: build undirected adjacency for the BFS + the edge
-        // rows (directed) for the rule program.
-        let mut adjacency: std::collections::HashMap<MemoryId, Vec<(MemoryId, RelationshipId)>> =
-            std::collections::HashMap::new();
-        {
-            use futures::StreamExt;
-            let mut rels = self.storage.stream_all_relationships().await;
-            while let Some(Ok(r)) = rels.next().await {
-                adjacency.entry(r.from).or_default().push((r.to, r.id));
-                adjacency.entry(r.to).or_default().push((r.from, r.id));
-            }
-        }
-
-        // Bounded BFS from the seed (CR-6 hard caps).
+        // Delta-driven BFS from the changed seed. Each hop asks storage for
+        // only edges touching the current frontier; it never enumerates the
+        // graph-wide relationship table.
         const MAX_NODES: usize = 512;
+        const MAX_EDGES: usize = 4096;
         let mut neighborhood: std::collections::HashSet<MemoryId> =
             std::collections::HashSet::from([seed]);
         let mut seen_edges: std::collections::HashSet<RelationshipId> =
             std::collections::HashSet::new();
+        let mut relationship_rows = Vec::new();
         let mut frontier = vec![seed];
         for _hop in 0..k {
             let mut next = Vec::new();
-            for node in &frontier {
-                if let Some(neighbors) = adjacency.get(node) {
-                    for (other, edge_id) in neighbors {
-                        if neighborhood.insert(*other) && neighborhood.len() <= MAX_NODES {
-                            next.push(*other);
-                        }
-                        if seen_edges.insert(*edge_id) {
-                            evidence.push(*edge_id);
-                        }
+            let rows = match self
+                .storage
+                .relationships_touching(&frontier, MAX_EDGES as u32)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    warn!(?error, "bounded reasoning frontier query failed");
+                    return;
+                }
+            };
+            for row in rows {
+                if !seen_edges.insert(row.id) {
+                    continue;
+                }
+                evidence.push(row.id);
+                for other in [row.from, row.to] {
+                    if neighborhood.len() < MAX_NODES && neighborhood.insert(other) {
+                        next.push(other);
                     }
                 }
+                relationship_rows.push(row);
             }
-            if next.is_empty() || neighborhood.len() > MAX_NODES {
+            if next.is_empty() || relationship_rows.len() >= MAX_EDGES {
                 break;
             }
             frontier = next;
@@ -126,13 +128,10 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
 
         // Edge facts: every edge with BOTH endpoints inside the
         // neighborhood, directed as stored.
-        {
-            use futures::StreamExt;
-            let mut rels = self.storage.stream_all_relationships().await;
-            while let Some(Ok(r)) = rels.next().await {
-                if neighborhood.contains(&r.from) && neighborhood.contains(&r.to) {
-                    edges.push(Edge(r.from, r.to, r.kind));
-                }
+        for relationship in &relationship_rows {
+            if neighborhood.contains(&relationship.from) && neighborhood.contains(&relationship.to)
+            {
+                edges.push(Edge(relationship.from, relationship.to, relationship.kind));
             }
         }
 
@@ -148,60 +147,55 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         //   2. high-frequency attributes are dropped (posting lists above
         //      the cap carry no affinity signal);
         //   3. a hard cap on derived pairs per pass, with a drop counter.
-        const MAX_ATTRIBUTE_MEMORIES: usize = 4096;
         const MAX_POSTING_LIST: usize = 256;
         const MAX_DERIVED_PAIRS: usize = 10_000;
-
-        // Pass 1: the neighborhood's attribute sets (bounded by MAX_NODES).
-        let mut nb_tag_set: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mut nb_ent_set: std::collections::HashSet<exocortex_kernel::EntityId> =
-            std::collections::HashSet::new();
-        {
-            use futures::StreamExt;
-            let mut mems = self.storage.stream_all_memories().await;
-            while let Some(Ok(m)) = mems.next().await {
-                if !neighborhood.contains(&m.id) {
-                    continue;
-                }
-                for t in &m.tags {
-                    nb_tag_set.insert(fxhash_tag(t.as_str()));
-                }
-                for e in &m.context.entities {
-                    nb_ent_set.insert(*e);
-                }
+        let neighborhood_ids: Vec<_> = neighborhood.iter().copied().collect();
+        let mut memory_rows = match self.storage.get_memories(&neighborhood_ids).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(?error, "bounded reasoning memory query failed");
+                return;
             }
+        };
+        let attribute_tags: std::collections::HashSet<_> = memory_rows
+            .iter()
+            .flat_map(|memory| memory.tags.iter().cloned())
+            .collect();
+        let attribute_entities: std::collections::HashSet<_> = memory_rows
+            .iter()
+            .flat_map(|memory| memory.context.entities.iter().copied())
+            .collect();
+        if !attribute_tags.is_empty() || !attribute_entities.is_empty() {
+            let mut expansion = match self
+                .storage
+                .memories_sharing_attributes(
+                    &attribute_tags.into_iter().collect::<Vec<_>>(),
+                    &attribute_entities.into_iter().collect::<Vec<_>>(),
+                    4096,
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    warn!(?error, "bounded reasoning attribute query failed");
+                    return;
+                }
+            };
+            let mut seen: std::collections::HashSet<_> =
+                memory_rows.iter().map(|memory| memory.id).collect();
+            expansion.retain(|memory| seen.insert(memory.id));
+            memory_rows.extend(expansion);
         }
-
-        // Pass 2: harvest members (neighborhood + attribute-sharing
-        // expansion), capped.
         let mut memories: Vec<rules::MemoryFact> = Vec::new();
         let mut raw_tags: Vec<(MemoryId, u32)> = Vec::new();
         let mut raw_entities: Vec<(MemoryId, exocortex_kernel::EntityId)> = Vec::new();
-        {
-            use futures::StreamExt;
-            let mut mems = self.storage.stream_all_memories().await;
-            while let Some(Ok(m)) = mems.next().await {
-                if memories.len() >= MAX_ATTRIBUTE_MEMORIES {
-                    metrics::counter!("exocortex_reasoning_attribute_harvest_capped_total")
-                        .increment(1);
-                    break;
-                }
-                let member = neighborhood.contains(&m.id) || {
-                    m.tags
-                        .iter()
-                        .any(|t| nb_tag_set.contains(&fxhash_tag(t.as_str())))
-                        || m.context.entities.iter().any(|e| nb_ent_set.contains(e))
-                };
-                if !member {
-                    continue;
-                }
-                memories.push(rules::MemoryFact(m.id, m.memory_type));
-                for t in &m.tags {
-                    raw_tags.push((m.id, fxhash_tag(t.as_str())));
-                }
-                for e in &m.context.entities {
-                    raw_entities.push((m.id, *e));
-                }
+        for memory in &memory_rows {
+            memories.push(rules::MemoryFact(memory.id, memory.memory_type));
+            for tag in &memory.tags {
+                raw_tags.push((memory.id, fxhash_tag(tag.as_str())));
+            }
+            for entity in &memory.context.entities {
+                raw_entities.push((memory.id, *entity));
             }
         }
 
@@ -262,7 +256,8 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         // supporting edges for each derivation); the k-hop neighborhood
         // list is no longer stamped wholesale on every row.
         let _ = &evidence;
-        self.write_back(derived).await;
+        self.write_back(derived, &memory_rows, &relationship_rows)
+            .await;
     }
 
     async fn session_reason(&self, ms: &[MemoryId]) {
@@ -276,17 +271,18 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
     /// provenance evidence is the SUPPORTING EDGE SET for that derivation
     /// (the two hops behind a transitive edge), not the whole k-hop
     /// neighborhood; attribute derivations carry no edge evidence.
-    async fn write_back(&self, mut derived: rules::Derived) {
+    async fn write_back(
+        &self,
+        mut derived: rules::Derived,
+        memory_rows: &[Memory],
+        relationship_rows: &[Relationship],
+    ) {
         let ontology = self.storage_ontology();
         let mut new_rels: Vec<Relationship> = Vec::new();
         let now = chrono::Utc::now();
         let mut memory_visibility = std::collections::HashMap::new();
-        {
-            use futures::StreamExt;
-            let mut memories = self.storage.stream_all_memories().await;
-            while let Some(Ok(memory)) = memories.next().await {
-                memory_visibility.insert(memory.id, memory.visibility);
-            }
+        for memory in memory_rows {
+            memory_visibility.insert(memory.id, memory.visibility);
         }
 
         // Kind-aware adjacency for resolving transitive support edges.
@@ -295,13 +291,13 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
             Vec<(MemoryId, exocortex_kernel::RelKindId, RelationshipId)>,
         > = std::collections::HashMap::new();
         let mut evidence_visibility = std::collections::HashMap::new();
-        {
-            use futures::StreamExt;
-            let mut rels = self.storage.stream_all_relationships().await;
-            while let Some(Ok(r)) = rels.next().await {
-                evidence_visibility.insert(r.id, r.visibility);
-                adj.entry(r.from).or_default().push((r.to, r.kind, r.id));
-            }
+        for relationship in relationship_rows {
+            evidence_visibility.insert(relationship.id, relationship.visibility);
+            adj.entry(relationship.from).or_default().push((
+                relationship.to,
+                relationship.kind,
+                relationship.id,
+            ));
         }
         // The two hops behind (from -> mid -> to) for the given kinds.
         let support = |from: MemoryId,
@@ -465,20 +461,19 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         if new_rels.is_empty() {
             return;
         }
-        // Idempotency: skip rows whose derived id already exists.
-        use futures::StreamExt;
-        let existing: std::collections::HashSet<RelationshipId> = {
-            let mut set = std::collections::HashSet::new();
-            let mut rs = self.storage.stream_all_relationships().await;
-            while let Some(Ok(r)) = rs.next().await {
-                set.insert(r.id);
+        // Idempotency uses indexed point reads over only the bounded derived
+        // candidates, never a graph-wide relationship enumeration.
+        let mut fresh = Vec::new();
+        for relationship in new_rels {
+            match self.storage.get_relationship(&relationship.id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => fresh.push(relationship),
+                Err(error) => {
+                    warn!(?error, "derived-edge existence check failed");
+                    return;
+                }
             }
-            set
-        };
-        let fresh: Vec<Relationship> = new_rels
-            .into_iter()
-            .filter(|r| !existing.contains(&r.id))
-            .collect();
+        }
         if !fresh.is_empty() {
             if let Err(e) = self.storage.upsert_batch(&[], &fresh).await {
                 warn!(?e, "derived-edge writeback failed");
@@ -494,14 +489,16 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
     pub async fn inferred_type(&self, id: MemoryId) -> Option<u8> {
         // Evaluate R1-R3 over the neighborhood of `id`.
         let mut edges = Vec::new();
-        use futures::StreamExt;
-        let mut rels = self.storage.stream_all_relationships().await;
-        while let Some(Ok(r)) = rels.next().await {
+        let rels = self
+            .storage
+            .relationships_touching(&[id], 4096)
+            .await
+            .ok()?;
+        for r in rels {
             if r.from == id || r.to == id {
                 edges.push(Edge(r.from, r.to, r.kind));
             }
         }
-        drop(rels);
         let derived = rules::evaluate(edges, vec![], vec![], vec![]);
         derived
             .type_from_solves

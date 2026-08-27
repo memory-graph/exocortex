@@ -160,6 +160,68 @@ pub trait Storage: Send + Sync + 'static {
     ) -> crate::Result<Option<Memory>>;
     /// Point read of several memories; missing ids are omitted.
     async fn get_memories(&self, ids: &[MemoryId]) -> crate::Result<Vec<Memory>>;
+    /// Indexed point read of one current relationship row.
+    async fn get_relationship(&self, id: &RelationshipId) -> crate::Result<Option<Relationship>> {
+        use futures::StreamExt;
+        let mut rows = self.stream_all_relationships().await;
+        while let Some(row) = rows.next().await {
+            let row = row?;
+            if row.id == *id {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+    /// Bounded relationship rows touching any node in `frontier`. Production
+    /// backends implement this with endpoint indexes; the default preserves
+    /// compatibility for specialized test stores.
+    async fn relationships_touching(
+        &self,
+        frontier: &[MemoryId],
+        limit: u32,
+    ) -> crate::Result<Vec<Relationship>> {
+        use futures::StreamExt;
+        let ids: std::collections::HashSet<_> = frontier.iter().copied().collect();
+        let mut rows = self.stream_all_relationships().await;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await {
+            let row = row?;
+            if ids.contains(&row.from) || ids.contains(&row.to) {
+                out.push(row);
+                if out.len() >= limit as usize {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+    /// Bounded attribute-posting expansion for reasoning rules R7/R9.
+    async fn memories_sharing_attributes(
+        &self,
+        tags: &[smol_str::SmolStr],
+        entities: &[EntityId],
+        limit: u32,
+    ) -> crate::Result<Vec<Memory>> {
+        use futures::StreamExt;
+        let mut rows = self.stream_all_memories().await;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await {
+            let row = row?;
+            if row.tags.iter().any(|tag| tags.contains(tag))
+                || row
+                    .context
+                    .entities
+                    .iter()
+                    .any(|entity| entities.contains(entity))
+            {
+                out.push(row);
+                if out.len() >= limit as usize {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
     /// Bounded k-hop traversal (CR-6 hard caps).
     async fn traverse(&self, from: &MemoryId, spec: &TraversalSpec) -> crate::Result<Vec<Memory>>;
     /// Memories about an entity, filtered and bounded.

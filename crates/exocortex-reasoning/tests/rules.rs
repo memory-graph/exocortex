@@ -73,6 +73,38 @@ fn edge(from: MemoryId, to: MemoryId, k: u32) -> Edge {
     Edge(from, to, exocortex_kernel::RelKindId(k))
 }
 
+#[tokio::test]
+async fn small_reasoning_update_never_scans_the_full_store() {
+    let storage = InMemoryStorage::new(ontology());
+    let seed = mem(exocortex_pack_dev_v1::MemoryType::General.id(), &[], &[]);
+    storage.upsert_memory(&seed).await.unwrap();
+    for _ in 0..2_000 {
+        storage
+            .upsert_memory(&mem(
+                exocortex_pack_dev_v1::MemoryType::General.id(),
+                &[],
+                &[],
+            ))
+            .await
+            .unwrap();
+    }
+    let engine = ReasoningEngine::new(Arc::new(storage.clone_dyn()), 8, 3);
+    engine.k_hop_reason(seed.id, 3).await;
+
+    let (memory_streams, relationship_streams, frontier_reads, attribute_reads) =
+        storage.reasoning_query_counts();
+    assert_eq!(memory_streams, 0, "memory inputs use bounded point reads");
+    assert_eq!(relationship_streams, 0, "edge inputs use frontier indexes");
+    assert_eq!(
+        frontier_reads, 1,
+        "an isolated change stops after one frontier"
+    );
+    assert_eq!(
+        attribute_reads, 0,
+        "empty attributes need no expansion query"
+    );
+}
+
 #[test]
 fn rules_r1_through_r3_derive_types() {
     rules::prime(&ontology());
