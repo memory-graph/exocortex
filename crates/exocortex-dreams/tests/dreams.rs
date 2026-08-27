@@ -46,7 +46,7 @@ fn mem_with_embedding(i: usize, dup_of: Option<usize>, embedding: Vec<f32>) -> M
             project_id: Some("p".into()),
             project_path: None,
             team_id: None,
-            tenant_id: None,
+            tenant_id: Some("o".into()),
             session_id: None,
             user_id: None,
             created_by: None,
@@ -213,10 +213,9 @@ async fn lease_race_two_engines_one_region() {
         memory_type: 3,
     };
     for i in 0..4 {
-        storage
-            .upsert_memory(&mem_with_embedding(i, None, unit(i)))
-            .await
-            .unwrap();
+        let mut memory = mem_with_embedding(i, None, unit(i));
+        memory.context.tenant_id = Some("race".into());
+        storage.upsert_memory(&memory).await.unwrap();
     }
     // InMemoryStorage grants leases permissively; the LIVE race is asserted
     // in exocortex-cluster's chaos test against FalkorDB. Here: the engine
@@ -226,6 +225,39 @@ async fn lease_race_two_engines_one_region() {
         res.lease_epoch >= 1,
         "R-C1: cycles run under an active lease"
     );
+}
+
+#[tokio::test]
+async fn named_project_region_requires_an_active_memory_in_the_same_org() {
+    let storage = InMemoryStorage::new(ontology());
+    let mut other_org = mem_with_embedding(91, None, unit(1));
+    other_org.context.tenant_id = Some("other-org".into());
+    other_org.context.project_id = Some("named-project".into());
+    storage.upsert_memory(&other_org).await.unwrap();
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        false,
+        "dreams-region-check".into(),
+    );
+    let region = RegionKey {
+        org: "org".into(),
+        project: "named-project".into(),
+        memory_type: 3,
+    };
+    let error = engine.try_consolidate(&region).await.unwrap_err();
+    assert!(error.to_string().contains("unknown project region"));
+
+    let lease_key = exocortex_storage::LeaseKey::Dreams {
+        org: "org".into(),
+        region: "named-project:3".into(),
+    };
+    storage
+        .acquire_lease(&lease_key, std::time::Duration::from_secs(1))
+        .await
+        .expect("invalid region was rejected before lease acquisition");
 }
 
 #[test]

@@ -217,6 +217,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     /// ride the fenced paths so a stale owner can never commit (R-C3).
     #[instrument(skip(self))]
     pub async fn try_consolidate(&self, region: &RegionKey) -> anyhow::Result<ConsolidationResult> {
+        self.validate_region(region).await?;
         // CS4: a follower (lost re-election) performs no consolidation,
         // even before contending on the region lease.
         if let Some(gate) = &self.leader_gate {
@@ -650,6 +651,28 @@ impl<S: Storage + 'static> DreamsEngine<S> {
 }
 
 impl<S: Storage + 'static> DreamsEngine<S> {
+    /// Reject forged/stale named region keys before lease acquisition. A
+    /// named project exists for this org only when storage contains an active
+    /// memory carrying that exact tenant/project scope; wildcard regions are
+    /// internal aggregate scopes and do not claim a named project.
+    async fn validate_region(&self, region: &RegionKey) -> anyhow::Result<()> {
+        if region.org == "*" || region.project == "*" {
+            return Ok(());
+        }
+        use futures::StreamExt;
+        let mut memories = self.storage.stream_all_memories().await;
+        while let Some(row) = memories.next().await {
+            let memory = row?;
+            if memory.valid_until.is_none()
+                && memory.context.tenant_id.as_deref() == Some(region.org.as_str())
+                && memory.context.project_id.as_deref() == Some(region.project.as_str())
+            {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("unknown project region {}/{}", region.org, region.project)
+    }
+
     /// §12.1 discovery pass — the Transitive finder (§23 #12): two-hop
     /// paths `a -e1-> b -e2-> c` with no direct `a->c` edge and no
     /// derived path edges (R4/R5 write `Derived` provenance; their
@@ -657,6 +680,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     /// the graph (R-Dr1/R-T16) — they wait in `pending_discoveries` for
     /// `accept_discovery`.
     pub async fn run_discovery(&self, region: &RegionKey) -> anyhow::Result<Vec<Discovery>> {
+        self.validate_region(region).await?;
         use futures::StreamExt;
         let mut edges: Vec<(MemoryId, MemoryId, u32, bool)> = Vec::new(); // (from, to, kind, derived)
         let mut rs = self.storage.stream_all_relationships().await;
@@ -799,15 +823,11 @@ fn in_region(m: &exocortex_kernel::Memory, region: &RegionKey) -> bool {
     if m.memory_type != region.memory_type {
         return false;
     }
-    if let (false, Some(t)) = (region.org == "*", m.context.tenant_id.as_deref()) {
-        if t != region.org.as_str() {
-            return false;
-        }
+    if region.org != "*" && m.context.tenant_id.as_deref() != Some(region.org.as_str()) {
+        return false;
     }
-    if let (false, Some(p)) = (region.project == "*", m.context.project_id.as_deref()) {
-        if p != region.project.as_str() {
-            return false;
-        }
+    if region.project != "*" && m.context.project_id.as_deref() != Some(region.project.as_str()) {
+        return false;
     }
     true
 }
