@@ -249,9 +249,11 @@ fn get_state_at_counts_versions() {
         let t = Utc::now();
         let mut live = base_memory("live".into(), "x".into(), 1, 3);
         live.valid_from = t - Duration::seconds(1);
+        live.recorded_at = t - Duration::seconds(1);
         let mut dead = base_memory("dead".into(), "x".into(), 1, 3);
         dead.valid_from = t - Duration::hours(2);
         dead.valid_until = Some(t - Duration::hours(1));
+        dead.recorded_at = t - Duration::hours(2);
         store.upsert_memory(&live).await.unwrap();
         store.upsert_memory(&dead).await.unwrap();
         let snap = store.get_state_at(t).await.unwrap();

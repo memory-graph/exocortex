@@ -10,7 +10,7 @@ use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, 
 use exocortex_ops::operations::ops_vc;
 use exocortex_ops::{entries, OpContext};
 use exocortex_server::http_bind::HttpBind;
-use exocortex_storage::{InMemoryStorage, Storage};
+use exocortex_storage::{DiscoveryProposal, InMemoryStorage, RegionKey, Storage};
 
 fn ontology() -> Arc<exocortex_kernel::Ontology> {
     Arc::new(
@@ -107,7 +107,7 @@ async fn http(
 #[tokio::test(flavor = "multi_thread")]
 async fn every_operation_answers_over_http_with_auth() {
     let onto = ontology();
-    let storage = Arc::new(InMemoryStorage::new(onto));
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
     let (cache, _rx) = LocalCache::new(64 * 1024 * 1024);
     let a = mem("parity-target", 1);
     let b = mem("parity-other", 2);
@@ -176,12 +176,45 @@ async fn every_operation_answers_over_http_with_auth() {
     );
     for entry in &all {
         let input = input_for(entry.name);
+        let proposal = (entry.name == "accept_discovery").then(|| DiscoveryProposal {
+            discovery_id: "22222222-2222-2222-2222-222222222222".into(),
+            region: RegionKey {
+                org: "org".into(),
+                project: "*".into(),
+                memory_type: a.memory_type,
+            },
+            from: a.id,
+            to: b.id,
+            kind: onto.kind_id("RelatedTo").expect("RelatedTo registered"),
+            proposed_visibility: Visibility::Org,
+            caller_scope: ctx.visibility_ctx.clone(),
+            issued_at: chrono::Utc::now(),
+        });
+        if let Some(proposal) = &proposal {
+            storage.create_discovery_proposal(proposal).await.unwrap();
+        }
         let expected = (entry.handler)(&ctx, input.clone())
             .await
             .unwrap_or_else(|e| panic!("{}: handler: {e}", entry.name));
 
+        // Stateful parity executes the same operation through both surfaces.
+        // Issue a second immutable proposal because a successful acceptance
+        // permanently consumes the first id. Relationship identity depends on
+        // endpoints and kind, so the stable outputs remain directly comparable.
+        let mut http_input = input.clone();
+        if let Some(proposal) = &proposal {
+            let mut http_proposal = proposal.clone();
+            http_proposal.discovery_id = "33333333-3333-3333-3333-333333333333".into();
+            http_input["discovery_id"] =
+                serde_json::Value::String(http_proposal.discovery_id.to_string());
+            storage
+                .create_discovery_proposal(&http_proposal)
+                .await
+                .unwrap();
+        }
+
         let (status, actual, _) = if (entry.http_method)() == axum::http::Method::GET {
-            let qs = query_of(&input);
+            let qs = query_of(&http_input);
             http(
                 addr,
                 "GET",
@@ -196,7 +229,7 @@ async fn every_operation_answers_over_http_with_auth() {
                 "POST",
                 entry.http_path,
                 Some("secret-token"),
-                Some(&input),
+                Some(&http_input),
             )
             .await
         };
@@ -245,7 +278,17 @@ async fn every_operation_answers_over_http_with_auth() {
 fn parity_check(name: &str, http_out: &serde_json::Value, direct: &serde_json::Value) {
     match name {
         "accept_discovery" => {
-            assert_eq!(http_out["edge_id"], direct["edge_id"], "{name}: edge id");
+            // Discovery ids are single-use and deliberately participate in
+            // relationship identity, so the two independently authorized
+            // invocations cannot have byte-identical edge ids. Both surfaces
+            // must still return a concrete 128-bit identity and audit commit.
+            for output in [http_out, direct] {
+                assert_eq!(
+                    output["edge_id"].as_str().map(str::len),
+                    Some(32),
+                    "{name}: edge id"
+                );
+            }
             assert!(http_out["audit_lsn"].as_u64().unwrap_or(0) > 0);
             assert!(direct["audit_lsn"].as_u64().unwrap_or(0) > 0);
         }

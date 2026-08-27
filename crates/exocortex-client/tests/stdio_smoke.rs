@@ -381,11 +381,12 @@ fn mcp_tool_list_matches_registry() {
     assert!(!listed.iter().any(|t| t.contains("explain_edge")));
 }
 
-/// CL5 (audit): with `--backend` configured the client never serves the
-/// fabricated synthetic snapshot — reads are honestly empty until real
-/// sync data arrives, not invented memories with plausible ids.
+/// R6-B06/CL5: backend mode does not expose MCP at all until an authenticated
+/// graph reseed arrives. An unreachable backend must therefore leave stdout
+/// silent rather than serve either fabricated rows or an unhydrated empty
+/// cache.
 #[test]
-fn backend_mode_search_returns_no_synthetic_memories() {
+fn backend_mode_waits_for_authenticated_hydration_before_stdio_readiness() {
     let dir = tempdir();
     let mut c = Client::spawn_with(|cmd| {
         cmd.args([
@@ -394,42 +395,41 @@ fn backend_mode_search_returns_no_synthetic_memories() {
             "--user",
             "tester",
             "--backend",
-            "http://127.0.0.1:1", // unreachable by design; lazy connect
+            "http://127.0.0.1:1", // unreachable by design
+            "--hmac-key",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--auth-token",
+            "smoke-token",
             "--data-dir",
             dir.to_str().unwrap(),
         ]);
     });
-    c.send_all(&[
-        serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "smoke-test", "version": "0" }
-            }
-        }),
-        serde_json::json!({
-            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
-        }),
-        serde_json::json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {
-                "name": "exocortex.search_memories",
-                "arguments": { "query": "auth", "limit": 5 }
-            }
-        }),
-    ]);
-    let _init = c.read_line();
-    let call = c.read_line();
-    let text = call["result"]["content"][0]["text"]
-        .as_str()
-        .expect("content text");
-    let payload: serde_json::Value = serde_json::from_str(text).expect("payload JSON");
-    let memories = payload["memories"].as_array().expect("memories");
+    c.send_all(&[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke-test", "version": "0" }
+        }
+    })]);
+
+    let mut stdout = c.child.stdout.take().expect("stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut byte = [0u8; 1];
+        let _ = tx.send(stdout.read(&mut byte));
+    });
     assert!(
-        memories.is_empty(),
-        "CL5: no fabricated rows with --backend set: {memories:?}"
+        matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(300)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "unhydrated backend mode exposed or closed MCP stdout"
     );
+    c.child.kill().expect("stop waiting client");
+    c.child.wait().expect("reap waiting client");
+    reader.join().expect("stdout reader exits after kill");
 }
 
 /// CL3 (audit): a malformed --hmac-key aborts startup with a diagnostic
