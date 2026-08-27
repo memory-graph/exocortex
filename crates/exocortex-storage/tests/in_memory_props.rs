@@ -2,9 +2,14 @@
 //! round-trip, LSN monotonicity, and bi-temporal semantics.
 
 use chrono::{Duration, Utc};
-use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
+use exocortex_kernel::{
+    EntityId, Memory, MemoryContext, MemoryId, Provenance, RelKindId, Relationship, RelationshipId,
+    RelationshipProperties, Visibility, LSN,
+};
 use exocortex_pack_dev_v1::pack_def;
-use exocortex_storage::{InMemoryStorage, Storage};
+use exocortex_storage::{
+    InMemoryStorage, IngestBatchKey, IngestCommitOutcome, MemoryFilter, Storage, VisibilityContext,
+};
 use proptest::prelude::*;
 use std::sync::Arc;
 
@@ -244,4 +249,129 @@ fn get_state_at_counts_versions() {
         let snap = store.get_state_at(t).await.unwrap();
         assert_eq!(snap.memory_count, 1);
     });
+}
+
+#[tokio::test]
+async fn ingest_claim_is_single_winner_and_replays_original_result() {
+    let store = Arc::new(InMemoryStorage::new(ontology()));
+    let key = IngestBatchKey {
+        org_id: "org".into(),
+        producer_id: "producer".into(),
+        batch_id: "same-batch".into(),
+    };
+    let left = base_memory("left".into(), "left".into(), 1, 3);
+    let right = base_memory("right".into(), "right".into(), 1, 3);
+    let left = [left];
+    let right = [right];
+    let (a, b) = tokio::join!(
+        store.commit_ingest_batch(&key, &left, &[], 1),
+        store.commit_ingest_batch(&key, &right, &[], 1),
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, IngestCommitOutcome::Committed { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, IngestCommitOutcome::Duplicate(_)))
+            .count(),
+        1
+    );
+    use futures::StreamExt;
+    let mut rows = store.stream_all_memories().await;
+    let mut count = 0;
+    while let Some(row) = rows.next().await {
+        row.unwrap();
+        count += 1;
+    }
+    assert_eq!(count, 1, "only the winning batch may mutate storage");
+}
+
+#[tokio::test]
+async fn failed_ingest_commit_leaves_key_retryable() {
+    let store = InMemoryStorage::new(ontology());
+    let key = IngestBatchKey {
+        org_id: "org".into(),
+        producer_id: "producer".into(),
+        batch_id: "retryable".into(),
+    };
+    let from = MemoryId::new_v7();
+    let to = MemoryId::new_v7();
+    let invalid = Relationship {
+        id: RelationshipId::derive(from, RelKindId(0), to, None),
+        kind: RelKindId(0),
+        from,
+        to,
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "test".into(),
+            producer_kind: None,
+        },
+        properties: RelationshipProperties {
+            strength: 0.8,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: Utc::now(),
+        valid_until: None,
+        recorded_at: Utc::now(),
+        invalidated_by: None,
+        lsn: LSN::new_local(0),
+    };
+    assert!(store
+        .commit_ingest_batch(&key, &[], &[invalid], 1)
+        .await
+        .is_err());
+
+    let valid = base_memory("valid".into(), "valid".into(), 1, 3);
+    assert!(matches!(
+        store
+            .commit_ingest_batch(&key, &[valid], &[], 1)
+            .await
+            .unwrap(),
+        IngestCommitOutcome::Committed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn find_by_entity_uses_canonical_memory_context() {
+    let store = InMemoryStorage::new(ontology());
+    let entity = EntityId([7; 16]);
+    let mut matching = base_memory("matching".into(), "matching".into(), 2, 3);
+    matching.context.entities.push(entity);
+    let other = base_memory("other".into(), "other".into(), 2, 3);
+    store
+        .upsert_batch(&[matching.clone(), other], &[])
+        .await
+        .unwrap();
+
+    let rows = store
+        .find_by_entity(
+            &entity,
+            &MemoryFilter {
+                limit: 10,
+                visibility_ctx: VisibilityContext {
+                    org_id: "org".into(),
+                    max_visibility: Visibility::Org,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, matching.id);
 }

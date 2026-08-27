@@ -19,6 +19,43 @@ pub struct CommitRecord {
     pub edge_id: Option<u64>,
 }
 
+/// Durable idempotency identity for one ingestion batch (R6-B09).
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct IngestBatchKey {
+    /// Owning organization.
+    pub org_id: SmolStr,
+    /// Authenticated producer.
+    pub producer_id: SmolStr,
+    /// Producer-assigned stable batch identifier.
+    pub batch_id: SmolStr,
+}
+
+/// Settled result retained with an ingestion dedup claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SettledIngestBatch {
+    /// Number of accepted rows reported by the original commit.
+    pub accepted: u32,
+    /// Number of rejected rows reported by the original commit.
+    pub rejected: u32,
+    /// Last LSN assigned to the atomic batch.
+    pub assigned_lsn: u64,
+}
+
+/// Result of the atomic dedup-claim plus graph commit boundary.
+#[derive(Clone, Debug)]
+pub enum IngestCommitOutcome {
+    /// This caller claimed the key and committed every supplied row.
+    Committed {
+        /// Per-row commit records in input order.
+        records: Vec<CommitRecord>,
+        /// Durable settled replay result.
+        settled: SettledIngestBatch,
+    },
+    /// The same key was already settled; no supplied row was evaluated or
+    /// written and the original result is returned.
+    Duplicate(SettledIngestBatch),
+}
+
 /// Bounded traversal descriptor. Every field carries a hard cap enforced
 /// server-side (CR-6: no unbounded traversal).
 #[derive(Clone, Debug, Serialize, Deserialize)]

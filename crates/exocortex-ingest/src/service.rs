@@ -11,7 +11,9 @@ use exocortex_kernel::{
     Memory, MemoryContext, MemoryId, Ontology, Provenance, Relationship, RelationshipId,
     Visibility, LSN,
 };
-use exocortex_storage::{RegionKey, Storage, VisibilityContext};
+use exocortex_storage::{
+    IngestBatchKey, IngestCommitOutcome, RegionKey, Storage, VisibilityContext,
+};
 use exocortex_wire::ingest::v1::{
     ingest_service_server::IngestService, FingerprintRequest, FingerprintResponse, IngestAck,
     IngestBatch, RegisterSourceRequest, RegisterSourceResponse, RejectCode, RejectRow, SubmitAck,
@@ -53,8 +55,9 @@ fn default_producer_kind() -> exocortex_kernel::ProducerKind {
 
 /// The source registry: (org, source_uri, producer_id) -> SourceEntry.
 pub type SourceRegistry = lru::LruCache<(String, String, String), SourceEntry>;
-/// The idempotency store: (producer_id, batch_id) -> original ack.
-pub type SeenBatchRegistry = lru::LruCache<(String, String), IngestAck>;
+/// Process-local replay accelerator. Durable authority uses the same
+/// `(org_id, producer_id, batch_id)` identity in storage.
+pub type SeenBatchRegistry = lru::LruCache<(String, String, String), IngestAck>;
 
 /// The Ingestion Protocol server over any Storage backend.
 pub struct IngestServer<S: Storage> {
@@ -75,10 +78,6 @@ pub struct IngestServer<S: Storage> {
     pub sources: Arc<Mutex<SourceRegistry>>,
     /// Where the ceiling registry persists (M6.5); `None` = ephemeral.
     pub sources_file: Option<std::path::PathBuf>,
-    /// W7 (audit): where the idempotency registry persists (JSONL of
-    /// (producer_id, batch_id, ack)). `None` = in-memory only (the old
-    /// behavior: a restart re-committed a replayed batch).
-    pub batches_file: Option<std::path::PathBuf>,
     /// Idempotency LRU: (producer_id, batch_id) -> original ack (§18.8.5).
     pub seen_batches: Arc<Mutex<SeenBatchRegistry>>,
     /// Backend-assigned embeddings (§7.5); `None` disables the embedding
@@ -148,7 +147,6 @@ impl<S: Storage> Clone for IngestServer<S> {
             hmac_key: self.hmac_key,
             sources: self.sources.clone(),
             sources_file: self.sources_file.clone(),
-            batches_file: self.batches_file.clone(),
             seen_batches: self.seen_batches.clone(),
             embedder: self.embedder.clone(),
             extractor: self.extractor.clone(),
@@ -180,7 +178,6 @@ impl<S: Storage> IngestServer<S> {
                 std::num::NonZeroUsize::new(REGISTRY_LRU_CAP).unwrap(),
             ))),
             sources_file: None,
-            batches_file: None,
             seen_batches: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(REGISTRY_LRU_CAP).unwrap(),
             ))),
@@ -272,54 +269,6 @@ impl<S: Storage> IngestServer<S> {
         }
         self.sources_file = Some(path);
         self
-    }
-
-    /// W7 (audit): persist the idempotency registry to a JSONL file, and
-    /// load it at boot — a replayed batch after a restart answers
-    /// `DuplicateBatch` instead of re-committing.
-    pub fn with_batches_file(mut self, path: std::path::PathBuf) -> Self {
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            let mut seen = self.seen_batches.lock().unwrap();
-            for line in raw.lines().filter(|l| !l.trim().is_empty()) {
-                if let Ok(row) = serde_json::from_str::<PersistedBatch>(line) {
-                    seen.put(
-                        (row.producer_id.clone(), row.batch_id.clone()),
-                        IngestAck {
-                            batch_id: row.batch_id,
-                            accepted: row.accepted,
-                            rejected: row.rejected,
-                            rejections: vec![],
-                            assigned_lsn: row.assigned_lsn,
-                            similar_to: vec![],
-                        },
-                    );
-                }
-            }
-        }
-        self.batches_file = Some(path);
-        self
-    }
-
-    /// Append one settled batch to the JSONL log (best effort).
-    fn persist_batch(&self, producer_id: &str, ack: &IngestAck) {
-        use std::io::Write as _;
-        let Some(path) = &self.batches_file else {
-            return;
-        };
-        let row = PersistedBatch {
-            producer_id: producer_id.to_string(),
-            batch_id: ack.batch_id.clone(),
-            accepted: ack.accepted,
-            rejected: ack.rejected,
-            assigned_lsn: ack.assigned_lsn,
-        };
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(f, "{}", serde_json::to_string(&row).unwrap_or_default());
-        }
     }
 
     /// Flush the ceiling registry to disk (best effort).
@@ -912,7 +861,11 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         // Idempotency: replay returns the original ack.
         {
             let mut seen = self.seen_batches.lock().unwrap();
-            if let Some(original) = seen.get(&(batch.producer_id.clone(), batch.batch_id.clone())) {
+            if let Some(original) = seen.get(&(
+                batch.org_id.clone(),
+                batch.producer_id.clone(),
+                batch.batch_id.clone(),
+            )) {
                 let mut replay = original.clone();
                 replay.rejections = vec![RejectRow {
                     draft_key: String::new(),
@@ -987,6 +940,7 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         // validation — the stored type is needed for the same R-T17 check
         // a within-batch edge gets, and a missing/malformed id rejects
         // with the id named in the detail (no new code).
+        let mut external_targets = Vec::new();
         for r in &batch.relationships {
             if !r.to_memory_id.is_empty() {
                 let id = match parse_hex_id(&r.to_memory_id) {
@@ -1003,19 +957,33 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                         continue;
                     }
                 };
-                match self.storage.get_memory(&id).await {
-                    Ok(Some(target)) => {
-                        draft_ids.insert(r.to_memory_id.clone(), target);
-                    }
-                    Ok(None) => rejections.push(RejectRow {
-                        draft_key: format!("{}->#{}", r.from_draft_key, r.to_memory_id),
-                        code: RejectCode::InvalidTypeTriple as i32,
-                        detail: format!("to_memory_id `{}` does not exist", r.to_memory_id),
-                    }),
-                    Err(e) => {
-                        return Err(Status::internal(format!("storage: {e}")));
-                    }
-                }
+                external_targets.push((r.from_draft_key.clone(), r.to_memory_id.clone(), id));
+            }
+        }
+        let unique_external: Vec<MemoryId> = external_targets
+            .iter()
+            .map(|(_, _, id)| *id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let loaded = self
+            .storage
+            .get_memories(&unique_external)
+            .await
+            .map_err(|e| Status::internal(format!("storage: {e}")))?;
+        let loaded: HashMap<MemoryId, Memory> = loaded
+            .into_iter()
+            .map(|memory| (memory.id, memory))
+            .collect();
+        for (from_draft_key, encoded_id, id) in external_targets {
+            if let Some(target) = loaded.get(&id) {
+                draft_ids.insert(encoded_id, target.clone());
+            } else {
+                rejections.push(RejectRow {
+                    draft_key: format!("{from_draft_key}->#{encoded_id}"),
+                    code: RejectCode::InvalidTypeTriple as i32,
+                    detail: format!("to_memory_id `{encoded_id}` does not exist"),
+                });
             }
         }
         if !rejections.is_empty() {
@@ -1045,12 +1013,52 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             return Ok(Response::new(ack));
         }
 
+        // D10a (§4.9/§4.10): fold supersession confidence changes into this
+        // same atomic commit. External targets were loaded in the single
+        // bounded read above; within-batch targets are already in `ok_mem`.
+        // No accepted edge may land without its confidence consequence.
+        let supersession_targets: std::collections::HashSet<MemoryId> = ok_rel
+            .iter()
+            .filter(|relationship| {
+                self.ontology
+                    .kinds_by_id
+                    .get(&relationship.kind)
+                    .is_some_and(|kind| {
+                        kind.display_name == "Replaces" || kind.display_name == "Contradicts"
+                    })
+            })
+            .map(|relationship| relationship.to)
+            .collect();
+        let confidence_floor = exocortex_kernel::memory::derived_confidence(true, 0, 0);
+        let producer_count = ok_mem.len();
+        for memory in &mut ok_mem {
+            if supersession_targets.contains(&memory.id)
+                && memory.confidence.partial_cmp_score(&confidence_floor)
+                    == std::cmp::Ordering::Greater
+            {
+                memory.confidence = confidence_floor;
+            }
+        }
+        for target in supersession_targets {
+            if ok_mem.iter().any(|memory| memory.id == target) {
+                continue;
+            }
+            if let Some(mut stale) = loaded.get(&target).cloned() {
+                if stale.confidence.partial_cmp_score(&confidence_floor)
+                    == std::cmp::Ordering::Greater
+                {
+                    stale.confidence = confidence_floor;
+                    ok_mem.push(stale);
+                }
+            }
+        }
+
         // D6: backend write grouping. One node per (org, flavor, key) under
         // a deterministic id, one member edge per accepted memory, both
         // `Derived` provenance. Idempotent across replays and restarts.
         // `committed_memories` stays PRODUCER rows only — reasoning,
         // Dreams counters, telemetry, and hints exclude structural rows.
-        let committed_memories = ok_mem.clone();
+        let committed_memories = ok_mem[..producer_count].to_vec();
         let mut grouping_nodes_created = 0u32;
         if let Some((rule, key)) = crate::grouping::grouping_key(&batch) {
             let now = chrono::Utc::now();
@@ -1068,8 +1076,8 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                     node.context.project_id = scope.context.project_id.clone();
                     node.context.team_id = scope.context.team_id.clone();
                 }
-                let mut edges = Vec::with_capacity(ok_mem.len());
-                for m in &ok_mem {
+                let mut edges = Vec::with_capacity(committed_memories.len());
+                for m in &committed_memories {
                     if let Some(e) =
                         crate::grouping::grouping_edge(&self.ontology, rule, m, &node, now)
                     {
@@ -1105,13 +1113,46 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             }
         }
 
-        // Step: persist accepted rows in one transactional batch.
-        let commit = self
+        // Step: atomically claim the durable idempotency key, persist every
+        // accepted row, and settle the exact replay result. Concurrent or
+        // post-restart retries never evaluate a second write.
+        let accepted = (committed_memories.len() + ok_rel.len()) as u32;
+        let key = IngestBatchKey {
+            org_id: batch.org_id.clone().into(),
+            producer_id: batch.producer_id.clone().into(),
+            batch_id: batch.batch_id.clone().into(),
+        };
+        let outcome = self
             .storage
-            .upsert_batch(&ok_mem, &ok_rel)
+            .commit_ingest_batch(&key, &ok_mem, &ok_rel, accepted)
             .await
             .map_err(|e| Status::internal(format!("storage: {e}")))?;
-        let assigned_lsn = commit.last().map(|c| c.lsn).unwrap_or(0);
+        let assigned_lsn = match outcome {
+            IngestCommitOutcome::Committed { settled, .. } => settled.assigned_lsn,
+            IngestCommitOutcome::Duplicate(settled) => {
+                let ack = IngestAck {
+                    batch_id: batch.batch_id.clone(),
+                    accepted: settled.accepted,
+                    rejected: settled.rejected,
+                    rejections: vec![RejectRow {
+                        draft_key: String::new(),
+                        code: RejectCode::DuplicateBatch as i32,
+                        detail: "idempotent replay".into(),
+                    }],
+                    assigned_lsn: settled.assigned_lsn,
+                    similar_to: vec![],
+                };
+                self.seen_batches.lock().unwrap().put(
+                    (
+                        batch.org_id.clone(),
+                        batch.producer_id.clone(),
+                        batch.batch_id.clone(),
+                    ),
+                    ack.clone(),
+                );
+                return Ok(Response::new(ack));
+            }
+        };
 
         // §10.7 step 8: on every session-wrapup submit, enqueue
         // `SessionWrapup { memories }` after the storage commit so the
@@ -1137,37 +1178,6 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                 dreams.on_write(region).await;
             }
         }
-        // D10a (§4.9/§4.10): derived confidence — a live Replaces/
-        // Contradicts edge pointing AT a memory floors that memory's
-        // confidence, so stale beliefs rank below their successors the
-        // moment the supersession lands (not when some later cycle
-        // notices). Best effort: a failure degrades to the old value and
-        // is logged, never fatal to the ack.
-        let supersession_targets: Vec<exocortex_kernel::MemoryId> = ok_rel
-            .iter()
-            .filter(|r| {
-                self.ontology.kinds_by_id.get(&r.kind).is_some_and(|m| {
-                    m.display_name == "Replaces" || m.display_name == "Contradicts"
-                })
-            })
-            .map(|r| r.to)
-            .collect();
-        for target in supersession_targets {
-            match self.storage.get_memory(&target).await {
-                Ok(Some(mut stale)) => {
-                    let floor = exocortex_kernel::memory::derived_confidence(true, 0, 0);
-                    if stale.confidence.partial_cmp_score(&floor) == std::cmp::Ordering::Greater {
-                        stale.confidence = floor;
-                        if let Err(e) = self.storage.upsert_batch(&[stale], &[]).await {
-                            tracing::warn!(?e, "supersession floor re-stamp failed");
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(?e, "supersession floor lookup failed"),
-            }
-        }
-
         // D10c (§4.10b): advisory near-duplicate hints. Deterministic
         // embedding cosine against the bounded recent-acceptance ring —
         // the same mechanism Dreams uses for merge candidates (0.92), no
@@ -1196,17 +1206,20 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
 
         let ack = IngestAck {
             batch_id: batch.batch_id.clone(),
-            accepted: (committed_memories.len() + ok_rel.len()) as u32,
+            accepted,
             rejected: 0,
             rejections: vec![],
             assigned_lsn,
             similar_to,
         };
         self.seen_batches.lock().unwrap().put(
-            (batch.producer_id.clone(), batch.batch_id.clone()),
+            (
+                batch.org_id.clone(),
+                batch.producer_id.clone(),
+                batch.batch_id.clone(),
+            ),
             ack.clone(),
         );
-        self.persist_batch(&batch.producer_id, &ack);
         Ok(Response::new(ack))
     }
 
@@ -1454,14 +1467,4 @@ fn kernel_error_to_reject(e: &exocortex_kernel::KernelError) -> RejectCode {
         | KernelError::DuplicateTypeName(_)
         | KernelError::UnboundKernelConstant(_) => RejectCode::Unknown,
     }
-}
-
-/// W7: the persisted idempotency row (JSONL).
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedBatch {
-    producer_id: String,
-    batch_id: String,
-    accepted: u32,
-    rejected: u32,
-    assigned_lsn: u64,
 }

@@ -7,8 +7,8 @@ use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId}
 
 use crate::types::{
     AuditEvent, CommitRecord, CypherQuery, DiscoveryAcceptance, DiscoveryProposal, Embedding,
-    GraphSnapshot, Invalidation, LeaseKey, MemoryFilter, OwnerLease, RegionKey, ResultSet,
-    StorageBackendId, StorageCapabilities, TraversalSpec,
+    GraphSnapshot, IngestBatchKey, IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter,
+    OwnerLease, RegionKey, ResultSet, StorageBackendId, StorageCapabilities, TraversalSpec,
 };
 
 /// Errors surfaced by every `Storage` implementation.
@@ -77,6 +77,20 @@ pub trait Storage: Send + Sync + 'static {
     async fn upsert_relationship(&self, r: &Relationship) -> crate::Result<CommitRecord>;
     /// Soft-delete a relationship: close `valid_until`.
     async fn delete_relationship(&self, id: &RelationshipId) -> crate::Result<CommitRecord>;
+    /// Atomically claim one ingestion idempotency key, commit every supplied
+    /// row, and settle the replay result. A crash/failure before commit leaves
+    /// no claim; a retry may claim. Once settled, retries return the original
+    /// result without evaluating or writing rows (R6-B09/R6-B24).
+    async fn commit_ingest_batch(
+        &self,
+        key: &IngestBatchKey,
+        memories: &[Memory],
+        relationships: &[Relationship],
+        accepted: u32,
+    ) -> crate::Result<IngestCommitOutcome> {
+        let _ = (key, memories, relationships, accepted);
+        Err(StorageError::Backend("atomic ingest unsupported".into()))
+    }
     /// Atomically upsert a protected memory mutation and its required audit
     /// event. Neither may commit without the other (R6-B18).
     async fn upsert_memory_audited(

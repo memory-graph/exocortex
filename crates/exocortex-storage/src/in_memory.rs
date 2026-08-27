@@ -37,6 +37,9 @@ struct InMemoryInner {
     lease_epochs: Mutex<HashMap<LeaseKey, u64>>,
     proposals: Mutex<HashMap<smol_str::SmolStr, StoredProposal>>,
     audits: Mutex<Vec<serde_json::Value>>,
+    settled_ingest: Mutex<HashMap<IngestBatchKey, SettledIngestBatch>>,
+    point_reads: AtomicU64,
+    batch_reads: AtomicU64,
     #[cfg(test)]
     fence_checkpoint: Mutex<Option<std::sync::Arc<FenceCheckpoint>>>,
     #[cfg(test)]
@@ -90,6 +93,9 @@ impl InMemoryStorage {
                 lease_epochs: Default::default(),
                 proposals: Default::default(),
                 audits: Default::default(),
+                settled_ingest: Default::default(),
+                point_reads: Default::default(),
+                batch_reads: Default::default(),
                 mutation_gate: Default::default(),
                 #[cfg(test)]
                 fence_checkpoint: Default::default(),
@@ -103,6 +109,14 @@ impl InMemoryStorage {
     /// A clone handle sharing the same underlying state (tests and caches).
     pub fn clone_dyn(&self) -> Self {
         self.clone()
+    }
+    /// Reset and return backend-read counters for scaling/conformance tests.
+    /// The first element is point reads; the second is batched reads.
+    pub fn take_read_counts(&self) -> (u64, u64) {
+        (
+            self.inner.point_reads.swap(0, Ordering::SeqCst),
+            self.inner.batch_reads.swap(0, Ordering::SeqCst),
+        )
     }
     fn next_lsn(&self) -> u64 {
         self.lsn.fetch_add(1, Ordering::SeqCst) + 1
@@ -224,6 +238,8 @@ impl InMemoryStorage {
         let mut records = Vec::with_capacity(ms.len() + rs.len());
         let mut invalidations = Vec::new();
         let mut next = self.lsn.load(Ordering::SeqCst);
+        let mut seen_relationships: std::collections::HashSet<RelationshipId> =
+            rs.iter().map(|relationship| relationship.id).collect();
         for m in ms {
             next += 1;
             let mut m = m.clone();
@@ -259,6 +275,9 @@ impl InMemoryStorage {
                 edge_id: None,
             });
             if let Some(mut inv) = exocortex_kernel::materialize_inverse(&self.inner.ontology, &r) {
+                if !seen_relationships.insert(inv.id) {
+                    continue;
+                }
                 next += 1;
                 inv.lsn = exocortex_kernel::LSN::new_backend(next);
                 staged_r.insert(inv.id, vec![inv.clone()]);
@@ -437,6 +456,36 @@ impl Storage for InMemoryStorage {
             node_id: None,
             edge_id: None,
         })
+    }
+    async fn commit_ingest_batch(
+        &self,
+        key: &IngestBatchKey,
+        memories: &[Memory],
+        relationships: &[Relationship],
+        accepted: u32,
+    ) -> Result<IngestCommitOutcome, StorageError> {
+        let (records, invalidations, settled) = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            if let Some(settled) = self.inner.settled_ingest.lock().unwrap().get(key).copied() {
+                return Ok(IngestCommitOutcome::Duplicate(settled));
+            }
+            let (records, invalidations) = self.upsert_batch_locked(memories, relationships)?;
+            let settled = SettledIngestBatch {
+                accepted,
+                rejected: 0,
+                assigned_lsn: records.last().map_or(0, |record| record.lsn),
+            };
+            self.inner
+                .settled_ingest
+                .lock()
+                .unwrap()
+                .insert(key.clone(), settled);
+            (records, invalidations, settled)
+        };
+        for invalidation in invalidations {
+            let _ = self.feed.send(invalidation);
+        }
+        Ok(IngestCommitOutcome::Committed { records, settled })
     }
     async fn upsert_memory_audited(
         &self,
@@ -631,6 +680,7 @@ impl Storage for InMemoryStorage {
             .collect())
     }
     async fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>, StorageError> {
+        self.inner.point_reads.fetch_add(1, Ordering::SeqCst);
         Ok(self
             .inner
             .memories
@@ -660,6 +710,7 @@ impl Storage for InMemoryStorage {
         Ok(Some(m))
     }
     async fn get_memories(&self, ids: &[MemoryId]) -> Result<Vec<Memory>, StorageError> {
+        self.inner.batch_reads.fetch_add(1, Ordering::SeqCst);
         let store = self.inner.memories.lock().unwrap();
         Ok(ids
             .iter()
@@ -675,10 +726,40 @@ impl Storage for InMemoryStorage {
     }
     async fn find_by_entity(
         &self,
-        _e: &EntityId,
-        _f: &MemoryFilter,
+        entity: &EntityId,
+        filter: &MemoryFilter,
     ) -> Result<Vec<Memory>, StorageError> {
-        Ok(vec![])
+        if filter.limit > 500 {
+            return Err(StorageError::Backend("limit > 500".into()));
+        }
+        let mut rows: Vec<Memory> = self
+            .inner
+            .memories
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|history| history.last())
+            .filter(|memory| memory.context.entities.contains(entity))
+            .filter(|memory| {
+                filter.memory_types.is_empty() || filter.memory_types.contains(&memory.memory_type)
+            })
+            .filter(|memory| {
+                filter
+                    .project_id
+                    .as_ref()
+                    .is_none_or(|project| memory.context.project_id.as_ref() == Some(project))
+            })
+            .filter(|memory| {
+                filter.valid_at.is_none_or(|at| {
+                    memory.valid_from <= at && memory.valid_until.is_none_or(|until| until > at)
+                })
+            })
+            .filter(|memory| crate::memory_visible(memory, &filter.visibility_ctx))
+            .cloned()
+            .collect();
+        rows.sort_by_key(|memory| std::cmp::Reverse(memory.recorded_at));
+        rows.truncate(filter.limit as usize);
+        Ok(rows)
     }
     async fn get_state_at(&self, t: DateTime<Utc>) -> Result<GraphSnapshot, StorageError> {
         let store = self.inner.memories.lock().unwrap();

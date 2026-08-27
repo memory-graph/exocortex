@@ -10,13 +10,14 @@
 
 use chrono::{Duration, Utc};
 use exocortex_kernel::{
-    Memory, MemoryContext, MemoryId, Provenance, Relationship, RelationshipId, Visibility, LSN,
+    EntityId, Memory, MemoryContext, MemoryId, Provenance, Relationship, RelationshipId,
+    Visibility, LSN,
 };
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{
     AuditEvent, CypherQuery, DiscoveryAcceptance, DiscoveryProposal, FalkorConfig, FalkorStorage,
-    Invalidation, LeaseKey, OwnerLease, RegionKey, Storage, StorageError, TraversalSpec,
-    VisibilityContext,
+    IngestBatchKey, IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter, OwnerLease,
+    RegionKey, Storage, StorageError, TraversalSpec, VisibilityContext,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -170,6 +171,81 @@ itest!(roundtrip_memory, {
     assert_eq!(got.visibility, m.visibility);
     assert_eq!(got.context.project_id, m.context.project_id);
     assert_eq!(got.provenance, m.provenance);
+});
+
+itest!(find_by_entity_reads_persisted_memory_entity_ids, {
+    let s = connect("entity-query").await;
+    let entity = EntityId([9; 16]);
+    let mut matching = mem("matching-entity", 3, Visibility::Org);
+    matching.context.entities.push(entity);
+    let other = mem("other-entity", 3, Visibility::Org);
+    s.upsert_batch(&[matching.clone(), other], &[])
+        .await
+        .expect("persist canonical memory contexts");
+
+    let rows = s
+        .find_by_entity(
+            &entity,
+            &MemoryFilter {
+                limit: 10,
+                visibility_ctx: VisibilityContext {
+                    user_id: "user-1".into(),
+                    org_id: "test-org".into(),
+                    project_ids: ["proj".into()].into_iter().collect(),
+                    max_visibility: Visibility::Org,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("entity lookup");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, matching.id);
+});
+
+itest!(ingest_settlement_survives_backend_reconnect, {
+    let first = connect("ingest-restart-a").await;
+    let graph = first.graph_name_clone();
+    let key = IngestBatchKey {
+        org_id: "test-org".into(),
+        producer_id: "producer".into(),
+        batch_id: format!("restart-{}", graph_suffix()).into(),
+    };
+    let committed = mem("first-ingest", 3, Visibility::Org);
+    let outcome = first
+        .commit_ingest_batch(&key, &[committed.clone()], &[], 1)
+        .await
+        .expect("first atomic ingest");
+    assert!(matches!(outcome, IngestCommitOutcome::Committed { .. }));
+    drop(first);
+
+    let url = falkor_url().unwrap();
+    let restarted = FalkorStorage::connect(
+        FalkorConfig {
+            falkor_url: url.clone(),
+            redis_url: std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+            graph_name: graph,
+            org_id: "test-org".into(),
+            node_id: "ingest-restart-b".into(),
+        },
+        ontology(),
+    )
+    .await
+    .expect("reconnect same durable graph");
+    let must_not_commit = mem("second-ingest", 3, Visibility::Org);
+    let replay = restarted
+        .commit_ingest_batch(&key, &[must_not_commit.clone()], &[], 1)
+        .await
+        .expect("settled replay");
+    assert!(matches!(replay, IngestCommitOutcome::Duplicate(_)));
+    assert!(restarted.get_memory(&committed.id).await.unwrap().is_some());
+    assert!(restarted
+        .get_memory(&must_not_commit.id)
+        .await
+        .unwrap()
+        .is_none());
 });
 
 itest!(fingerprint_mismatch_aborts_startup, {

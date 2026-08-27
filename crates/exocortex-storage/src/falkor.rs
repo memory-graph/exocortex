@@ -427,7 +427,13 @@ impl FalkorStorage {
         serde_json::json!({
             "id": hex(&m.id.0),
             "memory_type_label": mt_label,
+            "memory_type_id": m.memory_type,
             "props_json": FalkorStorage::props_json(m, lsn),
+            "entity_ids": m.context.entities.iter().map(|entity| hex(&entity.0)).collect::<Vec<_>>(),
+            "tenant_id": m.context.tenant_id,
+            "user_id": m.context.user_id,
+            "project_id": m.context.project_id,
+            "team_id": m.context.team_id,
             "visibility": m.visibility as u8,
             "valid_from": m.valid_from.to_rfc3339(),
             "valid_until": m.valid_until.map(|t| t.to_rfc3339()),
@@ -815,6 +821,178 @@ impl Storage for FalkorStorage {
         self.upsert_batch_inner(ms, rs, None).await
     }
 
+    async fn commit_ingest_batch(
+        &self,
+        key: &IngestBatchKey,
+        memories: &[Memory],
+        relationships: &[Relationship],
+        accepted: u32,
+    ) -> Result<IngestCommitOutcome, StorageError> {
+        let mut all_relationships = Vec::with_capacity(relationships.len() * 2);
+        let mut seen: std::collections::HashSet<RelationshipId> = relationships
+            .iter()
+            .map(|relationship| relationship.id)
+            .collect();
+        for relationship in relationships {
+            all_relationships.push(relationship.clone());
+            if let Some(inverse) =
+                exocortex_kernel::materialize_inverse(&self.ontology, relationship)
+            {
+                if seen.insert(inverse.id) {
+                    all_relationships.push(inverse);
+                }
+            }
+        }
+        let total = memories.len() + all_relationships.len();
+        let block = self.next_lsn_block(total).await?;
+        let assigned_lsn = if total == 0 { 0 } else { block.end - 1 };
+        let settled = SettledIngestBatch {
+            accepted,
+            rejected: 0,
+            assigned_lsn,
+        };
+        let claim_token = format!(
+            "{}:{}",
+            self.node_id,
+            Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000)
+        );
+        let mut parts = Vec::with_capacity(total + 3);
+        let batch_memory_ids: std::collections::HashSet<MemoryId> =
+            memories.iter().map(|memory| memory.id).collect();
+        let external_ids: std::collections::BTreeSet<String> = all_relationships
+            .iter()
+            .flat_map(|relationship| [relationship.from, relationship.to])
+            .filter(|id| !batch_memory_ids.contains(id))
+            .map(|id| hex(&id.0))
+            .collect();
+        parts.push((
+            "ingest_endpoint_guard",
+            serde_json::json!({
+                "external_count": external_ids.len(),
+                "external_ids": external_ids,
+            }),
+        ));
+        // Validate every external endpoint before creating the durable claim.
+        // A rejected query must leave no `claiming` marker that could strand
+        // a later retry after the caller repairs the batch.
+        parts.push((
+            "ingest_claim_guard",
+            serde_json::json!({
+                "org_id": key.org_id,
+                "producer_id": key.producer_id,
+                "batch_id": key.batch_id,
+                "claim_token": claim_token,
+            }),
+        ));
+        let now = Utc::now();
+        let mut records = Vec::with_capacity(total);
+        let mut invalidations = Vec::with_capacity(total);
+        let mut next = block.start;
+        for memory in memories {
+            let label = self
+                .ontology
+                .memory_type_names
+                .get(memory.memory_type as usize)
+                .ok_or_else(|| {
+                    StorageError::Backend(format!("bad memory_type {}", memory.memory_type))
+                })?;
+            parts.push((
+                "batch_upsert_memory",
+                self.memory_params(memory, next, label),
+            ));
+            records.push(CommitRecord {
+                lsn: next,
+                committed_at: now,
+                node_id: None,
+                edge_id: None,
+            });
+            invalidations.push(Invalidation::MemoryUpserted {
+                id: memory.id,
+                lsn: next,
+            });
+            next += 1;
+        }
+        for relationship in &all_relationships {
+            parts.push((
+                "batch_upsert_relationship",
+                serde_json::json!({
+                    "rel_id": hex(&relationship.id.0),
+                    "from": hex(&relationship.from.0),
+                    "to": hex(&relationship.to.0),
+                    "kind_label": self.kind_label(relationship.kind)?,
+                    "props_json": FalkorStorage::props_json(relationship, next),
+                    "visibility": relationship.visibility as u8,
+                    "valid_from": relationship.valid_from.to_rfc3339(),
+                    "valid_until": relationship.valid_until.map(|time| time.to_rfc3339()),
+                    "invalidated_by": relationship.invalidated_by.map(|id| hex(&id.0)),
+                    "recorded_at": relationship.recorded_at.to_rfc3339(),
+                    "lsn": next,
+                }),
+            ));
+            records.push(CommitRecord {
+                lsn: next,
+                committed_at: now,
+                node_id: None,
+                edge_id: None,
+            });
+            invalidations.push(Invalidation::RelationshipUpserted {
+                id: relationship.id,
+                from: relationship.from,
+                to: relationship.to,
+                kind: relationship.kind,
+                lsn: next,
+            });
+            next += 1;
+        }
+        parts.push((
+            "ingest_settle",
+            serde_json::json!({
+                "org_id": key.org_id,
+                "producer_id": key.producer_id,
+                "batch_id": key.batch_id,
+                "claim_token": claim_token,
+                "accepted": settled.accepted,
+                "rejected": settled.rejected,
+                "assigned_lsn": settled.assigned_lsn,
+            }),
+        ));
+        if !self.run_atomic_parts(&parts).await? {
+            let rows = self
+                .run_template(
+                    "ingest_get_settled",
+                    &serde_json::json!({
+                        "org_id": key.org_id,
+                        "producer_id": key.producer_id,
+                        "batch_id": key.batch_id,
+                    }),
+                    true,
+                )
+                .await?;
+            let row = rows.first().ok_or_else(|| {
+                StorageError::Backend("ingest claim did not settle atomically".into())
+            })?;
+            let number = |index: usize| match row.get(index) {
+                Some(FalkorValue::I64(value)) => u64::try_from(*value).ok(),
+                _ => None,
+            };
+            return Ok(IngestCommitOutcome::Duplicate(SettledIngestBatch {
+                accepted: number(0)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(0),
+                rejected: number(1)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(0),
+                assigned_lsn: number(2).unwrap_or(0),
+            }));
+        }
+        for invalidation in invalidations {
+            self.publish(invalidation).await;
+        }
+        Ok(IngestCommitOutcome::Committed { records, settled })
+    }
+
     async fn delete_memory(&self, id: &MemoryId) -> Result<CommitRecord, StorageError> {
         // Soft delete: set `valid_until = now()`; do not remove the node.
         let lsn = self.next_lsn().await?;
@@ -1147,13 +1325,23 @@ impl Storage for FalkorStorage {
     }
 
     async fn get_memories(&self, ids: &[MemoryId]) -> Result<Vec<Memory>, StorageError> {
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(m) = self.get_memory(id).await? {
-                out.push(m);
-            }
-        }
-        Ok(out)
+        let rows = self
+            .run_template(
+                "get_memories_by_ids",
+                &serde_json::json!({
+                    "ids": ids.iter().map(|id| hex(&id.0)).collect::<Vec<_>>(),
+                    "max_visibility": Visibility::Public as u8,
+                }),
+                true,
+            )
+            .await?;
+        let by_id: std::collections::HashMap<MemoryId, Memory> = rows
+            .iter()
+            .filter_map(|row| row.first())
+            .filter_map(|value| memory_from_value(value).ok())
+            .map(|memory| (memory.id, memory))
+            .collect();
+        Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
     }
 
     async fn traverse(
@@ -1203,16 +1391,39 @@ impl Storage for FalkorStorage {
         if filter.limit > 500 {
             return Err(StorageError::Backend("limit > 500".into()));
         }
+        let project_id = filter.project_id.as_deref().unwrap_or_default();
+        let valid_at = filter.valid_at.unwrap_or_else(Utc::now);
         let params = serde_json::json!({
             "entity_id": hex(&entity.0), "limit": filter.limit,
             "max_visibility": fetch_ceiling(filter.visibility_ctx.max_visibility),
+            "org_id": filter.visibility_ctx.org_id,
+            "user_id": filter.visibility_ctx.user_id,
+            "project_ids": filter.visibility_ctx.project_ids,
+            "team_ids": filter.visibility_ctx.team_ids,
+            "memory_types": filter.memory_types,
+            "project_id": project_id,
+            "has_project": filter.project_id.is_some(),
+            "valid_at": valid_at.to_rfc3339(),
+            "has_valid_at": filter.valid_at.is_some(),
         });
         let rows = self.run_template("find_by_entity", &params, true).await?;
         let mut out = Vec::new();
         for row in &rows {
             if let Some(v) = row.first() {
                 if let Ok(m) = memory_from_value(v) {
-                    out.push(m);
+                    if (filter.memory_types.is_empty()
+                        || filter.memory_types.contains(&m.memory_type))
+                        && filter
+                            .project_id
+                            .as_ref()
+                            .is_none_or(|project| m.context.project_id.as_ref() == Some(project))
+                        && filter.valid_at.is_none_or(|at| {
+                            m.valid_from <= at && m.valid_until.is_none_or(|until| until > at)
+                        })
+                        && crate::memory_visible(&m, &filter.visibility_ctx)
+                    {
+                        out.push(m);
+                    }
                 }
             }
         }

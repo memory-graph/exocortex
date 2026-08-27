@@ -34,7 +34,13 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         required_params: &[
             "id",
             "memory_type_label",
+            "memory_type_id",
             "props_json",
+            "entity_ids",
+            "tenant_id",
+            "user_id",
+            "project_id",
+            "team_id",
             "visibility",
             "valid_from",
             "valid_until",
@@ -45,12 +51,18 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MERGE (m:Memory {id: $id})
             SET m.memory_type_label = $memory_type_label,
+                m.memory_type_id    = $memory_type_id,
                 m.visibility        = $visibility,
                 m.valid_from        = $valid_from,
                 m.valid_until       = $valid_until,
                 m.recorded_at       = $recorded_at,
                 m.invalidated_by    = $invalidated_by,
                 m.props_json        = $props_json,
+                m.entity_ids        = $entity_ids,
+                m.tenant_id         = $tenant_id,
+                m.user_id           = $user_id,
+                m.project_id        = $project_id,
+                m.team_id           = $team_id,
                 m.lsn               = $lsn
             RETURN id(m) AS node_id, m.lsn AS lsn
         "#,
@@ -65,7 +77,13 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         required_params: &[
             "id",
             "memory_type_label",
+            "memory_type_id",
             "props_json",
+            "entity_ids",
+            "tenant_id",
+            "user_id",
+            "project_id",
+            "team_id",
             "visibility",
             "valid_from",
             "valid_until",
@@ -76,12 +94,18 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MERGE (m:Memory {id: $id})
             SET m.memory_type_label = $memory_type_label,
+                m.memory_type_id    = $memory_type_id,
                 m.visibility        = $visibility,
                 m.valid_from        = $valid_from,
                 m.valid_until       = $valid_until,
                 m.recorded_at       = $recorded_at,
                 m.invalidated_by    = $invalidated_by,
                 m.props_json        = $props_json,
+                m.entity_ids        = $entity_ids,
+                m.tenant_id         = $tenant_id,
+                m.user_id           = $user_id,
+                m.project_id        = $project_id,
+                m.team_id           = $team_id,
                 m.lsn               = $lsn
         "#,
     });
@@ -237,6 +261,65 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "ingest_claim_guard",
+        read_only: false,
+        required_params: &["org_id", "producer_id", "batch_id", "claim_token"],
+        cypher: r#"
+            MERGE (d:_IngestBatch {
+                org_id: $org_id, producer_id: $producer_id, batch_id: $batch_id})
+            ON CREATE SET d.claim_token = $claim_token, d.state = 'claiming'
+            WITH d
+            WHERE d.claim_token = $claim_token AND d.state = 'claiming'
+        "#,
+    });
+
+    reg!(Template {
+        id: "ingest_endpoint_guard",
+        read_only: false,
+        required_params: &["external_ids", "external_count"],
+        cypher: r#"
+            OPTIONAL MATCH (endpoint:Memory)
+            WHERE endpoint.id IN $external_ids
+            WITH __atomic_step, count(endpoint) AS found
+            WHERE found = $external_count
+        "#,
+    });
+
+    reg!(Template {
+        id: "ingest_settle",
+        read_only: false,
+        required_params: &[
+            "org_id",
+            "producer_id",
+            "batch_id",
+            "claim_token",
+            "accepted",
+            "rejected",
+            "assigned_lsn"
+        ],
+        cypher: r#"
+            MATCH (d:_IngestBatch {
+                org_id: $org_id, producer_id: $producer_id, batch_id: $batch_id})
+            WHERE d.claim_token = $claim_token AND d.state = 'claiming'
+            SET d.state = 'settled', d.accepted = $accepted,
+                d.rejected = $rejected, d.assigned_lsn = $assigned_lsn
+            REMOVE d.claim_token
+        "#,
+    });
+
+    reg!(Template {
+        id: "ingest_get_settled",
+        read_only: true,
+        required_params: &["org_id", "producer_id", "batch_id"],
+        cypher: r#"
+            MATCH (d:_IngestBatch {
+                org_id: $org_id, producer_id: $producer_id, batch_id: $batch_id})
+            WHERE d.state = 'settled'
+            RETURN d.accepted, d.rejected, d.assigned_lsn LIMIT 1
+        "#,
+    });
+
+    reg!(Template {
         id: "get_memory_by_id",
         read_only: true,
         required_params: &["id", "max_visibility"],
@@ -244,6 +327,17 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (m:Memory {id: $id})
             WHERE m.visibility <= $max_visibility
             RETURN m LIMIT 1
+        "#,
+    });
+
+    reg!(Template {
+        id: "get_memories_by_ids",
+        read_only: true,
+        required_params: &["ids", "max_visibility"],
+        cypher: r#"
+            MATCH (m:Memory)
+            WHERE m.id IN $ids AND m.visibility <= $max_visibility
+            RETURN m
         "#,
     });
 
@@ -294,10 +388,34 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "find_by_entity",
         read_only: true,
-        required_params: &["entity_id", "limit", "max_visibility"],
+        required_params: &[
+            "entity_id",
+            "limit",
+            "max_visibility",
+            "org_id",
+            "user_id",
+            "project_ids",
+            "team_ids",
+            "memory_types",
+            "project_id",
+            "has_project",
+            "valid_at",
+            "has_valid_at"
+        ],
         cypher: r#"
-            MATCH (m:Memory)-[:MENTIONS]->(e:Entity {id: $entity_id})
-            WHERE m.visibility <= $max_visibility
+            MATCH (m:Memory)
+            WHERE $entity_id IN m.entity_ids
+              AND m.visibility <= $max_visibility
+              AND (m.tenant_id IS NULL OR m.tenant_id = $org_id)
+              AND (m.visibility >= 3
+                   OR (m.visibility = 0 AND m.user_id = $user_id)
+                   OR (m.visibility = 1 AND m.project_id IN $project_ids)
+                   OR (m.visibility = 2 AND m.team_id IN $team_ids))
+              AND (size($memory_types) = 0 OR m.memory_type_id IN $memory_types)
+              AND ($has_project = false OR m.project_id = $project_id)
+              AND ($has_valid_at = false OR
+                   (m.valid_from <= $valid_at AND
+                    (m.valid_until IS NULL OR m.valid_until > $valid_at)))
             RETURN m ORDER BY m.recorded_at DESC LIMIT $limit
         "#,
     });

@@ -114,6 +114,93 @@ async fn e2e_valid_batch_accepted_with_monotonic_lsn() {
 }
 
 #[tokio::test]
+async fn concurrent_identical_submits_have_one_durable_winner() {
+    let srv = Arc::new(server());
+    registered(&srv, 3).await;
+    let b = signed_batch(&srv, vec![draft("concurrent", "Fix", 1)]);
+    let (left, right) = tokio::join!(
+        srv.submit(tonic::Request::new(b.clone())),
+        srv.submit(tonic::Request::new(b)),
+    );
+    let acks = [left.unwrap().into_inner(), right.unwrap().into_inner()];
+    assert_eq!(
+        acks.iter()
+            .filter(|ack| ack
+                .rejections
+                .iter()
+                .any(|row| row.code == RejectCode::DuplicateBatch as i32))
+            .count(),
+        1,
+        "exactly one concurrent submit must replay the durable settlement"
+    );
+    assert_eq!(acks[0].assigned_lsn, acks[1].assigned_lsn);
+}
+
+#[tokio::test]
+async fn external_target_resolution_is_one_bounded_backend_read() {
+    let srv = server();
+    registered(&srv, 3).await;
+
+    let mut seed = signed_batch(&srv, vec![draft("target", "Problem", 1)]);
+    seed.batch_id = "target-seed".into();
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut seed);
+    assert!(srv
+        .submit(tonic::Request::new(seed))
+        .await
+        .unwrap()
+        .into_inner()
+        .rejections
+        .is_empty());
+    use futures::StreamExt;
+    let mut memories = srv.storage.stream_all_memories().await;
+    let mut target = None;
+    while let Some(memory) = memories.next().await {
+        let memory = memory.unwrap();
+        if memory.title == "title target" {
+            target = Some(memory.id);
+            break;
+        }
+    }
+    let target = target.expect("seed target persisted");
+    use std::fmt::Write as _;
+    let target_id = target.0.iter().fold(String::new(), |mut encoded, byte| {
+        write!(encoded, "{byte:02x}").expect("writing to String is infallible");
+        encoded
+    });
+    srv.storage.take_read_counts();
+
+    let memories: Vec<_> = (0..32)
+        .map(|index| draft(&format!("source-{index}"), "Fix", 1))
+        .collect();
+    let mut batch = signed_batch(&srv, memories);
+    batch.batch_id = "bounded-resolution".into();
+    batch.relationships = (0..32)
+        .map(|index| exocortex_wire::ingest::v1::RelationshipDraft {
+            from_draft_key: format!("source-{index}"),
+            to_draft_key: String::new(),
+            kind: "Fixes".into(),
+            strength: 0.8,
+            confidence: 0.8,
+            context: String::new(),
+            visibility: 1,
+            to_memory_id: target_id.clone(),
+        })
+        .collect();
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut batch);
+    let ack = srv
+        .submit(tonic::Request::new(batch))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(ack.rejections.is_empty(), "batch rejected: {ack:?}");
+    assert_eq!(
+        srv.storage.take_read_counts(),
+        (0, 1),
+        "target cardinality must not produce point-read N+1"
+    );
+}
+
+#[tokio::test]
 async fn missing_hmac_rejected_before_anything() {
     let srv = server();
     registered(&srv, 3).await;
@@ -855,30 +942,14 @@ async fn session_source_stamps_session_id() {
     assert!(any, "committed row present");
 }
 
-/// W7 (audit): the idempotency registry survives a restart. Submit a
-/// batch, rebuild the server over the same batches file, replay the
-/// identical batch — the answer is `DuplicateBatch`, not a second commit.
+/// R6-B09: the idempotency registry survives a server restart because the
+/// claim and settled result live in the same durable storage boundary as the
+/// graph mutation, not in a best-effort process file.
 #[tokio::test]
 async fn duplicate_replay_dedup_survives_restart() {
-    let dir = std::env::temp_dir().join(format!(
-        "exo-w7-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
     let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
-    let mk = || {
-        IngestServer::new(
-            Arc::new(InMemoryStorage::new(onto.clone())),
-            onto.clone(),
-            [5u8; 32],
-        )
-        .with_batches_file(dir.join("batches.jsonl"))
-    };
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let mk = || IngestServer::new(storage.clone(), onto.clone(), [5u8; 32]);
 
     // Process #1: register, commit one batch.
     let srv = mk();
@@ -891,10 +962,17 @@ async fn duplicate_replay_dedup_survives_restart() {
         .into_inner();
     // D6: memory + InSession + companion.
     assert_eq!(ack.accepted, 3);
+    use futures::StreamExt;
+    let mut before = 0;
+    let mut memories = storage.stream_all_memories().await;
+    while let Some(Ok(_)) = memories.next().await {
+        before += 1;
+    }
     drop(srv); // "restart"
 
     // Process #2: same batch replays -> DuplicateBatch, nothing commits.
     let srv2 = mk();
+    registered(&srv2, 3).await;
     let replay = srv2
         .submit(tonic::Request::new(b))
         .await
@@ -908,13 +986,10 @@ async fn duplicate_replay_dedup_survives_restart() {
         "W7: restart keeps the dedup set: {:?}",
         replay.rejections
     );
-    use futures::StreamExt;
-    let storage = &srv2.storage;
-    let mut n = 0;
-    let mut ms = storage.stream_all_memories().await;
-    while let Some(Ok(_)) = ms.next().await {
-        n += 1;
+    let mut after = 0;
+    let mut memories = storage.stream_all_memories().await;
+    while let Some(Ok(_)) = memories.next().await {
+        after += 1;
     }
-    assert_eq!(n, 0, "in-memory backend is fresh; nothing re-committed");
-    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(after, before, "restart replay must not commit another row");
 }
