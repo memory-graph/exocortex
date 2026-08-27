@@ -20,7 +20,7 @@ use smol_str::SmolStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId, Visibility};
+use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId};
 use exocortex_storage::{Direction, Invalidation, Storage, TraversalSpec, VisibilityContext};
 
 /// Immutable snapshot of one org's graph. Reads see a consistent view.
@@ -237,13 +237,7 @@ impl GraphSnapshot {
 
     /// Visibility check per §17.2: `Private` resolves against the author.
     pub fn visible(&self, m: &Memory, vc: &VisibilityContext) -> bool {
-        if m.visibility as u8 > vc.max_visibility as u8 {
-            return false;
-        }
-        if m.visibility == Visibility::Private {
-            return m.context.user_id.as_deref() == Some(vc.user_id.as_str());
-        }
-        true
+        exocortex_storage::memory_visible(m, vc)
     }
 
     /// Per-user filtered view (R-MT2): a lazy iterator over the memories the
@@ -585,6 +579,13 @@ impl LocalCache {
         let Some(start) = snap.by_id.get(from).map(|r| *r) else {
             return vec![];
         };
+        if !snap
+            .petgraph
+            .node_weight(start)
+            .is_some_and(|memory| snap.visible(memory, &spec.visibility_ctx))
+        {
+            return vec![];
+        }
         let mut out = Vec::new();
         let mut queue = std::collections::VecDeque::from([(start, 0u8)]);
         let mut seen = std::collections::HashSet::from([start]);
@@ -604,14 +605,13 @@ impl LocalCache {
                 if er.visibility as u8 > spec.visibility_ctx.max_visibility as u8 {
                     return;
                 }
-                if !seen.insert(other) {
+                let Some(m) = snap.petgraph.node_weight(other) else {
+                    return;
+                };
+                if !snap.visible(m, &spec.visibility_ctx) || !seen.insert(other) {
                     return;
                 }
-                if let Some(m) = snap.petgraph.node_weight(other) {
-                    if snap.visible(m, &spec.visibility_ctx) {
-                        out.push(m.clone());
-                    }
-                }
+                out.push(m.clone());
                 if d + 1 < spec.max_depth {
                     queue.push_back((other, d + 1));
                 }

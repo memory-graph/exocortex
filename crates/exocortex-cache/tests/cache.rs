@@ -7,7 +7,7 @@ use std::sync::Arc;
 use exocortex_cache::{CacheWrite, GraphSnapshot, LocalCache};
 use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
 use exocortex_pack_dev_v1::pack_def;
-use exocortex_storage::{InMemoryStorage, Storage, VisibilityContext};
+use exocortex_storage::{Direction, InMemoryStorage, Storage, TraversalSpec, VisibilityContext};
 
 fn ontology() -> Arc<exocortex_kernel::Ontology> {
     Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap())
@@ -65,6 +65,37 @@ fn vc(max: Visibility, user: &str) -> VisibilityContext {
         project_ids: Default::default(),
         team_ids: Default::default(),
         max_visibility: max,
+    }
+}
+
+fn rel(from: MemoryId, to: MemoryId, id_byte: u8) -> exocortex_kernel::Relationship {
+    exocortex_kernel::Relationship {
+        id: exocortex_kernel::RelationshipId([id_byte; 16]),
+        kind: exocortex_kernel::RelKindId(1),
+        from,
+        to,
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "test".into(),
+            producer_kind: None,
+        },
+        properties: exocortex_kernel::RelationshipProperties {
+            strength: 0.5,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: chrono::Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        lsn: LSN::new_local(0),
     }
 }
 
@@ -280,6 +311,56 @@ fn visibility_view_filters_private_by_author() {
     let low_titles: Vec<_> = snap.view(&low).map(|m| m.title.to_string()).collect();
     assert!(!low_titles.contains(&"orgnote".to_string()));
     assert!(low_titles.contains(&"mine".to_string()));
+}
+
+#[test]
+fn visibility_view_enforces_project_and_team_membership() {
+    let mut project = mem("project", Visibility::Project, None);
+    project.context.project_id = Some("p1".into());
+    let mut team = mem("team", Visibility::Team, None);
+    team.context.team_id = Some("t1".into());
+    let mut missing_scope = mem("missing", Visibility::Project, None);
+    missing_scope.context.project_id = None;
+    let mut snap = GraphSnapshot::empty();
+    snap.push_test_memory(project);
+    snap.push_test_memory(team);
+    snap.push_test_memory(missing_scope);
+
+    let mut member = vc(Visibility::Org, "alice");
+    member.project_ids.push("p1".into());
+    member.team_ids.push("t1".into());
+    let titles: Vec<_> = snap.view(&member).map(|m| m.title.as_str()).collect();
+    assert_eq!(titles.len(), 2);
+    assert!(titles.contains(&"project") && titles.contains(&"team"));
+
+    let outsider = vc(Visibility::Org, "bob");
+    assert_eq!(snap.view(&outsider).count(), 0);
+}
+
+#[test]
+fn traversal_never_crosses_an_invisible_intermediate_node() {
+    let a = mem("a", Visibility::Org, None);
+    let mut hidden = mem("hidden", Visibility::Project, None);
+    hidden.context.project_id = Some("secret".into());
+    let c = mem("c", Visibility::Org, None);
+    let mut snap = GraphSnapshot::empty();
+    for memory in [&a, &hidden, &c] {
+        snap.push_test_memory(memory.clone());
+    }
+    snap.push_test_relationship(rel(a.id, hidden.id, 1));
+    snap.push_test_relationship(rel(hidden.id, c.id, 2));
+
+    let cache = LocalCache::new(1024 * 1024).0;
+    cache.publish("org", Arc::new(snap));
+    let spec = TraversalSpec {
+        direction: Direction::Out,
+        kinds: Default::default(),
+        max_depth: 3,
+        max_nodes: 10,
+        visibility_ctx: vc(Visibility::Org, "outsider"),
+        as_of: None,
+    };
+    assert!(cache.traverse("org", &a.id, &spec).is_empty());
 }
 
 /// CR1 (audit): applying MemoryUpserted for an EXISTING id replaces the

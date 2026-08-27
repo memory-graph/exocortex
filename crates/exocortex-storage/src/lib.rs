@@ -20,9 +20,9 @@ pub use falkor::{FalkorConfig, FalkorStorage};
 pub use in_memory::InMemoryStorage;
 pub use trait_::{Storage, StorageError};
 pub use types::{
-    CommitRecord, CypherQuery, Direction, Embedding, GraphSnapshot, Invalidation, LeaseKey,
-    MemoryFilter, OwnerLease, RegionKey, ResultSet, StorageBackendId, StorageCapabilities,
-    TraversalSpec, VisibilityContext,
+    memory_visible, CommitRecord, CypherQuery, Direction, Embedding, GraphSnapshot, Invalidation,
+    LeaseKey, MemoryFilter, OwnerLease, RegionKey, ResultSet, StorageBackendId,
+    StorageCapabilities, TraversalSpec, VisibilityContext,
 };
 
 /// Result alias for storage operations (§6.1).

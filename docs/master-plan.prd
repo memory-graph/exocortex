@@ -173,6 +173,8 @@ each step (88 tests at completion).
 |----|-------------|----------|
 | R6-B01 | **Done** — backend-node, backend clients, and adapter workers fail closed without explicit signing/authentication material; no public release key remains | `exocortex-server` unit `backend_credentials_fail_closed_when_missing_empty_or_malformed`; `exocortex-client/tests/stdio_smoke.rs::backend_mode_requires_nonempty_authentication_material`; worker `fixture_adapter_requires_explicit_hmac_key`; real-node fixtures pass only with explicit secrets |
 | R6-B04 | **Done** — backend startup requires an administrator source-policy file and unknown producers cannot create policy | server unit `source_policy_is_required_and_validated_before_startup`; ingest `production_policy_rejects_unknown_source_without_registration`; real-node `adapter_sdk_out_of_process` loads an explicit immutable policy |
+| R6-B02 | **In progress** — one authoritative memory predicate now enforces tenant, private author, project membership, and team membership in storage/cache point reads | cache `visibility_view_enforces_project_and_team_membership`; per-request transport principals and scoped writes remain open |
+| R6-B13 | **Done** — traversal rejects an invisible start and never marks/enqueues an invisible neighbor, so hidden bridges cannot affect reachability or distance | `exocortex-cache/tests/cache.rs::traversal_never_crosses_an_invisible_intermediate_node` |
 | R6-U01 | **Promoted — fix in progress** — empty bearer is rejected at startup; executable inspection found gRPC still outside bearer middleware | Startup regression above; transport-wide principal/auth fix remains under R6-B02 |
 
 ## Done

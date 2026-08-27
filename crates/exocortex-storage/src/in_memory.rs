@@ -343,16 +343,7 @@ impl Storage for InMemoryStorage {
         else {
             return Ok(None);
         };
-        // R-T11 parity with the Falkor adapter: a Public row reads as Org
-        // for scope decisions (ST3/ST4).
-        let effective = match m.visibility {
-            Visibility::Public => Visibility::Org,
-            other => other,
-        };
-        if effective > vc.max_visibility
-            || (m.visibility == Visibility::Private
-                && m.context.user_id.as_deref() != Some(vc.user_id.as_str()))
-        {
+        if !crate::memory_visible(&m, vc) {
             return Err(StorageError::PermissionDenied);
         }
         Ok(Some(m))

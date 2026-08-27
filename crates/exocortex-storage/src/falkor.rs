@@ -823,15 +823,7 @@ impl Storage for FalkorStorage {
         match rows.first().and_then(|r| r.first()) {
             Some(v) if !matches!(v, FalkorValue::None) => {
                 let m = memory_from_value(v)?;
-                // R-T11: a Public row reads as Org for scope decisions.
-                let effective = match m.visibility {
-                    Visibility::Public => Visibility::Org,
-                    other => other,
-                };
-                if effective > vc.max_visibility
-                    || (m.visibility == Visibility::Private
-                        && m.context.user_id.as_deref() != Some(vc.user_id.as_str()))
-                {
+                if !crate::memory_visible(&m, vc) {
                     return Err(StorageError::PermissionDenied);
                 }
                 Ok(Some(m))

@@ -79,6 +79,41 @@ pub struct VisibilityContext {
     pub max_visibility: Visibility,
 }
 
+/// One authoritative §17.2 memory visibility decision, shared by storage and
+/// cache. Project/team rows require an explicit row scope and membership;
+/// missing scope never widens access.
+pub fn memory_visible(memory: &exocortex_kernel::Memory, vc: &VisibilityContext) -> bool {
+    if memory
+        .context
+        .tenant_id
+        .as_deref()
+        .is_some_and(|tenant| tenant != vc.org_id.as_str())
+    {
+        return false;
+    }
+    let effective = match memory.visibility {
+        Visibility::Public => Visibility::Org,
+        other => other,
+    };
+    if effective > vc.max_visibility {
+        return false;
+    }
+    match effective {
+        Visibility::Private => memory.context.user_id.as_deref() == Some(vc.user_id.as_str()),
+        Visibility::Project => memory
+            .context
+            .project_id
+            .as_ref()
+            .is_some_and(|project| vc.project_ids.contains(project)),
+        Visibility::Team => memory
+            .context
+            .team_id
+            .as_ref()
+            .is_some_and(|team| vc.team_ids.contains(team)),
+        Visibility::Org | Visibility::Public => true,
+    }
+}
+
 /// Server-side memory filter for point and entity queries.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MemoryFilter {
