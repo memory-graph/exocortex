@@ -128,7 +128,33 @@ pub fn relationship_visible(
         Visibility::Public => Visibility::Org,
         other => other,
     };
-    effective <= vc.max_visibility && memory_visible(from, vc) && memory_visible(to, vc)
+    if effective > vc.max_visibility || !memory_visible(from, vc) || !memory_visible(to, vc) {
+        return false;
+    }
+    let endpoints = [from, to];
+    match effective {
+        Visibility::Private => endpoints.iter().any(|memory| {
+            memory.visibility == Visibility::Private
+                && memory.context.user_id.as_deref() == Some(vc.user_id.as_str())
+        }),
+        Visibility::Project => endpoints.iter().any(|memory| {
+            memory.visibility == Visibility::Project
+                && memory
+                    .context
+                    .project_id
+                    .as_ref()
+                    .is_some_and(|project| vc.project_ids.contains(project))
+        }),
+        Visibility::Team => endpoints.iter().any(|memory| {
+            memory.visibility == Visibility::Team
+                && memory
+                    .context
+                    .team_id
+                    .as_ref()
+                    .is_some_and(|team| vc.team_ids.contains(team))
+        }),
+        Visibility::Org | Visibility::Public => true,
+    }
 }
 
 /// Server-side memory filter for point and entity queries.

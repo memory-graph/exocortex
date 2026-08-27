@@ -375,13 +375,25 @@ async fn replay_filters_relationship_upserts_and_deletes_by_endpoint_scope() {
     let hidden_endpoint = scoped_memory(61, "hidden-project");
     let visible_a = scoped_memory(62, "visible-project");
     let visible_b = scoped_memory(63, "visible-project");
+    let mut unscoped_a = scoped_memory(66, "visible-project");
+    unscoped_a.visibility = Visibility::Org;
+    unscoped_a.context.project_id = None;
+    let mut unscoped_b = scoped_memory(67, "visible-project");
+    unscoped_b.visibility = Visibility::Org;
+    unscoped_b.context.project_id = None;
     storage.upsert_memory(&hidden_endpoint).await.unwrap();
     storage.upsert_memory(&visible_a).await.unwrap();
     storage.upsert_memory(&visible_b).await.unwrap();
+    storage.upsert_memory(&unscoped_a).await.unwrap();
+    storage.upsert_memory(&unscoped_b).await.unwrap();
     let hidden = relationship(64, hidden_endpoint.id, visible_a.id);
     let visible = relationship(65, visible_a.id, visible_b.id);
+    // A narrowed Project edge between Org endpoints has no project subject
+    // to authorize against and must fail closed.
+    let unscoped = relationship(68, unscoped_a.id, unscoped_b.id);
     let hidden_upsert = storage.upsert_relationship(&hidden).await.unwrap();
     let visible_upsert = storage.upsert_relationship(&visible).await.unwrap();
+    let unscoped_upsert = storage.upsert_relationship(&unscoped).await.unwrap();
     let hidden_delete = storage.delete_relationship(&hidden.id).await.unwrap();
     let visible_delete = storage.delete_relationship(&visible.id).await.unwrap();
     for invalidation in [
@@ -398,6 +410,13 @@ async fn replay_filters_relationship_upserts_and_deletes_by_endpoint_scope() {
             to: visible.to,
             kind: visible.kind,
             lsn: visible_upsert.lsn,
+        },
+        Invalidation::RelationshipUpserted {
+            id: unscoped.id,
+            from: unscoped.from,
+            to: unscoped.to,
+            kind: unscoped.kind,
+            lsn: unscoped_upsert.lsn,
         },
         Invalidation::RelationshipDeleted {
             id: hidden.id,
@@ -421,14 +440,15 @@ async fn replay_filters_relationship_upserts_and_deletes_by_endpoint_scope() {
     .await;
     assert_eq!(status, "200", "relationship replay is served: {body}");
     let events = decoded_events(&body);
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 5);
     assert!(matches!(events[0].kind, Some(Kind::VisibilityAdvance(_))));
     assert!(matches!(
         events[1].kind,
         Some(Kind::RelationshipUpserted(_))
     ));
     assert!(matches!(events[2].kind, Some(Kind::VisibilityAdvance(_))));
-    assert!(matches!(events[3].kind, Some(Kind::RelationshipDeleted(_))));
+    assert!(matches!(events[3].kind, Some(Kind::VisibilityAdvance(_))));
+    assert!(matches!(events[4].kind, Some(Kind::RelationshipDeleted(_))));
     assert_eq!(
         events
             .iter()
@@ -437,6 +457,7 @@ async fn replay_filters_relationship_upserts_and_deletes_by_endpoint_scope() {
         vec![
             hidden_upsert.lsn,
             visible_upsert.lsn,
+            unscoped_upsert.lsn,
             hidden_delete.lsn,
             visible_delete.lsn
         ]
