@@ -41,6 +41,24 @@ impl F01 {
     }
 }
 
+/// Immutable identity of the model that produced an embedding (R-Mcr1).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EmbeddingModel {
+    /// Stable model family/name.
+    pub name: SmolStr,
+    /// Exact model revision used to produce the vector.
+    pub version: SmolStr,
+}
+
+/// A vector inseparably paired with its producing model revision (R-Dr5).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Embedding {
+    /// Producing model identity.
+    pub model: EmbeddingModel,
+    /// Dense vector values.
+    pub vector: Vec<f32>,
+}
+
 /// The canonical memory: heavy envelope, single-string content (§7.5).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Memory {
@@ -78,8 +96,8 @@ pub struct Memory {
     pub recorded_at: DateTime<Utc>,
     /// Identity of the memory that superseded this one, if any.
     pub invalidated_by: Option<MemoryId>,
-    /// R-T8: stripped before cache/SSE.
-    pub embedding: Option<Vec<f32>>,
+    /// R-T8: model-stamped and stripped before cache/SSE.
+    pub embedding: Option<Embedding>,
     /// Storage-assigned log sequence number (§6.2).
     pub lsn: LSN,
 }

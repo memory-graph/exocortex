@@ -11,8 +11,8 @@ use exocortex_dreams::{
     Discovery, DiscoveryKind, DreamsEngine, PruneReason,
 };
 use exocortex_kernel::{
-    Memory, MemoryContext, MemoryId, Provenance, RelKindId, Relationship, RelationshipId,
-    RelationshipProperties, Visibility, LSN,
+    Embedding, EmbeddingModel, Memory, MemoryContext, MemoryId, Provenance, RelKindId,
+    Relationship, RelationshipId, RelationshipProperties, Visibility, LSN,
 };
 use exocortex_storage::{InMemoryStorage, RegionKey, Storage};
 
@@ -71,8 +71,18 @@ fn mem_with_embedding(i: usize, dup_of: Option<usize>, embedding: Vec<f32>) -> M
         valid_until: None,
         recorded_at: chrono::Utc::now(),
         invalidated_by: None,
-        embedding: Some(embedding),
+        embedding: Some(stamped(embedding)),
         lsn: LSN::new_local(0),
+    }
+}
+
+fn stamped(vector: Vec<f32>) -> Embedding {
+    Embedding {
+        model: EmbeddingModel {
+            name: "bge-small".into(),
+            version: "v1".into(),
+        },
+        vector,
     }
 }
 
@@ -247,8 +257,8 @@ async fn injected_mid_cycle_failure_restores_exact_mixed_preimage() {
     let target = mem_with_embedding(70_000, None, unit(20));
     let mut duplicate_a = mem_with_embedding(70_001, Some(1), unit(1));
     let mut duplicate_b = mem_with_embedding(70_002, Some(1), unit(1));
-    duplicate_a.embedding.as_mut().unwrap()[2] = 0.01;
-    duplicate_b.embedding.as_mut().unwrap()[3] = 0.01;
+    duplicate_a.embedding.as_mut().unwrap().vector[2] = 0.01;
+    duplicate_b.embedding.as_mut().unwrap().vector[3] = 0.01;
     let mut preclosed = mem_with_embedding(70_003, None, unit(30));
     preclosed.valid_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
     let edge_a = relationship(duplicate_a.id, target.id, exocortex_kernel::kinds::SOLVES);
@@ -342,7 +352,7 @@ async fn merge_rewiring_trips_default_hairball_without_delta_r_regression() {
     let storage = InMemoryStorage::new(ontology.clone());
     let source_a = mem_with_embedding(80_000, Some(2), unit(2));
     let mut source_b = mem_with_embedding(80_001, Some(2), unit(2));
-    source_b.embedding.as_mut().unwrap()[3] = 0.01;
+    source_b.embedding.as_mut().unwrap().vector[3] = 0.01;
     let targets: Vec<_> = (0..4)
         .map(|index| {
             let mut memory = mem_with_embedding(81_000 + index, None, unit(20 + index));
@@ -491,32 +501,29 @@ fn discovery_is_a_proposal_not_an_edge() {
 #[test]
 fn mcr2_cross_model_comparison_is_prohibited() {
     let e = MCR2Engine::default();
-    let rows = vec![
+    let matching = vec![
         MemoryWithEmbedding {
             id: MemoryId::new_v7(),
             class: 1,
-            embedding: unit(1),
+            embedding: stamped(unit(1)),
         },
         MemoryWithEmbedding {
             id: MemoryId::new_v7(),
             class: 2,
-            embedding: unit(2),
+            embedding: stamped(unit(2)),
         },
     ];
-    let v = e.compute(&rows).expect("compute");
+    let v = e.compute(&matching).expect("compute");
     assert_eq!(
         v.embedding_model,
         exocortex_dreams::mcr2::EmbeddingModelId::bge_small()
     );
-    // R-Mcr1: the stamp rides every value; mixing models is a type-level
-    // prohibition — different EmbeddingModelId values never compare here.
-    assert_ne!(
-        exocortex_dreams::mcr2::EmbeddingModelId::bge_small(),
-        exocortex_dreams::mcr2::EmbeddingModelId {
-            name: "bge-large".into(),
-            version: "v1".into()
-        }
-    );
+    let mut mixed = matching;
+    mixed[1].embedding.model.version = "v2".into();
+    assert!(matches!(
+        e.compute(&mixed),
+        Err(exocortex_dreams::mcr2::MCR2Error::CrossModelComparison)
+    ));
 }
 
 #[test]
@@ -572,20 +579,17 @@ const _UNUSED: Option<PruneReason> = None;
 /// would yield ln 3 instead.
 #[test]
 fn mcr2_log_det_matches_closed_form() {
-    let e = MCR2Engine {
-        epsilon: 0.5,
-        embedding_model: exocortex_dreams::mcr2::EmbeddingModelId::bge_small(),
-    };
+    let e = MCR2Engine { epsilon: 0.5 };
     let rows = vec![
         MemoryWithEmbedding {
             id: MemoryId::new_v7(),
             class: 1,
-            embedding: vec![1.0, 0.0],
+            embedding: stamped(vec![1.0, 0.0]),
         },
         MemoryWithEmbedding {
             id: MemoryId::new_v7(),
             class: 2,
-            embedding: vec![0.0, 1.0],
+            embedding: stamped(vec![0.0, 1.0]),
         },
     ];
     let v = e.compute(&rows).expect("compute");

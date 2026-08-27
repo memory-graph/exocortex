@@ -9,7 +9,7 @@
 //! download) and the fastembed-backed default (bge-small, 384-dim) enabled
 //! by the `fastembed` cargo feature. The fake is NOT a substitute in
 //! production: cross-model comparison is prohibited (R-Mcr1), so the model
-//! identity rides every vector via the configured embedder's `model_id`.
+//! identity and revision ride every vector via the configured embedder.
 
 use std::sync::Arc;
 
@@ -17,8 +17,10 @@ use std::sync::Arc;
 pub trait Embedder: Send + Sync {
     /// Embed one `title + "\n" + content` document.
     fn embed(&self, text: &str) -> Result<Vec<f32>, String>;
-    /// Stable model identity (stamped on MCR² values, R-Mcr1/R-Dr5).
+    /// Stable model name (R-Mcr1/R-Dr5).
     fn model_id(&self) -> &'static str;
+    /// Exact model revision stamped beside every stored vector.
+    fn model_version(&self) -> &'static str;
     /// Vector dimensionality.
     fn dim(&self) -> usize;
 }
@@ -68,6 +70,10 @@ impl Embedder for FakeEmbedder {
         "fake-deterministic"
     }
 
+    fn model_version(&self) -> &'static str {
+        "v1"
+    }
+
     fn dim(&self) -> usize {
         self.dim
     }
@@ -110,6 +116,10 @@ impl Embedder for FastEmbedder {
 
     fn model_id(&self) -> &'static str {
         "bge-small"
+    }
+
+    fn model_version(&self) -> &'static str {
+        "v1"
     }
 
     fn dim(&self) -> usize {

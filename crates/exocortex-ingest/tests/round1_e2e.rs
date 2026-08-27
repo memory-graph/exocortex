@@ -143,7 +143,10 @@ async fn dreams_cycle_over_ingested_data() {
             if matches!(m.provenance, exocortex_kernel::Provenance::Derived { .. }) {
                 continue;
             }
-            assert!(m.embedding.is_some(), "ingest stored an embedding");
+            let embedding = m.embedding.expect("ingest stored an embedding");
+            assert_eq!(embedding.model.name, "fake-deterministic");
+            assert_eq!(embedding.model.version, "v1");
+            assert_eq!(embedding.vector.len(), 64);
             n += 1;
         }
         assert_eq!(n, 5);

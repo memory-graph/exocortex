@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use exocortex_kernel::MemoryId;
+use exocortex_kernel::{Embedding, EmbeddingModel, MemoryId};
 
 /// Embedding model identity for version stamping (R-Mcr1/R-Dr5).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -29,6 +29,15 @@ impl EmbeddingModelId {
     }
 }
 
+impl From<&EmbeddingModel> for EmbeddingModelId {
+    fn from(model: &EmbeddingModel) -> Self {
+        Self {
+            name: model.name.to_string(),
+            version: model.version.to_string(),
+        }
+    }
+}
+
 /// One memory with its embedding, the engine's input.
 #[derive(Clone, Debug)]
 pub struct MemoryWithEmbedding {
@@ -36,8 +45,8 @@ pub struct MemoryWithEmbedding {
     pub id: MemoryId,
     /// Partition class (memory type id).
     pub class: u8,
-    /// The embedding vector.
-    pub embedding: Vec<f32>,
+    /// The model-stamped embedding vector.
+    pub embedding: Embedding,
 }
 
 /// A computed MCR² value with full provenance (§11.6).
@@ -68,22 +77,20 @@ pub enum MCR2Error {
     /// Too few points to score.
     #[error("too few memories to score (need >= {0})")]
     TooFew(usize),
+    /// Vectors from one declared model must share one dimensionality.
+    #[error("embedding dimensions differ within one model revision")]
+    DimensionMismatch,
 }
 
 /// The engine (§11.6). `epsilon` default 0.5.
 pub struct MCR2Engine {
     /// Distortion parameter ε.
     pub epsilon: f32,
-    /// Model identity stamped on every value.
-    pub embedding_model: EmbeddingModelId,
 }
 
 impl Default for MCR2Engine {
     fn default() -> Self {
-        Self {
-            epsilon: 0.5,
-            embedding_model: EmbeddingModelId::bge_small(),
-        }
+        Self { epsilon: 0.5 }
     }
 }
 
@@ -153,8 +160,24 @@ impl MCR2Engine {
         if memories.len() < 2 {
             return Err(MCR2Error::TooFew(2));
         }
-        let d = memories[0].embedding.len();
-        let all: Vec<&[f32]> = memories.iter().map(|m| m.embedding.as_slice()).collect();
+        let model = &memories[0].embedding.model;
+        if memories
+            .iter()
+            .any(|memory| &memory.embedding.model != model)
+        {
+            return Err(MCR2Error::CrossModelComparison);
+        }
+        let d = memories[0].embedding.vector.len();
+        if memories
+            .iter()
+            .any(|memory| memory.embedding.vector.len() != d)
+        {
+            return Err(MCR2Error::DimensionMismatch);
+        }
+        let all: Vec<&[f32]> = memories
+            .iter()
+            .map(|m| m.embedding.vector.as_slice())
+            .collect();
         let total = log_det_cov(&all, self.epsilon);
 
         let mut by_class: HashMap<u8, Vec<&[f32]>> = HashMap::new();
@@ -162,7 +185,7 @@ impl MCR2Engine {
             by_class
                 .entry(m.class)
                 .or_default()
-                .push(m.embedding.as_slice());
+                .push(m.embedding.vector.as_slice());
         }
         let mut class_rates = HashMap::new();
         let mut compact = 0.0f32;
@@ -173,14 +196,13 @@ impl MCR2Engine {
             class_rates.insert(*class, rate);
             compact += weight * rate;
         }
-        let _ = d;
         Ok(MCR2Value {
             delta_r: total - compact,
             total_rate: total,
             class_rates,
             compact_rate: compact,
             n_memories: memories.len(),
-            embedding_model: self.embedding_model.clone(),
+            embedding_model: model.into(),
             computed_at: Utc::now(),
         })
     }
@@ -205,7 +227,7 @@ impl MCR2Engine {
                 if a.class != b.class {
                     continue;
                 }
-                let sim = cosine(&a.embedding, &b.embedding);
+                let sim = cosine(&a.embedding.vector, &b.embedding.vector);
                 if sim > 0.9 {
                     out.push(MergeCandidate {
                         a: a.id,

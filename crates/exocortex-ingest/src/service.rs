@@ -127,7 +127,7 @@ pub struct RecentEmbedding {
     /// Exact-content marker (title + content equality ⇒ duplicate).
     pub content_exact: String,
     /// The embedding (None rows are not ringed).
-    pub embedding: Vec<f32>,
+    pub embedding: exocortex_kernel::Embedding,
 }
 
 /// Ring bound: hints are a recency heuristic; beyond this the Dreams
@@ -577,7 +577,13 @@ impl<S: Storage> IngestServer<S> {
         if let Some(embedder) = &self.embedder {
             if let Ok(v) = embedder.embed(&format!("{}\n{}", m.title, m.content)) {
                 metrics::counter!("exocortex_ingest_embeddings_total").increment(1);
-                mem.embedding = Some(v);
+                mem.embedding = Some(exocortex_kernel::Embedding {
+                    model: exocortex_kernel::EmbeddingModel {
+                        name: embedder.model_id().into(),
+                        version: embedder.model_version().into(),
+                    },
+                    vector: v,
+                });
             }
         }
         Ok(mem)
@@ -724,10 +730,13 @@ impl<S: Storage> IngestServer<S> {
                 let Some(emb) = &m.embedding else { continue };
                 let mut best: Option<(f32, &RecentEmbedding)> = None;
                 for e in ring.iter() {
-                    if e.org != org || e.embedding.len() != emb.len() {
+                    if e.org != org
+                        || e.embedding.model != emb.model
+                        || e.embedding.vector.len() != emb.vector.len()
+                    {
                         continue;
                     }
-                    let c = exocortex_dreams::mcr2::cosine(emb, &e.embedding);
+                    let c = exocortex_dreams::mcr2::cosine(&emb.vector, &e.embedding.vector);
                     if c >= SIMILAR_HINT_THRESHOLD && best.is_none_or(|(bc, _)| c > bc) {
                         best = Some((c, e));
                     }

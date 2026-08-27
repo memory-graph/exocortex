@@ -736,7 +736,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 if a.class != b.class || a.id == b.id {
                     continue;
                 }
-                let sim = mcr2::cosine(&a.embedding, &b.embedding);
+                let sim = mcr2::cosine(&a.embedding.vector, &b.embedding.vector);
                 if sim < SIMILAR_TO_THRESHOLD {
                     continue;
                 }

@@ -55,7 +55,7 @@ pub use error::{KernelError, KernelResult};
 pub use fingerprint::OntologyFingerprint;
 pub use ids::{EntityId, MemoryId, PackId, RelationshipId, LSN};
 pub use kinds::{RelBucket, RelKindId, RelMeta};
-pub use memory::{normalize_tag, normalize_tags, Memory, MemoryContext};
+pub use memory::{normalize_tag, normalize_tags, Embedding, EmbeddingModel, Memory, MemoryContext};
 pub use ontology::Ontology;
 pub use pack::{PackDef, PackVersion};
 pub use provenance::{ExternalKey, ExternalSnapshot, ProducerKind, Provenance};
