@@ -36,7 +36,7 @@ fn synth_memory(i: usize) -> Memory {
             project_id: Some("bench".into()),
             project_path: None,
             team_id: None,
-            tenant_id: None,
+            tenant_id: Some("bench-org".into()),
             session_id: None,
             user_id: Some("bench-user".into()),
             created_by: None,
@@ -67,7 +67,7 @@ fn vc() -> exocortex_storage::VisibilityContext {
     exocortex_storage::VisibilityContext {
         user_id: "bench-user".into(),
         org_id: "bench-org".into(),
-        project_ids: Default::default(),
+        project_ids: ["bench".into()].into_iter().collect(),
         team_ids: Default::default(),
         max_visibility: Visibility::Org,
     }
