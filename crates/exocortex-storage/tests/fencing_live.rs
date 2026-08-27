@@ -5,7 +5,10 @@
 #![cfg(feature = "integration")]
 
 use chrono::Utc;
-use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
+use exocortex_kernel::{
+    Memory, MemoryContext, MemoryId, Provenance, Relationship, RelationshipId,
+    RelationshipProperties, Visibility, LSN,
+};
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::types::LeaseKey;
 use exocortex_storage::{FalkorStorage, Storage, StorageError};
@@ -74,6 +77,37 @@ fn mem(seed: u8) -> Memory {
         recorded_at: Utc::now(),
         invalidated_by: None,
         embedding: None,
+        lsn: LSN::new_local(0),
+    }
+}
+
+fn rel(from: MemoryId, to: MemoryId) -> Relationship {
+    Relationship {
+        id: RelationshipId::derive(from, exocortex_kernel::kinds::SOLVES, to, None),
+        kind: exocortex_kernel::kinds::SOLVES,
+        from,
+        to,
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "fence".into(),
+            producer_kind: None,
+        },
+        properties: RelationshipProperties {
+            strength: 0.8,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: Utc::now(),
+        valid_until: None,
+        recorded_at: Utc::now(),
+        invalidated_by: None,
         lsn: LSN::new_local(0),
     }
 }
@@ -151,7 +185,7 @@ async fn held_lease_blocks_second_holder_live() {
         s.acquire_lease(&key, std::time::Duration::from_secs(60))
             .await
             .is_err(),
-        "SET NX must refuse a second holder while the TTL lives"
+        "the graph lease must refuse a second holder while the TTL lives"
     );
     // Renewal under the matching token succeeds; a mutated token fails.
     assert!(s.renew_lease(&a).await.is_ok());
@@ -159,4 +193,25 @@ async fn held_lease_blocks_second_holder_live() {
     forged.fencing_token = "someone-else:99".into();
     assert!(s.renew_lease(&forged).await.is_err());
     s.release_lease(a).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn later_graph_row_failure_rolls_back_earlier_rows_live() {
+    if falkor_url().is_none() {
+        eprintln!(
+            "skipping later_graph_row_failure_rolls_back_earlier_rows_live: FALKOR_URL not set"
+        );
+        return;
+    }
+    let s = falkor("rollback").await;
+    let staged = mem(4);
+    let missing = MemoryId::new_v7();
+    let err = s
+        .upsert_batch(&[staged.clone()], &[rel(staged.id, missing)])
+        .await;
+    assert!(err.is_err(), "missing endpoint must reject the batch");
+    assert!(
+        s.get_memory(&staged.id).await.unwrap().is_none(),
+        "the single modifying GRAPH.QUERY rolls every row back"
+    );
 }

@@ -14,8 +14,8 @@ use exocortex_kernel::{
 };
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{
-    FalkorConfig, FalkorStorage, Invalidation, LeaseKey, OwnerLease, RegionKey, Storage,
-    TraversalSpec, VisibilityContext,
+    CypherQuery, FalkorConfig, FalkorStorage, Invalidation, LeaseKey, OwnerLease, RegionKey,
+    Storage, TraversalSpec, VisibilityContext,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -210,6 +210,52 @@ itest!(fingerprint_mismatch_aborts_startup, {
     );
 });
 
+itest!(malformed_fingerprint_fails_closed_without_rewrite, {
+    let s = connect("corrupt-fingerprint").await;
+    let graph = s.graph_name_clone();
+    let malformed = "0".repeat(63);
+    s.query_cypher(&CypherQuery {
+        template_id: "write_fingerprint",
+        params: serde_json::json!({ "fp": malformed }),
+        read_only: false,
+        deadline: Utc::now() + Duration::seconds(5),
+    })
+    .await
+    .unwrap();
+
+    let url = falkor_url().unwrap();
+    let cfg = FalkorConfig {
+        falkor_url: url.clone(),
+        redis_url: std::env::var("REDIS_URL")
+            .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+        graph_name: graph,
+        org_id: "test-org".into(),
+        node_id: "corrupt-reader".into(),
+    };
+    let err = match FalkorStorage::connect(cfg, ontology()).await {
+        Ok(_) => panic!("malformed fingerprint must fail startup"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        exocortex_storage::StorageError::CorruptMetadata {
+            key: "ontology_fingerprint",
+            ..
+        }
+    ));
+
+    let persisted = s
+        .query_cypher(&CypherQuery {
+            template_id: "read_fingerprint",
+            params: serde_json::json!({}),
+            read_only: true,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+    assert_eq!(persisted.rows, vec![serde_json::json!([malformed])]);
+});
+
 itest!(three_hop_traverse, {
     let s = connect("node-1").await;
     let a = mem("A", 4, Visibility::Org);
@@ -283,9 +329,22 @@ itest!(bi_temporal_valid_at, {
 
 itest!(lease_race_single_winner, {
     let a = connect("node-A").await;
-    let b = connect("node-B").await;
-    // Both connect()s used distinct graphs but leases share the org namespace;
-    // use an explicit shared key.
+    // Cluster peers for one org share the data graph. The lease lives in that
+    // graph so its epoch guard and the owner mutation can be one atomic query.
+    let url = falkor_url().unwrap();
+    let b = FalkorStorage::connect(
+        FalkorConfig {
+            falkor_url: url.clone(),
+            redis_url: std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+            graph_name: a.graph_name_clone(),
+            org_id: "test-org".into(),
+            node_id: "node-B".into(),
+        },
+        ontology(),
+    )
+    .await
+    .expect("connect peer to shared graph");
     let key = LeaseKey::Dreams {
         org: format!("race-{}", graph_suffix()).into(),
         region: "p:1".into(),

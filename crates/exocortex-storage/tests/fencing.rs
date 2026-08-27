@@ -1,7 +1,10 @@
 // R-C3 fencing-token tests against the InMemory double: re-election bumps
 // the epoch and stale-owner writes are rejected before any row commits.
 use chrono::Utc;
-use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
+use exocortex_kernel::{
+    Memory, MemoryContext, MemoryId, Provenance, Relationship, RelationshipId,
+    RelationshipProperties, Visibility, LSN,
+};
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::types::LeaseKey;
 use exocortex_storage::{InMemoryStorage, Storage, StorageError};
@@ -54,6 +57,37 @@ fn mem(seed: u8) -> Memory {
         recorded_at: Utc::now(),
         invalidated_by: None,
         embedding: None,
+        lsn: LSN::new_local(0),
+    }
+}
+
+fn rel(from: MemoryId, to: MemoryId) -> Relationship {
+    Relationship {
+        id: RelationshipId::derive(from, exocortex_kernel::kinds::SOLVES, to, None),
+        kind: exocortex_kernel::kinds::SOLVES,
+        from,
+        to,
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "fence".into(),
+            producer_kind: None,
+        },
+        properties: RelationshipProperties {
+            strength: 0.8,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: Utc::now(),
+        valid_until: None,
+        recorded_at: Utc::now(),
+        invalidated_by: None,
         lsn: LSN::new_local(0),
     }
 }
@@ -117,4 +151,22 @@ async fn held_lease_blocks_second_acquire_and_fenced_delete() {
         Err(StorageError::FencedWriteRejected { .. })
     ));
     s.delete_memory_fenced(&m.id, &b).await.unwrap();
+}
+
+#[tokio::test]
+async fn batch_row_failure_rolls_back_every_memory_and_lsn() {
+    let s = store();
+    let before = s.last_lsn();
+    let staged = mem(4);
+    let missing = MemoryId::new_v7();
+
+    let err = s
+        .upsert_batch(&[staged.clone()], &[rel(staged.id, missing)])
+        .await;
+    assert!(err.is_err(), "missing endpoint must reject the batch");
+    assert!(
+        s.get_memory(&staged.id).await.unwrap().is_none(),
+        "a later-row failure rolls the earlier memory back"
+    );
+    assert_eq!(s.last_lsn(), before, "a rejected batch allocates no LSN");
 }

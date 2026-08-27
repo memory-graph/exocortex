@@ -150,6 +150,38 @@ fn memory_from_value(v: &FalkorValue) -> Result<Memory, StorageError> {
     serde_json::from_str(json).map_err(|e| StorageError::Backend(format!("bad props_json: {e}")))
 }
 
+fn decode_persisted_fingerprint(
+    rows: &[Vec<FalkorValue>],
+) -> Result<Option<[u8; 32]>, StorageError> {
+    let Some(value) = rows.first().and_then(|row| row.first()) else {
+        return Ok(None);
+    };
+    let FalkorValue::String(encoded) = value else {
+        return Err(StorageError::CorruptMetadata {
+            key: "ontology_fingerprint",
+            detail: "expected a 64-character hexadecimal string".into(),
+        });
+    };
+    if encoded.len() != 64 {
+        return Err(StorageError::CorruptMetadata {
+            key: "ontology_fingerprint",
+            detail: format!(
+                "expected 64 hexadecimal characters, found {}",
+                encoded.len()
+            ),
+        });
+    }
+    let mut fingerprint = [0u8; 32];
+    for (index, byte) in fingerprint.iter_mut().enumerate() {
+        let pair = &encoded[index * 2..index * 2 + 2];
+        *byte = u8::from_str_radix(pair, 16).map_err(|_| StorageError::CorruptMetadata {
+            key: "ontology_fingerprint",
+            detail: format!("invalid hexadecimal byte at offset {}", index * 2),
+        })?;
+    }
+    Ok(Some(fingerprint))
+}
+
 fn hex(id: &[u8; 16]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(32);
@@ -229,19 +261,7 @@ impl FalkorStorage {
         } else {
             vec![]
         };
-        let stored: Option<[u8; 32]> =
-            rows.first()
-                .and_then(|row| row.first())
-                .and_then(|v| match v {
-                    FalkorValue::String(s) => {
-                        let mut fp = [0u8; 32];
-                        for (i, slot) in fp.iter_mut().enumerate() {
-                            *slot = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
-                        }
-                        Some(fp)
-                    }
-                    _ => None,
-                });
+        let stored = decode_persisted_fingerprint(&rows)?;
         let runtime = self.ontology.fingerprint.0;
         match stored {
             None => {
@@ -455,22 +475,35 @@ impl FalkorStorage {
         })
     }
 
-    /// Build the fully-substituted, parameterized text for one template
-    /// (same substitution rules as `run_template`) WITHOUT executing it —
-    /// the batch path queues these inside one MULTI/EXEC.
-    fn build_query_text(
+    /// Namespace one registered write template so several template bodies
+    /// can be composed into one parameterized GRAPH.QUERY.
+    fn namespaced_template(
         &self,
         template_id: &str,
         params: &serde_json::Value,
-    ) -> Result<String, StorageError> {
+        prefix: &str,
+    ) -> Result<(String, Vec<(String, String)>), StorageError> {
         let t = cypher::TEMPLATES.get(template_id).ok_or_else(|| {
             StorageError::Backend(format!("unregistered cypher template: {template_id}"))
         })?;
-        let map = params_to_map(params)?;
-        let mut text = t.cypher.to_string();
-        if let Some(depth) = params.get("max_depth").and_then(|v| v.as_u64()) {
-            text = text.replace("$max_depth", &format!("{depth}"));
+        if t.read_only {
+            return Err(StorageError::Backend(format!(
+                "batch template must be writable: {template_id}"
+            )));
         }
+        let serde_json::Value::Object(map) = params else {
+            return Err(StorageError::Backend(
+                "cypher params must be an object".into(),
+            ));
+        };
+        for required in t.required_params {
+            if !map.contains_key(*required) {
+                return Err(StorageError::Backend(format!(
+                    "missing parameter `{required}` for {template_id}"
+                )));
+            }
+        }
+        let mut text = t.cypher.to_string();
         if let Some(kind) = params.get("kind_label").and_then(|v| v.as_str()) {
             if !self
                 .ontology
@@ -484,72 +517,44 @@ impl FalkorStorage {
             }
             text = text.replace("__KIND_TYPE__", kind);
         }
-        if map.is_empty() {
-            Ok(text)
-        } else {
-            let kv: Vec<String> = map.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            Ok(format!("CYPHER {} {}", kv.join(" "), text))
+
+        // Longest first keeps a shorter parameter name from touching the
+        // prefix of a longer one.
+        let mut names: Vec<&str> = t.required_params.to_vec();
+        names.sort_by_key(|name| std::cmp::Reverse(name.len()));
+        let mut bound = Vec::with_capacity(names.len());
+        for name in names {
+            let namespaced = format!("{prefix}_{name}");
+            text = text.replace(&format!("${name}"), &format!("${namespaced}"));
+            bound.push((
+                namespaced,
+                cypher_literal(map.get(name).expect("required parameter checked")),
+            ));
         }
+        Ok((text, bound))
     }
 
-    /// Allocate a contiguous block of `n` LSNs. When `lease` is present
-    /// the allocation itself is fenced (ST5): an atomic Lua gate on the
-    /// lease token + TTL — without a passing gate no row in the batch can
-    /// obtain an LSN, so a stale owner cannot commit.
-    async fn next_lsn_block(
-        &self,
-        n: usize,
-        lease: Option<&OwnerLease>,
-    ) -> Result<std::ops::Range<u64>, StorageError> {
+    /// Allocate a contiguous block of `n` LSNs. Allocation may leave a gap
+    /// when the subsequent graph transaction rejects; committed rows remain
+    /// monotonic and the graph transaction is the mutation authority.
+    async fn next_lsn_block(&self, n: usize) -> Result<std::ops::Range<u64>, StorageError> {
         if n == 0 {
             return Ok(0..0);
         }
-        let start = match lease {
-            None => {
-                let s: u64 = self
-                    .redis
-                    .clone()
-                    .incr(&self.lsn_key, n as u64)
-                    .await
-                    .map_err(|e| StorageError::Backend(e.to_string()))?;
-                s + 1 - n as u64
-            }
-            Some(lease) => {
-                let key_str = serde_json::to_string(&lease.key).unwrap();
-                let redis_key = format!("exocortex:lease:{key_str}");
-                let end: i64 = redis::Script::new(
-                    r#"
-                    if redis.call('GET', KEYS[2]) == ARGV[1]
-                       and redis.call('TTL', KEYS[2]) > 0 then
-                        return redis.call('INCRBY', KEYS[1], ARGV[2])
-                    else
-                        return -1
-                    end
-                    "#,
-                )
-                .key(&self.lsn_key)
-                .key(&redis_key)
-                .arg(lease.fencing_token.as_str())
-                .arg(n as i64)
-                .invoke_async(&mut self.redis.clone())
-                .await
-                .map_err(|e| StorageError::Backend(e.to_string()))?;
-                if end < 0 {
-                    return Err(StorageError::FencedWriteRejected {
-                        lease_epoch: lease.epoch,
-                    });
-                }
-                end as u64 + 1 - n as u64
-            }
-        };
+        let end: u64 = self
+            .redis
+            .clone()
+            .incr(&self.lsn_key, n as u64)
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let start = end + 1 - n as u64;
         Ok(start..start + n as u64)
     }
 
-    /// The transactional batch (ST6): every row — memories, relationships,
-    /// and their R-T4 inverse companions — commits inside ONE MULTI/EXEC
-    /// over the FalkorDB Redis connection, so a mid-batch connection
-    /// failure rolls the whole batch back instead of leaving a partial
-    /// commit. LSNs are block-allocated up front.
+    /// Every row, inverse companion, endpoint guard, and optional lease
+    /// guard is one compound GRAPH.QUERY. FalkorDB makes a modifying query
+    /// atomic; Redis MULTI/EXEC does not roll back an earlier command when a
+    /// later queued command fails (R6-U02).
     async fn upsert_batch_inner(
         &self,
         ms: &[Memory],
@@ -569,13 +574,42 @@ impl FalkorStorage {
         }
 
         let total = ms.len() + all_rels.len();
-        let block = self.next_lsn_block(total, lease).await?;
+        let block = self.next_lsn_block(total).await?;
         let now = Utc::now();
 
-        let mut queries = Vec::with_capacity(total);
+        let mut parts: Vec<(&str, serde_json::Value)> = Vec::with_capacity(total + 2);
         let mut records = Vec::with_capacity(total);
         let mut invalidations = Vec::with_capacity(total);
         let mut next = block.start;
+
+        if let Some(lease) = lease {
+            parts.push((
+                "lease_fence_guard",
+                serde_json::json!({
+                    "lease_key": serde_json::to_string(&lease.key)
+                        .map_err(|e| StorageError::Backend(e.to_string()))?,
+                    "token": lease.fencing_token.as_str(),
+                    "epoch": lease.epoch,
+                    "now_ms": Utc::now().timestamp_millis(),
+                }),
+            ));
+        }
+
+        let batch_memory_ids: std::collections::HashSet<MemoryId> =
+            ms.iter().map(|m| m.id).collect();
+        let external_ids: std::collections::BTreeSet<String> = all_rels
+            .iter()
+            .flat_map(|r| [r.from, r.to])
+            .filter(|id| !batch_memory_ids.contains(id))
+            .map(|id| hex(&id.0))
+            .collect();
+        parts.push((
+            "batch_endpoint_guard",
+            serde_json::json!({
+                "external_count": external_ids.len(),
+                "external_ids": external_ids,
+            }),
+        ));
 
         for m in ms {
             let mt_label = self
@@ -586,7 +620,7 @@ impl FalkorStorage {
                     StorageError::Backend(format!("bad memory_type {}", m.memory_type))
                 })?;
             let params = self.memory_params(m, next, mt_label);
-            queries.push(self.build_query_text("upsert_memory", &params)?);
+            parts.push(("batch_upsert_memory", params));
             invalidations.push(Invalidation::MemoryUpserted {
                 id: m.id,
                 lsn: next,
@@ -614,7 +648,7 @@ impl FalkorStorage {
                 "recorded_at": r.recorded_at.to_rfc3339(),
                 "lsn": next,
             });
-            queries.push(self.build_query_text("upsert_relationship", &params)?);
+            parts.push(("batch_upsert_relationship", params));
             invalidations.push(Invalidation::RelationshipUpserted {
                 id: r.id,
                 from: r.from,
@@ -631,19 +665,38 @@ impl FalkorStorage {
             next += 1;
         }
 
-        if !queries.is_empty() {
-            let mut pipe = redis::pipe();
-            pipe.atomic();
-            for q in &queries {
-                pipe.cmd("GRAPH.QUERY")
-                    .arg(&self.graph)
-                    .arg(q)
-                    .arg("--compact");
-            }
-            let _: Vec<i64> = pipe
-                .query_async(&mut self.redis.clone())
-                .await
-                .map_err(|e| StorageError::Backend(format!("batch commit failed: {e}")))?;
+        let mut query_params = Vec::new();
+        let mut bodies = Vec::with_capacity(parts.len());
+        for (index, (template, params)) in parts.iter().enumerate() {
+            let (body, mut bound) =
+                self.namespaced_template(template, params, &format!("p{index}"))?;
+            bodies.push(body);
+            query_params.append(&mut bound);
+        }
+        query_params.sort_by(|a, b| a.0.cmp(&b.0));
+        let prefix = query_params
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let body = bodies.join("\nWITH 1 AS __batch_step\n");
+        let text = format!("CYPHER {prefix} WITH 1 AS __batch_step\n{body}\nRETURN 1 AS committed");
+        let mut graph = self.client.select_graph(self.graph.clone());
+        let result = graph
+            .query(text.as_str())
+            .execute()
+            .await
+            .map_err(|e| StorageError::Backend(format!("atomic batch failed: {e}")))?;
+        let committed = result.data.count() > 0;
+        if !committed {
+            return match lease {
+                Some(lease) => Err(StorageError::FencedWriteRejected {
+                    lease_epoch: lease.epoch,
+                }),
+                None => Err(StorageError::Backend(
+                    "atomic batch rejected: relationship endpoint missing".into(),
+                )),
+            };
         }
 
         for inv in invalidations {
@@ -1078,100 +1131,91 @@ impl Storage for FalkorStorage {
         key: &LeaseKey,
         ttl: std::time::Duration,
     ) -> Result<OwnerLease, StorageError> {
-        // Redis: SET NX EX with (epoch = INCR of epoch key) as the token.
-        let key_str = serde_json::to_string(key).unwrap();
-        let redis_key = format!("exocortex:lease:{key_str}");
-        let epoch_key = format!("{redis_key}:epoch");
-        let epoch: u64 = self
-            .redis
-            .clone()
-            .incr(&epoch_key, 1_u64)
-            .await
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
-        let token = format!("{}:{}", self.node_id, epoch);
-        // ST10 (audit): acquisition is ONE atomic command (SET NX EX) — the
-        // old SET NX followed by a separate EXPIRE left an immortal lease
-        // whenever the process died between the two.
-        let ok: Option<String> = redis::Script::new(
-            r#"
-            if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then
-                return ARGV[1]
-            else
-                return nil
-            end
-            "#,
-        )
-        .key(&redis_key)
-        .arg(&token)
-        .arg(ttl.as_secs().max(1) as i64)
-        .invoke_async(&mut self.redis.clone())
-        .await
-        .map_err(|e| StorageError::Backend(e.to_string()))?;
-        if ok.is_none() {
-            return Err(StorageError::Backend("lease held by another node".into()));
-        }
+        let key_str = serde_json::to_string(key)
+            .map_err(|e| StorageError::Backend(format!("serialize lease key: {e}")))?;
         let now = Utc::now();
+        let ttl = chrono::Duration::from_std(ttl)
+            .map_err(|e| StorageError::Backend(format!("invalid lease ttl: {e}")))?;
+        let expires_at = now + ttl;
+        let token = format!(
+            "{}:{}",
+            self.node_id,
+            now.timestamp_nanos_opt()
+                .unwrap_or(now.timestamp_micros() * 1_000)
+        );
+        let rows = self
+            .run_template(
+                "lease_acquire",
+                &serde_json::json!({
+                    "lease_key": key_str,
+                    "token": token,
+                    "now_ms": now.timestamp_millis(),
+                    "expires_at_ms": expires_at.timestamp_millis(),
+                }),
+                false,
+            )
+            .await?;
+        let Some(epoch) = rows.first().and_then(|row| row.first()).and_then(|v| {
+            if let FalkorValue::I64(epoch) = v {
+                u64::try_from(*epoch).ok()
+            } else {
+                None
+            }
+        }) else {
+            return Err(StorageError::Backend("lease held by another node".into()));
+        };
         Ok(OwnerLease {
             key: key.clone(),
             owner_node_id: self.node_id.clone(),
             epoch,
             acquired_at: now,
-            expires_at: now + chrono::Duration::from_std(ttl).unwrap(),
+            expires_at,
             grace_period: crate::trait_::grace_duration(),
             fencing_token: token.into(),
         })
     }
 
     async fn renew_lease(&self, lease: &OwnerLease) -> Result<OwnerLease, StorageError> {
-        let key_str = serde_json::to_string(&lease.key).unwrap();
-        let redis_key = format!("exocortex:lease:{key_str}");
-        // ST10: compare-and-EXPIRE — atomic, so a renew can neither extend a
-        // lease another node just re-acquired nor trust a GET-then-EXPIRE
-        // window.
-        let ttl = (lease.expires_at - lease.acquired_at).to_std().unwrap();
-        let renewed: i64 = redis::Script::new(
-            r#"
-            if redis.call('GET', KEYS[1]) == ARGV[1] then
-                return redis.call('EXPIRE', KEYS[1], ARGV[2])
-            else
-                return -1
-            end
-            "#,
-        )
-        .key(&redis_key)
-        .arg(lease.fencing_token.as_str())
-        .arg(ttl.as_secs().max(1) as i64)
-        .invoke_async(&mut self.redis.clone())
-        .await
-        .map_err(|e| StorageError::Backend(e.to_string()))?;
-        if renewed < 0 {
+        let now = Utc::now();
+        let ttl = lease.expires_at - lease.acquired_at;
+        let expires_at = now + ttl;
+        let rows = self
+            .run_template(
+                "lease_renew",
+                &serde_json::json!({
+                    "lease_key": serde_json::to_string(&lease.key)
+                        .map_err(|e| StorageError::Backend(e.to_string()))?,
+                    "token": lease.fencing_token.as_str(),
+                    "epoch": lease.epoch,
+                    "now_ms": now.timestamp_millis(),
+                    "expires_at_ms": expires_at.timestamp_millis(),
+                }),
+                false,
+            )
+            .await?;
+        if rows.is_empty() {
             return Err(StorageError::Backend("lease lost (token mismatch)".into()));
         }
         Ok(OwnerLease {
-            expires_at: Utc::now() + chrono::Duration::from_std(ttl).unwrap(),
+            acquired_at: now,
+            expires_at,
             ..lease.clone()
         })
     }
 
     async fn release_lease(&self, lease: OwnerLease) -> Result<(), StorageError> {
-        let key_str = serde_json::to_string(&lease.key).unwrap();
-        let redis_key = format!("exocortex:lease:{key_str}");
-        // ST10: compare-and-DELETE — the old GET-then-DEL could delete a
-        // lease another node re-acquired between the two commands.
-        let _: i64 = redis::Script::new(
-            r#"
-            if redis.call('GET', KEYS[1]) == ARGV[1] then
-                return redis.call('DEL', KEYS[1])
-            else
-                return 0
-            end
-            "#,
-        )
-        .key(&redis_key)
-        .arg(lease.fencing_token.as_str())
-        .invoke_async(&mut self.redis.clone())
-        .await
-        .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let _ = self
+            .run_template(
+                "lease_release",
+                &serde_json::json!({
+                    "lease_key": serde_json::to_string(&lease.key)
+                        .map_err(|e| StorageError::Backend(e.to_string()))?,
+                    "token": lease.fencing_token.as_str(),
+                    "epoch": lease.epoch,
+                }),
+                false,
+            )
+            .await?;
         Ok(())
     }
 
@@ -1181,15 +1225,7 @@ impl Storage for FalkorStorage {
         rs: &[Relationship],
         lease: &OwnerLease,
     ) -> Result<Vec<CommitRecord>, StorageError> {
-        // ST5 (audit): the fence gates the LSN allocation itself (atomic
-        // Lua: lease token + TTL must hold for the INCRBY), the batch
-        // commits as ONE MULTI/EXEC unit, and the lease is re-checked after
-        // the commit — a stale owner's rows can no longer land one
-        // round-trip at a time after the pre-flight check.
-        self.check_lease_current(lease).await?;
-        let out = self.upsert_batch_inner(ms, rs, Some(lease)).await?;
-        self.check_lease_current(lease).await?;
-        Ok(out)
+        self.upsert_batch_inner(ms, rs, Some(lease)).await
     }
 
     async fn delete_memory_fenced(
@@ -1197,8 +1233,73 @@ impl Storage for FalkorStorage {
         id: &MemoryId,
         lease: &OwnerLease,
     ) -> Result<CommitRecord, StorageError> {
-        self.check_lease_current(lease).await?;
-        self.delete_memory(id).await
+        let lsn = self.next_lsn().await?;
+        let now = Utc::now();
+        let props_json = match self.get_memory(id).await? {
+            Some(mut m) => {
+                m.valid_until = Some(now);
+                FalkorStorage::props_json(&m, lsn)
+            }
+            None => String::new(),
+        };
+        let parts = [
+            (
+                "lease_fence_guard",
+                serde_json::json!({
+                    "lease_key": serde_json::to_string(&lease.key)
+                        .map_err(|e| StorageError::Backend(e.to_string()))?,
+                    "token": lease.fencing_token.as_str(),
+                    "epoch": lease.epoch,
+                    "now_ms": Utc::now().timestamp_millis(),
+                }),
+            ),
+            (
+                "batch_soft_delete_memory",
+                serde_json::json!({
+                    "id": hex(&id.0),
+                    "now": now.to_rfc3339(),
+                    "lsn": lsn,
+                    "props_json": props_json,
+                }),
+            ),
+        ];
+        let mut params = Vec::new();
+        let mut bodies = Vec::new();
+        for (index, (template, values)) in parts.iter().enumerate() {
+            let (body, mut bound) =
+                self.namespaced_template(template, values, &format!("d{index}"))?;
+            bodies.push(body);
+            params.append(&mut bound);
+        }
+        params.sort_by(|a, b| a.0.cmp(&b.0));
+        let prefix = params
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!(
+            "CYPHER {prefix} WITH 1 AS __delete_step\n{}\nRETURN 1 AS committed",
+            bodies.join("\nWITH 1 AS __delete_step\n")
+        );
+        let mut graph = self.client.select_graph(self.graph.clone());
+        let result = graph
+            .query(text.as_str())
+            .execute()
+            .await
+            .map_err(|e| StorageError::Backend(format!("atomic fenced delete failed: {e}")))?;
+        if result.data.count() == 0 {
+            return Err(StorageError::FencedWriteRejected {
+                lease_epoch: lease.epoch,
+            });
+        }
+        self.publish(Invalidation::MemoryDeleted { id: *id, lsn })
+            .await;
+        Ok(CommitRecord {
+            lsn,
+            committed_at: now,
+            node_id: None,
+            edge_id: None,
+        })
     }
 
     async fn ping(&self) -> Result<(), StorageError> {
@@ -1293,38 +1394,6 @@ impl FalkorStorage {
         self.redis.clone().get(&self.lsn_key).await.unwrap_or(0)
     }
 
-    /// R-C3 fencing check: the lease key must still hold this lease's
-    /// token AND a positive TTL (ST10: an immortal key from an interrupted
-    /// acquire must never pass). A missing key (expiry/release) or a
-    /// different token (re-election bumped the epoch) means the caller is a
-    /// stale owner — reject before any row commits.
-    async fn check_lease_current(&self, lease: &OwnerLease) -> Result<(), StorageError> {
-        let key_str = serde_json::to_string(&lease.key).unwrap();
-        let redis_key = format!("exocortex:lease:{key_str}");
-        let ok: i64 = redis::Script::new(
-            r#"
-            local t = redis.call('GET', KEYS[1])
-            if t == ARGV[1] and redis.call('TTL', KEYS[1]) > 0 then
-                return 1
-            else
-                return 0
-            end
-            "#,
-        )
-        .key(&redis_key)
-        .arg(lease.fencing_token.as_str())
-        .invoke_async(&mut self.redis.clone())
-        .await
-        .map_err(|e| StorageError::Backend(e.to_string()))?;
-        if ok == 1 {
-            Ok(())
-        } else {
-            Err(StorageError::FencedWriteRejected {
-                lease_epoch: lease.epoch,
-            })
-        }
-    }
-
     /// Hex helper exposed for tests.
     pub fn id_hex(id: &MemoryId) -> String {
         hex(&id.0)
@@ -1332,5 +1401,28 @@ impl FalkorStorage {
     /// Reverse hex helper exposed for tests.
     pub fn id_unhex(s: &str) -> Option<MemoryId> {
         unhex(s).map(MemoryId)
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_decode_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_persisted_fingerprint_is_not_missing() {
+        assert_eq!(decode_persisted_fingerprint(&[]).unwrap(), None);
+        for value in [
+            FalkorValue::String("0".repeat(63)),
+            FalkorValue::String(format!("{}zz", "0".repeat(62))),
+            FalkorValue::I64(7),
+        ] {
+            assert!(matches!(
+                decode_persisted_fingerprint(&[vec![value]]),
+                Err(StorageError::CorruptMetadata {
+                    key: "ontology_fingerprint",
+                    ..
+                })
+            ));
+        }
     }
 }

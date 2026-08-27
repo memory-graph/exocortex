@@ -29,6 +29,14 @@ pub enum StorageError {
         /// Fingerprint of the running process.
         runtime: [u8; 32],
     },
+    /// Persisted storage metadata exists but cannot be decoded safely.
+    #[error("corrupt storage metadata `{key}`: {detail}")]
+    CorruptMetadata {
+        /// Stable metadata key.
+        key: &'static str,
+        /// Precise incompatibility/corruption detail.
+        detail: String,
+    },
     /// A write made under a lease that is no longer current (R-C3 fencing
     /// token): the lease expired or was re-acquired by another owner. The
     /// write is rejected before any row commits.

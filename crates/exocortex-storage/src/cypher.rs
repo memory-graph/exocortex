@@ -56,6 +56,36 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         "#,
     });
 
+    // Batch mutations are composed into one GRAPH.QUERY by the Falkor
+    // adapter. They intentionally omit RETURN so a WITH boundary can join
+    // every row mutation into the query engine's single atomic unit.
+    reg!(Template {
+        id: "batch_upsert_memory",
+        read_only: false,
+        required_params: &[
+            "id",
+            "memory_type_label",
+            "props_json",
+            "visibility",
+            "valid_from",
+            "valid_until",
+            "invalidated_by",
+            "recorded_at",
+            "lsn"
+        ],
+        cypher: r#"
+            MERGE (m:Memory {id: $id})
+            SET m.memory_type_label = $memory_type_label,
+                m.visibility        = $visibility,
+                m.valid_from        = $valid_from,
+                m.valid_until       = $valid_until,
+                m.recorded_at       = $recorded_at,
+                m.invalidated_by    = $invalidated_by,
+                m.props_json        = $props_json,
+                m.lsn               = $lsn
+        "#,
+    });
+
     reg!(Template {
         id: "upsert_relationship",
         read_only: false,
@@ -98,6 +128,111 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                                    props_json: $props_json,
                                    lsn: $lsn}]->(b)
             RETURN id(r) AS edge_id
+        "#,
+    });
+
+    reg!(Template {
+        id: "batch_upsert_relationship",
+        read_only: false,
+        required_params: &[
+            "rel_id",
+            "from",
+            "to",
+            "kind_label",
+            "props_json",
+            "visibility",
+            "valid_from",
+            "valid_until",
+            "invalidated_by",
+            "recorded_at",
+            "lsn"
+        ],
+        cypher: r#"
+            MATCH (a:Memory {id: $from}), (b:Memory {id: $to})
+            OPTIONAL MATCH (a)-[old]->(b) WHERE old.id = $rel_id
+            DELETE old
+            WITH a, b
+            CREATE (a)-[r:__KIND_TYPE__ {id: $rel_id,
+                                   kind_label: $kind_label,
+                                   visibility: $visibility,
+                                   valid_from: $valid_from,
+                                   valid_until: $valid_until,
+                                   recorded_at: $recorded_at,
+                                   invalidated_by: $invalidated_by,
+                                   props_json: $props_json,
+                                   lsn: $lsn}]->(b)
+        "#,
+    });
+
+    // Graph-resident leases are the authoritative Falkor fencing state.
+    // Keeping the guard and owner mutation in one GRAPH.QUERY makes the
+    // query engine's atomic transaction the R-C3 linearization point.
+    reg!(Template {
+        id: "lease_acquire",
+        read_only: false,
+        required_params: &["lease_key", "token", "now_ms", "expires_at_ms"],
+        cypher: r#"
+            MERGE (l:_ExocortexLease {lease_key: $lease_key})
+            ON CREATE SET l.epoch = 0, l.token = '', l.expires_at_ms = 0
+            WITH l
+            WHERE l.expires_at_ms <= $now_ms
+            SET l.epoch = l.epoch + 1,
+                l.token = $token,
+                l.expires_at_ms = $expires_at_ms
+            RETURN l.epoch AS epoch
+        "#,
+    });
+
+    reg!(Template {
+        id: "lease_renew",
+        read_only: false,
+        required_params: &["lease_key", "token", "epoch", "now_ms", "expires_at_ms"],
+        cypher: r#"
+            MATCH (l:_ExocortexLease {lease_key: $lease_key})
+            WHERE l.token = $token
+              AND l.epoch = $epoch
+              AND l.expires_at_ms > $now_ms
+            SET l.expires_at_ms = $expires_at_ms
+            RETURN l.epoch AS epoch
+        "#,
+    });
+
+    reg!(Template {
+        id: "lease_release",
+        read_only: false,
+        required_params: &["lease_key", "token", "epoch"],
+        cypher: r#"
+            MATCH (l:_ExocortexLease {lease_key: $lease_key})
+            WHERE l.token = $token AND l.epoch = $epoch
+            SET l.token = '', l.expires_at_ms = 0
+            RETURN l.epoch AS epoch
+        "#,
+    });
+
+    reg!(Template {
+        id: "lease_fence_guard",
+        read_only: false,
+        required_params: &["lease_key", "token", "epoch", "now_ms"],
+        cypher: r#"
+            MATCH (l:_ExocortexLease {lease_key: $lease_key})
+            WHERE l.token = $token
+              AND l.epoch = $epoch
+              AND l.expires_at_ms > $now_ms
+        "#,
+    });
+
+    // Run before any batch mutation. Endpoints supplied by the batch are
+    // excluded by the adapter; every remaining id must already exist or the
+    // pipeline produces no row and therefore performs no writes.
+    reg!(Template {
+        id: "batch_endpoint_guard",
+        read_only: false,
+        required_params: &["external_ids", "external_count"],
+        cypher: r#"
+            OPTIONAL MATCH (endpoint:Memory)
+            WHERE endpoint.id IN $external_ids
+            WITH __batch_step, count(endpoint) AS found
+            WHERE found = $external_count
         "#,
     });
 
@@ -226,6 +361,18 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             WHERE m.valid_until IS NULL
             SET m.valid_until = $now, m.lsn = $lsn, m.props_json = $props_json
             RETURN id(m) AS node_id
+        "#,
+    });
+
+    reg!(Template {
+        id: "batch_soft_delete_memory",
+        read_only: false,
+        required_params: &["id", "now", "lsn", "props_json"],
+        cypher: r#"
+            MATCH (m:Memory {id: $id})
+            SET m.valid_until = $now,
+                m.lsn = $lsn,
+                m.props_json = $props_json
         "#,
     });
 

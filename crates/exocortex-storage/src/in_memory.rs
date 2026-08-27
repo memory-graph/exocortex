@@ -23,6 +23,9 @@ pub struct InMemoryStorage {
 }
 
 struct InMemoryInner {
+    /// Serializes lease turnover with every mutation. A fenced write holds
+    /// this gate from token validation through the staged state swap.
+    mutation_gate: Mutex<()>,
     memories: Mutex<HashMap<MemoryId, Vec<Memory>>>, // history stack per id
     rels: Mutex<HashMap<RelationshipId, Vec<Relationship>>>,
     ontology: std::sync::Arc<exocortex_kernel::Ontology>,
@@ -32,6 +35,14 @@ struct InMemoryInner {
     leases: Mutex<HashMap<LeaseKey, InMemoryLease>>,
     /// Monotonic fencing-epoch counter per lease key (never resets).
     lease_epochs: Mutex<HashMap<LeaseKey, u64>>,
+    #[cfg(test)]
+    fence_checkpoint: Mutex<Option<std::sync::Arc<FenceCheckpoint>>>,
+}
+
+#[cfg(test)]
+struct FenceCheckpoint {
+    reached: std::sync::Arc<std::sync::Barrier>,
+    release: std::sync::Arc<std::sync::Barrier>,
 }
 
 /// Current lease holder entry for the in-memory lease table.
@@ -60,6 +71,9 @@ impl InMemoryStorage {
                 ontology,
                 leases: Default::default(),
                 lease_epochs: Default::default(),
+                mutation_gate: Default::default(),
+                #[cfg(test)]
+                fence_checkpoint: Default::default(),
             }),
             lsn: std::sync::Arc::new(AtomicU64::new(0)),
             feed: tokio::sync::broadcast::channel(4096).0,
@@ -100,6 +114,20 @@ impl InMemoryStorage {
         self.lsn.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    fn set_fence_checkpoint(&self, checkpoint: std::sync::Arc<FenceCheckpoint>) {
+        *self.inner.fence_checkpoint.lock().unwrap() = Some(checkpoint);
+    }
+
+    #[cfg(test)]
+    fn pause_at_fence_checkpoint(&self) {
+        let checkpoint = self.inner.fence_checkpoint.lock().unwrap().take();
+        if let Some(checkpoint) = checkpoint {
+            checkpoint.reached.wait();
+            checkpoint.release.wait();
+        }
+    }
+
     /// R-C3 fencing check: the lease table must still hold this lease's
     /// token and it must be unexpired. Mirrors the Redis-side check in
     /// `FalkorStorage`.
@@ -119,7 +147,7 @@ impl InMemoryStorage {
 
     /// Row write without inverse materialization (the companion path's
     /// terminal, so R-T4 never recurses).
-    async fn upsert_relationship_row(
+    fn upsert_relationship_row_locked(
         &self,
         r: &Relationship,
     ) -> Result<CommitRecord, StorageError> {
@@ -147,45 +175,34 @@ impl InMemoryStorage {
             edge_id: None,
         })
     }
-}
 
-#[async_trait]
-impl Storage for InMemoryStorage {
-    async fn upsert_memory(&self, m: &Memory) -> Result<CommitRecord, StorageError> {
-        let lsn = self.next_lsn();
-        let mut store = self.inner.memories.lock().unwrap();
-        let mut m = m.clone();
-        m.lsn = exocortex_kernel::LSN::new_backend(lsn);
-        let id = m.id;
-        // ST7/ST8 (audit): overwrite in place — one current row per id,
-        // matching the FalkorDB adapter's MERGE and the trait's "current
-        // versions" streaming contract.
-        store.insert(id, vec![m]);
-        drop(store);
-        let _ = self.feed.send(Invalidation::MemoryUpserted { id, lsn });
-        Ok(CommitRecord {
-            lsn,
-            committed_at: Utc::now(),
-            node_id: None,
-            edge_id: None,
-        })
-    }
-    async fn upsert_batch(
+    /// Stage and atomically swap one complete batch. The caller holds
+    /// `mutation_gate`, which also excludes lease turnover for fenced calls.
+    fn upsert_batch_locked(
         &self,
         ms: &[Memory],
         rs: &[Relationship],
-    ) -> Result<Vec<CommitRecord>, StorageError> {
-        // ST6 (audit): all-or-nothing — stage every write (including R-T4
-        // inverse companions) onto cloned maps and swap only when every
-        // row resolved. A mid-batch failure leaves the store untouched.
+    ) -> Result<(Vec<CommitRecord>, Vec<Invalidation>), StorageError> {
         let mut staged_m: HashMap<MemoryId, Vec<Memory>> =
             self.inner.memories.lock().unwrap().clone();
         let mut staged_r: HashMap<RelationshipId, Vec<Relationship>> =
             self.inner.rels.lock().unwrap().clone();
+
+        // A missing endpoint is a per-row failure. Reject before allocating
+        // an LSN or swapping any staged row, matching Falkor's query guard.
+        if let Some(r) = rs.iter().find(|r| {
+            !staged_m.contains_key(&r.from) && !ms.iter().any(|m| m.id == r.from)
+                || !staged_m.contains_key(&r.to) && !ms.iter().any(|m| m.id == r.to)
+        }) {
+            return Err(StorageError::Backend(format!(
+                "relationship {:02x?} endpoint missing",
+                r.id.0
+            )));
+        }
+
         let mut records = Vec::with_capacity(ms.len() + rs.len());
         let mut invalidations = Vec::new();
-        let base_lsn = self.lsn.load(Ordering::SeqCst);
-        let mut next = base_lsn;
+        let mut next = self.lsn.load(Ordering::SeqCst);
         for m in ms {
             next += 1;
             let mut m = m.clone();
@@ -220,7 +237,6 @@ impl Storage for InMemoryStorage {
                 node_id: None,
                 edge_id: None,
             });
-            // R-T4: write `k'(b,a)` in the same batch.
             if let Some(mut inv) = exocortex_kernel::materialize_inverse(&self.inner.ontology, &r) {
                 next += 1;
                 inv.lsn = exocortex_kernel::LSN::new_backend(next);
@@ -240,26 +256,46 @@ impl Storage for InMemoryStorage {
                 });
             }
         }
-        // Publish the LSN frontier, then swap staged maps in atomically.
         self.lsn.store(next, Ordering::SeqCst);
         *self.inner.memories.lock().unwrap() = staged_m;
         *self.inner.rels.lock().unwrap() = staged_r;
-        for inv in invalidations {
-            let _ = self.feed.send(inv);
-        }
-        Ok(records)
+        Ok((records, invalidations))
     }
-    async fn delete_memory(&self, id: &MemoryId) -> Result<CommitRecord, StorageError> {
+
+    fn delete_memory_locked(&self, id: &MemoryId) -> CommitRecord {
         let lsn = self.next_lsn();
+        let now = Utc::now();
         let mut store = self.inner.memories.lock().unwrap();
         if let Some(h) = store.get_mut(id) {
             if let Some(last) = h.last_mut() {
-                last.valid_until = Some(Utc::now());
+                last.valid_until = Some(now);
                 last.lsn = exocortex_kernel::LSN::new_backend(lsn);
             }
         }
+        CommitRecord {
+            lsn,
+            committed_at: now,
+            node_id: None,
+            edge_id: None,
+        }
+    }
+}
+
+#[async_trait]
+impl Storage for InMemoryStorage {
+    async fn upsert_memory(&self, m: &Memory) -> Result<CommitRecord, StorageError> {
+        let _gate = self.inner.mutation_gate.lock().unwrap();
+        let lsn = self.next_lsn();
+        let mut store = self.inner.memories.lock().unwrap();
+        let mut m = m.clone();
+        m.lsn = exocortex_kernel::LSN::new_backend(lsn);
+        let id = m.id;
+        // ST7/ST8 (audit): overwrite in place — one current row per id,
+        // matching the FalkorDB adapter's MERGE and the trait's "current
+        // versions" streaming contract.
+        store.insert(id, vec![m]);
         drop(store);
-        let _ = self.feed.send(Invalidation::MemoryDeleted { id: *id, lsn });
+        let _ = self.feed.send(Invalidation::MemoryUpserted { id, lsn });
         Ok(CommitRecord {
             lsn,
             committed_at: Utc::now(),
@@ -267,8 +303,34 @@ impl Storage for InMemoryStorage {
             edge_id: None,
         })
     }
+    async fn upsert_batch(
+        &self,
+        ms: &[Memory],
+        rs: &[Relationship],
+    ) -> Result<Vec<CommitRecord>, StorageError> {
+        let (records, invalidations) = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            self.upsert_batch_locked(ms, rs)?
+        };
+        for inv in invalidations {
+            let _ = self.feed.send(inv);
+        }
+        Ok(records)
+    }
+    async fn delete_memory(&self, id: &MemoryId) -> Result<CommitRecord, StorageError> {
+        let record = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            self.delete_memory_locked(id)
+        };
+        let _ = self.feed.send(Invalidation::MemoryDeleted {
+            id: *id,
+            lsn: record.lsn,
+        });
+        Ok(record)
+    }
     async fn upsert_relationship(&self, r: &Relationship) -> Result<CommitRecord, StorageError> {
-        let rec = self.upsert_relationship_row(r).await?;
+        let _gate = self.inner.mutation_gate.lock().unwrap();
+        let rec = self.upsert_relationship_row_locked(r)?;
         // R-T4: write `k'(b,a)` in the same operation. Skipped when the
         // companion is already current, so repeated writes are idempotent.
         if let Some(inv) = exocortex_kernel::materialize_inverse(&self.inner.ontology, r) {
@@ -281,12 +343,13 @@ impl Storage for InMemoryStorage {
                 .and_then(|h| h.last())
                 .is_some_and(|cur| cur.valid_until.is_none());
             if !already_current {
-                self.upsert_relationship_row(&inv).await?;
+                self.upsert_relationship_row_locked(&inv)?;
             }
         }
         Ok(rec)
     }
     async fn delete_relationship(&self, id: &RelationshipId) -> Result<CommitRecord, StorageError> {
+        let _gate = self.inner.mutation_gate.lock().unwrap();
         let lsn = self.next_lsn();
         let mut store = self.inner.rels.lock().unwrap();
         // ST11 (audit): publish the invalidation like every other write —
@@ -450,6 +513,7 @@ impl Storage for InMemoryStorage {
         key: &LeaseKey,
         ttl: std::time::Duration,
     ) -> Result<OwnerLease, StorageError> {
+        let _gate = self.inner.mutation_gate.lock().unwrap();
         let now = Utc::now();
         let mut leases = self.inner.leases.lock().unwrap();
         if let Some(held) = leases.get(key) {
@@ -487,14 +551,15 @@ impl Storage for InMemoryStorage {
         })
     }
     async fn renew_lease(&self, l: &OwnerLease) -> Result<OwnerLease, StorageError> {
+        let _gate = self.inner.mutation_gate.lock().unwrap();
         let mut leases = self.inner.leases.lock().unwrap();
+        let now = Utc::now();
         match leases.get_mut(&l.key) {
-            Some(held)
-                if held.token == l.fencing_token.as_str() && held.expires_at > Utc::now() =>
-            {
+            Some(held) if held.token == l.fencing_token.as_str() && held.expires_at > now => {
                 let ttl = l.expires_at - l.acquired_at;
-                held.expires_at = Utc::now() + ttl;
+                held.expires_at = now + ttl;
                 Ok(OwnerLease {
+                    acquired_at: now,
                     expires_at: held.expires_at,
                     ..l.clone()
                 })
@@ -503,6 +568,7 @@ impl Storage for InMemoryStorage {
         }
     }
     async fn release_lease(&self, l: OwnerLease) -> Result<(), StorageError> {
+        let _gate = self.inner.mutation_gate.lock().unwrap();
         let mut leases = self.inner.leases.lock().unwrap();
         if leases
             .get(&l.key)
@@ -519,32 +585,33 @@ impl Storage for InMemoryStorage {
         rs: &[Relationship],
         lease: &OwnerLease,
     ) -> Result<Vec<CommitRecord>, StorageError> {
-        // ST5 (audit): the fencing check and the commit are one unit on
-        // the double — the check runs under the lease-table lock, then the
-        // staged batch swaps in atomically (no per-row await windows).
-        let current = {
-            let leases = self.inner.leases.lock().unwrap();
-            matches!(
-                leases.get(&lease.key),
-                Some(held)
-                    if held.token == lease.fencing_token.as_str()
-                        && held.expires_at > Utc::now()
-            )
+        let (records, invalidations) = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            self.check_lease_current(lease)?;
+            #[cfg(test)]
+            self.pause_at_fence_checkpoint();
+            self.upsert_batch_locked(ms, rs)?
         };
-        if !current {
-            return Err(StorageError::FencedWriteRejected {
-                lease_epoch: lease.epoch,
-            });
+        for inv in invalidations {
+            let _ = self.feed.send(inv);
         }
-        self.upsert_batch(ms, rs).await
+        Ok(records)
     }
     async fn delete_memory_fenced(
         &self,
         id: &MemoryId,
         lease: &OwnerLease,
     ) -> Result<CommitRecord, StorageError> {
-        self.check_lease_current(lease)?;
-        self.delete_memory(id).await
+        let record = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            self.check_lease_current(lease)?;
+            self.delete_memory_locked(id)
+        };
+        let _ = self.feed.send(Invalidation::MemoryDeleted {
+            id: *id,
+            lsn: record.lsn,
+        });
+        Ok(record)
     }
     async fn subscribe_invalidations(
         &self,
@@ -585,5 +652,124 @@ pub fn org_visibility_ctx(org: &str, user: &str) -> VisibilityContext {
         project_ids: Default::default(),
         team_ids: Default::default(),
         max_visibility: Visibility::Org,
+    }
+}
+
+#[cfg(test)]
+mod atomic_fence_tests {
+    use super::*;
+    use exocortex_kernel::{MemoryContext, Provenance, LSN};
+
+    fn memory() -> Memory {
+        Memory {
+            id: MemoryId::new_v7(),
+            memory_type: 0,
+            title: "atomic fence".into(),
+            content: "probe".into(),
+            summary: None,
+            tags: Default::default(),
+            visibility: Visibility::Org,
+            provenance: Provenance::Asserted {
+                author: "test".into(),
+                producer_kind: None,
+            },
+            context: MemoryContext {
+                timestamp: Utc::now(),
+                project_id: None,
+                project_path: None,
+                team_id: None,
+                tenant_id: None,
+                session_id: None,
+                user_id: None,
+                created_by: None,
+                files_involved: Default::default(),
+                languages: Default::default(),
+                frameworks: Default::default(),
+                technologies: Default::default(),
+                git_commit: None,
+                git_branch: None,
+                working_directory: None,
+                entities: Default::default(),
+                additional_metadata: serde_json::Value::Null,
+            },
+            importance: exocortex_kernel::memory::F01::new(0.5).unwrap(),
+            confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
+            effectiveness: None,
+            usage_count: 0,
+            valid_from: Utc::now(),
+            valid_until: None,
+            recorded_at: Utc::now(),
+            invalidated_by: None,
+            embedding: None,
+            lsn: LSN::new_local(0),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lease_turnover_waits_for_fenced_commit_linearization_point() {
+        let ontology = std::sync::Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = InMemoryStorage::new(ontology);
+        let key = LeaseKey::Cleanup { org: "org".into() };
+        let old = storage
+            .acquire_lease(&key, std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        let reached = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        storage.set_fence_checkpoint(std::sync::Arc::new(FenceCheckpoint {
+            reached: reached.clone(),
+            release: release.clone(),
+        }));
+
+        let row = memory();
+        let old_writer = {
+            let storage = storage.clone();
+            let row = row.clone();
+            let old = old.clone();
+            tokio::spawn(async move { storage.upsert_batch_fenced(&[row], &[], &old).await })
+        };
+        tokio::task::spawn_blocking(move || reached.wait())
+            .await
+            .unwrap();
+
+        // Expiry becomes observable while the old writer is paused after
+        // validation. A replacement acquisition must still wait for the
+        // mutation gate; otherwise it can become owner before the old row
+        // commits.
+        storage
+            .inner
+            .leases
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .expires_at = Utc::now() - chrono::Duration::seconds(1);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let replacement = storage.clone();
+        let replacement_key = key.clone();
+        tokio::spawn(async move {
+            let result = replacement
+                .acquire_lease(&replacement_key, std::time::Duration::from_secs(60))
+                .await;
+            let _ = tx.send(result);
+        });
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "lease turnover crossed the fenced commit boundary"
+        );
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        old_writer.await.unwrap().unwrap();
+        let new = rx.await.unwrap().unwrap();
+        assert!(new.epoch > old.epoch);
+        assert!(storage.get_memory(&row.id).await.unwrap().is_some());
     }
 }

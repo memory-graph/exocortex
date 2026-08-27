@@ -106,18 +106,9 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> Result<()> {
 /// §2.1: the storage suite against the double, plus the live Falkor
 /// integration suite when FALKOR_URL is present.
 fn storage_conformance() -> Result<()> {
-    run(
-        &[
-            "test",
-            "--workspace",
-            "--features",
-            "exocortex-adapter-sdk/testing,integration",
-            "-p",
-            "exocortex-storage",
-        ],
-        &[],
-    )?;
-    if std::env::var("FALKOR_URL").is_ok() {
+    run(&["test", "-p", "exocortex-storage"], &[])?;
+    println!("storage-conformance: in-memory suite PASS");
+    if std::env::var("FALKOR_URL").is_ok_and(|url| !url.is_empty()) {
         println!("storage-conformance: live Falkor suite (FALKOR_URL set)");
         run(
             &[
@@ -127,14 +118,19 @@ fn storage_conformance() -> Result<()> {
                 "--features",
                 "integration",
                 "--test",
-                "integration_live",
+                "integration",
+                "--test",
+                "fencing_live",
             ],
             &[],
         )?;
+        println!("storage-conformance: live Falkor suite PASS");
     } else {
-        println!("storage-conformance: FALKOR_URL unset — live suite skipped (loudly)");
+        println!(
+            "storage-conformance: live Falkor suite UNEXECUTED — FALKOR_URL is unset or empty"
+        );
     }
-    println!("storage-conformance ok");
+    println!("storage-conformance: available suites complete");
     Ok(())
 }
 
