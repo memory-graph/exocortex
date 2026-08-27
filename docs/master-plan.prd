@@ -168,6 +168,8 @@ each step (88 tests at completion).
 | R6-B30-25 | PRD §23 #25: executable kernel-name absence and omit-dev-pack link failure | Codex | Done — production entrypoint requires the pack-owned link anchor; kernel purity builds packless and linked fixtures and verifies the former fails on the unresolved anchor |
 | R6-A1 | Advisory test quality and cleanup (A01-A08) | Codex | Done — every advisory has executable or focused-cleanup evidence below |
 | R6-Q1 | Evidence R6-U01 through R6-U04 and promote confirmed defects | Codex | Done — U01/U02 were promoted and fixed; U03/U04 have authoritative safe dispositions and executable evidence below |
+| R6-B31 | Scope derived session-grouping nodes so project-visible structural rows survive fail-closed visibility filtering without crossing project boundaries | Codex | In progress — promoted from the mandatory workspace-test failure in `standalone_readback::edges_and_grouping_readable_dangling_edge_harmless` |
+| R6-B32 | Fail backend-client startup when the mandatory initial authenticated cache hydration fails | Codex | In progress — promoted after mandatory-gate inspection found the hydration result discarded before MCP readiness |
 
 ### Round 6 item evidence
 
@@ -225,6 +227,8 @@ each step (88 tests at completion).
 | R6-U04 | **Verified public contract and Done without breaking change** — `intern_name` is an exported function from the published `exocortex-ingest` library and may be used downstream even though the internal extractor field was dead; the public function/signature remains intact while only the unused owned interner was removed | public API inspection plus successful `cargo doc --no-deps -p exocortex-ingest`; R6-A06 entity regressions |
 | R6-A02 | **Done** — organization-backup verification treats relationship iteration order as unspecified and asserts restoration by stable relationship identity after deliberately reversing the returned rows | server `org_round_trip_is_byte_faithful_across_storage_instances` |
 | R6-A08 | **Done** — removed filename-only path banners from executable and protocol sources while preserving comments that carry an invariant or rationale | focused source scan `rg '^// (crates|xtask|proto|scripts)/[A-Za-z0-9_./-]+\.(rs|proto|sh)$'` returns no matches; formatting, clippy, and `proto-sync` validate the cleanup |
+| R6-B31 | **In progress** — grouping nodes claim Project visibility but currently omit the authoritative project identifier, so the corrected traversal visibility gate hides the structural node even from an authorized project member | mandatory workspace-test regression identified before release closure; implementation and focused evidence pending |
+| R6-B32 | **In progress** — `exocortex-mcp-client` awaits initial backend hydration but discards its error, allowing MCP readiness against an unhydrated empty cache after backend failure | mandatory-gate source inspection; implementation and focused evidence pending |
 
 ## Done
 
