@@ -12,6 +12,16 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 
+extern "C" {
+    fn exocortex_required_ontology_pack_anchor();
+}
+
+fn require_linked_ontology_pack() {
+    // SAFETY: the shipped ontology pack exports this no-argument anchor. It
+    // has no inputs, output, or mutable state; its only purpose is linkage.
+    unsafe { exocortex_required_ontology_pack_anchor() }
+}
+
 /// Node deployment mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Mode {
@@ -115,7 +125,9 @@ fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
-    // Force-link the pack so its inventory registration runs in this binary.
+    // Refuse to link a production server with no ontology pack (§23 #25), then
+    // force-link the pack's inventory registration.
+    require_linked_ontology_pack();
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
     let ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
     if args.verify_rules {

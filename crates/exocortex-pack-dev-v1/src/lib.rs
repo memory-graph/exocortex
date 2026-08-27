@@ -6,6 +6,12 @@
 
 use exocortex_kernel::pack;
 
+/// Link anchor consumed by production entrypoints through the pack-agnostic
+/// kernel contract. Removing this crate from the link leaves the symbol
+/// unresolved, so a packless binary cannot be produced accidentally.
+#[no_mangle]
+pub extern "C" fn exocortex_required_ontology_pack_anchor() {}
+
 pack! {
     name: "exocortex-pack-dev-v1",
     version: "1.0.0",

@@ -383,7 +383,64 @@ fn kernel_purity() -> Result<()> {
             violations.join("; ")
         );
     }
-    println!("kernel-purity ok: kernel pure; SDK wire-only; worker kernel-free");
+    verify_pack_link_contract()?;
+    println!(
+        "kernel-purity ok: kernel pure; SDK wire-only; worker kernel-free; pack omission fails linking"
+    );
+    Ok(())
+}
+
+/// §23 #25: the production pack requirement is a linker contract, not merely
+/// a runtime inventory check. Build two tiny binaries against the current
+/// sources: the packless one must fail to link and the pack-linked one must
+/// succeed.
+fn verify_pack_link_contract() -> Result<()> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    let fixture = root.join("target/xtask-pack-link-contract");
+    std::fs::create_dir_all(fixture.join("src"))?;
+    let kernel = root.join("crates/exocortex-kernel");
+    let pack = root.join("crates/exocortex-pack-dev-v1");
+    let manifest = format!(
+        "[workspace]\n\n[package]\nname = \"pack-link-contract\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\nexocortex-kernel = {{ path = {:?} }}\nexocortex-pack-dev-v1 = {{ path = {:?}, optional = true }}\n\n[features]\nwith-pack = [\"dep:exocortex-pack-dev-v1\"]\n\n[[bin]]\nname = \"pack-link-contract\"\npath = \"src/main.rs\"\n",
+        kernel, pack
+    );
+    std::fs::write(fixture.join("Cargo.toml"), manifest)?;
+    std::fs::copy(root.join("Cargo.lock"), fixture.join("Cargo.lock"))?;
+    std::fs::write(
+        fixture.join("src/main.rs"),
+        "extern \"C\" { fn exocortex_required_ontology_pack_anchor(); }\nfn main() {\n    #[cfg(feature = \"with-pack\")]\n    let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def());\n    // SAFETY: the optional pack supplies this inert linkage anchor.\n    unsafe { exocortex_required_ontology_pack_anchor() }\n}\n",
+    )?;
+
+    let target = fixture.join("target");
+    let build = |with_pack: bool| -> Result<std::process::Output> {
+        let mut command = std::process::Command::new(cargo());
+        command
+            .args(["build", "--manifest-path"])
+            .arg(fixture.join("Cargo.toml"))
+            .args(["--target-dir"])
+            .arg(&target)
+            .arg("--offline");
+        if with_pack {
+            command.args(["--features", "with-pack"]);
+        }
+        Ok(command.output()?)
+    };
+    let omitted = build(false)?;
+    anyhow::ensure!(
+        !omitted.status.success(),
+        "pack-link contract FAILED: packless fixture linked successfully"
+    );
+    let omitted_stderr = String::from_utf8_lossy(&omitted.stderr);
+    anyhow::ensure!(
+        omitted_stderr.contains("exocortex_required_ontology_pack_anchor"),
+        "packless fixture failed for the wrong reason: {omitted_stderr}"
+    );
+    let linked = build(true)?;
+    anyhow::ensure!(
+        linked.status.success(),
+        "pack-link contract FAILED with dev-v1 linked: {}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
     Ok(())
 }
 
