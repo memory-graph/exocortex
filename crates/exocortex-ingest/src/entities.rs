@@ -98,8 +98,6 @@ static TABLE: Lazy<Vec<(&'static str, RegexSet)>> = Lazy::new(|| {
 #[derive(Clone)]
 pub struct EntityExtractor {
     org_id: String,
-    #[allow(dead_code)] // interner hook ships for R-M4 parity; wired at M7
-    interner: std::sync::Arc<std::sync::Mutex<Rodeo>>,
 }
 
 impl EntityExtractor {
@@ -107,7 +105,6 @@ impl EntityExtractor {
     pub fn new(org_id: &str) -> Self {
         Self {
             org_id: org_id.to_string(),
-            interner: std::sync::Arc::new(std::sync::Mutex::new(Rodeo::new())),
         }
     }
 

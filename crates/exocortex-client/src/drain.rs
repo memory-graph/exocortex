@@ -16,7 +16,7 @@ use exocortex_wire::ingest::v1::{
 };
 use tonic::transport::Channel;
 
-use crate::wal::{Wal, WalEntry, WalState};
+use crate::wal::{Wal, WalEntry};
 
 /// The producer id every session-wrapup batch carries.
 pub const PRODUCER_ID: &str = "session-wrapup";
@@ -360,11 +360,4 @@ pub async fn drain_all(
             }
         }
     }
-}
-
-/// Keep the unused-import lint honest for WalState (referenced in doc tests
-/// of the state machine).
-#[allow(dead_code)]
-fn _state_witness(s: WalState) -> bool {
-    s == WalState::Pending
 }
