@@ -218,6 +218,14 @@ impl Wal {
             .collect()
     }
 
+    /// SR-PRD F2: fetch one entry by its local LSN — the live write-back
+    /// reads back exactly what was appended, through the same materialize
+    /// path boot seeding uses (one implementation, no drift).
+    pub fn entry(&self, local_lsn: u64) -> Option<WalEntry> {
+        let raw = self.tree.get(local_lsn.to_be_bytes()).ok().flatten()?;
+        decode_entry(&raw).ok()
+    }
+
     /// D5 `--tail-audit`: the N most recent entries (newest first),
     /// pending + settled, with the fields a developer scanning "did my
     /// wrapup fire?" needs. Undecodable entries are listed by LSN rather

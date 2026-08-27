@@ -785,6 +785,51 @@ impl LocalCache {
         }
     }
 
+    /// SR-PRD F2 (docs/bug-prd-standalone-readback.md): apply one
+    /// offline batch to the served snapshot in a SINGLE copy-on-write
+    /// publish — materialized rows + edges inserted, the local WAL
+    /// frontier stamped in the same swap (`advance_local_lsn` alone
+    /// bumps the counter; this makes the rows readable). Auto-creates
+    /// the org graph so a first write can never be silently dropped,
+    /// though standalone boot publishes the (possibly empty) seed graph
+    /// first (F3). Stale LSNs are ignored — boot re-seeding races no one.
+    pub fn apply_local(
+        &self,
+        org: &str,
+        memories: &[Memory],
+        relationships: &[Relationship],
+        local_lsn: u64,
+    ) {
+        let g = self
+            .graphs
+            .entry(org.into())
+            .or_insert_with(|| Arc::new(ArcSwap::from_pointee(GraphSnapshot::empty())))
+            .clone();
+        let cur = g.load_full();
+        if local_lsn <= cur.last_local_lsn {
+            return;
+        }
+        let mut next = clone_snapshot(&cur);
+        for m in memories {
+            next.insert_memory(m.clone());
+        }
+        for r in relationships {
+            next.insert_relationship(r.clone());
+        }
+        next.last_local_lsn = local_lsn;
+        let delta = next.est_bytes.abs_diff(cur.est_bytes);
+        {
+            let mut tq = self.tq.lock();
+            if next.est_bytes >= cur.est_bytes {
+                tq.bytes += delta;
+            } else {
+                tq.bytes = tq.bytes.saturating_sub(delta);
+            }
+        }
+        g.store(Arc::new(next));
+        self.admit(&org.into());
+    }
+
     /// Submit a writer message (tests + client wiring).
     pub async fn submit(&self, w: CacheWrite) {
         let _ = self.writer.send(w).await;

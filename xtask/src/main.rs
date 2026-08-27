@@ -165,6 +165,9 @@ fn dead_enforcement() -> Result<()> {
         ),
         ("drain_all", "crates/exocortex-client/src/main.rs"),
         ("advance_local_lsn", "crates/exocortex-client/src/mcp.rs"),
+        // SR-PRD F2: the offline write path must publish into the served
+        // snapshot (advance_local_lsn is only the LSN-only degrade path).
+        ("apply_local", "crates/exocortex-client/src/mcp.rs"),
     ];
     for (name, witness) in checks {
         anyhow::ensure!(

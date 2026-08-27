@@ -403,9 +403,31 @@ impl ExocortexMcp {
         let local_lsn = wal
             .append_batch_full(&session_id, drafts, memory_ids, batch_id, draft_keys, tags)
             .map_err(|e| json_error("wal-error", e.to_string()))?;
-        // CL6 (audit): publish the WAL frontier into the served snapshot so
-        // read-your-writes can observe it (R-M7).
-        self.cache.advance_local_lsn(&self.vc.org_id, local_lsn);
+        // SR-PRD F2: read-your-writes — publish the materialized batch
+        // into the served snapshot (ONE copy-on-write swap that also
+        // stamps the R-M7 local LSN). Read back through the SAME
+        // materializer boot seeding uses; cross-batch edge targets
+        // resolve against the served graph. Degrades to the CL6
+        // LSN-only advance if the entry cannot be read back — logged,
+        // never failing the ack; the WAL remains the source of truth.
+        match wal.entry(local_lsn) {
+            Some(entry) => {
+                let rows = crate::materialize::materialize_entry(&self.ontology, &entry, &|id| {
+                    self.cache
+                        .get_memory(&self.org, id, &self.vc)
+                        .map(|m| (m.memory_type, m.visibility))
+                });
+                if !rows.dropped_edges.is_empty() {
+                    tracing::warn!(?rows.dropped_edges, "offline edges not served");
+                }
+                self.cache
+                    .apply_local(&self.org, &rows.memories, &rows.edges, local_lsn);
+            }
+            None => {
+                tracing::warn!("wal entry {local_lsn} unreadable after append; advancing LSN only");
+                self.cache.advance_local_lsn(&self.vc.org_id, local_lsn);
+            }
+        }
         #[derive(Serialize)]
         struct OfflineAck {
             local_lsns: Vec<u64>,
