@@ -19,8 +19,8 @@ use smol_str::SmolStr;
 use tokio::sync::mpsc;
 use tracing::{info, instrument, warn};
 
-use exocortex_kernel::{MemoryId, Provenance, RelationshipId};
-use exocortex_storage::{LeaseKey, RegionKey, Storage};
+use exocortex_kernel::{Memory, MemoryId, Provenance, Relationship, RelationshipId};
+use exocortex_storage::{FencedRestore, LeaseKey, RegionKey, Storage};
 
 use mcr2::{
     compute_sparsity, effective_strength, GraphSparsity, MCR2Engine, MCR2Value, MemoryWithEmbedding,
@@ -92,6 +92,54 @@ pub enum PruneReason {
     LowValue,
 }
 
+#[derive(Default)]
+struct CycleJournal {
+    memories: std::collections::BTreeMap<MemoryId, Memory>,
+    relationships: std::collections::BTreeMap<RelationshipId, Relationship>,
+    created_memories: std::collections::BTreeSet<MemoryId>,
+    created_relationships: std::collections::BTreeSet<RelationshipId>,
+}
+
+impl CycleJournal {
+    fn record_memory(&mut self, memory: &Memory) {
+        if !self.created_memories.contains(&memory.id) {
+            self.memories
+                .entry(memory.id)
+                .or_insert_with(|| memory.clone());
+        }
+    }
+
+    fn record_relationship(&mut self, relationship: &Relationship) {
+        if !self.created_relationships.contains(&relationship.id) {
+            self.relationships
+                .entry(relationship.id)
+                .or_insert_with(|| relationship.clone());
+        }
+    }
+
+    fn create_relationship(&mut self, id: RelationshipId) {
+        if !self.relationships.contains_key(&id) {
+            self.created_relationships.insert(id);
+        }
+    }
+
+    fn restore(&self) -> FencedRestore {
+        FencedRestore {
+            memories: self.memories.values().cloned().collect(),
+            relationships: self.relationships.values().cloned().collect(),
+            created_memories: self.created_memories.iter().copied().collect(),
+            created_relationships: self.created_relationships.iter().copied().collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.memories.is_empty()
+            && self.relationships.is_empty()
+            && self.created_memories.is_empty()
+            && self.created_relationships.is_empty()
+    }
+}
+
 /// The Dreams engine: queue-fed, lease-gated, per-region.
 pub struct DreamsEngine<S: Storage> {
     /// Durable storage (data + leases).
@@ -127,6 +175,7 @@ pub struct DreamsEngine<S: Storage> {
     pub node_id: SmolStr,
     /// Discovery proposals awaiting `accept_discovery` (R-Dr1).
     pub discoveries: DashMap<uuid::Uuid, Discovery>,
+    cycle_fault_after: Option<usize>,
 }
 
 impl<S: Storage + 'static> DreamsEngine<S> {
@@ -160,7 +209,16 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             rx_fire: tokio::sync::Mutex::new(rx_fire),
             node_id,
             discoveries: DashMap::new(),
+            cycle_fault_after: None,
         }
+    }
+
+    /// Inject a failure after the specified owner mutation. This exercises
+    /// crash compensation against both the double and live backend.
+    #[doc(hidden)]
+    pub fn with_cycle_fault_after(mut self, mutation: usize) -> Self {
+        self.cycle_fault_after = Some(mutation);
+        self
     }
 
     /// Record a write; fire when the predicate trips (§12.2 transport is
@@ -257,6 +315,32 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         lease: &exocortex_storage::OwnerLease,
         region: &RegionKey,
     ) -> anyhow::Result<ConsolidationResult> {
+        let mut journal = CycleJournal::default();
+        let outcome = self
+            .consolidate_under_tracked(lease, region, &mut journal)
+            .await;
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                if !journal.is_empty() {
+                    self.rollback(&journal, lease).await.map_err(|rollback| {
+                        anyhow::anyhow!(
+                            "cycle failed ({error}); atomic restore failed ({rollback})"
+                        )
+                    })?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn consolidate_under_tracked(
+        &self,
+        lease: &exocortex_storage::OwnerLease,
+        region: &RegionKey,
+        journal: &mut CycleJournal,
+    ) -> anyhow::Result<ConsolidationResult> {
+        let mut mutations = 0usize;
         let anchors = self.select_anchors(region).await?;
         // IN5 (audit): a region with fewer than two anchors cannot be
         // scored — that is a no-op cycle, not an error (erroring here
@@ -304,7 +388,11 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let candidates = engine.identify_merge_candidates(&anchors);
         for c in candidates.iter().take(32) {
             if c.cosine_similarity >= 0.92 {
-                self.merge(&mut res, c, lease).await?;
+                let merged_before = res.merged.len();
+                self.merge(&mut res, c, lease, region, journal).await?;
+                if res.merged.len() > merged_before {
+                    self.mutation_checkpoint(&mut mutations)?;
+                }
             }
         }
         // §12.1 step 4 ABSTRACT (informational in v1): the PRD names the
@@ -326,8 +414,11 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 }
             }
         }
+        self.strengthen(&mut res, region, lease, journal).await?;
+        if !res.strengthened.is_empty() {
+            self.mutation_checkpoint(&mut mutations)?;
+        }
         for a in &anchors {
-            self.strengthen(&mut res, region, lease).await?;
             self.prune(&mut res, a).await?;
         }
         res.memories_output = (res.memories_input as usize - res.merged.len()).max(0) as u32;
@@ -341,8 +432,11 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             .filter(|a| !res.merged.contains(&a.id))
             .cloned()
             .collect();
-        self.write_similar_edges(&mut res, &survivors, lease)
+        self.write_similar_edges(&mut res, &survivors, lease, journal)
             .await?;
+        if !res.similar_edges.is_empty() {
+            self.mutation_checkpoint(&mut mutations)?;
+        }
 
         // Re-score with the post-cycle set (merged anchors removed).
         let remaining: Vec<MemoryWithEmbedding> = anchors
@@ -375,7 +469,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                     "MCR2 degraded {} -> {} - rolling back",
                     res.mcr2_before.delta_r, res.mcr2_after.delta_r
                 );
-                self.rollback(&res, lease).await?;
+                self.rollback(journal, lease).await?;
             }
         }
         if res.sparsity_after.hairball_fraction
@@ -385,6 +479,14 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         }
         self.write_audit(&res).await?;
         Ok(res)
+    }
+
+    fn mutation_checkpoint(&self, mutations: &mut usize) -> anyhow::Result<()> {
+        *mutations += 1;
+        if self.cycle_fault_after == Some(*mutations) {
+            anyhow::bail!("injected cycle failure after mutation {mutations}");
+        }
+        Ok(())
     }
 
     /// Rank regional memories by recency decay; take top 32 (§12.5 step 3),
@@ -397,7 +499,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             // IN1 (audit): the write set must be a subset of what the held
             // lease covers — scope by the region's org and project too,
             // not just memory_type.
-            if !in_region(&m, region) {
+            if !in_region(&m, region) || m.valid_until.is_some() {
                 continue;
             }
             if let Some(emb) = &m.embedding {
@@ -430,7 +532,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let mut edges = Vec::new();
         let mut ms = self.storage.stream_all_memories().await;
         while let Some(Ok(m)) = ms.next().await {
-            if !in_region(&m, region) {
+            if !in_region(&m, region) || m.valid_until.is_some() {
                 continue; // IN1: sparsity measures the region, not the graph
             }
             nodes.push((m.id, m.memory_type));
@@ -440,7 +542,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             nodes.iter().map(|(id, _)| *id).collect();
         let mut rs = self.storage.stream_all_relationships().await;
         while let Some(Ok(r)) = rs.next().await {
-            if members.contains(&r.from) && members.contains(&r.to) {
+            if r.valid_until.is_none() && members.contains(&r.from) && members.contains(&r.to) {
                 edges.push((r.from, r.to, r.kind.0, 0u64, r.properties.confidence));
             }
         }
@@ -456,25 +558,92 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         res: &mut ConsolidationResult,
         c: &mcr2::MergeCandidate,
         lease: &exocortex_storage::OwnerLease,
+        region: &RegionKey,
+        journal: &mut CycleJournal,
     ) -> anyhow::Result<()> {
         use futures::StreamExt;
         let mut newer = None;
+        let mut survivor_live = false;
         let mut ms = self.storage.stream_all_memories().await;
         while let Some(Ok(m)) = ms.next().await {
-            if m.id == c.b {
+            if m.id == c.a && m.valid_until.is_none() {
+                survivor_live = true;
+            }
+            if m.id == c.b && m.valid_until.is_none() {
                 newer = Some(m);
-                break;
             }
         }
         drop(ms);
-        if let Some(mut m) = newer {
-            m.valid_until = Some(chrono::Utc::now());
-            m.invalidated_by = Some(c.a);
-            self.storage
-                .upsert_batch_fenced(&[m], &[], lease)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            res.merged.push(c.b);
+        if survivor_live {
+            if let Some(mut m) = newer {
+                let now = chrono::Utc::now();
+                journal.record_memory(&m);
+                let mut region_members = std::collections::HashSet::new();
+                let mut memories = self.storage.stream_all_memories().await;
+                while let Some(row) = memories.next().await {
+                    let memory = row?;
+                    if in_region(&memory, region) && memory.valid_until.is_none() {
+                        region_members.insert(memory.id);
+                    }
+                }
+                drop(memories);
+                let mut current_relationships = std::collections::HashMap::new();
+                let mut relationships = self.storage.stream_all_relationships().await;
+                while let Some(row) = relationships.next().await {
+                    let relationship = row?;
+                    current_relationships.insert(relationship.id, relationship);
+                }
+                drop(relationships);
+
+                let mut relationship_updates = std::collections::BTreeMap::new();
+                for relationship in current_relationships.values().filter(|relationship| {
+                    relationship.valid_until.is_none()
+                        && (relationship.from == c.b || relationship.to == c.b)
+                        && region_members.contains(&relationship.from)
+                        && region_members.contains(&relationship.to)
+                }) {
+                    journal.record_relationship(relationship);
+                    let mut closed = relationship.clone();
+                    closed.valid_until = Some(now);
+                    relationship_updates.insert(closed.id, closed);
+
+                    let mut rewired = relationship.clone();
+                    if rewired.from == c.b {
+                        rewired.from = c.a;
+                    }
+                    if rewired.to == c.b {
+                        rewired.to = c.a;
+                    }
+                    if rewired.from == rewired.to {
+                        continue;
+                    }
+                    rewired.id =
+                        RelationshipId::derive(rewired.from, rewired.kind, rewired.to, None);
+                    rewired.recorded_at = now;
+                    rewired.valid_from = now;
+                    rewired.valid_until = None;
+                    rewired.invalidated_by = None;
+                    if let Some(existing) = current_relationships.get(&rewired.id) {
+                        if existing.valid_until.is_none() {
+                            continue;
+                        }
+                        journal.record_relationship(existing);
+                    } else {
+                        journal.create_relationship(rewired.id);
+                    }
+                    res.rewired.push(rewired.id);
+                    relationship_updates.insert(rewired.id, rewired);
+                }
+
+                m.valid_until = Some(now);
+                m.invalidated_by = Some(c.a);
+                let relationship_updates: Vec<_> = relationship_updates.into_values().collect();
+                self.storage
+                    .upsert_batch_fenced(&[m], &relationship_updates, lease)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                res.merged.push(c.b);
+            }
         }
         Ok(())
     }
@@ -488,6 +657,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         res: &mut ConsolidationResult,
         region: &RegionKey,
         lease: &exocortex_storage::OwnerLease,
+        journal: &mut CycleJournal,
     ) -> anyhow::Result<()> {
         use futures::StreamExt;
         let now = chrono::Utc::now();
@@ -498,7 +668,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         {
             let mut ms = self.storage.stream_all_memories().await;
             while let Some(Ok(m)) = ms.next().await {
-                if in_region(&m, region) {
+                if in_region(&m, region) && m.valid_until.is_none() {
                     member_ids.insert(m.id);
                 }
             }
@@ -508,12 +678,16 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             if !member_ids.contains(&r.from) || !member_ids.contains(&r.to) {
                 continue;
             }
+            if r.valid_until.is_some() {
+                continue;
+            }
             if matches!(r.provenance, Provenance::Computed { .. }) {
                 continue;
             }
             if res.strengthened.contains(&r.id) {
                 continue; // one evidence bump per cycle, not per anchor
             }
+            journal.record_relationship(&r);
             r.properties.evidence_count += 1;
             // IN8 (audit): the stored field is the BASE strength — the
             // §14.3 decay/success derivation applies at READ time, so
@@ -549,6 +723,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         res: &mut ConsolidationResult,
         survivors: &[MemoryWithEmbedding],
         lease: &exocortex_storage::OwnerLease,
+        journal: &mut CycleJournal,
     ) -> anyhow::Result<()> {
         let Some(similar_kind) = similar_to_kind() else {
             return Ok(());
@@ -598,18 +773,23 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         }
         // Idempotency: only write edges that do not already exist.
         use futures::StreamExt;
-        let mut existing: std::collections::HashSet<exocortex_kernel::RelationshipId> = {
-            let mut set = std::collections::HashSet::new();
+        let existing: std::collections::HashMap<exocortex_kernel::RelationshipId, Relationship> = {
+            let mut rows = std::collections::HashMap::new();
             let mut rs = self.storage.stream_all_relationships().await;
             while let Some(Ok(r)) = rs.next().await {
-                set.insert(r.id);
+                rows.insert(r.id, r);
             }
-            set
+            rows
         };
-        let fresh: Vec<_> = edges
-            .into_iter()
-            .filter(|e| existing.insert(e.id))
-            .collect();
+        let mut fresh = Vec::new();
+        for edge in edges {
+            match existing.get(&edge.id) {
+                Some(row) if row.valid_until.is_none() => continue,
+                Some(row) => journal.record_relationship(row),
+                None => journal.create_relationship(edge.id),
+            }
+            fresh.push(edge);
+        }
         if !fresh.is_empty() {
             self.storage
                 .upsert_batch_fenced(&[], &fresh, lease)
@@ -638,16 +818,17 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         Ok(())
     }
 
-    /// Rollback is bi-temporal, never destructive: close everything the
-    /// cycle wrote (§12.5 step 8).
+    /// Restore the complete semantic preimage in one fenced storage call.
+    /// Only ids absent from the preimage are physically removed.
     async fn rollback(
         &self,
-        res: &ConsolidationResult,
+        journal: &CycleJournal,
         lease: &exocortex_storage::OwnerLease,
     ) -> anyhow::Result<()> {
-        for id in &res.merged {
-            let _ = self.storage.delete_memory_fenced(id, lease).await;
-        }
+        self.storage
+            .restore_fenced(&journal.restore(), lease)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         Ok(())
     }
 

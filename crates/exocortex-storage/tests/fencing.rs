@@ -7,7 +7,7 @@ use exocortex_kernel::{
 };
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::types::LeaseKey;
-use exocortex_storage::{InMemoryStorage, Storage, StorageError};
+use exocortex_storage::{FencedRestore, InMemoryStorage, Storage, StorageError};
 use std::sync::Arc;
 
 fn store() -> InMemoryStorage {
@@ -119,6 +119,10 @@ async fn stale_lease_write_is_fenced() {
         "stale write must be fenced, got {err:?}"
     );
     assert!(s.get_memory(&m.id).await.unwrap().is_none());
+    assert!(matches!(
+        s.restore_fenced(&FencedRestore::default(), &old).await,
+        Err(StorageError::FencedWriteRejected { .. })
+    ));
 
     // Current holder commits fine.
     s.upsert_batch_fenced(&[mem(2)], &[], &new).await.unwrap();
@@ -169,4 +173,83 @@ async fn batch_row_failure_rolls_back_every_memory_and_lsn() {
         "a later-row failure rolls the earlier memory back"
     );
     assert_eq!(s.last_lsn(), before, "a rejected batch allocates no LSN");
+}
+
+#[tokio::test]
+async fn fenced_restore_preserves_preimages_and_removes_only_created_rows() {
+    use futures::StreamExt;
+    let s = store();
+    let mut preclosed = mem(10);
+    preclosed.valid_until = Some(Utc::now());
+    let existing = mem(11);
+    let target = mem(12);
+    let mut preclosed_edge = rel(preclosed.id, target.id);
+    preclosed_edge.valid_until = preclosed.valid_until;
+    let existing_edge = rel(existing.id, target.id);
+    s.upsert_batch(
+        &[preclosed.clone(), existing.clone(), target.clone()],
+        &[preclosed_edge.clone(), existing_edge.clone()],
+    )
+    .await
+    .unwrap();
+
+    let key = LeaseKey::Dreams {
+        org: "org".into(),
+        region: "*:*".into(),
+    };
+    let lease = s
+        .acquire_lease(&key, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let mut reopened = preclosed.clone();
+    reopened.valid_until = None;
+    let mut changed = existing.clone();
+    changed.title = "changed".into();
+    let mut changed_edge = existing_edge.clone();
+    changed_edge.properties.evidence_count += 10;
+    let created = mem(13);
+    let mut created_edge = rel(created.id, target.id);
+    created_edge.kind = exocortex_kernel::RelKindId(0x8000_0024);
+    created_edge.id =
+        RelationshipId::derive(created_edge.from, created_edge.kind, created_edge.to, None);
+    s.upsert_batch_fenced(
+        &[reopened, changed, created.clone()],
+        &[changed_edge, created_edge.clone()],
+        &lease,
+    )
+    .await
+    .unwrap();
+
+    s.restore_fenced(
+        &FencedRestore {
+            memories: vec![preclosed.clone(), existing.clone()],
+            relationships: vec![preclosed_edge.clone(), existing_edge.clone()],
+            created_memories: vec![created.id],
+            created_relationships: vec![created_edge.id],
+        },
+        &lease,
+    )
+    .await
+    .unwrap();
+
+    let restored_closed = s.get_memory(&preclosed.id).await.unwrap().unwrap();
+    let restored_existing = s.get_memory(&existing.id).await.unwrap().unwrap();
+    assert_eq!(restored_closed.valid_until, preclosed.valid_until);
+    assert_eq!(restored_existing.title, existing.title);
+    assert!(s.get_memory(&created.id).await.unwrap().is_none());
+    let mut relationships = s.stream_all_relationships().await;
+    let mut by_id = std::collections::HashMap::new();
+    while let Some(row) = relationships.next().await {
+        let relationship = row.unwrap();
+        by_id.insert(relationship.id, relationship);
+    }
+    assert_eq!(
+        by_id[&preclosed_edge.id].valid_until,
+        preclosed_edge.valid_until
+    );
+    assert_eq!(
+        by_id[&existing_edge.id].properties.evidence_count,
+        existing_edge.properties.evidence_count
+    );
+    assert!(!by_id.contains_key(&created_edge.id));
 }

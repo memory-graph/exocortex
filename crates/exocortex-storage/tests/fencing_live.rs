@@ -11,7 +11,7 @@ use exocortex_kernel::{
 };
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::types::LeaseKey;
-use exocortex_storage::{FalkorStorage, Storage, StorageError};
+use exocortex_storage::{FalkorStorage, FencedRestore, Storage, StorageError};
 use std::sync::Arc;
 
 fn falkor_url() -> Option<String> {
@@ -214,4 +214,94 @@ async fn later_graph_row_failure_rolls_back_earlier_rows_live() {
         s.get_memory(&staged.id).await.unwrap().is_none(),
         "the single modifying GRAPH.QUERY rolls every row back"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fenced_restore_is_one_live_atomic_preimage_swap() {
+    if falkor_url().is_none() {
+        eprintln!("skipping fenced_restore_is_one_live_atomic_preimage_swap: FALKOR_URL not set");
+        return;
+    }
+    use futures::StreamExt;
+    let s = falkor("restore").await;
+    let mut preclosed = mem(20);
+    preclosed.valid_until = Some(Utc::now());
+    let existing = mem(21);
+    let target = mem(22);
+    let mut preclosed_edge = rel(preclosed.id, target.id);
+    preclosed_edge.valid_until = preclosed.valid_until;
+    let existing_edge = rel(existing.id, target.id);
+    s.upsert_batch(
+        &[preclosed.clone(), existing.clone(), target.clone()],
+        &[preclosed_edge.clone(), existing_edge.clone()],
+    )
+    .await
+    .unwrap();
+    let lease = s
+        .acquire_lease(
+            &LeaseKey::Dreams {
+                org: "org".into(),
+                region: "*:*".into(),
+            },
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let mut reopened = preclosed.clone();
+    reopened.valid_until = None;
+    let mut changed = existing.clone();
+    changed.title = "changed".into();
+    let mut changed_edge = existing_edge.clone();
+    changed_edge.properties.evidence_count += 4;
+    let created = mem(23);
+    let mut created_edge = rel(created.id, target.id);
+    created_edge.kind = exocortex_kernel::RelKindId(0x8000_0024);
+    created_edge.id =
+        RelationshipId::derive(created_edge.from, created_edge.kind, created_edge.to, None);
+    s.upsert_batch_fenced(
+        &[reopened, changed, created.clone()],
+        &[changed_edge, created_edge.clone()],
+        &lease,
+    )
+    .await
+    .unwrap();
+    s.restore_fenced(
+        &FencedRestore {
+            memories: vec![preclosed.clone(), existing.clone()],
+            relationships: vec![preclosed_edge.clone(), existing_edge.clone()],
+            created_memories: vec![created.id],
+            created_relationships: vec![created_edge.id],
+        },
+        &lease,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        s.get_memory(&preclosed.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .valid_until,
+        preclosed.valid_until
+    );
+    assert_eq!(
+        s.get_memory(&existing.id).await.unwrap().unwrap().title,
+        existing.title
+    );
+    assert!(s.get_memory(&created.id).await.unwrap().is_none());
+    let mut relationships = s.stream_all_relationships().await;
+    let mut by_id = std::collections::HashMap::new();
+    while let Some(row) = relationships.next().await {
+        let relationship = row.unwrap();
+        by_id.insert(relationship.id, relationship);
+    }
+    assert_eq!(
+        by_id[&preclosed_edge.id].valid_until,
+        preclosed_edge.valid_until
+    );
+    assert_eq!(
+        by_id[&existing_edge.id].properties.evidence_count,
+        existing_edge.properties.evidence_count
+    );
+    assert!(!by_id.contains_key(&created_edge.id));
 }

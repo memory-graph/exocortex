@@ -1,6 +1,8 @@
 // crates/exocortex-storage/src/types.rs
 use chrono::{DateTime, Utc};
-use exocortex_kernel::{EntityId, MemoryId, RelKindId, RelationshipId, Visibility};
+use exocortex_kernel::{
+    EntityId, Memory, MemoryId, RelKindId, Relationship, RelationshipId, Visibility,
+};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -54,6 +56,21 @@ pub enum IngestCommitOutcome {
     /// The same key was already settled; no supplied row was evaluated or
     /// written and the original result is returned.
     Duplicate(SettledIngestBatch),
+}
+
+/// Exact semantic preimage and cycle-created rows for one fenced rollback.
+/// Restored rows receive fresh backend LSNs; every other field is restored
+/// verbatim. Created ids are physically removed rather than soft-closed.
+#[derive(Clone, Debug, Default)]
+pub struct FencedRestore {
+    /// Pre-existing memories changed by the failed owner cycle.
+    pub memories: Vec<Memory>,
+    /// Pre-existing relationships changed by the failed owner cycle.
+    pub relationships: Vec<Relationship>,
+    /// Memory rows absent before, but created by, this cycle.
+    pub created_memories: Vec<MemoryId>,
+    /// Relationship rows absent before, but created by, this cycle.
+    pub created_relationships: Vec<RelationshipId>,
 }
 
 /// Bounded traversal descriptor. Every field carries a hard cap enforced

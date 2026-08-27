@@ -10,7 +10,10 @@ use exocortex_dreams::{
     trigger::{DreamsTrigger, RegionWriteCounters},
     Discovery, DiscoveryKind, DreamsEngine, PruneReason,
 };
-use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
+use exocortex_kernel::{
+    Memory, MemoryContext, MemoryId, Provenance, RelKindId, Relationship, RelationshipId,
+    RelationshipProperties, Visibility, LSN,
+};
 use exocortex_storage::{InMemoryStorage, RegionKey, Storage};
 
 fn ontology() -> Arc<exocortex_kernel::Ontology> {
@@ -77,6 +80,46 @@ fn unit(i: usize) -> Vec<f32> {
     let mut v = vec![0.0; 64];
     v[i % 64] = 1.0;
     v
+}
+
+fn relationship(from: MemoryId, to: MemoryId, kind: RelKindId) -> Relationship {
+    Relationship {
+        id: RelationshipId::derive(from, kind, to, None),
+        kind,
+        from,
+        to,
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "dreams".into(),
+            producer_kind: None,
+        },
+        properties: RelationshipProperties {
+            strength: 0.6,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: chrono::Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        lsn: LSN::new_local(0),
+    }
+}
+
+fn kind_named(name: &str) -> RelKindId {
+    ontology()
+        .kinds_by_id
+        .values()
+        .find(|kind| kind.display_name == name)
+        .map(|kind| kind.id)
+        .unwrap()
 }
 
 #[tokio::test]
@@ -186,14 +229,165 @@ async fn poison_consolidation_flags_regression_and_rolls_back() {
         res.regression,
         "R-Mcr3 guard fired on the poisoned tolerance"
     );
-    // Rollback really ran: every merged row is closed in storage.
+    assert!(!res.hairball_regression, "ΔR guard is independent");
+    // Rollback really ran: every merged row is restored to its live preimage.
     for id in &res.merged {
         let row = storage.get_memory(id).await.unwrap().expect("row present");
         assert!(
-            row.valid_until.is_some(),
-            "rollback closed merged row {id:?}"
+            row.valid_until.is_none(),
+            "rollback restored merged row {id:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn injected_mid_cycle_failure_restores_exact_mixed_preimage() {
+    use futures::StreamExt;
+    let storage = InMemoryStorage::new(ontology());
+    let target = mem_with_embedding(70_000, None, unit(20));
+    let mut duplicate_a = mem_with_embedding(70_001, Some(1), unit(1));
+    let mut duplicate_b = mem_with_embedding(70_002, Some(1), unit(1));
+    duplicate_a.embedding.as_mut().unwrap()[2] = 0.01;
+    duplicate_b.embedding.as_mut().unwrap()[3] = 0.01;
+    let mut preclosed = mem_with_embedding(70_003, None, unit(30));
+    preclosed.valid_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+    let edge_a = relationship(duplicate_a.id, target.id, exocortex_kernel::kinds::SOLVES);
+    let edge_b = relationship(duplicate_b.id, target.id, kind_named("Precedes"));
+    let mut preclosed_edge = relationship(preclosed.id, target.id, kind_named("RelatedTo"));
+    preclosed_edge.valid_until = preclosed.valid_until;
+    storage
+        .upsert_batch(
+            &[target, duplicate_a, duplicate_b, preclosed.clone()],
+            &[edge_a, edge_b, preclosed_edge.clone()],
+        )
+        .await
+        .unwrap();
+    let mut before_memories = std::collections::HashMap::new();
+    let mut memories = storage.stream_all_memories().await;
+    while let Some(row) = memories.next().await {
+        let mut memory = row.unwrap();
+        memory.lsn = LSN::new_local(0);
+        before_memories.insert(memory.id, memory);
+    }
+    drop(memories);
+    let mut before_relationships = std::collections::HashMap::new();
+    let mut relationships = storage.stream_all_relationships().await;
+    while let Some(row) = relationships.next().await {
+        let mut relationship = row.unwrap();
+        relationship.lsn = LSN::new_local(0);
+        before_relationships.insert(relationship.id, relationship);
+    }
+    drop(relationships);
+
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        true,
+        "faulted".into(),
+    )
+    .with_cycle_fault_after(1);
+    let region = RegionKey {
+        org: "o".into(),
+        project: "p".into(),
+        memory_type: 3,
+    };
+    assert!(engine.try_consolidate(&region).await.is_err());
+
+    let mut after_memories = std::collections::HashMap::new();
+    let mut memories = storage.stream_all_memories().await;
+    while let Some(row) = memories.next().await {
+        let mut memory = row.unwrap();
+        memory.lsn = LSN::new_local(0);
+        after_memories.insert(memory.id, memory);
+    }
+    drop(memories);
+    let mut after_relationships = std::collections::HashMap::new();
+    let mut relationships = storage.stream_all_relationships().await;
+    while let Some(row) = relationships.next().await {
+        let mut relationship = row.unwrap();
+        relationship.lsn = LSN::new_local(0);
+        after_relationships.insert(relationship.id, relationship);
+    }
+    assert_eq!(after_memories.len(), before_memories.len());
+    for (id, before) in &before_memories {
+        assert_eq!(
+            serde_json::to_value(&after_memories[id]).unwrap(),
+            serde_json::to_value(before).unwrap(),
+            "memory {id:?} differs from its preimage"
+        );
+    }
+    assert_eq!(after_relationships.len(), before_relationships.len());
+    for (id, before) in &before_relationships {
+        assert_eq!(
+            serde_json::to_value(&after_relationships[id]).unwrap(),
+            serde_json::to_value(before).unwrap(),
+            "relationship {id:?} differs from its preimage"
+        );
+    }
+    assert_eq!(
+        after_memories[&preclosed.id].valid_until,
+        preclosed.valid_until
+    );
+    assert_eq!(
+        after_relationships[&preclosed_edge.id].valid_until,
+        preclosed_edge.valid_until
+    );
+}
+
+#[tokio::test]
+async fn merge_rewiring_trips_default_hairball_without_delta_r_regression() {
+    let ontology = ontology();
+    let storage = InMemoryStorage::new(ontology.clone());
+    let source_a = mem_with_embedding(80_000, Some(2), unit(2));
+    let mut source_b = mem_with_embedding(80_001, Some(2), unit(2));
+    source_b.embedding.as_mut().unwrap()[3] = 0.01;
+    let targets: Vec<_> = (0..4)
+        .map(|index| {
+            let mut memory = mem_with_embedding(81_000 + index, None, unit(20 + index));
+            memory.embedding = None;
+            memory
+        })
+        .collect();
+    let kinds: Vec<_> = ontology
+        .kinds_by_id
+        .keys()
+        .copied()
+        .filter(|kind| *kind != RelKindId(0x8000_0024))
+        .take(34)
+        .collect();
+    assert_eq!(kinds.len(), 34);
+    let mut edges = Vec::new();
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let from = if index < 17 { source_a.id } else { source_b.id };
+        edges.push(relationship(from, targets[index % targets.len()].id, kind));
+    }
+    let mut memories = vec![source_a, source_b];
+    memories.extend(targets);
+    storage.upsert_batch(&memories, &edges).await.unwrap();
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        true,
+        "hairball".into(),
+    );
+    let result = engine
+        .try_consolidate(&RegionKey {
+            org: "o".into(),
+            project: "p".into(),
+            memory_type: 3,
+        })
+        .await
+        .unwrap();
+    assert!(!result.regression, "hairball guard is independent of ΔR");
+    assert!(result.hairball_regression);
+    assert!(
+        result.sparsity_after.hairball_fraction > result.sparsity_before.hairball_fraction + 0.05
+    );
+    assert!(!result.rewired.is_empty(), "merge must rewire real edges");
 }
 
 #[tokio::test]

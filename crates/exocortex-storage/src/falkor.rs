@@ -1774,6 +1774,114 @@ impl Storage for FalkorStorage {
         })
     }
 
+    async fn restore_fenced(
+        &self,
+        restore: &FencedRestore,
+        lease: &OwnerLease,
+    ) -> Result<Vec<CommitRecord>, StorageError> {
+        let total = restore.created_relationships.len()
+            + restore.created_memories.len()
+            + restore.memories.len()
+            + restore.relationships.len();
+        let block = self.next_lsn_block(total).await?;
+        let now = Utc::now();
+        let mut next = block.start;
+        let mut parts = vec![(
+            "lease_fence_guard",
+            serde_json::json!({
+                "lease_key": serde_json::to_string(&lease.key)
+                    .map_err(|error| StorageError::Backend(error.to_string()))?,
+                "token": lease.fencing_token.as_str(),
+                "epoch": lease.epoch,
+                "now_ms": now.timestamp_millis(),
+            }),
+        )];
+        let mut records = Vec::with_capacity(total);
+        let mut invalidations = Vec::with_capacity(total);
+        let mut push_record = |lsn| {
+            records.push(CommitRecord {
+                lsn,
+                committed_at: now,
+                node_id: None,
+                edge_id: None,
+            });
+        };
+
+        for id in &restore.created_relationships {
+            parts.push((
+                "batch_purge_relationship",
+                serde_json::json!({ "rel_id": hex(&id.0) }),
+            ));
+            push_record(next);
+            invalidations.push(Invalidation::RelationshipDeleted { id: *id, lsn: next });
+            next += 1;
+        }
+        for id in &restore.created_memories {
+            parts.push((
+                "batch_purge_memory",
+                serde_json::json!({ "id": hex(&id.0) }),
+            ));
+            push_record(next);
+            invalidations.push(Invalidation::MemoryDeleted { id: *id, lsn: next });
+            next += 1;
+        }
+        for memory in &restore.memories {
+            let label = self
+                .ontology
+                .memory_type_names
+                .get(memory.memory_type as usize)
+                .ok_or_else(|| {
+                    StorageError::Backend(format!("bad memory_type {}", memory.memory_type))
+                })?;
+            parts.push((
+                "batch_upsert_memory",
+                self.memory_params(memory, next, label),
+            ));
+            push_record(next);
+            invalidations.push(Invalidation::MemoryUpserted {
+                id: memory.id,
+                lsn: next,
+            });
+            next += 1;
+        }
+        for relationship in &restore.relationships {
+            parts.push((
+                "batch_upsert_relationship",
+                serde_json::json!({
+                    "rel_id": hex(&relationship.id.0),
+                    "from": hex(&relationship.from.0),
+                    "to": hex(&relationship.to.0),
+                    "kind_label": self.kind_label(relationship.kind)?,
+                    "props_json": FalkorStorage::props_json(relationship, next),
+                    "visibility": relationship.visibility as u8,
+                    "valid_from": relationship.valid_from.to_rfc3339(),
+                    "valid_until": relationship.valid_until.map(|time| time.to_rfc3339()),
+                    "invalidated_by": relationship.invalidated_by.map(|id| hex(&id.0)),
+                    "recorded_at": relationship.recorded_at.to_rfc3339(),
+                    "lsn": next,
+                }),
+            ));
+            push_record(next);
+            invalidations.push(Invalidation::RelationshipUpserted {
+                id: relationship.id,
+                from: relationship.from,
+                to: relationship.to,
+                kind: relationship.kind,
+                lsn: next,
+            });
+            next += 1;
+        }
+        if !self.run_atomic_parts(&parts).await? {
+            return Err(StorageError::FencedWriteRejected {
+                lease_epoch: lease.epoch,
+            });
+        }
+        for invalidation in invalidations {
+            self.publish(invalidation).await;
+        }
+        Ok(records)
+    }
+
     async fn ping(&self) -> Result<(), StorageError> {
         // R-O4 liveness: the Redis PING backing LSNs/leases answers.
         let pong: String = redis::cmd("PING")

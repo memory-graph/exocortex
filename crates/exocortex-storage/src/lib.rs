@@ -21,9 +21,10 @@ pub use in_memory::InMemoryStorage;
 pub use trait_::{Storage, StorageError};
 pub use types::{
     memory_visible, relationship_visible, AuditEvent, CommitRecord, CypherQuery, Direction,
-    DiscoveryAcceptance, DiscoveryProposal, Embedding, GraphSnapshot, IngestBatchKey,
-    IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter, OwnerLease, RegionKey, ResultSet,
-    SettledIngestBatch, StorageBackendId, StorageCapabilities, TraversalSpec, VisibilityContext,
+    DiscoveryAcceptance, DiscoveryProposal, Embedding, FencedRestore, GraphSnapshot,
+    IngestBatchKey, IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter, OwnerLease,
+    RegionKey, ResultSet, SettledIngestBatch, StorageBackendId, StorageCapabilities, TraversalSpec,
+    VisibilityContext,
 };
 
 /// Result alias for storage operations (§6.1).

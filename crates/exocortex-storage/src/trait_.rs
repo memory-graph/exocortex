@@ -7,8 +7,9 @@ use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId}
 
 use crate::types::{
     AuditEvent, CommitRecord, CypherQuery, DiscoveryAcceptance, DiscoveryProposal, Embedding,
-    GraphSnapshot, IngestBatchKey, IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter,
-    OwnerLease, RegionKey, ResultSet, StorageBackendId, StorageCapabilities, TraversalSpec,
+    FencedRestore, GraphSnapshot, IngestBatchKey, IngestCommitOutcome, Invalidation, LeaseKey,
+    MemoryFilter, OwnerLease, RegionKey, ResultSet, StorageBackendId, StorageCapabilities,
+    TraversalSpec,
 };
 
 /// Errors surfaced by every `Storage` implementation.
@@ -230,6 +231,14 @@ pub trait Storage: Send + Sync + 'static {
         id: &MemoryId,
         lease: &OwnerLease,
     ) -> crate::Result<CommitRecord>;
+    /// Atomically restore the semantic preimage of an owner cycle and
+    /// physically remove only rows that cycle created. The fence check and
+    /// complete restore share one storage linearization point (R6-B10).
+    async fn restore_fenced(
+        &self,
+        restore: &FencedRestore,
+        lease: &OwnerLease,
+    ) -> crate::Result<Vec<CommitRecord>>;
 
     // ---- Change feed (backs SSE clients; §9.1, §9.6) ----
 

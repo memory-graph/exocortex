@@ -110,6 +110,30 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         "#,
     });
 
+    // Fenced rollback physically removes only rows proven absent from the
+    // cycle preimage. OPTIONAL MATCH makes an ambiguous failed write safe to
+    // compensate even when the row never reached storage.
+    reg!(Template {
+        id: "batch_purge_memory",
+        read_only: false,
+        required_params: &["id"],
+        cypher: r#"
+            OPTIONAL MATCH (m:Memory {id: $id})
+            DELETE m
+        "#,
+    });
+
+    reg!(Template {
+        id: "batch_purge_relationship",
+        read_only: false,
+        required_params: &["rel_id"],
+        cypher: r#"
+            OPTIONAL MATCH ()-[r]->()
+            WHERE r.rel_id = $rel_id
+            DELETE r
+        "#,
+    });
+
     reg!(Template {
         id: "upsert_relationship",
         read_only: false,

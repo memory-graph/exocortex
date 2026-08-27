@@ -942,6 +942,71 @@ impl Storage for InMemoryStorage {
         });
         Ok(record)
     }
+    async fn restore_fenced(
+        &self,
+        restore: &FencedRestore,
+        lease: &OwnerLease,
+    ) -> Result<Vec<CommitRecord>, StorageError> {
+        let (records, invalidations) = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            self.check_lease_current(lease)?;
+            let mut memories = self.inner.memories.lock().unwrap().clone();
+            let mut relationships = self.inner.rels.lock().unwrap().clone();
+            let mut next = self.lsn.load(Ordering::SeqCst);
+            let mut records = Vec::new();
+            let mut invalidations = Vec::new();
+            let mut record = || {
+                next += 1;
+                let committed_at = Utc::now();
+                records.push(CommitRecord {
+                    lsn: next,
+                    committed_at,
+                    node_id: None,
+                    edge_id: None,
+                });
+                next
+            };
+
+            for id in &restore.created_relationships {
+                relationships.remove(id);
+                let lsn = record();
+                invalidations.push(Invalidation::RelationshipDeleted { id: *id, lsn });
+            }
+            for id in &restore.created_memories {
+                memories.remove(id);
+                let lsn = record();
+                invalidations.push(Invalidation::MemoryDeleted { id: *id, lsn });
+            }
+            for preimage in &restore.memories {
+                let lsn = record();
+                let mut memory = preimage.clone();
+                memory.lsn = exocortex_kernel::LSN::new_backend(lsn);
+                memories.insert(memory.id, vec![memory.clone()]);
+                invalidations.push(Invalidation::MemoryUpserted { id: memory.id, lsn });
+            }
+            for preimage in &restore.relationships {
+                let lsn = record();
+                let mut relationship = preimage.clone();
+                relationship.lsn = exocortex_kernel::LSN::new_backend(lsn);
+                relationships.insert(relationship.id, vec![relationship.clone()]);
+                invalidations.push(Invalidation::RelationshipUpserted {
+                    id: relationship.id,
+                    from: relationship.from,
+                    to: relationship.to,
+                    kind: relationship.kind,
+                    lsn,
+                });
+            }
+            self.lsn.store(next, Ordering::SeqCst);
+            *self.inner.memories.lock().unwrap() = memories;
+            *self.inner.rels.lock().unwrap() = relationships;
+            (records, invalidations)
+        };
+        for invalidation in invalidations {
+            let _ = self.feed.send(invalidation);
+        }
+        Ok(records)
+    }
     async fn subscribe_invalidations(
         &self,
         _r: &RegionKey,
