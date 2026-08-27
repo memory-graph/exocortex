@@ -242,6 +242,67 @@ async fn missing_hmac_rejected_before_anything() {
 }
 
 #[tokio::test]
+async fn empty_content_emits_unknown_reject_code() {
+    let srv = server();
+    registered(&srv, 3).await;
+    let mut invalid = draft("unknown", "Fix", 1);
+    invalid.content.clear();
+    let ack = srv
+        .submit(tonic::Request::new(signed_batch(&srv, vec![invalid])))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ack.accepted, 0);
+    assert!(ack
+        .rejections
+        .iter()
+        .any(|row| row.code == RejectCode::Unknown as i32));
+}
+
+#[test]
+fn reject_code_protocol_catalogue_is_exhaustive() {
+    // §23 #27: each entry is exercised by a targeted Submit batch in this
+    // integration-test target or the adjacent e2e/external-key targets. Keep
+    // this match wildcard-free so adding a protocol code cannot silently
+    // escape the executable rejection matrix.
+    fn targeted_test(code: RejectCode) -> &'static str {
+        match code {
+            RejectCode::Unknown => "empty_content_emits_unknown_reject_code",
+            RejectCode::IncompatibleOntology => "fingerprint_mismatch_rejected",
+            RejectCode::UnknownSource => "unknown_source_rejected_after_hmac",
+            RejectCode::UnknownMemoryType => "unknown_memory_type_rejected",
+            RejectCode::UnknownKind => "unknown_relationship_kind_rejected",
+            RejectCode::InvalidTypeTriple => "bad_triple_rejects_whole_batch_naming_the_key",
+            RejectCode::VisibilityWidening => "visibility_widening_rejected_under_lowered_ceiling",
+            RejectCode::MissingExternalKey => {
+                "external_batch_without_key_rejected_and_with_key_deterministic"
+            }
+            RejectCode::DuplicateBatch => "same_batch_id_different_payload_is_rejected",
+            RejectCode::BadChecksum => "tampered_external_coordinates_fail_checksum",
+            RejectCode::Unauthorized => "missing_hmac_rejected_before_anything",
+            RejectCode::RateLimited => {
+                "saturated_submit_capacity_emits_rate_limited_without_storage_work"
+            }
+            RejectCode::ComputedKindRejected => "computed_kind_rejected_at_ingest_boundary",
+            RejectCode::InvalidExternalKey => "malformed_external_coordinates_are_rejected",
+            RejectCode::ResourceLimitExceeded => {
+                "resource_ceiling_rejects_before_ontology_or_storage_work"
+            }
+        }
+    }
+
+    let codes: Vec<_> = (0..=14).filter_map(|value| RejectCode::try_from(value).ok()).collect();
+    assert_eq!(
+        codes.len(),
+        15,
+        "wire RejectCode discriminants must stay dense"
+    );
+    for code in codes {
+        assert!(!targeted_test(code).is_empty());
+    }
+}
+
+#[tokio::test]
 async fn resource_ceiling_rejects_before_ontology_or_storage_work() {
     let srv = server();
     let edge = exocortex_wire::ingest::v1::RelationshipDraft {
