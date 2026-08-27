@@ -30,18 +30,18 @@ three because of three years of governed Objects and Links, not any
 single query.
 
 Exocortex is that ontology as a single Rust binary, under an OSS license,
-fed by your agents, your documents, and — coming — your analytics tables,
-instead of a data team. Claude Code, Codex, Cursor, any MCP client writes
-to it and reads from it — so what your org learns in one session is what
-it knows in the next. Documents feed the same graph through
-`exocortex-adapter-mintlify`, the reference Ingestion Protocol adapter:
-authors tag a page with `exocortex:` frontmatter and it lands as typed
-memories, deterministically — no LLM anywhere in the loop. Analytics
-tables join the same way through the planned S3 Tables / Iceberg
-adapter. The ontology's shape (type-tagged memories + a typed edge
-vocabulary, not per-type payload schemas) was validated by our prior
-memory-graph deployment; Exocortex is that idea as one fast, governed
-binary.
+fed by your agents today — your documents and analytics tables next —
+instead of a data team. Claude Code, Codex, Cursor, any MCP client
+writes to it and reads from it — so what your org learns in one session
+is what it knows in the next. Documents are the next feed:
+`exocortex-adapter-mintlify`, the reference Ingestion Protocol adapter
+(PRD'd in-repo, in development), turns pages tagged with `exocortex:`
+frontmatter into typed memories — deterministically, no LLM anywhere
+in the loop. Analytics tables follow the same seam via the planned
+S3 Tables / Iceberg adapter. The ontology's shape (type-tagged
+memories + a typed edge vocabulary, not per-type payload schemas) was
+validated by our prior memory-graph deployment; Exocortex is that idea
+as one fast, governed binary.
 
 | Foundry | Exocortex |
 |---|---|
