@@ -1,29 +1,6 @@
 # Exocortex
 
-```
-              ____________________________________________________
-           .-"                                                    "-.
-         .'                                                        '.
-        /                                                            \
-       |                                                              |
-       |     o------o       o------o       o------o       o------o    |
-       |                                                              |
-       |    .---------. --Fixes-> .---------. <-Solves- .---------.   |
-       |    |   FIX   |           | PROBLEM |           | SOLUTION |   |
-       |    '---------'           '---------'           '---------'   |
-       |                                                              |
-       |     o------o       o------o       o------o       o------o    |
-       |                                                              |
-        \                                                            /
-         '.                                                        .'
-           '-.                                                    .-'
-              '--______________________________________________--'
-                              ^       ||||       |
-               end_session    |       ||||       |   search_memories
-                              |       ||||       v
-                           [ MCP over stdio ]
-                Claude Code  ·  Codex  ·  Cursor  ·  any agent
-```
+![The Exocortex knowledge graph — a typed memory graph rendered as a blueprint schematic](images/hero.jpeg)
 
 **The open-source Palantir: the ontology, in-house.** By
 [MemoryGraph](https://github.com/memory-graph).
