@@ -33,10 +33,6 @@ struct Args {
     /// across restarts (SR-PRD F1-F5).
     #[arg(long)]
     backend: Option<String>,
-    /// Bearer token for the backend (attached to every ingest call;
-    /// audit CL4: parsed-and-unused is an inert credential surface).
-    #[arg(long)]
-    auth_token: Option<String>,
     /// Org id (defaults to the single-user org).
     #[arg(long, default_value = "personal")]
     org: String,
@@ -47,9 +43,6 @@ struct Args {
     /// platform's user data home).
     #[arg(long)]
     data_dir: Option<std::path::PathBuf>,
-    /// Producer HMAC key (64 hex chars) for backend submits.
-    #[arg(long)]
-    hmac_key: Option<String>,
     /// D5: print the compiled Agent Playbook to stdout and exit.
     #[arg(long)]
     dump_playbook: bool,
@@ -108,21 +101,27 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // CL3 (audit): validate --hmac-key BEFORE anything opens (a malformed
+    // CL3 (audit): validate EXOCORTEX_HMAC_KEY BEFORE anything opens (a malformed
     // key is a startup error, never a silent all-zero key signing every
     // wrapup batch).
-    let hmac_key = match args.hmac_key.as_deref() {
+    let hmac_key_hex = std::env::var("EXOCORTEX_HMAC_KEY")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let auth_token = std::env::var("EXOCORTEX_AUTH_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let hmac_key = match hmac_key_hex.as_deref() {
         Some(hex) => Some(
             exocortex_wire::signing::decode_hex32(hex)
-                .map_err(|e| anyhow::anyhow!("--hmac-key: {e}"))?,
+                .map_err(|e| anyhow::anyhow!("EXOCORTEX_HMAC_KEY: {e}"))?,
         ),
         None => None,
     };
     if args.backend.is_some() && hmac_key.is_none() {
-        anyhow::bail!("--hmac-key is required when --backend is configured");
+        anyhow::bail!("EXOCORTEX_HMAC_KEY is required when --backend is configured");
     }
-    if args.backend.is_some() && args.auth_token.as_deref().is_none_or(str::is_empty) {
-        anyhow::bail!("--auth-token must be non-empty when --backend is configured");
+    if args.backend.is_some() && auth_token.is_none() {
+        anyhow::bail!("EXOCORTEX_AUTH_TOKEN is required when --backend is configured");
     }
 
     // Ontology: fail fast if the linked pack set does not assemble. The
@@ -134,7 +133,7 @@ fn main() -> anyhow::Result<()> {
         exocortex_reasoning::acceptance::verify_nine_catalogued_rules(&ontology)
             .map_err(anyhow::Error::msg)?;
         println!(
-            "rules-ok mode={} count=9",
+            "rules-ok mode={} count=9 artifact=exocortex-mcp-client",
             std::env::var("EXOCORTEX_DEPLOYMENT_MODE").unwrap_or_else(|_| "mcp-client".into())
         );
         return Ok(());
@@ -184,7 +183,13 @@ fn main() -> anyhow::Result<()> {
     }
 
     if args.verify {
-        return verify(&args, &ontology, &data_dir);
+        return verify(
+            &args,
+            &ontology,
+            &data_dir,
+            hmac_key_hex.as_deref(),
+            auth_token.as_deref(),
+        );
     }
 
     // Cache seed. CL5 (audit): with `--backend` configured, reads must be
@@ -240,7 +245,7 @@ fn main() -> anyhow::Result<()> {
     let hmac_key = hmac_key.unwrap_or([0u8; 32]);
     let org = args.org.clone();
     let user = args.user.clone();
-    let auth_token = args.auth_token.clone();
+    let auth_token = auth_token.clone();
     let fingerprint = ontology.fingerprint.0;
     let ontology_for_drain = ontology.clone();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -442,7 +447,13 @@ fn tail_audit(wal_dir: &std::path::Path, last: usize) -> anyhow::Result<()> {
 /// write, each row green or red; exit code = red count. It must never
 /// return green when a known precondition fails, and never attempts a
 /// polluting probe write.
-fn verify(args: &Args, ontology: &Ontology, data_dir: &std::path::Path) -> anyhow::Result<()> {
+fn verify(
+    args: &Args,
+    ontology: &Ontology,
+    data_dir: &std::path::Path,
+    hmac_key_hex: Option<&str>,
+    auth_token: Option<&str>,
+) -> anyhow::Result<()> {
     let mut red = 0usize;
 
     // 1. Playbook installed and current.
@@ -473,10 +484,10 @@ fn verify(args: &Args, ontology: &Ontology, data_dir: &std::path::Path) -> anyho
     );
 
     // 3. HMAC key shape (when a backend is configured, submits need it).
-    match (&args.backend, &args.hmac_key) {
+    match (&args.backend, hmac_key_hex) {
         (Some(_), None) => {
             red += 1;
-            println!("  RED   hmac-key: --backend set but --hmac-key missing");
+            println!("  RED   hmac-key: --backend set but EXOCORTEX_HMAC_KEY missing");
         }
         (Some(_), Some(k)) => {
             let ok = exocortex_wire::signing::decode_hex32(k).is_ok();
@@ -506,7 +517,7 @@ fn verify(args: &Args, ontology: &Ontology, data_dir: &std::path::Path) -> anyho
                 .await
                 .map_err(|e| e.to_string())?;
             let mut req = tonic::Request::new(exocortex_wire::ingest::v1::FingerprintRequest {});
-            if let Some(token) = &args.auth_token {
+            if let Some(token) = auth_token {
                 if let Ok(v) = format!("Bearer {token}").parse() {
                     req.metadata_mut().insert("authorization", v);
                 }

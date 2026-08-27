@@ -16,6 +16,7 @@
 use hmac::{Hmac, Mac};
 use prost::Message;
 
+use crate::cluster::v1::InvalidationEnvelope;
 use crate::ingest::v1::{IngestBatch, RegisterSourceRequest};
 
 type HmacSha256 = Hmac<sha2::Sha256>;
@@ -28,6 +29,38 @@ pub fn derive_sse_client_key(cluster_key: &[u8; 32], token: &str) -> [u8; 32] {
     mac.update(b"sse-client:");
     mac.update(token.as_bytes());
     mac.finalize().into_bytes().into()
+}
+
+fn unsigned_envelope_bytes(envelope: &InvalidationEnvelope) -> Vec<u8> {
+    let mut unsigned = envelope.clone();
+    unsigned.hmac.clear();
+    unsigned.encode_to_vec()
+}
+
+/// HMAC-SHA256 an invalidation envelope over fields 1 through 4 (R-W4).
+/// Idempotent: an existing signature is cleared before the canonical bytes
+/// are encoded.
+pub fn sign_invalidation_envelope(key: &[u8; 32], envelope: &mut InvalidationEnvelope) {
+    let bytes = unsigned_envelope_bytes(envelope);
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(&bytes);
+    envelope.hmac = mac.finalize().into_bytes().to_vec();
+}
+
+/// Constant-time verification of an invalidation-envelope signature.
+pub fn verify_invalidation_envelope(key: &[u8; 32], envelope: &InvalidationEnvelope) -> bool {
+    if envelope.hmac.is_empty() {
+        return false;
+    }
+    let bytes = unsigned_envelope_bytes(envelope);
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(&bytes);
+    let expected = mac.finalize().into_bytes();
+    expected.len() == envelope.hmac.len()
+        && bool::from(subtle::ConstantTimeEq::ct_eq(
+            expected.as_slice(),
+            envelope.hmac.as_slice(),
+        ))
 }
 
 /// Version tag baked into the checksum preimage so a deliberate format
@@ -257,6 +290,26 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::ingest::v1::{ExternalKey, MemoryDraft, ProducerIdentity};
+
+    #[test]
+    fn invalidation_envelope_signing_is_canonical_and_tamper_evident() {
+        let key = [9u8; 32];
+        let mut envelope = InvalidationEnvelope {
+            wire_version: crate::WIRE_VERSION,
+            ontology_fingerprint: vec![3; 32],
+            emitter_node_id: "node-a".into(),
+            inv: None,
+            hmac: vec![0xff; 32],
+        };
+        sign_invalidation_envelope(&key, &mut envelope);
+        let first = envelope.hmac.clone();
+        assert!(verify_invalidation_envelope(&key, &envelope));
+        sign_invalidation_envelope(&key, &mut envelope);
+        assert_eq!(envelope.hmac, first, "re-signing is idempotent");
+        envelope.emitter_node_id = "node-b".into();
+        assert!(!verify_invalidation_envelope(&key, &envelope));
+        assert!(!verify_invalidation_envelope(&[8; 32], &envelope));
+    }
 
     fn draft(key: &str, title: &str) -> MemoryDraft {
         MemoryDraft {

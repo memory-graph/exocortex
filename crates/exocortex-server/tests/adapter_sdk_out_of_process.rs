@@ -63,11 +63,13 @@ fn spawn_node() -> Node {
             &format!("127.0.0.1:{gossip}"),
             "--principal-policy",
             principals.to_str().unwrap(),
-            "--cluster-secret",
-            "4242424242424242424242424242424242424242424242424242424242424242",
             "--source-policy",
             policy.to_str().unwrap(),
         ])
+        .env(
+            "EXOCORTEX_CLUSTER_SECRET",
+            "4242424242424242424242424242424242424242424242424242424242424242",
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

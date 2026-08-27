@@ -121,6 +121,11 @@ pub(crate) fn dependency_tree_violations(crate_name: &str, tree: &str) -> Vec<St
     let packages: Vec<&str> = tree.lines().skip(1).collect();
     let mut violations = Vec::new();
     if crate_name == "exocortex-kernel" {
+        for package in packages.iter().filter_map(|line| package_name(line)) {
+            if package.starts_with("exocortex-") {
+                violations.push(format!("internal dependency `{package}` is reachable"));
+            }
+        }
         for banned in kernel_banned {
             if packages.iter().any(|line| package_line_is(line, &banned)) {
                 violations.push(format!("banned dependency `{banned}` is reachable"));
@@ -153,6 +158,69 @@ pub(crate) fn dependency_tree_violations(crate_name: &str, tree: &str) -> Vec<St
         }
     }
     violations
+}
+
+pub(crate) fn kernel_boundary_violations(root: &Path) -> Result<Vec<String>> {
+    const ALLOWED_DIRECT: &[&str] = &[
+        "serde",
+        "serde_json",
+        "bincode",
+        "schemars",
+        "smol_str",
+        "smallvec",
+        "thiserror",
+        "tracing",
+        "chrono",
+        "uuid",
+        "blake3",
+        "sha2",
+        "inventory",
+        "lasso",
+        "crepe",
+    ];
+    let kernel = root.join("crates/exocortex-kernel");
+    let manifest = std::fs::read_to_string(kernel.join("Cargo.toml"))?;
+    let mut in_dependencies = false;
+    let mut violations = Vec::new();
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_dependencies = trimmed == "[dependencies]";
+            continue;
+        }
+        if !in_dependencies || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((name, _)) = trimmed.split_once('=') {
+            let name = name.trim();
+            if !ALLOWED_DIRECT.contains(&name) {
+                violations.push(format!(
+                    "kernel direct dependency `{name}` is not pure-approved"
+                ));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk_rust_files(&kernel.join("src"), &mut files)?;
+    for path in files {
+        let source = strip_comments_and_strings(&std::fs::read_to_string(&path)?);
+        for marker in [
+            "std::fs::",
+            "std::io::",
+            "std::net::",
+            "std::process::",
+            "tokio::",
+            "async_std::",
+        ] {
+            if source.contains(marker) {
+                violations.push(format!(
+                    "{} uses I/O boundary `{marker}`",
+                    path.strip_prefix(root).unwrap_or(&path).display()
+                ));
+            }
+        }
+    }
+    Ok(violations)
 }
 
 pub(crate) fn kernel_pack_coupling_violations(root: &Path) -> Result<Vec<String>> {
@@ -296,17 +364,15 @@ pub(crate) fn signing_hygiene_violations(root: &Path) -> Result<Vec<String>> {
             continue;
         }
         let code = strip_comments_and_strings(&source);
+        if code.contains("hmac::") || code.contains("Hmac<") || code.contains("Mac>::") {
+            violations.push(format!(
+                "{rel}: local HMAC implementation outside exocortex-wire::signing"
+            ));
+        }
         for name in ["sign_batch", "compute_checksum", "canonical_checksum"] {
             if code.contains(&format!("fn {name}(")) {
                 violations.push(format!("{rel}: local batch-signing function `{name}`"));
             }
-        }
-        if code.contains("IngestBatch")
-            && (code.contains("hmac::") || code.contains("Hmac<") || code.contains("Mac::"))
-        {
-            violations.push(format!(
-                "{rel}: combines IngestBatch with a local HMAC implementation"
-            ));
         }
         if code.contains("checksum: String::new()")
             && !code.contains("prepare_batch")
@@ -523,6 +589,23 @@ mod tests {
             dependency_tree_violations("exocortex-kernel", &tree),
             ["banned dependency `reqwest` is reachable"]
         );
+    }
+
+    #[test]
+    fn kernel_boundary_rejects_unknown_dependencies_and_standard_io() {
+        let root = fixture("kernel-boundary");
+        write(
+            &root,
+            "crates/exocortex-kernel/Cargo.toml",
+            "[dependencies]\nserde = \"1\"\nexocortex-storage = \"1\"\n",
+        );
+        write(
+            &root,
+            "crates/exocortex-kernel/src/lib.rs",
+            "fn leak() { let _ = std::fs::read(\"x\"); }\n",
+        );
+        let violations = kernel_boundary_violations(&root).unwrap();
+        assert_eq!(violations.len(), 2, "{violations:?}");
     }
 
     #[test]

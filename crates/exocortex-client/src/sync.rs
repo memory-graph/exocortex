@@ -21,8 +21,6 @@ use exocortex_kernel::{MemoryId, RelationshipId};
 use exocortex_ops::Invalidation;
 use exocortex_wire::cluster::v1::InvalidationEnvelope;
 use exocortex_wire::WIRE_VERSION;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 
 #[derive(serde::Deserialize)]
 struct ClientGraphSnapshot {
@@ -137,18 +135,7 @@ pub fn verify_envelope(
     if env.ontology_fingerprint.as_slice() != fingerprint {
         return Err(SyncError::Rejected("ontology fingerprint mismatch".into()));
     }
-    let mut unsigned = env.clone();
-    unsigned.hmac = vec![];
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(hmac_key).expect("HMAC accepts any key length");
-    mac.update(&unsigned.encode_to_vec());
-    let expected = mac.finalize().into_bytes();
-    if expected.len() != env.hmac.len()
-        || !bool::from(subtle::ConstantTimeEq::ct_eq(
-            expected.as_slice(),
-            env.hmac.as_slice(),
-        ))
-    {
+    if !exocortex_wire::signing::verify_invalidation_envelope(hmac_key, env) {
         return Err(SyncError::Rejected("hmac verification failed".into()));
     }
     Ok(())

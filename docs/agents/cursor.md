@@ -18,14 +18,16 @@ Cursor reads `~/.cursor/mcp.json`:
   "mcpServers": {
     "exocortex": {
       "command": "exocortex-mcp-client",
-      "args": ["--backend", "https://your-node:7443", "--org", "your-org",
-               "--hmac-key", "<64-hex producer key>", "--auth-token", "<bearer>"]
+      "args": ["--backend", "https://your-node:7443", "--org", "your-org"],
+      "env": {"EXOCORTEX_HMAC_KEY": "<64-hex producer key>",
+              "EXOCORTEX_AUTH_TOKEN": "<bearer>"}
     }
   }
 }
 ```
 
-Standalone (offline WAL embedded store): omit all four flags. On first
+Standalone (offline WAL embedded store): omit the backend flag and credential
+environment. On first
 run the client installs the playbook under the OS data home; `--verify`
 prints its exact path.
 
@@ -65,6 +67,6 @@ rows are buffered in the WAL, not lost.
 |---|---|
 | Agent never calls `end_session` | The block is missing from `.cursorrules` — check it exists verbatim |
 | `not-connected` error | No `--backend` and no WAL — check `--data-dir` writable |
-| Every write rejected `Unauthorized` | Wrong/missing `--hmac-key` (`--verify` flags it red) |
+| Every write rejected `Unauthorized` | Wrong/missing `EXOCORTEX_HMAC_KEY` (`--verify` flags it red) |
 | Duplicate memories from reverted edits | Reverted-in-same-turn edits are NOT accepted — the block's checklist is the contract; tighten your copy if drift persists |
 | `ONTOLOGY FINGERPRINT MISMATCH` | Client and backend run different pack versions — upgrade both |

@@ -11,8 +11,6 @@ description = "Exocortex cluster coherence: Chubby-style leases with epoch fenci
 metrics = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-prost = { workspace = true }
-subtle = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -22,8 +20,6 @@ exocortex-wire = { workspace = true }
 exocortex-storage = { workspace = true }
 redis = { workspace = true }
 chitchat = { workspace = true }
-hmac = { workspace = true }
-sha2 = { workspace = true }
 axum = { workspace = true }
 eventsource-client = { workspace = true }
 serde_json = { workspace = true } # R6-B06: hydrate signed SSE row snapshots

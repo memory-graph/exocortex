@@ -64,8 +64,9 @@ workspace license/repository metadata applies).
   curl -LsSf     https://github.com/memory-graph/exocortex/releases/latest/download/install.sh | sh
   ```
 
-  The script resolves `latest` (or honors `$INSTALL_VERSION`), picks the
-  platform archive, and installs into `$CARGO_HOME/bin`. No Rust
+  The script resolves `latest` (or honors `$INSTALL_VERSION`), downloads the
+  archive and its published SHA-256 file, refuses a mismatch before extraction,
+  and installs into `$CARGO_HOME/bin`. No Rust
   toolchain or protoc required — that was the point.
   The build and release jobs cannot start until `scripts/verify-release.sh`
   and the disposable publish regression pass on the tagged commit.

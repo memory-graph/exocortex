@@ -6,14 +6,12 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use hmac::{Hmac, Mac};
 use tokio::sync::broadcast;
 
 use exocortex_kernel::OntologyFingerprint;
 use exocortex_storage::{Invalidation, LeaseKey, OwnerLease, Storage};
 use exocortex_wire::cluster::v1::InvalidationEnvelope;
 use exocortex_wire::WIRE_VERSION;
-use prost::Message;
 
 /// Peer-admission and transport errors (§9.7 — names are pinned).
 #[derive(Debug, thiserror::Error)]
@@ -236,27 +234,13 @@ impl<S: Storage + 'static> ClusterNode<S> {
             inv: Some(inv_pb),
             hmac: vec![],
         };
-        let mut mac = <Hmac<Sha256Mac> as Mac>::new_from_slice(&self.hmac_key)
-            .expect("HMAC accepts any key length");
-        mac.update(&env.encode_to_vec());
-        env.hmac = mac.finalize().into_bytes().to_vec();
+        exocortex_wire::signing::sign_invalidation_envelope(&self.hmac_key, &mut env);
         env
     }
 
     /// Verify an envelope's HMAC in constant time (R-Sec4).
     pub fn verify_hmac(&self, env: &InvalidationEnvelope) -> Result<(), ClusterError> {
-        let mut unsigned = env.clone();
-        unsigned.hmac = vec![];
-        let mut mac = <Hmac<Sha256Mac> as Mac>::new_from_slice(&self.hmac_key)
-            .expect("HMAC accepts any key length");
-        mac.update(&unsigned.encode_to_vec());
-        let expected = mac.finalize().into_bytes();
-        if expected.len() != env.hmac.len()
-            || !bool::from(subtle::ConstantTimeEq::ct_eq(
-                expected.as_slice(),
-                env.hmac.as_slice(),
-            ))
-        {
+        if !exocortex_wire::signing::verify_invalidation_envelope(&self.hmac_key, env) {
             return Err(ClusterError::HmacFailed);
         }
         Ok(())
@@ -292,8 +276,6 @@ impl<S: Storage + 'static> ClusterNode<S> {
         self.tx.subscribe()
     }
 }
-
-type Sha256Mac = sha2::Sha256;
 
 /// The backend LSN an envelope carries (0 when malformed).
 fn envelope_lsn(env: &InvalidationEnvelope) -> u64 {

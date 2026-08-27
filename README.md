@@ -231,8 +231,6 @@ authenticated HTTP.
 | `--org` | `personal` | Your org id (personal use = any string). |
 | `--user` | `dev` | Your user id — drives Private-memory visibility. |
 | `--backend` | none | Backend URL for shared-org mode (see below). Omitted: standalone personal mode — writes land in the local WAL and are searchable immediately and across restarts (the WAL is the embedded store). |
-| `--auth-token` | none | Bearer token for the backend. |
-| `--hmac-key` | none | 64-hex-char producer key for backend submits. |
 | `--data-dir` | OS data home | Where the offline WAL and the playbook live. |
 | `--dump-playbook` | — | Print the compiled playbook and exit. |
 | `--dump-block` | — | Print the CLAUDE.md/AGENTS.md instruction block and exit. |
@@ -363,7 +361,10 @@ exocortex-node --mode backend-node --storage falkor://falkordb:6379   --graph-na
 exocortex-node --mode backend-node --storage falkor://falkordb:6379   --graph-name my-org --import-org org-backup.json
 ```
 
-Then run clients with `--backend https://host:8080 --auth-token <token>`.
+Set `EXOCORTEX_AUTH_TOKEN` and `EXOCORTEX_HMAC_KEY` in the client process
+environment, then run clients with `--backend https://host:8080`. Backend
+nodes similarly read `EXOCORTEX_CLUSTER_SECRET`; credentials are never CLI
+arguments visible in process listings.
 Every operation is also available over authenticated HTTP; the SSE
 change feed keeps each client's local cache current. See the
 [PRD](docs/prd/exocortex-core-prd.md) (§4 deployment, §17 tenancy) and

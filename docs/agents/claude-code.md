@@ -19,15 +19,16 @@ curl -fsSL https://github.com/exocortex/exocortex/releases/latest/download/insta
   "mcpServers": {
     "exocortex": {
       "command": "exocortex-mcp-client",
-      "args": ["--backend", "https://your-node:7443", "--org", "your-org",
-               "--hmac-key", "<64-hex producer key>", "--auth-token", "<bearer>"]
+      "args": ["--backend", "https://your-node:7443", "--org", "your-org"],
+      "env": {"EXOCORTEX_HMAC_KEY": "<64-hex producer key>",
+              "EXOCORTEX_AUTH_TOKEN": "<bearer>"}
     }
   }
 }
 ```
 
-Standalone (no backend, offline WAL embedded store): omit all four
-flags. On first run the client installs the playbook under the OS data
+Standalone (no backend, offline WAL embedded store): omit the backend flag and
+credential environment. On first run the client installs the playbook under the OS data
 home and prints a notice on stderr; `--verify` prints its exact path.
 
 ## 3. The `CLAUDE.md` block
@@ -71,7 +72,7 @@ startup); `pending` is buffered, not lost.
 |---|---|
 | Agent never calls `end_session` | The `CLAUDE.md` block is missing or the file isn't loaded — check the block exists verbatim |
 | `not-connected` error | No `--backend` and no WAL — rerun with `--data-dir` writable |
-| Every write rejected `Unauthorized` | Wrong/missing `--hmac-key` (`exocortex-mcp-client --verify` flags it red) |
+| Every write rejected `Unauthorized` | Wrong/missing `EXOCORTEX_HMAC_KEY` (`exocortex-mcp-client --verify` flags it red) |
 | Rejections the agent never mentions | Expected behavior per the block ("never drop silently") — if the agent stays silent, tighten the block's wording in your copy |
 | `ONTOLOGY FINGERPRINT MISMATCH` | Client and backend run different pack versions — upgrade both |
 | Playbook stale after upgrade | First run of the new binary rewrites it; `--verify` confirms the version |

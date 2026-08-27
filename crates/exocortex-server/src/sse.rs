@@ -12,7 +12,6 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use futures::StreamExt;
-use hmac::{Hmac, Mac};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -468,12 +467,7 @@ fn decode_id(raw: &[u8]) -> Result<[u8; 16], StorageError> {
 
 /// Re-sign an envelope in place with a per-client key (R-Sec5).
 fn resign(key: &[u8; 32], env: &mut exocortex_wire::cluster::v1::InvalidationEnvelope) {
-    use prost::Message;
-    env.hmac = vec![];
-    let mut mac =
-        <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(&env.encode_to_vec());
-    env.hmac = mac.finalize().into_bytes().to_vec();
+    exocortex_wire::signing::sign_invalidation_envelope(key, env);
 }
 
 // Local base64 (standard library has none; hand-rolled 30-liner to avoid a

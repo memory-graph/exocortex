@@ -91,10 +91,6 @@ struct Args {
     /// project/team memberships, and maximum visibility.
     #[arg(long)]
     principal_policy: Option<std::path::PathBuf>,
-    /// Cluster-shared HMAC secret (exactly 64 hex chars). Required for every
-    /// backend node; tests inject an explicit known key.
-    #[arg(long)]
-    cluster_secret: Option<String>,
     /// Administrator-owned JSON source policy. Required in backend-node
     /// mode, including when the policy is intentionally empty (`[]`).
     #[arg(long)]
@@ -134,7 +130,7 @@ fn main() -> anyhow::Result<()> {
         exocortex_reasoning::acceptance::verify_nine_catalogued_rules(&ontology)
             .map_err(anyhow::Error::msg)?;
         println!(
-            "rules-ok mode={} count=9",
+            "rules-ok mode={} count=9 artifact=exocortex-node",
             std::env::var("EXOCORTEX_DEPLOYMENT_MODE").unwrap_or_else(|_| "backend-node".into())
         );
         return Ok(());
@@ -269,7 +265,8 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
             std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
         // Storage arms stay concrete (run_backend_node is generic over the
         // backend); a shared tail serves whichever arm won.
-        let cluster_secret = resolve_cluster_secret(args.cluster_secret.as_deref())?;
+        let cluster_secret_value = std::env::var("EXOCORTEX_CLUSTER_SECRET").ok();
+        let cluster_secret = resolve_cluster_secret(cluster_secret_value.as_deref())?;
         let principal_policy = args.principal_policy.as_deref().ok_or_else(|| {
             anyhow::anyhow!("--principal-policy is required for backend-node")
         })?;
@@ -354,10 +351,10 @@ async fn serve_forever<S: exocortex_storage::Storage + 'static>(
 /// fallback. Local tests and fixtures pass explicit known values.
 fn resolve_cluster_secret(secret: Option<&str>) -> anyhow::Result<[u8; 32]> {
     let secret = secret.filter(|value| !value.is_empty()).ok_or_else(|| {
-        anyhow::anyhow!("--cluster-secret is required for backend-node (64 hex chars)")
+        anyhow::anyhow!("EXOCORTEX_CLUSTER_SECRET is required for backend-node (64 hex chars)")
     })?;
     exocortex_wire::signing::decode_hex32(secret)
-        .map_err(|e| anyhow::anyhow!("--cluster-secret: {e}"))
+        .map_err(|e| anyhow::anyhow!("EXOCORTEX_CLUSTER_SECRET: {e}"))
 }
 
 fn resolve_transport(

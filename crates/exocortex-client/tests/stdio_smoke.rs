@@ -396,13 +396,14 @@ fn backend_mode_waits_for_authenticated_hydration_before_stdio_readiness() {
             "tester",
             "--backend",
             "http://127.0.0.1:1", // unreachable by design
-            "--hmac-key",
-            "1111111111111111111111111111111111111111111111111111111111111111",
-            "--auth-token",
-            "smoke-token",
             "--data-dir",
             dir.to_str().unwrap(),
-        ]);
+        ])
+        .env(
+            "EXOCORTEX_HMAC_KEY",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .env("EXOCORTEX_AUTH_TOKEN", "smoke-token");
     });
     c.send_all(&[serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -432,31 +433,26 @@ fn backend_mode_waits_for_authenticated_hydration_before_stdio_readiness() {
     reader.join().expect("stdout reader exits after kill");
 }
 
-/// CL3 (audit): a malformed --hmac-key aborts startup with a diagnostic
+/// CL3 (audit): a malformed environment key aborts startup with a diagnostic
 /// instead of panicking (short) or silently signing with zeros (non-hex).
 #[test]
 fn malformed_hmac_key_fails_startup() {
     for bad in ["deadbeef", &"z".repeat(64)] {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-mcp-client"))
-            .args([
-                "--org",
-                "x",
-                "--backend",
-                "http://127.0.0.1:1",
-                "--hmac-key",
-                bad,
-            ])
+            .args(["--org", "x", "--backend", "http://127.0.0.1:1"])
+            .env("EXOCORTEX_HMAC_KEY", bad)
+            .env("EXOCORTEX_AUTH_TOKEN", "test")
             .output()
             .expect("run client");
         assert!(
             !out.status.success(),
-            "malformed --hmac-key {bad:?} must not start: {:?}",
+            "malformed EXOCORTEX_HMAC_KEY {bad:?} must not start: {:?}",
             String::from_utf8_lossy(&out.stderr)
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("hmac-key"),
-            "diagnostic names the flag: {stderr}"
+            stderr.contains("EXOCORTEX_HMAC_KEY"),
+            "diagnostic names the variable: {stderr}"
         );
         assert!(
             !stderr.contains("panicked"),
@@ -468,37 +464,31 @@ fn malformed_hmac_key_fails_startup() {
 #[test]
 fn backend_mode_requires_nonempty_authentication_material() {
     let bin = env!("CARGO_BIN_EXE_exocortex-mcp-client");
-    let cases: &[(&[&str], &str)] = &[
+    for (hmac, token, expected) in [
+        (None, Some("token"), "EXOCORTEX_HMAC_KEY"),
         (
-            &["--backend", "http://127.0.0.1:1", "--auth-token", "token"],
-            "hmac-key",
+            Some("4242424242424242424242424242424242424242424242424242424242424242"),
+            None,
+            "EXOCORTEX_AUTH_TOKEN",
         ),
         (
-            &[
-                "--backend",
-                "http://127.0.0.1:1",
-                "--hmac-key",
-                "4242424242424242424242424242424242424242424242424242424242424242",
-            ],
-            "auth-token",
+            Some("4242424242424242424242424242424242424242424242424242424242424242"),
+            Some(""),
+            "EXOCORTEX_AUTH_TOKEN",
         ),
-        (
-            &[
-                "--backend",
-                "http://127.0.0.1:1",
-                "--hmac-key",
-                "4242424242424242424242424242424242424242424242424242424242424242",
-                "--auth-token",
-                "",
-            ],
-            "auth-token",
-        ),
-    ];
-    for (args, expected) in cases {
-        let out = std::process::Command::new(bin)
-            .args(*args)
-            .output()
-            .expect("run client");
+    ] {
+        let mut command = std::process::Command::new(bin);
+        command
+            .args(["--backend", "http://127.0.0.1:1"])
+            .env_remove("EXOCORTEX_HMAC_KEY")
+            .env_remove("EXOCORTEX_AUTH_TOKEN");
+        if let Some(value) = hmac {
+            command.env("EXOCORTEX_HMAC_KEY", value);
+        }
+        if let Some(value) = token {
+            command.env("EXOCORTEX_AUTH_TOKEN", value);
+        }
+        let out = command.output().expect("run client");
         assert!(!out.status.success(), "backend mode must fail closed");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains(expected), "{expected} diagnostic: {stderr}");

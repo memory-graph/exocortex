@@ -12,9 +12,7 @@ use exocortex_cluster::ClusterNode;
 use exocortex_kernel::{MemoryId, RelKindId};
 use exocortex_storage::{InMemoryStorage, Invalidation, Storage, VisibilityContext};
 use exocortex_wire::WIRE_VERSION;
-use hmac::{Hmac, Mac};
 use prost::Message;
-use sha2::Sha256;
 
 const HMAC_KEY: [u8; 32] = [9u8; 32];
 
@@ -352,13 +350,8 @@ async fn per_client_sse_hmac_verifies_with_derived_key() {
     // (The server re-signs before this reaches the wire; simulate the
     // re-sign here to check the negative path deterministically.)
     let resigned = {
-        use prost::Message;
         let mut e = env.clone();
-        e.hmac = vec![];
-        let raw = e.encode_to_vec();
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&derived).unwrap();
-        mac.update(&raw);
-        e.hmac = mac.finalize().into_bytes().to_vec();
+        exocortex_wire::signing::sign_invalidation_envelope(&derived, &mut e);
         b64_encode(&e.encode_to_vec())
     };
     assert!(decode_envelope(&derived, &onto.fingerprint.0, &resigned).is_ok());

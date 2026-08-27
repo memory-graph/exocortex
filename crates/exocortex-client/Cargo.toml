@@ -19,7 +19,6 @@ blake3 = { workspace = true }
 bincode = { workspace = true}
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-hmac = { workspace = true }
 sha2 = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
@@ -44,7 +43,6 @@ eventsource-client = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 metrics = { workspace = true }
-subtle = { workspace = true }
 
 [[bin]]
 name = "exocortex-mcp-client"

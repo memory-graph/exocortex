@@ -79,11 +79,13 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
             &format!("127.0.0.1:{gossip_port}"),
             "--principal-policy",
             principal_policy.to_str().unwrap(),
-            "--cluster-secret",
-            "4242424242424242424242424242424242424242424242424242424242424242",
             "--source-policy",
             source_policy.to_str().unwrap(),
         ])
+        .env(
+            "EXOCORTEX_CLUSTER_SECRET",
+            "4242424242424242424242424242424242424242424242424242424242424242",
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -129,11 +131,12 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
             fixture.to_str().unwrap(),
             "--cursor",
             dir.path().join("fx.cursor").to_str().unwrap(),
-            "--hmac-key",
-            "4242424242424242424242424242424242424242424242424242424242424242",
-            "--auth-token",
-            "fixture-e2e",
         ])
+        .env(
+            "EXOCORTEX_HMAC_KEY",
+            "4242424242424242424242424242424242424242424242424242424242424242",
+        )
+        .env("EXOCORTEX_AUTH_TOKEN", "fixture-e2e")
         .output()
         .expect("run exocortex-worker fixture");
     let _ = node.kill();
@@ -163,9 +166,8 @@ fn malformed_hmac_key_fails_loudly() {
             "http://127.0.0.1:1",
             "--fixture",
             "/nonexistent.json",
-            "--hmac-key",
-            "zzzz",
         ])
+        .env("EXOCORTEX_HMAC_KEY", "zzzz")
         .output()
         .unwrap();
     assert!(!out.status.success(), "bad hex must fail");
@@ -194,5 +196,5 @@ fn fixture_adapter_requires_explicit_hmac_key() {
         .output()
         .unwrap();
     assert!(!out.status.success(), "missing key must fail closed");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("hmac-key"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("EXOCORTEX_HMAC_KEY"));
 }

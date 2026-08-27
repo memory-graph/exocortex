@@ -101,6 +101,13 @@ fn main() -> Result<()> {
 }
 
 fn deployment_acceptance() -> Result<()> {
+    let installer = std::process::Command::new("sh")
+        .arg("scripts/test-release-installer.sh")
+        .status()?;
+    anyhow::ensure!(
+        installer.success(),
+        "release installer checksum test failed"
+    );
     let compose =
         std::fs::read_to_string("crates/exocortex-cluster/tests/docker-compose-cluster.yml")?;
     for node in ["node1", "node2", "node3"] {
@@ -122,10 +129,31 @@ fn deployment_acceptance() -> Result<()> {
         );
     }
     run(
-        &["build", "-p", "exocortex-client", "-p", "exocortex-server"],
+        &[
+            "build",
+            "-p",
+            "exocortex-client",
+            "-p",
+            "exocortex-server",
+            "-p",
+            "exocortex-worker",
+        ],
         &[],
     )?;
     let bin_dir = std::path::Path::new("target/debug").canonicalize()?;
+    for binary in ["exocortex-mcp-client", "exocortex-node", "exocortex-worker"] {
+        let help = std::process::Command::new(bin_dir.join(binary))
+            .arg("--help")
+            .output()?;
+        anyhow::ensure!(help.status.success(), "{binary} --help failed");
+        let help = String::from_utf8(help.stdout)?;
+        for secret_flag in ["--auth-token", "--hmac-key", "--cluster-secret"] {
+            anyhow::ensure!(
+                !help.contains(secret_flag),
+                "{binary} exposes secret-bearing argv flag {secret_flag}"
+            );
+        }
+    }
     for mode in ["mcp-client", "mcp-standalone", "backend-node"] {
         let output = std::process::Command::new("scripts/exocortex")
             .args(["--mode", mode, "--verify-rules"])
@@ -141,8 +169,17 @@ fn deployment_acceptance() -> Result<()> {
             stdout.contains(&format!("rules-ok mode={mode} count=9")),
             "deployment mode {mode} did not execute all nine rules: {stdout}"
         );
+        let artifact = if mode == "mcp-client" {
+            "exocortex-mcp-client"
+        } else {
+            "exocortex-node"
+        };
+        anyhow::ensure!(
+            stdout.contains(&format!("artifact={artifact}")),
+            "deployment mode {mode} selected the wrong artifact: {stdout}"
+        );
     }
-    println!("deployment-acceptance ok: chaos nodes build the current image; one artifact selected 3 modes; each executed 9 rules");
+    println!("deployment-acceptance ok: chaos nodes build the current image; one entrypoint selected the correct artifact for 3 modes; each executed 9 rules; no secret-bearing argv flags");
     Ok(())
 }
 
@@ -384,6 +421,12 @@ fn kernel_purity() -> Result<()> {
         pack_coupling.is_empty(),
         "kernel-purity FAILED: {}",
         pack_coupling.join("; ")
+    );
+    let boundary = gates::kernel_boundary_violations(std::path::Path::new("."))?;
+    anyhow::ensure!(
+        boundary.is_empty(),
+        "kernel-purity FAILED: {}",
+        boundary.join("; ")
     );
     for crate_name in [
         "exocortex-kernel",
@@ -755,7 +798,7 @@ fn signing_hygiene() -> anyhow::Result<()> {
         "signing-hygiene FAILED:\n{}",
         violations.join("\n")
     );
-    println!("signing-hygiene ok: single batch-signing implementation; no unsigning blank-checksum submitters");
+    println!("signing-hygiene ok: all HMAC lives in exocortex-wire::signing; no unsigned blank-checksum submitters");
     Ok(())
 }
 

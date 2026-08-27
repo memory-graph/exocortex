@@ -391,3 +391,9 @@ proto-sync-guarded copy).
   dev-v1. `cargo xtask kernel-purity` proves a packless fixture fails on that
   unresolved symbol and its linked counterpart succeeds; the kernel itself
   neither depends on nor names dev-v1.
+- **Process-listing safety supersedes the §4.2 client command example.** The
+  PRD example places the bearer credential in `--auth-token`, which exposes it
+  through process arguments. Shared clients and workers now require
+  `EXOCORTEX_AUTH_TOKEN` and `EXOCORTEX_HMAC_KEY`; backend nodes require
+  `EXOCORTEX_CLUSTER_SECRET`. The deployment behavior is unchanged, but the
+  credential transport deliberately differs from the older example.

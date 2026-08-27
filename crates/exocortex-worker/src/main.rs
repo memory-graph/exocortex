@@ -32,15 +32,6 @@ struct Args {
     /// `--adapter fixture`: org to submit into.
     #[arg(long, default_value = "org")]
     org: String,
-    /// `--adapter fixture`: producer HMAC key, 64 hex chars. Falls back
-    /// to `$EXOCORTEX_HMAC_KEY`, then the shared dev key `[0x42; 32]` —
-    /// which must match the backend's ingest key (round-3 C2: the
-    /// hardcoded `[5u8; 32]` could never authenticate).
-    #[arg(long)]
-    hmac_key: Option<String>,
-    /// `--adapter fixture`: bearer credential for the backend principal.
-    #[arg(long)]
-    auth_token: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -97,13 +88,12 @@ async fn run_fixture(args: Args) -> anyhow::Result<()> {
     use exocortex_adapter_sdk::{AdapterConfig, AdapterSession, BatchUnit};
     use exocortex_wire::ingest::v1::{MemoryDraft, RelationshipDraft};
 
-    // Key resolution order: --hmac-key > $EXOCORTEX_HMAC_KEY. Shared-mode
-    // producers never fall back to a published key.
-    let hmac_key_hex = args
-        .hmac_key
-        .clone()
-        .or_else(|| std::env::var("EXOCORTEX_HMAC_KEY").ok())
-        .ok_or_else(|| anyhow::anyhow!("--hmac-key or EXOCORTEX_HMAC_KEY is required"))?;
+    // Shared-mode producers accept secrets only from the process environment,
+    // never command-line arguments visible to process listings.
+    let hmac_key_hex = std::env::var("EXOCORTEX_HMAC_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("EXOCORTEX_HMAC_KEY is required"))?;
     let hmac_key =
         exocortex_wire::signing::decode_hex32(&hmac_key_hex).map_err(anyhow::Error::msg)?;
     let path = args
@@ -164,11 +154,12 @@ async fn run_fixture(args: Args) -> anyhow::Result<()> {
         producer_kind: exocortex_wire::ingest::v1::ProducerKind::AnalyticsAdapter,
         ceiling: 3,
         backend_url: args.backend.clone(),
-        auth_token: args
-            .auth_token
-            .clone()
+        auth_token: std::env::var("EXOCORTEX_AUTH_TOKEN")
+            .ok()
             .filter(|token| !token.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("--auth-token is required for fixture adapter"))?,
+            .ok_or_else(|| {
+                anyhow::anyhow!("EXOCORTEX_AUTH_TOKEN is required for fixture adapter")
+            })?,
         hmac_key,
         max_batch_bytes: 4 * 1024 * 1024,
         cursor_path,

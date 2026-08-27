@@ -22,11 +22,11 @@ esac
 bin_dir=${EXOCORTEX_BIN_DIR:-"$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"}
 export EXOCORTEX_DEPLOYMENT_MODE="$mode"
 case "$mode" in
-  mcp-client|mcp-standalone)
+  mcp-client)
     exec "$bin_dir/exocortex-mcp-client" "$@"
     ;;
-  backend-node)
-    exec "$bin_dir/exocortex-node" --mode backend-node "$@"
+  mcp-standalone|backend-node)
+    exec "$bin_dir/exocortex-node" --mode "$mode" "$@"
     ;;
   *)
     echo "unknown deployment mode: $mode" >&2

@@ -16,11 +16,12 @@ Codex reads `~/.codex/config.toml`:
 ```toml
 [mcp_servers.exocortex]
 command = "exocortex-mcp-client"
-args = ["--backend", "https://your-node:7443", "--org", "your-org",
-        "--hmac-key", "<64-hex producer key>", "--auth-token", "<bearer>"]
+args = ["--backend", "https://your-node:7443", "--org", "your-org"]
+env = { EXOCORTEX_HMAC_KEY = "<64-hex producer key>", EXOCORTEX_AUTH_TOKEN = "<bearer>" }
 ```
 
-Standalone (offline WAL embedded store): omit all four flags. On first
+Standalone (offline WAL embedded store): omit the backend flag and credential
+environment. On first
 run the client installs the playbook under the OS data home; `--verify`
 prints its exact path.
 
@@ -59,6 +60,6 @@ rows are buffered in the WAL, not lost.
 |---|---|
 | Agent never calls `end_session` | `AGENTS.md` block missing — check it exists verbatim |
 | `not-connected` error | No `--backend` and no WAL — check `--data-dir` writable |
-| Every write rejected `Unauthorized` | Wrong/missing `--hmac-key` (`--verify` flags it red) |
+| Every write rejected `Unauthorized` | Wrong/missing `EXOCORTEX_HMAC_KEY` (`--verify` flags it red) |
 | Rejections never surfaced | The block requires surfacing unfixable rejections in the final message — check your copy wasn't trimmed |
 | `ONTOLOGY FINGERPRINT MISMATCH` | Client and backend run different pack versions — upgrade both |
