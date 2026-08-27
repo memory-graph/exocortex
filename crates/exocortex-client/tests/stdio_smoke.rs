@@ -678,7 +678,7 @@ async fn omitted_session_id_gets_process_minted_default() {
     let tail = wal.tail(5);
     assert_eq!(tail.len(), 2);
     // Recover the session ids through the WAL entries themselves.
-    let entries = wal.pending_entries();
+    let entries = wal.pending_entries().unwrap();
     let ids: Vec<&str> = entries.iter().map(|e| e.session_id.as_str()).collect();
     assert!(
         ids.contains(&"shared-conv"),

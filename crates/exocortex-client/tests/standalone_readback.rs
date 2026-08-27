@@ -249,7 +249,7 @@ fn boot_seeds_pending_synced_and_failed_entries() {
         // Settle two of the three entries directly in the WAL (the
         // states a drain leaves behind), then drop the handle.
         let wal = exocortex_client::wal::Wal::open(&dir.join("wal")).unwrap();
-        let states = wal.states_for_test();
+        let states = wal.states_for_test().unwrap();
         assert_eq!(states.len(), 3);
         wal.mark_synced(states[0].0, 500).unwrap();
         wal.mark_failed(states[1].0).unwrap();

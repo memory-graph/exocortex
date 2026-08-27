@@ -62,6 +62,15 @@ pub enum WalError {
     /// sled failure.
     #[error("wal io: {0}")]
     Io(String),
+    /// A record exists but cannot be decoded by this build. The original
+    /// sled value is deliberately left untouched for operator recovery.
+    #[error("wal record {local_lsn} is corrupt or incompatible: {detail}")]
+    Corrupt {
+        /// Record key in the local WAL.
+        local_lsn: u64,
+        /// Codec or storage detail.
+        detail: String,
+    },
     /// The configured byte budget is exhausted (R-Sc8 `WAL Full`).
     #[error("wal full: {0} bytes used of {1} budget")]
     Full(#[allow(dead_code)] u64, #[allow(dead_code)] u64),
@@ -90,10 +99,9 @@ pub struct TailRow {
 
 /// Sled-backed write-ahead log.
 pub struct Wal {
-    #[allow(dead_code)] // flushed through in append_batch; kept for db lifetime
-    db: sled::Db,
     tree: sled::Tree,
     max_bytes: u64,
+    append_gate: std::sync::Mutex<()>,
 }
 
 impl Wal {
@@ -109,19 +117,17 @@ impl Wal {
             .open_tree("wal")
             .map_err(|e| WalError::Io(e.to_string()))?;
         Ok(Self {
-            db,
             tree,
             max_bytes,
+            append_gate: std::sync::Mutex::new(()),
         })
     }
 
-    fn used_bytes(&self) -> u64 {
-        self.tree
-            .iter()
-            .values()
-            .flatten()
-            .map(|v| v.len() as u64 + 16)
-            .sum()
+    fn used_bytes(&self) -> Result<u64, WalError> {
+        self.tree.iter().try_fold(0u64, |used, item| {
+            let (_, value) = item.map_err(|error| WalError::Io(error.to_string()))?;
+            Ok(used.saturating_add(value.len() as u64 + 16))
+        })
     }
 
     /// Append one batch; assigns and returns the batch's local LSN.
@@ -176,27 +182,77 @@ impl Wal {
         self.insert_entry(entry)
     }
 
-    /// Assign the next local LSN, run the byte budget (R-Sc8), persist.
-    fn insert_entry(&self, mut entry: WalEntry) -> Result<u64, WalError> {
-        entry.local_lsn = self
-            .tree
+    /// Atomically append a complete imported backup. Every row is encoded and
+    /// the aggregate budget is checked before a single sled key is mutated.
+    pub fn append_imported_batch(&self, mut entries: Vec<WalEntry>) -> Result<u64, WalError> {
+        self.append_imported_batch_with(&mut entries, || Ok(()))
+    }
+
+    fn append_imported_batch_with(
+        &self,
+        entries: &mut [WalEntry],
+        before_commit: impl FnOnce() -> Result<(), WalError>,
+    ) -> Result<u64, WalError> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let _append = self
+            .append_gate
+            .lock()
+            .map_err(|_| WalError::Io("WAL append serialization mutex is poisoned".to_string()))?;
+        let first_lsn = self.next_lsn()?;
+        let mut batch = sled::Batch::default();
+        let mut encoded_bytes = 0u64;
+        for (offset, entry) in entries.iter_mut().enumerate() {
+            entry.local_lsn = first_lsn
+                .checked_add(offset as u64)
+                .ok_or_else(|| WalError::Io("WAL local LSN overflow during import".to_string()))?;
+            let bytes = encode_entry(entry).map_err(WalError::Io)?;
+            encoded_bytes = encoded_bytes.saturating_add(bytes.len() as u64 + 16);
+            batch.insert(entry.local_lsn.to_be_bytes().to_vec(), bytes);
+        }
+        let used = self.used_bytes()?;
+        if used.saturating_add(encoded_bytes) > self.max_bytes {
+            return Err(WalError::Full(used, self.max_bytes));
+        }
+        before_commit()?;
+        self.tree
+            .apply_batch(batch)
+            .map_err(|e| WalError::Io(e.to_string()))?;
+        self.tree.flush().map_err(|e| WalError::Io(e.to_string()))?;
+        Ok(first_lsn)
+    }
+
+    fn next_lsn(&self) -> Result<u64, WalError> {
+        self.tree
             .last()
             .map_err(|e| WalError::Io(e.to_string()))?
-            .map(|(k, _)| {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&k);
-                u64::from_be_bytes(b) + 1
+            .map(|(key, _)| {
+                key_to_lsn(&key)?
+                    .checked_add(1)
+                    .ok_or_else(|| WalError::Io("WAL local LSN space is exhausted".to_string()))
             })
-            .unwrap_or(1);
+            .transpose()
+            .map(|next| next.unwrap_or(1))
+    }
+
+    /// Assign the next local LSN, run the byte budget (R-Sc8), persist.
+    fn insert_entry(&self, mut entry: WalEntry) -> Result<u64, WalError> {
+        let _append = self
+            .append_gate
+            .lock()
+            .map_err(|_| WalError::Io("WAL append serialization mutex is poisoned".to_string()))?;
+        entry.local_lsn = self.next_lsn()?;
         let local_lsn = entry.local_lsn;
         let bytes = encode_entry(&entry).map_err(WalError::Io)?;
-        if self.used_bytes() + bytes.len() as u64 > self.max_bytes {
-            return Err(WalError::Full(self.used_bytes(), self.max_bytes));
+        let used = self.used_bytes()?;
+        if used.saturating_add(bytes.len() as u64) > self.max_bytes {
+            return Err(WalError::Full(used, self.max_bytes));
         }
         self.tree
             .insert(local_lsn.to_be_bytes(), bytes)
             .map_err(|e| WalError::Io(e.to_string()))?;
-        self.db.flush().map_err(|e| WalError::Io(e.to_string()))?;
+        self.tree.flush().map_err(|e| WalError::Io(e.to_string()))?;
         Ok(local_lsn)
     }
 
@@ -207,49 +263,54 @@ impl Wal {
     }
 
     /// True at >= 90% of the budget (R-Sc8 `WAL Near Full`).
-    pub fn near_full(&self) -> bool {
-        self.used_bytes() * 10 >= self.max_bytes * 9
+    pub fn near_full(&self) -> Result<bool, WalError> {
+        Ok(self.used_bytes()?.saturating_mul(10) >= self.max_bytes.saturating_mul(9))
     }
 
     /// Count of entries still `Pending`.
-    pub fn pending_count(&self) -> usize {
-        self.tree
-            .iter()
-            .values()
-            .flatten()
-            .filter_map(|v| decode_entry(&v).ok())
-            .filter(|e| e.state == WalState::Pending)
-            .count()
+    pub fn pending_count(&self) -> Result<usize, WalError> {
+        Ok(self
+            .decoded_entries()?
+            .into_iter()
+            .filter(|entry| entry.state == WalState::Pending)
+            .count())
     }
 
     /// Every `Pending` entry in local-LSN order (W1: the drain input).
-    pub fn pending_entries(&self) -> Vec<WalEntry> {
-        self.tree
-            .iter()
-            .values()
-            .flatten()
-            .filter_map(|v| decode_entry(&v).ok())
-            .filter(|e| e.state == WalState::Pending)
-            .collect()
+    pub fn pending_entries(&self) -> Result<Vec<WalEntry>, WalError> {
+        Ok(self
+            .decoded_entries()?
+            .into_iter()
+            .filter(|entry| entry.state == WalState::Pending)
+            .collect())
     }
 
     /// SR-PRD F2: fetch one entry by its local LSN — the live write-back
     /// reads back exactly what was appended, through the same materialize
     /// path boot seeding uses (one implementation, no drift).
-    pub fn entry(&self, local_lsn: u64) -> Option<WalEntry> {
-        let raw = self.tree.get(local_lsn.to_be_bytes()).ok().flatten()?;
-        decode_entry(&raw).ok()
+    pub fn entry(&self, local_lsn: u64) -> Result<Option<WalEntry>, WalError> {
+        let raw = self
+            .tree
+            .get(local_lsn.to_be_bytes())
+            .map_err(|e| WalError::Io(e.to_string()))?;
+        raw.map(|raw| decode_at(local_lsn, &raw)).transpose()
     }
 
     /// SR-PRD F3: every entry in local-LSN order, ALL states — standalone
     /// boot seeds from the WAL because nothing else will ever deliver
     /// these rows server-side (`Pending`, `Synced`, and `Failed` alike).
-    pub fn entries(&self) -> Vec<WalEntry> {
+    pub fn entries(&self) -> Result<Vec<WalEntry>, WalError> {
+        self.decoded_entries()
+    }
+
+    fn decoded_entries(&self) -> Result<Vec<WalEntry>, WalError> {
         self.tree
             .iter()
-            .values()
-            .flatten()
-            .filter_map(|v| decode_entry(&v).ok())
+            .map(|item| {
+                let (key, value) = item.map_err(|e| WalError::Io(e.to_string()))?;
+                let local_lsn = key_to_lsn(&key)?;
+                decode_at(local_lsn, &value)
+            })
             .collect()
     }
 
@@ -320,6 +381,18 @@ impl Wal {
     }
 }
 
+fn key_to_lsn(key: &[u8]) -> Result<u64, WalError> {
+    let bytes: [u8; 8] = key.try_into().map_err(|_| WalError::Corrupt {
+        local_lsn: 0,
+        detail: format!("invalid {}-byte sled key", key.len()),
+    })?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn decode_at(local_lsn: u64, raw: &[u8]) -> Result<WalEntry, WalError> {
+    decode_entry(raw).map_err(|detail| WalError::Corrupt { local_lsn, detail })
+}
+
 /// Entry codec: `[version u8][len u32 BE][json]`. Version 1.
 const WAL_CODEC_VERSION: u8 = 1;
 
@@ -343,14 +416,12 @@ fn decode_entry(bytes: &[u8]) -> Result<WalEntry, String> {
 impl Wal {
     /// Test-only: every entry's (local_lsn, state) in LSN order.
     #[doc(hidden)]
-    pub fn states_for_test(&self) -> Vec<(u64, WalState)> {
-        self.tree
-            .iter()
-            .values()
-            .flatten()
-            .filter_map(|v| decode_entry(&v).ok())
-            .map(|e| (e.local_lsn, e.state))
-            .collect()
+    pub fn states_for_test(&self) -> Result<Vec<(u64, WalState)>, WalError> {
+        Ok(self
+            .entries()?
+            .into_iter()
+            .map(|entry| (entry.local_lsn, entry.state))
+            .collect())
     }
 }
 
@@ -410,12 +481,29 @@ mod tests {
             )
             .unwrap();
         assert!(b > a);
-        assert_eq!(wal.pending_count(), 2);
+        assert_eq!(wal.pending_count().unwrap(), 2);
         wal.mark_synced(a, 100).unwrap();
-        assert_eq!(wal.pending_count(), 1);
+        assert_eq!(wal.pending_count().unwrap(), 1);
         wal.mark_failed(b).unwrap();
-        assert_eq!(wal.pending_count(), 0);
+        assert_eq!(wal.pending_count().unwrap(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tree_owns_its_database_context_and_flushes_without_a_db_field() {
+        let dir =
+            std::env::temp_dir().join(format!("exocortex-tree-owner-{}", uuid::Uuid::new_v4()));
+        {
+            // `open` drops its local sled::Db handle before returning. The
+            // retained Tree owns an Arc<TreeInner> with the page-cache context.
+            let wal = Wal::open(&dir).unwrap();
+            wal.append_batch("s", vec![draft("durable")], vec![MemoryId::new_v7()])
+                .unwrap();
+        }
+        let reopened = Wal::open(&dir).unwrap();
+        assert_eq!(reopened.entries().unwrap().len(), 1);
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -446,5 +534,90 @@ mod tests {
             "budget enforced (R-Sc8)"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_record_is_reported_with_lsn_and_left_untouched() {
+        let dir = std::env::temp_dir().join(format!("exocortex-corrupt-{}", uuid::Uuid::new_v4()));
+        let wal = Wal::open(&dir).unwrap();
+        wal.tree
+            .insert(7u64.to_be_bytes(), b"not-a-wal-record")
+            .unwrap();
+        wal.tree.flush().unwrap();
+
+        let err = wal.entries().unwrap_err();
+        assert!(matches!(err, WalError::Corrupt { local_lsn: 7, .. }));
+        assert_eq!(
+            wal.tree.get(7u64.to_be_bytes()).unwrap().unwrap().as_ref(),
+            b"not-a-wal-record",
+            "diagnosis must preserve original recovery bytes"
+        );
+        assert!(matches!(
+            wal.pending_entries().unwrap_err(),
+            WalError::Corrupt { local_lsn: 7, .. }
+        ));
+        drop(wal);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn imported_batch_budget_failure_leaves_destination_unchanged() {
+        let dir = std::env::temp_dir().join(format!("exocortex-import-{}", uuid::Uuid::new_v4()));
+        let wal = Wal::open_with_budget(&dir, 1).unwrap();
+        let entry = WalEntry {
+            local_lsn: 99,
+            session_id: "import".into(),
+            memories: vec![draft("staged")],
+            memory_ids: vec![MemoryId::new_v7()],
+            state: WalState::Pending,
+            batch_id: "batch".into(),
+            draft_keys: vec!["k".into()],
+            tags: vec![vec![]],
+        };
+        assert!(matches!(
+            wal.append_imported_batch(vec![entry.clone(), entry]),
+            Err(WalError::Full(_, _))
+        ));
+        assert_eq!(wal.db_len(), 0, "no imported prefix may survive failure");
+        drop(wal);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn imported_batch_injected_precommit_failure_preserves_existing_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "exocortex-import-injected-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let wal = Wal::open(&dir).unwrap();
+        wal.append_batch(
+            "existing",
+            vec![draft("existing")],
+            vec![MemoryId::new_v7()],
+        )
+        .unwrap();
+        let before = wal.entries().unwrap();
+        let mut imported = vec![WalEntry {
+            local_lsn: 99,
+            session_id: "import".into(),
+            memories: vec![draft("staged")],
+            memory_ids: vec![MemoryId::new_v7()],
+            state: WalState::Pending,
+            batch_id: "batch".into(),
+            draft_keys: vec!["k".into()],
+            tags: vec![vec![]],
+        }];
+        let error = wal
+            .append_imported_batch_with(&mut imported, || {
+                Err(WalError::Io("injected before atomic commit".into()))
+            })
+            .unwrap_err();
+        assert!(matches!(error, WalError::Io(_)));
+        let after = wal.entries().unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[0].local_lsn, before[0].local_lsn);
+        assert_eq!(after[0].session_id, before[0].session_id);
+        drop(wal);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

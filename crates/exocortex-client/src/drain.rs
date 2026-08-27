@@ -48,7 +48,10 @@ pub async fn drain_once(
     node_id: &str,
 ) -> Result<DrainReport, tonic::Status> {
     let mut report = DrainReport::default();
-    for entry in wal.pending_entries() {
+    for entry in wal
+        .pending_entries()
+        .map_err(|error| tonic::Status::data_loss(error.to_string()))?
+    {
         report.attempted += 1;
         let mut batch = match rebuild_batch(&entry, fingerprint, org_id, ontology) {
             Ok(b) => b,
@@ -346,8 +349,13 @@ pub async fn drain_all(
             Err(e) => {
                 tracing::warn!(%e, "wal drain pass failed; will retry");
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                if wal.pending_count() == 0 {
-                    break;
+                match wal.pending_count() {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "WAL corruption stops drain retries");
+                        break;
+                    }
                 }
             }
         }

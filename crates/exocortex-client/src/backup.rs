@@ -11,6 +11,7 @@
 //! the drain).
 
 use anyhow::{Context, Result};
+use std::io::Write as _;
 
 use crate::wal::{Wal, WalEntry};
 
@@ -37,7 +38,7 @@ pub struct Backup {
 /// Export every entry to `path` (pretty JSON, LSN order). Returns the
 /// entry count.
 pub fn export(wal: &Wal, fingerprint: &str, path: &std::path::Path) -> Result<usize> {
-    let entries = wal.entries();
+    let entries = wal.entries().context("read WAL for backup")?;
     let doc = Backup {
         format: FORMAT.into(),
         version: VERSION,
@@ -47,7 +48,8 @@ pub fn export(wal: &Wal, fingerprint: &str, path: &std::path::Path) -> Result<us
     };
     let n = doc.entries.len();
     let json = serde_json::to_string_pretty(&doc).context("serialize backup")?;
-    std::fs::write(path, json).with_context(|| format!("write backup {}", path.display()))?;
+    atomic_write_private(path, json.as_bytes())
+        .with_context(|| format!("write backup {}", path.display()))?;
     Ok(n)
 }
 
@@ -111,13 +113,9 @@ pub fn import(
         }
     }
     let imported = doc.entries.len();
-    let mut first = 0u64;
-    for (i, e) in doc.entries.into_iter().enumerate() {
-        let lsn = wal.append_imported(e).context("append imported entry")?;
-        if i == 0 {
-            first = lsn;
-        }
-    }
+    let first = wal
+        .append_imported_batch(doc.entries)
+        .context("atomically append imported backup")?;
     Ok(ImportReport {
         imported,
         first_local_lsn: first,
@@ -131,4 +129,91 @@ fn hex(b: &[u8]) -> String {
         let _ = write!(s, "{x:02x}");
     }
     s
+}
+
+fn atomic_write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_private_with(path, bytes, |_| Ok(()))
+}
+
+fn atomic_write_private_with(
+    path: &std::path::Path,
+    bytes: &[u8],
+    before_rename: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("backup");
+    let mut opened = None;
+    for attempt in 0..100u32 {
+        let candidate = parent.join(format!(".{name}.tmp-{}-{attempt}", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                opened = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let (temporary, mut file) = opened.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate backup temporary file",
+        )
+    })?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        before_rename(&temporary)?;
+        std::fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::atomic_write_private_with;
+
+    #[test]
+    fn private_atomic_write_preserves_previous_file_on_injected_failure() {
+        let dir =
+            std::env::temp_dir().join(format!("exocortex-private-backup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("backup.json");
+        std::fs::write(&path, b"previous").unwrap();
+        let error = atomic_write_private_with(&path, b"replacement", |_| {
+            Err(std::io::Error::other("injected before rename"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+
+        atomic_write_private_with(&path, b"replacement", |_| Ok(())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

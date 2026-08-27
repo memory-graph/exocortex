@@ -26,9 +26,9 @@ fn wal_pending_count_diagnostics() {
     let tree_entries: usize = { wal.db_len() };
     println!(
         "lsn={lsn} entries={tree_entries} pending={}",
-        wal.pending_count()
+        wal.pending_count().unwrap()
     );
-    assert_eq!(wal.pending_count(), 1);
+    assert_eq!(wal.pending_count().unwrap(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -103,7 +103,7 @@ async fn wal_drain_settles_pending_entries() {
         vec![vec![]],
     )
     .unwrap();
-    assert_eq!(wal.pending_count(), 2);
+    assert_eq!(wal.pending_count().unwrap(), 2);
 
     // Serve the real IngestService on a loopback port and connect to it.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -154,9 +154,9 @@ async fn wal_drain_settles_pending_entries() {
         report.failed, 1,
         "unknown-type entry is terminal: {report:?}"
     );
-    assert_eq!(wal.pending_count(), 0, "nothing left Pending");
+    assert_eq!(wal.pending_count().unwrap(), 0, "nothing left Pending");
 
-    let all = wal.states_for_test();
+    let all = wal.states_for_test().unwrap();
     assert!(
         matches!(all[0], (1, WalState::Synced { .. })),
         "entry 1 synced: {all:?}"

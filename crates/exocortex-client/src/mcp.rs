@@ -413,11 +413,11 @@ impl ExocortexMcp {
         // into the served snapshot (ONE copy-on-write swap that also
         // stamps the R-M7 local LSN). Read back through the SAME
         // materializer boot seeding uses; cross-batch edge targets
-        // resolve against the served graph. Degrades to the CL6
-        // LSN-only advance if the entry cannot be read back — logged,
-        // never failing the ack; the WAL remains the source of truth.
+        // resolve against the served graph. A missing just-appended row may
+        // still degrade to an LSN-only advance; a corrupt row is a precise,
+        // fail-closed error and remains untouched for recovery (R6-B15).
         match wal.entry(local_lsn) {
-            Some(entry) => {
+            Ok(Some(entry)) => {
                 let rows = crate::materialize::materialize_entry(
                     &self.ontology,
                     &self.org,
@@ -434,10 +434,11 @@ impl ExocortexMcp {
                 self.cache
                     .apply_local(&self.org, &rows.memories, &rows.edges, local_lsn);
             }
-            None => {
+            Ok(None) => {
                 tracing::warn!("wal entry {local_lsn} unreadable after append; advancing LSN only");
                 self.cache.advance_local_lsn(&self.vc.org_id, local_lsn);
             }
+            Err(error) => return Err(json_error("wal-corrupt", error.to_string())),
         }
         #[derive(Serialize)]
         struct OfflineAck {

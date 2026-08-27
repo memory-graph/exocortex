@@ -185,13 +185,13 @@ fn main() -> anyhow::Result<()> {
 
     // WAL: offline write buffer + (standalone) the embedded store.
     let wal = Arc::new(wal::Wal::open(&data_dir.join("wal"))?);
-    if wal.near_full() {
+    if wal.near_full()? {
         tracing::warn!("WAL Near Full (R-Sc8)");
     }
 
     match args.backend.as_ref() {
         None => {
-            let entries = wal.entries();
+            let entries = wal.entries()?;
             let last_lsn = entries.last().map(|e| e.local_lsn).unwrap_or(0);
             let rows =
                 exocortex_client::materialize::materialize_all(&ontology, &args.org, &entries);
@@ -244,7 +244,7 @@ fn main() -> anyhow::Result<()> {
             // each Pending entry is rebuilt, signed fresh, and settled via
             // the R13 classify table. Runs at startup and retries
             // transport-failed entries every 30s until quiescent.
-            if wal.pending_count() > 0 {
+            if wal.pending_count()? > 0 {
                 let wal = wal.clone();
                 let mut drain_client =
                     exocortex_wire::ingest::v1::ingest_service_client::IngestServiceClient::new(
@@ -504,7 +504,7 @@ fn verify(args: &Args, ontology: &Ontology, data_dir: &std::path::Path) -> anyho
     let wal_dir = data_dir.join("wal");
     if wal_dir.exists() {
         let wal = wal::Wal::open(&wal_dir)?;
-        let pending = wal.pending_count();
+        let pending = wal.pending_count()?;
         if pending > 0 {
             red += 1;
         }

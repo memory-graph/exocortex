@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use exocortex_kernel::{Memory, Ontology, Relationship};
 use exocortex_storage::Storage;
 use futures::StreamExt;
+use std::io::Write as _;
 
 /// The format discriminator written into every org backup.
 pub const FORMAT: &str = "exocortex-org-backup";
@@ -79,11 +80,9 @@ pub async fn export_org<S: Storage>(
         memories,
         relationships,
     };
-    std::fs::write(
-        path,
-        serde_json::to_string_pretty(&doc).context("serialize backup")?,
-    )
-    .with_context(|| format!("write backup {}", path.display()))?;
+    let bytes = serde_json::to_vec_pretty(&doc).context("serialize backup")?;
+    atomic_write_private(path, &bytes)
+        .with_context(|| format!("write backup {}", path.display()))?;
     Ok((nm, nr))
 }
 
@@ -143,4 +142,76 @@ fn hex(b: &[u8]) -> String {
         let _ = write!(s, "{x:02x}");
     }
     s
+}
+
+fn atomic_write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_private_with(path, bytes, |_| Ok(()))
+}
+
+fn atomic_write_private_with(
+    path: &std::path::Path,
+    bytes: &[u8],
+    before_rename: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("backup");
+    let mut opened = None;
+    for attempt in 0..100u32 {
+        let candidate = parent.join(format!(".{name}.tmp-{}-{attempt}", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                opened = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let (temporary, mut file) = opened.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate backup temporary file",
+        )
+    })?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        before_rename(&temporary)?;
+        std::fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::atomic_write_private_with;
+
+    #[test]
+    fn org_backup_atomic_write_preserves_previous_file_on_injected_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("org.json");
+        std::fs::write(&path, b"previous").unwrap();
+        atomic_write_private_with(&path, b"replacement", |_| {
+            Err(std::io::Error::other("injected before rename"))
+        })
+        .unwrap_err();
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+    }
 }

@@ -324,7 +324,7 @@ fn states_ride_verbatim() {
     // Settle the entry directly, then export.
     {
         let wal = exocortex_client::wal::Wal::open(&dir.join("wal")).unwrap();
-        let states = wal.states_for_test();
+        let states = wal.states_for_test().unwrap();
         assert_eq!(states.len(), 1);
         wal.mark_synced(states[0].0, 777).unwrap();
         drop(wal);
@@ -337,7 +337,7 @@ fn states_ride_verbatim() {
         .status
         .success());
     let wal = exocortex_client::wal::Wal::open(&dir.join("wal")).unwrap();
-    let states = wal.states_for_test();
+    let states = wal.states_for_test().unwrap();
     assert_eq!(
         states.len(),
         1,
