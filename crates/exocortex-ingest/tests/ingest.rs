@@ -1196,6 +1196,10 @@ async fn duplicate_replay_dedup_survives_restart() {
         "W7: restart keeps the dedup set: {:?}",
         replay.rejections
     );
+    assert_eq!(replay.batch_id, ack.batch_id);
+    assert_eq!(replay.accepted, ack.accepted);
+    assert_eq!(replay.rejected, ack.rejected);
+    assert_eq!(replay.assigned_lsn, ack.assigned_lsn);
     let mut after = 0;
     let mut memories = storage.stream_all_memories().await;
     while let Some(Ok(_)) = memories.next().await {

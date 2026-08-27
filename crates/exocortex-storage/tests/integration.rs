@@ -301,7 +301,10 @@ itest!(ingest_settlement_survives_backend_reconnect, {
         .commit_ingest_batch(&key, &[committed.clone()], &[], 1)
         .await
         .expect("first atomic ingest");
-    assert!(matches!(outcome, IngestCommitOutcome::Committed { .. }));
+    let original = match outcome {
+        IngestCommitOutcome::Committed { settled, .. } => settled,
+        other => panic!("expected first commit, got {other:?}"),
+    };
     drop(first);
 
     let url = falkor_url().unwrap();
@@ -323,7 +326,14 @@ itest!(ingest_settlement_survives_backend_reconnect, {
         .commit_ingest_batch(&key, &[must_not_commit.clone()], &[], 1)
         .await
         .expect("settled replay");
-    assert!(matches!(replay, IngestCommitOutcome::Duplicate(_)));
+    let replay = match replay {
+        IngestCommitOutcome::Duplicate(settled) => settled,
+        other => panic!("expected durable duplicate, got {other:?}"),
+    };
+    assert_eq!(
+        replay, original,
+        "reconnect returns the exact settled result"
+    );
     assert!(restarted.get_memory(&committed.id).await.unwrap().is_some());
     assert!(restarted
         .get_memory(&must_not_commit.id)

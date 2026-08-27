@@ -173,6 +173,45 @@ impl Wal {
         self.insert_entry(entry)
     }
 
+    /// Atomically return the existing entry for an exact content-derived
+    /// batch id, or append it once. This is the offline equivalent of the
+    /// backend's durable ingest claim: response loss and concurrent retries
+    /// cannot mint a second WAL row.
+    pub fn append_batch_full_idempotent(
+        &self,
+        session_id: &str,
+        memories: Vec<MemoryDraft>,
+        memory_ids: Vec<MemoryId>,
+        batch_id: String,
+        draft_keys: Vec<String>,
+        tags: Vec<Vec<String>>,
+    ) -> Result<u64, WalError> {
+        let entry = WalEntry {
+            local_lsn: 0,
+            session_id: session_id.to_string(),
+            memories,
+            memory_ids,
+            state: WalState::Pending,
+            batch_id,
+            draft_keys,
+            tags,
+        };
+        let _append = self
+            .append_gate
+            .lock()
+            .map_err(|_| WalError::Io("WAL append serialization mutex is poisoned".to_string()))?;
+        if !entry.batch_id.is_empty() {
+            for item in self.tree.iter() {
+                let (key, raw) = item.map_err(|error| WalError::Io(error.to_string()))?;
+                let local_lsn = key_to_lsn(&key)?;
+                if decode_at(local_lsn, &raw)?.batch_id == entry.batch_id {
+                    return Ok(local_lsn);
+                }
+            }
+        }
+        self.insert_entry_locked(entry)
+    }
+
     /// BR-PRD: append one IMPORTED entry, preserving its ids, batch id,
     /// rebuild inputs, and state verbatim; only the local LSN is re-keyed
     /// to this WAL's next slot. State preservation is load-bearing — a
@@ -237,11 +276,15 @@ impl Wal {
     }
 
     /// Assign the next local LSN, run the byte budget (R-Sc8), persist.
-    fn insert_entry(&self, mut entry: WalEntry) -> Result<u64, WalError> {
+    fn insert_entry(&self, entry: WalEntry) -> Result<u64, WalError> {
         let _append = self
             .append_gate
             .lock()
             .map_err(|_| WalError::Io("WAL append serialization mutex is poisoned".to_string()))?;
+        self.insert_entry_locked(entry)
+    }
+
+    fn insert_entry_locked(&self, mut entry: WalEntry) -> Result<u64, WalError> {
         entry.local_lsn = self.next_lsn()?;
         let local_lsn = entry.local_lsn;
         let bytes = encode_entry(&entry).map_err(WalError::Io)?;

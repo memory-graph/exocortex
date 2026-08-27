@@ -180,6 +180,36 @@ fn in_session_read_back_after_offline_write() {
     );
 }
 
+#[test]
+fn exact_offline_retry_reuses_the_original_wal_result_and_memory_ids() {
+    let dir = tempdir();
+    {
+        let mut client = Client::spawn(&dir);
+        let request = Client::end_session(
+            serde_json::json!([
+                { "draft_key": "retry", "memory_type": "Problem", "title": "Retry-safe offline row", "content": "same request after response loss", "visibility": "org", "tags": [] }
+            ]),
+            serde_json::json!([]),
+        );
+        let mut messages = Client::init_msgs();
+        messages.push(request.clone());
+        messages.push(request);
+        messages.push(Client::search("retry-safe"));
+        client.send_all(&messages);
+        let _init = client.read_line();
+        let first = client.read_line();
+        let retry = client.read_line();
+        assert_eq!(
+            first["result"]["content"][0]["text"], retry["result"]["content"][0]["text"],
+            "response-loss retry returns the original local LSN"
+        );
+        let hits = search_hits(&client.read_line());
+        assert_eq!(hits.len(), 1, "retry publishes one semantic memory");
+    }
+    let wal = exocortex_client::wal::Wal::open(&dir.join("wal")).unwrap();
+    assert_eq!(wal.db_len(), 1, "retry appends no second durable row");
+}
+
 /// AC2: restart over the same `--data-dir` — the write is still
 /// searchable and the id is byte-stable (the WAL-stored id, not a
 /// regeneration). Requires F3 boot seeding.

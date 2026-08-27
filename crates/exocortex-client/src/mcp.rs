@@ -407,7 +407,14 @@ impl ExocortexMcp {
         }
         let memory_ids: Vec<MemoryId> = ids.into_iter().map(|(_, id)| id).collect();
         let local_lsn = wal
-            .append_batch_full(&session_id, drafts, memory_ids, batch_id, draft_keys, tags)
+            .append_batch_full_idempotent(
+                &session_id,
+                drafts,
+                memory_ids,
+                batch_id,
+                draft_keys,
+                tags,
+            )
             .map_err(|e| json_error("wal-error", e.to_string()))?;
         // SR-PRD F2: read-your-writes — publish the materialized batch
         // into the served snapshot (ONE copy-on-write swap that also
