@@ -83,7 +83,7 @@ fn authed<T>(message: T) -> tonic::Request<T> {
 }
 
 async fn boot() -> (
-    exocortex_server::backend::BackendNode,
+    exocortex_server::backend::BackendNode<InMemoryStorage>,
     Arc<InMemoryStorage>,
     Arc<Ontology>,
     std::net::SocketAddr,

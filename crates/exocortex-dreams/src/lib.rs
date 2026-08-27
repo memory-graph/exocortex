@@ -175,6 +175,9 @@ pub struct DreamsEngine<S: Storage> {
     pub node_id: SmolStr,
     /// Discovery proposals awaiting `accept_discovery` (R-Dr1).
     pub discoveries: DashMap<uuid::Uuid, Discovery>,
+    /// Last successfully consolidated cycle, retained for health/acceptance
+    /// observation without scraping logs or metrics.
+    pub last_result: tokio::sync::RwLock<Option<ConsolidationResult>>,
     cycle_fault_after: Option<usize>,
 }
 
@@ -209,6 +212,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             rx_fire: tokio::sync::Mutex::new(rx_fire),
             node_id,
             discoveries: DashMap::new(),
+            last_result: tokio::sync::RwLock::new(None),
             cycle_fault_after: None,
         }
     }
@@ -254,7 +258,10 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     pub async fn run(self: Arc<Self>) {
         while let Some((region, fired_at)) = { self.rx_fire.lock().await.recv().await } {
             match self.try_consolidate(&region).await {
-                Ok(res) => info!(?res, "consolidation ok"),
+                Ok(res) => {
+                    *self.last_result.write().await = Some(res.clone());
+                    info!(?res, "consolidation ok");
+                }
                 Err(e) => {
                     warn!(?e, "consolidation failed");
                     continue;

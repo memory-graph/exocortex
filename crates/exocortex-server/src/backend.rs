@@ -78,7 +78,7 @@ fn dreams_lease_key(org: &str) -> LeaseKey {
 }
 
 /// A running backend node's handles (tests abort these).
-pub struct BackendNode {
+pub struct BackendNode<S: Storage> {
     /// The shared health snapshot (R-O5/R-O6).
     pub health: Arc<arc_swap::ArcSwap<HealthSnapshot>>,
     /// The ingress listener's local address.
@@ -87,10 +87,12 @@ pub struct BackendNode {
     pub cache: Arc<LocalCache>,
     /// True only while this node owns the cluster Dreams lease.
     pub leader_gate: Arc<std::sync::atomic::AtomicBool>,
+    /// Production Dreams engine, exposed for lifecycle readiness and health.
+    pub dreams: Arc<exocortex_dreams::DreamsEngine<S>>,
     leader_election: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl BackendNode {
+impl<S: Storage> BackendNode<S> {
     /// Simulate leader process loss while leaving peer runtimes alive.
     pub fn stop_leader_election(&mut self) {
         self.leader_gate
@@ -107,7 +109,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
     storage: Arc<S>,
     ontology: Arc<Ontology>,
     args: BackendNodeArgs,
-) -> anyhow::Result<BackendNode> {
+) -> anyhow::Result<BackendNode<S>> {
     // Parse TLS material and bind before starting any background subsystem.
     // Bad transport configuration is a startup failure, never a node that
     // appears alive while its protected listener is absent.
@@ -438,6 +440,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
         local_addr,
         cache,
         leader_gate,
+        dreams,
         leader_election: Some(leader_election),
     })
 }

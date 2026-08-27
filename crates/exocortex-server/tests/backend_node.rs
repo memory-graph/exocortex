@@ -180,8 +180,18 @@ fn acceptance_memory(seed: u8, embedding: bool) -> exocortex_kernel::Memory {
         valid_until: None,
         recorded_at: chrono::Utc::now(),
         invalidated_by: None,
-        embedding: embedding.then(|| vec![1.0; 64]),
+        embedding: embedding.then(|| acceptance_embedding(vec![1.0; 64])),
         lsn: LSN::new_local(0),
+    }
+}
+
+fn acceptance_embedding(vector: Vec<f32>) -> exocortex_kernel::Embedding {
+    exocortex_kernel::Embedding {
+        model: exocortex_kernel::EmbeddingModel {
+            name: "fake-deterministic".into(),
+            version: "v1".into(),
+        },
+        vector,
     }
 }
 
@@ -340,6 +350,176 @@ async fn three_node_p95_handoff_no_duplicate_and_stale_fence() {
         rejected,
         Err(exocortex_storage::StorageError::FencedWriteRejected { .. })
     ));
+}
+
+fn acceptance_relationship(
+    from: exocortex_kernel::MemoryId,
+    to: exocortex_kernel::MemoryId,
+) -> exocortex_kernel::Relationship {
+    use exocortex_kernel::{Provenance, RelKindId, Relationship, RelationshipId};
+    let kind = RelKindId(5);
+    Relationship {
+        id: RelationshipId::derive(from, kind, to, None),
+        kind,
+        from,
+        to,
+        visibility: exocortex_kernel::Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "lifecycle-acceptance".into(),
+            producer_kind: None,
+        },
+        properties: exocortex_kernel::RelationshipProperties {
+            strength: 0.5,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: chrono::Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        lsn: exocortex_kernel::LSN::new_local(0),
+    }
+}
+
+/// §23 #20: one event burst enters the production owner-gated run loop on a
+/// three-node backend and yields consolidation, prune, discovery, and reset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_node_owner_runs_full_event_driven_dreams_lifecycle() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let mut nodes = Vec::new();
+    for offset in 0..3u16 {
+        nodes.push(
+            run_backend_node(
+                storage.clone(),
+                onto.clone(),
+                args("127.0.0.1:0", 44101 + offset, vec![]),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let owner = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let owners: Vec<_> = nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.leader_gate.load(std::sync::atomic::Ordering::SeqCst))
+                .map(|(index, _)| index)
+                .collect();
+            if owners.len() == 1 {
+                break owners[0];
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("exactly one Dreams owner is ready");
+
+    let mut duplicate_a = acceptance_memory(100, true);
+    let mut duplicate_b = acceptance_memory(101, true);
+    duplicate_a.embedding = Some(acceptance_embedding(vec![1.0; 64]));
+    duplicate_b.embedding = Some(acceptance_embedding(vec![1.0; 64]));
+    let mut chain_a = acceptance_memory(102, true);
+    let mut chain_b = acceptance_memory(103, true);
+    let mut chain_c = acceptance_memory(104, true);
+    chain_a.embedding = Some(acceptance_embedding({
+        let mut value = vec![0.0; 64];
+        value[0] = 1.0;
+        value
+    }));
+    chain_b.embedding = Some(acceptance_embedding({
+        let mut value = vec![0.0; 64];
+        value[1] = 1.0;
+        value
+    }));
+    chain_c.embedding = Some(acceptance_embedding({
+        let mut value = vec![0.0; 64];
+        value[2] = 1.0;
+        value
+    }));
+    let mut already_closed = acceptance_memory(105, false);
+    already_closed.valid_until = Some(chrono::Utc::now());
+    storage
+        .upsert_batch(
+            &[
+                duplicate_a,
+                duplicate_b,
+                chain_a.clone(),
+                chain_b.clone(),
+                chain_c.clone(),
+                already_closed.clone(),
+            ],
+            &[
+                acceptance_relationship(chain_a.id, chain_b.id),
+                acceptance_relationship(chain_b.id, chain_c.id),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let region = exocortex_storage::RegionKey {
+        org: "org".into(),
+        project: "p".into(),
+        memory_type: 3,
+    };
+    nodes[owner].dreams.last_cycle_at.insert(
+        region.clone(),
+        chrono::Utc::now() - chrono::Duration::hours(7),
+    );
+    for _ in 0..1000 {
+        nodes[owner].dreams.on_write(region.clone()).await;
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let result = nodes[owner].dreams.last_result.read().await.clone();
+            let discovered = nodes[owner]
+                .dreams
+                .pending_discoveries()
+                .iter()
+                .any(|proposal| proposal.endpoints == (chain_a.id, chain_c.id));
+            let reset = nodes[owner]
+                .dreams
+                .counters
+                .get(&region)
+                .is_some_and(|counter| *counter == Default::default());
+            if let Some(result) = result.filter(|_| discovered && reset) {
+                break result;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owner completes the full event-driven lifecycle and resets counters");
+
+    assert_eq!(result.owner_node_id, format!("node-{}", 44101 + owner));
+    assert!(!result.merged.is_empty(), "cycle consolidates duplicates");
+    assert!(
+        result
+            .pruned
+            .iter()
+            .any(|(id, reason)| *id == already_closed.id
+                && *reason == exocortex_dreams::PruneReason::Redundant),
+        "cycle observes the closed row in its prune result"
+    );
+    for (index, node) in nodes.iter().enumerate() {
+        if index != owner {
+            assert!(
+                node.dreams.last_result.read().await.is_none(),
+                "followers never execute the owner-only cycle"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
