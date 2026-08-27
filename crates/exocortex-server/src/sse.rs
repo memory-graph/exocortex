@@ -12,13 +12,20 @@
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use axum::Extension;
+use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
 use exocortex_cluster::{ClusterNode, Replay};
-use exocortex_storage::Storage;
+use exocortex_kernel::{MemoryId, RelationshipId};
+use exocortex_storage::{
+    memory_visible, relationship_visible, Invalidation, Storage, StorageError, VisibilityContext,
+};
+use exocortex_wire::cluster::v1::InvalidationEnvelope;
+use exocortex_wire::sse::v1::invalidation::Kind;
 
 /// Whether `/v1/changes` demands a per-client token (R-Sec5).
 /// `backend-node` requires one; `mcp-standalone` (loopback-only) keeps
@@ -61,6 +68,7 @@ pub fn derive_client_sse_key(cluster_key: &[u8; 32], token: &str) -> [u8; 32] {
 async fn handler<S: Storage + 'static>(
     State((cluster, auth)): State<(Arc<ClusterNode<S>>, SseAuth)>,
     axum::extract::RawQuery(q): axum::extract::RawQuery,
+    principal: Option<Extension<VisibilityContext>>,
 ) -> Response {
     let mut token = None;
     let mut since_lsn = None;
@@ -81,8 +89,8 @@ async fn handler<S: Storage + 'static>(
         }
     }
     // R-Sec7 posture: on the backend op surface the feed is authenticated.
-    if auth == SseAuth::RequiredToken && token.is_none() {
-        return (http::StatusCode::UNAUTHORIZED, "missing SSE token").into_response();
+    if auth == SseAuth::RequiredToken && (token.is_none() || principal.is_none()) {
+        return (http::StatusCode::UNAUTHORIZED, "missing SSE credentials").into_response();
     }
     // R-C6: a reconnect older than the replay window must reseed, not
     // silently skip deltas. The 409 carries the buffer floor so the client
@@ -103,16 +111,23 @@ async fn handler<S: Storage + 'static>(
 
     let rx = cluster.subscribe_local();
     let node_id = cluster.node_id.to_string();
+    let visibility = principal.map(|Extension(vc)| vc);
     // R-Sec5: token → per-client key; envelopes re-sign with it.
     let client_key = token.map(|t| derive_client_sse_key(&cluster.hmac_key, &t));
     let stream = async_stream::stream! {
         let mut rx = tokio_stream::wrappers::BroadcastStream::new(rx);
-        use futures::StreamExt;
         // Initial comment anchors the connection before the first delta.
         yield Ok::<Event, Infallible>(Event::default().comment(format!("exocortex {node_id}")));
         // R-C6 replay first (LSN order); the client's LSN gate dedups any
         // overlap with the live stream that follows.
-        for mut env in replay {
+        for env in replay {
+            let mut env = match prepare_for_subscriber(&cluster, env, visibility.as_ref()).await {
+                Ok(env) => env,
+                Err(error) => {
+                    tracing::warn!(?error, "closing SSE stream after visibility lookup failure");
+                    return;
+                }
+            };
             if let Some(key) = &client_key {
                 if env.hmac.is_empty() || cluster.verify_hmac(&env).is_ok() {
                     resign(key, &mut env);
@@ -122,7 +137,14 @@ async fn handler<S: Storage + 'static>(
             yield Ok(Event::default().event("inv").data(payload));
         }
         while let Some(item) = rx.next().await {
-            if let Ok(mut env) = item {
+            if let Ok(env) = item {
+                let mut env = match prepare_for_subscriber(&cluster, env, visibility.as_ref()).await {
+                    Ok(env) => env,
+                    Err(error) => {
+                        tracing::warn!(?error, "closing SSE stream after visibility lookup failure");
+                        return;
+                    }
+                };
                 if let Some(key) = &client_key {
                     if env.hmac.is_empty() || cluster.verify_hmac(&env).is_ok() {
                         resign(key, &mut env);
@@ -136,6 +158,119 @@ async fn handler<S: Storage + 'static>(
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(5)))
         .into_response()
+}
+
+/// Replace an invisible row event with a signed, identifier-free LSN advance.
+/// Lookup failures close the stream instead: advancing past a row whose
+/// visibility could not be established would permanently hide a visible
+/// change from this subscriber.
+async fn prepare_for_subscriber<S: Storage + 'static>(
+    cluster: &ClusterNode<S>,
+    env: InvalidationEnvelope,
+    visibility: Option<&VisibilityContext>,
+) -> Result<InvalidationEnvelope, StorageError> {
+    let Some(vc) = visibility else {
+        return Ok(env);
+    };
+    let inv = env
+        .inv
+        .as_ref()
+        .ok_or_else(|| StorageError::Backend("SSE envelope missing invalidation".into()))?;
+    let lsn = inv.backend_lsn;
+    let visible = match inv.kind.as_ref() {
+        Some(Kind::MemoryUpserted(row)) => {
+            memory_event_visible(cluster.storage.as_ref(), &row.id, vc).await?
+        }
+        Some(Kind::MemoryDeleted(row)) => {
+            memory_event_visible(cluster.storage.as_ref(), &row.id, vc).await?
+        }
+        Some(Kind::RelationshipUpserted(row)) => {
+            relationship_event_visible(cluster.storage.as_ref(), &row.id, vc).await?
+        }
+        Some(Kind::RelationshipDeleted(row)) => {
+            relationship_event_visible(cluster.storage.as_ref(), &row.id, vc).await?
+        }
+        Some(Kind::VisibilityAdvance(_)) => true,
+        None => {
+            return Err(StorageError::Backend(
+                "SSE invalidation missing event kind".into(),
+            ));
+        }
+    };
+    if visible {
+        Ok(env)
+    } else {
+        Ok(cluster.envelope(Invalidation::VisibilityAdvance { lsn }))
+    }
+}
+
+async fn memory_event_visible<S: Storage>(
+    storage: &S,
+    raw_id: &[u8],
+    vc: &VisibilityContext,
+) -> Result<bool, StorageError> {
+    let id = MemoryId(decode_id(raw_id)?);
+    Ok(storage
+        .get_memory(&id)
+        .await?
+        .as_ref()
+        .is_some_and(|memory| memory_visible(memory, vc)))
+}
+
+async fn relationship_event_visible<S: Storage>(
+    storage: &S,
+    raw_id: &[u8],
+    vc: &VisibilityContext,
+) -> Result<bool, StorageError> {
+    let id = RelationshipId(decode_id(raw_id)?);
+    let mut rows = storage.stream_all_relationships().await;
+    let mut relationship = None;
+    while let Some(row) = rows.next().await {
+        let row = row?;
+        if row.id == id {
+            relationship = Some(row);
+            break;
+        }
+    }
+    let Some(relationship) = relationship else {
+        return Ok(false);
+    };
+    let endpoints = storage
+        .get_memories(&[relationship.from, relationship.to])
+        .await?;
+    let from = endpoints
+        .iter()
+        .find(|memory| memory.id == relationship.from);
+    let to = endpoints.iter().find(|memory| memory.id == relationship.to);
+    Ok(match (from, to) {
+        (Some(from), Some(to)) => relationship_visible(&relationship, from, to, vc),
+        _ => false,
+    })
+}
+
+fn decode_id(raw: &[u8]) -> Result<[u8; 16], StorageError> {
+    if raw.len() == 16 {
+        return Ok(raw.try_into().expect("length checked"));
+    }
+    if raw.len() != 32 {
+        return Err(StorageError::Backend(
+            "SSE invalidation id has invalid width".into(),
+        ));
+    }
+    let mut out = [0u8; 16];
+    for (index, byte) in out.iter_mut().enumerate() {
+        let hi = (raw[index * 2] as char).to_digit(16);
+        let lo = (raw[index * 2 + 1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(hi), Some(lo)) => *byte = ((hi << 4) | lo) as u8,
+            _ => {
+                return Err(StorageError::Backend(
+                    "SSE invalidation id is not hexadecimal".into(),
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Re-sign an envelope in place with a per-client key (R-Sec5).

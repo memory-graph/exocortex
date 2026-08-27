@@ -114,6 +114,23 @@ pub fn memory_visible(memory: &exocortex_kernel::Memory, vc: &VisibilityContext)
     }
 }
 
+/// One authoritative relationship visibility decision. An edge is visible
+/// only when its own label is within the caller's ceiling and both endpoint
+/// memories are visible to that caller; endpoint contexts resolve the label's
+/// project, team, private-author, and tenant subjects (§17.2).
+pub fn relationship_visible(
+    relationship: &exocortex_kernel::Relationship,
+    from: &exocortex_kernel::Memory,
+    to: &exocortex_kernel::Memory,
+    vc: &VisibilityContext,
+) -> bool {
+    let effective = match relationship.visibility {
+        Visibility::Public => Visibility::Org,
+        other => other,
+    };
+    effective <= vc.max_visibility && memory_visible(from, vc) && memory_visible(to, vc)
+}
+
 /// Server-side memory filter for point and entity queries.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MemoryFilter {
@@ -269,6 +286,12 @@ pub enum Invalidation {
         /// Backend LSN of the commit.
         lsn: u64,
     },
+    /// Identifier-free LSN advancement substituted for a row that is outside
+    /// an authenticated change-feed subscriber's visibility context.
+    VisibilityAdvance {
+        /// Backend LSN of the hidden commit.
+        lsn: u64,
+    },
 }
 
 /// What a storage backend supports; drives capability-gated code paths.
@@ -303,7 +326,8 @@ impl Invalidation {
             Invalidation::MemoryUpserted { lsn, .. }
             | Invalidation::MemoryDeleted { lsn, .. }
             | Invalidation::RelationshipUpserted { lsn, .. }
-            | Invalidation::RelationshipDeleted { lsn, .. } => *lsn,
+            | Invalidation::RelationshipDeleted { lsn, .. }
+            | Invalidation::VisibilityAdvance { lsn } => *lsn,
         }
     }
 }

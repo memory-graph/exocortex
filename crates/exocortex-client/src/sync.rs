@@ -177,6 +177,9 @@ pub fn decode_envelope(
                 lsn,
             }
         }
+        Some(exocortex_wire::sse::v1::invalidation::Kind::VisibilityAdvance(_)) => {
+            Invalidation::VisibilityAdvance { lsn }
+        }
         None => return Err(SyncError::BadPayload("no kind".into())),
     };
     Ok((inv, lsn))

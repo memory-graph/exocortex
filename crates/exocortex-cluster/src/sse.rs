@@ -54,5 +54,11 @@ pub fn invalidation_to_pb(inv: &StorageInv) -> pb::Invalidation {
             )),
             backend_lsn: *lsn,
         },
+        StorageInv::VisibilityAdvance { lsn } => pb::Invalidation {
+            kind: Some(pb::invalidation::Kind::VisibilityAdvance(
+                pb::VisibilityAdvance {},
+            )),
+            backend_lsn: *lsn,
+        },
     }
 }

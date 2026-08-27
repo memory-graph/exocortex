@@ -126,6 +126,41 @@ fn envelope_decode_verifies_hmac_fingerprint_and_wire_version() {
     );
 }
 
+#[test]
+fn visibility_advance_decodes_and_keeps_the_lsn_gate_gap_free() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let node = ClusterNode::new(
+        Arc::new(InMemoryStorage::new(onto.clone())),
+        "visibility-client".into(),
+        onto.fingerprint,
+        HMAC_KEY,
+    );
+    let hidden = node.envelope(Invalidation::VisibilityAdvance { lsn: 7 });
+    let payload = b64_encode(&hidden.encode_to_vec());
+    let (decoded, lsn) = decode_envelope(&HMAC_KEY, &onto.fingerprint.0, &payload)
+        .expect("signed identifier-free advance decodes");
+    assert_eq!(lsn, 7);
+    assert!(matches!(
+        decoded,
+        Invalidation::VisibilityAdvance { lsn: 7 }
+    ));
+
+    let mut gate = LsnGate::new(7);
+    let released = gate.push(7, decoded);
+    assert!(matches!(
+        released.as_slice(),
+        [Invalidation::VisibilityAdvance { lsn: 7 }]
+    ));
+    let visible = Invalidation::MemoryUpserted {
+        id: MemoryId([8; 16]),
+        lsn: 8,
+    };
+    assert_eq!(gate.push(8, visible).len(), 1);
+    assert_eq!(gate.next_lsn(), 9, "hidden LSN never creates a gap loop");
+}
+
 /// Live server + SSE + cache: a committed upsert reaches the client cache
 /// through the feed within 500ms.
 #[tokio::test(flavor = "multi_thread")]

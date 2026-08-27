@@ -456,6 +456,9 @@ impl LocalCache {
                 next.remove_relationship(&id);
                 next.last_backend_lsn = next.last_backend_lsn.max(lsn);
             }
+            Invalidation::VisibilityAdvance { lsn } => {
+                next.last_backend_lsn = next.last_backend_lsn.max(lsn);
+            }
         }
         let new_bytes = next.est_bytes;
         g.store(Arc::new(next));

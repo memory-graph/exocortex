@@ -8,9 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use exocortex_cluster::ClusterNode;
-use exocortex_kernel::MemoryId;
-use exocortex_storage::{InMemoryStorage, Invalidation};
+use exocortex_kernel::{
+    Memory, MemoryContext, MemoryId, Provenance, RelKindId, Relationship, RelationshipId,
+    RelationshipProperties, Visibility, LSN,
+};
+use exocortex_storage::{InMemoryStorage, Invalidation, Storage, VisibilityContext};
 use exocortex_wire::cluster::v1::InvalidationEnvelope;
+use exocortex_wire::sse::v1::invalidation::Kind;
 use prost::Message;
 
 const HMAC_KEY: [u8; 32] = [7u8; 32];
@@ -37,6 +41,21 @@ async fn serve(
     auth: exocortex_server::sse::SseAuth,
 ) -> std::net::SocketAddr {
     let app = exocortex_server::sse::sse_router(node, auth);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    addr
+}
+
+async fn serve_for(
+    node: Arc<ClusterNode<InMemoryStorage>>,
+    visibility: VisibilityContext,
+) -> std::net::SocketAddr {
+    let app =
+        exocortex_server::sse::sse_router(node, exocortex_server::sse::SseAuth::RequiredToken)
+            .layer(axum::Extension(visibility));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -80,6 +99,109 @@ async fn get_status_and_body(addr: std::net::SocketAddr, path: &str) -> (String,
         .unwrap_or_default()
         .to_string();
     (status, raw)
+}
+
+fn decoded_events(body: &str) -> Vec<exocortex_wire::sse::v1::Invalidation> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|payload| {
+            let raw = exocortex_client::sync::b64_decode(payload.trim()).unwrap();
+            InvalidationEnvelope::decode(raw.as_slice())
+                .unwrap()
+                .inv
+                .expect("SSE envelope carries an invalidation")
+        })
+        .collect()
+}
+
+fn scoped_memory(id: u8, project: &str) -> Memory {
+    let now = chrono::Utc::now();
+    Memory {
+        id: MemoryId([id; 16]),
+        memory_type: 3,
+        title: format!("memory-{id}").into(),
+        content: format!("content-{id}"),
+        summary: None,
+        tags: Default::default(),
+        visibility: Visibility::Project,
+        provenance: Provenance::Asserted {
+            author: "author".into(),
+            producer_kind: None,
+        },
+        context: MemoryContext {
+            timestamp: now,
+            project_id: Some(project.into()),
+            project_path: None,
+            team_id: None,
+            tenant_id: Some("org".into()),
+            session_id: None,
+            user_id: Some("author".into()),
+            created_by: None,
+            files_involved: Default::default(),
+            languages: Default::default(),
+            frameworks: Default::default(),
+            technologies: Default::default(),
+            git_commit: None,
+            git_branch: None,
+            working_directory: None,
+            entities: Default::default(),
+            additional_metadata: serde_json::Value::Null,
+        },
+        importance: exocortex_kernel::memory::F01::new(0.5).unwrap(),
+        confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
+        effectiveness: None,
+        usage_count: 0,
+        valid_from: now,
+        valid_until: None,
+        recorded_at: now,
+        invalidated_by: None,
+        embedding: None,
+        lsn: LSN::new_local(0),
+    }
+}
+
+fn project_reader() -> VisibilityContext {
+    let mut context = VisibilityContext {
+        user_id: "reader".into(),
+        org_id: "org".into(),
+        project_ids: Default::default(),
+        team_ids: Default::default(),
+        max_visibility: Visibility::Org,
+    };
+    context.project_ids.push("visible-project".into());
+    context
+}
+
+fn relationship(id: u8, from: MemoryId, to: MemoryId) -> Relationship {
+    let now = chrono::Utc::now();
+    Relationship {
+        id: RelationshipId([id; 16]),
+        kind: RelKindId(1),
+        from,
+        to,
+        visibility: Visibility::Project,
+        provenance: Provenance::Asserted {
+            author: "author".into(),
+            producer_kind: None,
+        },
+        properties: RelationshipProperties {
+            strength: 0.8,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: now,
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: now,
+        valid_until: None,
+        recorded_at: now,
+        invalidated_by: None,
+        lsn: LSN::new_local(0),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -140,7 +262,185 @@ async fn required_token_mode_answers_401_without_token() {
     assert_eq!(status, "401", "empty token is rejected");
 
     let (status, _) = get_status_and_body(addr, "/v1/changes?token=t&since_lsn=0").await;
-    assert_eq!(status, "200", "token-bearing subscriber is served");
+    assert_eq!(
+        status, "401",
+        "a query token without an authenticated visibility context is rejected"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_replaces_hidden_rows_with_identifier_free_lsn_advances() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let node = Arc::new(
+        ClusterNode::new(
+            storage.clone(),
+            "visibility-replay".into(),
+            onto.fingerprint,
+            HMAC_KEY,
+        )
+        .with_replay_capacity(16),
+    );
+    let hidden = scoped_memory(41, "hidden-project");
+    let visible = scoped_memory(42, "visible-project");
+    let hidden_commit = storage.upsert_memory(&hidden).await.unwrap();
+    let visible_commit = storage.upsert_memory(&visible).await.unwrap();
+    let _ = node.admit_and_publish(node.envelope(Invalidation::MemoryUpserted {
+        id: hidden.id,
+        lsn: hidden_commit.lsn,
+    }));
+    let _ = node.admit_and_publish(node.envelope(Invalidation::MemoryUpserted {
+        id: visible.id,
+        lsn: visible_commit.lsn,
+    }));
+    let addr = serve_for(node, project_reader()).await;
+
+    let (status, body) = get_status_and_body(addr, "/v1/changes?token=reader&since_lsn=0").await;
+    assert_eq!(status, "200", "authenticated replay is served: {body}");
+    let events = decoded_events(&body);
+    assert_eq!(events.len(), 2, "hidden commits still advance replay LSN");
+    assert_eq!(events[0].backend_lsn, hidden_commit.lsn);
+    assert!(matches!(events[0].kind, Some(Kind::VisibilityAdvance(_))));
+    assert_eq!(events[1].backend_lsn, visible_commit.lsn);
+    assert!(matches!(
+        &events[1].kind,
+        Some(Kind::MemoryUpserted(row)) if row.id == b"2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+    ));
+    let hidden_hex = b"29292929292929292929292929292929";
+    assert!(
+        !events[0]
+            .encode_to_vec()
+            .windows(hidden_hex.len())
+            .any(|window| window == hidden_hex),
+        "the no-op carries no hidden row identifier"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_delivery_filters_with_the_same_visibility_and_lsn_contract() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let node = Arc::new(ClusterNode::new(
+        storage.clone(),
+        "visibility-live".into(),
+        onto.fingerprint,
+        HMAC_KEY,
+    ));
+    let hidden = scoped_memory(51, "hidden-project");
+    let visible = scoped_memory(52, "visible-project");
+    let hidden_commit = storage.upsert_memory(&hidden).await.unwrap();
+    let visible_commit = storage.upsert_memory(&visible).await.unwrap();
+    let addr = serve_for(node.clone(), project_reader()).await;
+
+    let reader = tokio::spawn(get_status_and_body(
+        addr,
+        "/v1/changes?token=reader&since_lsn=0",
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = node.admit_and_publish(node.envelope(Invalidation::MemoryUpserted {
+        id: hidden.id,
+        lsn: hidden_commit.lsn,
+    }));
+    let _ = node.admit_and_publish(node.envelope(Invalidation::MemoryUpserted {
+        id: visible.id,
+        lsn: visible_commit.lsn,
+    }));
+
+    let (status, body) = reader.await.unwrap();
+    assert_eq!(status, "200", "authenticated live stream is served: {body}");
+    let events = decoded_events(&body);
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[0].kind, Some(Kind::VisibilityAdvance(_))));
+    assert_eq!(events[0].backend_lsn, hidden_commit.lsn);
+    assert!(matches!(events[1].kind, Some(Kind::MemoryUpserted(_))));
+    assert_eq!(events[1].backend_lsn, visible_commit.lsn);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_filters_relationship_upserts_and_deletes_by_endpoint_scope() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let node = Arc::new(ClusterNode::new(
+        storage.clone(),
+        "visibility-relationships".into(),
+        onto.fingerprint,
+        HMAC_KEY,
+    ));
+    let hidden_endpoint = scoped_memory(61, "hidden-project");
+    let visible_a = scoped_memory(62, "visible-project");
+    let visible_b = scoped_memory(63, "visible-project");
+    storage.upsert_memory(&hidden_endpoint).await.unwrap();
+    storage.upsert_memory(&visible_a).await.unwrap();
+    storage.upsert_memory(&visible_b).await.unwrap();
+    let hidden = relationship(64, hidden_endpoint.id, visible_a.id);
+    let visible = relationship(65, visible_a.id, visible_b.id);
+    let hidden_upsert = storage.upsert_relationship(&hidden).await.unwrap();
+    let visible_upsert = storage.upsert_relationship(&visible).await.unwrap();
+    let hidden_delete = storage.delete_relationship(&hidden.id).await.unwrap();
+    let visible_delete = storage.delete_relationship(&visible.id).await.unwrap();
+    for invalidation in [
+        Invalidation::RelationshipUpserted {
+            id: hidden.id,
+            from: hidden.from,
+            to: hidden.to,
+            kind: hidden.kind,
+            lsn: hidden_upsert.lsn,
+        },
+        Invalidation::RelationshipUpserted {
+            id: visible.id,
+            from: visible.from,
+            to: visible.to,
+            kind: visible.kind,
+            lsn: visible_upsert.lsn,
+        },
+        Invalidation::RelationshipDeleted {
+            id: hidden.id,
+            lsn: hidden_delete.lsn,
+        },
+        Invalidation::RelationshipDeleted {
+            id: visible.id,
+            lsn: visible_delete.lsn,
+        },
+    ] {
+        let _ = node.admit_and_publish(node.envelope(invalidation));
+    }
+    let addr = serve_for(node, project_reader()).await;
+    let (status, body) = get_status_and_body(
+        addr,
+        &format!(
+            "/v1/changes?token=reader&since_lsn={}",
+            hidden_upsert.lsn - 1
+        ),
+    )
+    .await;
+    assert_eq!(status, "200", "relationship replay is served: {body}");
+    let events = decoded_events(&body);
+    assert_eq!(events.len(), 4);
+    assert!(matches!(events[0].kind, Some(Kind::VisibilityAdvance(_))));
+    assert!(matches!(
+        events[1].kind,
+        Some(Kind::RelationshipUpserted(_))
+    ));
+    assert!(matches!(events[2].kind, Some(Kind::VisibilityAdvance(_))));
+    assert!(matches!(events[3].kind, Some(Kind::RelationshipDeleted(_))));
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.backend_lsn)
+            .collect::<Vec<_>>(),
+        vec![
+            hidden_upsert.lsn,
+            visible_upsert.lsn,
+            hidden_delete.lsn,
+            visible_delete.lsn
+        ]
+    );
 }
 
 /// CS1 (audit): on a backend-node router the SSE feed is merged INSIDE the
