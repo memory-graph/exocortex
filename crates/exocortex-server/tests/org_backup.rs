@@ -150,12 +150,16 @@ async fn org_round_trip_is_byte_faithful_across_storage_instances() {
         .unwrap();
     assert_eq!(report.memories, 2);
     assert_eq!(report.relationships, 2);
-    let (b_mems, b_rels) = rows(&b).await;
+    let (b_mems, mut b_rels) = rows(&b).await;
     assert_eq!(b_mems.len(), 2);
     // The restored edge plus its R-T4 inverse companion (materialized
     // by the write path) — both are legitimate; the ORIGINAL row must
     // be present under its original id.
     assert!(!b_rels.is_empty());
+    // Storage does not promise relationship order. Reverse the observed
+    // sequence so this regression cannot accidentally rely on the adapter's
+    // current iteration order.
+    b_rels.reverse();
     assert!(
         b_rels.iter().any(|r| r.id == rel.id),
         "the backed-up edge restored under its own id"
@@ -186,7 +190,6 @@ async fn org_round_trip_is_byte_faithful_across_storage_instances() {
             "re-stamped in Backend space"
         );
     }
-    assert_eq!(b_rels[0].id, rel.id);
 }
 
 #[tokio::test]
