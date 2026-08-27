@@ -1,5 +1,12 @@
 # Exocortex — Master Plan
 
+**Status (2026-08-27, Round 6):** RELEASE BLOCKED. A strict whole-project
+review at `f7bf463` reopened 30 blocking findings, eight advisory findings,
+and four verification questions. The authoritative ledger and closure
+criteria are `docs/reviews/round-6-review.prd`; accepted work is promoted in
+the Backlog below as R6-S1 through R6-Q1. The prior post-BR-PRD green-gate
+claim is historical, not the current release verdict.
+
 **Status:** BR-PRD shipped. **[2026-08-27]** Memory backup/restore
 landed as `exocortex-client 0.2.2`: `--export`/`--import` one-shot
 modes over a versioned, fingerprint-stamped file in the WAL's own row
@@ -61,7 +68,7 @@ items are promoted into this file, tracked to done, and never silently
 dropped. Anything not listed here is either shipped or explicitly deferred
 to v2 in the PRD's own terms.
 
-**Current baseline (2026-08-27, post-BR-PRD):** 229 tests / 0 failed
+**Historical baseline (2026-08-27, post-BR-PRD):** 229 tests / 0 failed
 across 73 suites (`cargo test --workspace --features
 exocortex-adapter-sdk/testing --no-fail-fast` — the feature is
 mandatory: a lib canary fails any run that would leave the SDK's
@@ -152,7 +159,13 @@ each step (88 tests at completion).
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
-| — | — | — | — |
+| R6-S1 | Fail-closed secrets and authorization (B01-B05, B19, B25-B26) | Codex | Round 6 remediation in progress; release blocker |
+| R6-S2 | Cache and reasoning correctness (B06-B07, B13, B21-B23) | Codex | Round 6 remediation in progress; release blocker |
+| R6-S3 | Atomicity and durability (B08-B10, B15-B18, B20) | Codex | Round 6 remediation in progress; release blocker |
+| R6-S4 | Backend/runtime completeness (B11-B12, B14, B24) | Codex | Round 6 remediation in progress; release blocker |
+| R6-S5 | Delivery truth (B27-B30) | Codex | Round 6 remediation in progress; release blocker |
+| R6-A1 | Advisory test quality and cleanup (A01-A08) | Codex | Round 6 remediation in progress |
+| R6-Q1 | Evidence R6-U01 through R6-U04 and promote confirmed defects | Codex | Investigation in progress |
 
 ## Done
 

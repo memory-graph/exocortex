@@ -1,0 +1,347 @@
+# Exocortex v1 — Round 6 Whole-Project Review
+
+**Status:** OPEN — changes requested.
+
+**Review baseline:** `f7bf463aa4a77ac719c485bfe713541d79edeab1`
+(2026-08-27). Scope was the entire tracked repository: 199 files, of which
+184 were classified as hand-authored, 14 as generated/copied artifacts, and
+one as a lockfile. This review supersedes any claim that the post-BR-PRD tree
+is release-ready. Findings below remain open until the master plan records
+closing evidence and a fresh strict whole-project review finds no verified
+actionable issue.
+
+**Method:** nine independent lenses covered correctness, security, tests,
+migrations/persistence, performance, architecture, product/PRD conformance,
+cleanup, and cross-boundary hazards. Every accepted finding was reopened and
+verified against the baseline before inclusion. The review was read-only and
+made no repository or GitHub changes.
+
+## Release verdict
+
+**Changes requested.** Thirty verified blockers affect authentication,
+visibility, durability, fencing, rollback, backend parity, resource bounds,
+release integrity, or formal acceptance coverage. Eight advisory findings are
+also accepted work. Seven items remain explicit PRD-backed deferrals. Four
+questions require targeted verification before they may be closed or promoted
+to defects.
+
+Closure rules:
+
+1. Every behavioral fix has a regression test that fails without the fix.
+2. Gates must enforce the stated contract; a renamed, narrowed, or skipped
+   test is not closure evidence.
+3. A PRD conflict is recorded in `docs/MILESTONE_REPORT.md`, never silently
+   resolved by changing behavior or weakening the contract.
+4. Each item is closed in `docs/master-plan.prd` with concrete test/gate or
+   commit evidence in the same commit as its fix.
+5. A fresh strict whole-project review must return zero verified actionable
+   findings before release.
+
+## Blocking findings
+
+### Security and authorization
+
+#### R6-B01 — Release configurations contain a public signing key
+
+The cluster/ingest release path can use `[0x42; 32]`, a value published in the
+source. A deployed node can therefore appear configured while accepting
+signatures computable by anyone. Production/shared mode must fail closed when
+the secret is absent or malformed. Explicit local test/dev setup may inject a
+known key but must not be reachable accidentally from a release invocation.
+
+#### R6-B02 — Project and team membership are not enforced end to end
+
+Visibility context carries project/team dimensions, but backend construction
+and request paths discard or fail to enforce them. Reads and writes must apply
+the authenticated principal's membership at every storage, cache, operation,
+and transport boundary. Tests must cover same-org users with disjoint project
+and team membership.
+
+#### R6-B03 — SSE publishes rows outside subscriber visibility
+
+Bearer authentication alone does not authorize every event in the change
+feed. Filter events using the same visibility semantics as ordinary reads,
+including replay. A subscriber must neither receive payloads nor infer hidden
+row identifiers through event metadata.
+
+#### R6-B04 — Producers can select their own production ceiling
+
+The ingest type exposes administrator ceilings but production assembly does
+not provision them, leaving the producer-provided value authoritative in the
+deployed path. Production startup must load an administrator-owned policy and
+fail closed for missing/unknown producer policy. Producer registration must
+never create or widen that policy.
+
+#### R6-B05 — `accept_discovery` accepts inventable or unscoped proposals
+
+Acceptance is not strongly bound to a server-issued proposal, region, caller,
+and proposed visibility, allowing fabricated identifiers or widened scope.
+Persist an immutable proposal record/token and require exact scoped acceptance;
+the accepted result may not exceed proposal or caller visibility.
+
+#### R6-B19 — Shared-mode HTTP defaults and docs are plaintext
+
+Public shared-mode configuration and documentation must not normalize bearer
+tokens or graph data over plaintext HTTP. Require TLS/secure transport, or an
+explicitly named local-only mode bound to loopback with prominent constraints.
+
+#### R6-B25 — MCP inputs lack bounded resource contracts
+
+Add and enforce limits for request bytes, memory content, tags, and edges
+before expensive decode/allocation/work. Rejections must be deterministic and
+tested at boundary, just-under, and just-over values.
+
+#### R6-B26 — Metrics expose identities and unbounded label cardinality
+
+Protect metrics consistently with the deployment threat model. Remove raw or
+free-form user/org/producer identity labels, or map them to a bounded safe
+dimension. Tests/gates must reject new unbounded label sources.
+
+### Cache, visibility, and reasoning correctness
+
+#### R6-B06 — Backend clients never establish continuous cache sync
+
+The backend client cache starts empty and production does not run the SSE sync
+loop. Hydrate before readiness, subscribe with replay, reconcile LSN gaps, and
+recover from stream/fetch failures without serving a permanently stale cache.
+
+#### R6-B07 — Derived relationships are hardcoded to org visibility
+
+Reasoning writeback stamps derived edges as organization-visible rather than
+deriving the narrowest authorized visibility from evidence/endpoints. Centralize
+the visibility rule and test project/team/user evidence combinations.
+
+#### R6-B13 — Traversal crosses invisible intermediate nodes
+
+Filtering only returned nodes still allows hidden nodes to create paths between
+visible endpoints. Apply visibility during expansion, not after traversal, and
+test that an invisible bridge cannot affect reachability, distance, or ranking.
+
+#### R6-B21 — The search arena retains update-history garbage
+
+The cache search arena is append-oriented and grows with repeated replacements,
+even when logical resident data is bounded. Reclaim/compact stale entries or use
+a bounded index representation; include a repeated-update allocation/growth
+regression test.
+
+#### R6-B22 — Invalidations clone the graph and edge lookup scans all edges
+
+Each invalidation performs graph-scale copying, and edge fetch paths linearly
+scan all relationships. Introduce indexed/delta application while preserving
+the lock-free read contract. Benchmark update and edge-fetch scaling, not only
+steady-state search.
+
+#### R6-B23 — Reasoning repeatedly scans the entire store
+
+Incremental cycles re-read graph-wide state for work that should be bounded by
+the changed region/frontier. Add indexed or delta-driven inputs and a scaling
+test proving a small update does not cause a full-store scan.
+
+### Atomicity, persistence, and backend parity
+
+#### R6-B08 — Fence validation is not atomic with mutation
+
+A lease may become stale after validation but before the write commits. Both
+InMemory and Falkor implementations must make epoch comparison and mutation one
+atomic operation, with a concurrency test where ownership changes at the
+critical boundary.
+
+#### R6-B09 — Deduplication races and persisted dedup is not production-wired
+
+Concurrent requests can both pass the check before registration, while the
+persisted registry builder is not used by production assembly. Make claim and
+commit atomic, define retry/crash semantics, wire persistence in production,
+and test concurrent duplicate submission plus restart.
+
+#### R6-B10 — Dreams rollback corrupts pre-existing state
+
+Rollback soft-deletes rows that were already closed before a failed cycle and
+does not fully reverse relationships created by the cycle. Track the exact
+write-set/preimage and restore it atomically. Test mixed pre-existing and newly
+created memories/edges under injected mid-cycle failure.
+
+#### R6-B12 — Dreams accepts nonexistent named project regions
+
+Named regions can be scheduled/processed without validating that the project
+exists and belongs to the org/caller. Reject missing or unauthorized region
+keys before lease acquisition or mutation.
+
+#### R6-B14 — Falkor `find_by_entity` queries data that writes never create
+
+The adapter searches `Entity`/`MENTIONS` graph structures absent from its write
+model. Align the registered Cypher catalogue with the canonical persisted
+representation and add the same conformance case to the InMemory and live
+Falkor suites.
+
+#### R6-B15 — Corrupt WAL records are silently discarded
+
+Deserialization/filtering treats malformed or newly incompatible records as if
+they did not exist. Surface a precise corruption/incompatibility error with
+record location while preserving the original file for recovery.
+
+#### R6-B16 — WAL import is not all-or-nothing
+
+Validation and append are separated such that a later error can leave an
+imported prefix. Stage and atomically commit the complete import, with injected
+failure tests proving the destination is byte/logically unchanged.
+
+#### R6-B17 — Malformed persisted fingerprints are treated as absent
+
+A malformed fingerprint can enter the initialization path and be overwritten
+as though no fingerprint existed. Distinguish missing from malformed and fail
+closed without mutating persisted state.
+
+#### R6-B18 — Audit persistence is not atomic and errors are swallowed
+
+Protected mutations may succeed without their required audit record. Define a
+single atomic commit boundary (or a durable outbox with equivalent guarantees),
+propagate failure, and test both mutation-side and audit-side injected faults.
+
+#### R6-B20 — Backup creation is neither atomic nor permission-restricted
+
+Write to a same-directory temporary file, flush/sync as required, set owner-only
+permissions (for example `0600` on Unix), then atomically rename. Failure must
+leave any previous backup intact.
+
+### Runtime completeness, delivery, and release truth
+
+#### R6-B11 — Production Dreams cycles never run discovery
+
+The discovery implementation exists but the production cycle path does not call
+it. Wire it at the specified lifecycle point, with deterministic budgets and a
+production-path integration test.
+
+#### R6-B24 — Ingestion is sequential N+1
+
+The commit path performs per-row/per-edge storage work serially. Add bounded
+batch operations or safe concurrency while preserving ordering, validation,
+fencing, audit, and all-or-nothing semantics. Add a query/round-trip-count or
+scaling regression test.
+
+#### R6-B27 — CI omits seam gates and release lacks a correctness prerequisite
+
+The documented gate list and actual CI/release dependency graph differ. Run all
+mandatory gates on push/PR and require their successful aggregate before any
+release/publish job can execute.
+
+#### R6-B28 — Gates do not enforce their advertised contracts
+
+Strengthen at least `storage-conformance`, `dead-enforcement`, `no-llm`,
+`kernel-purity`, and `signing-hygiene`. Each must prove the semantic invariant,
+include the promised targets/features, and fail under a deliberate violating
+fixture. A grep that misses aliases, generated targets, or production callers
+is not sufficient evidence.
+
+#### R6-B29 — Publishing bypasses checks and can damage the worktree
+
+`scripts/publish.sh` uses `--no-verify`, can destroy dirty manifest edits, and
+can label a mixed-version release. Refuse dirty overlapping manifests, preserve
+unrelated changes, run required verification, and derive/validate one coherent
+release version before mutation or publication. Test the script in a disposable
+repository fixture.
+
+#### R6-B30 — Formal PRD §23 acceptance coverage is incomplete
+
+Build a requirement-to-test/gate matrix for every §23 criterion. Implement all
+non-deferred missing cases. Each deferral must have an explicit PRD citation and
+master-plan row; prose claims and indirectly related tests do not count.
+
+## Advisory findings
+
+| ID | Accepted improvement | Closure evidence |
+|----|----------------------|------------------|
+| R6-A01 | Cache tests use fixed sleeps. Replace them with deterministic readiness/event synchronization. | No timing sleep used as correctness synchronization. |
+| R6-A02 | Organization-backup round-trip asserts `relationships[0]` even though order is unspecified. Compare by identity/set or define canonical ordering. | Test passes under reordered relationship output. |
+| R6-A03 | The SSE test named “within 500ms” waits 1000ms. Enforce the stated 500ms contract or rename/document an authoritative budget. | Name, deadline, and PRD agree. |
+| R6-A04 | SLO/allocation gates cover too narrow a slice of production behavior. Add update, hydration, invalidation, and relevant backend-path budgets. | Gates exercise representative production paths. |
+| R6-A05 | `exocortex-worker` contains a placeholder library surface. Implement the intended public contract or remove the unused target. | No shipped placeholder target/API. |
+| R6-A06 | The entity interner is unused. Remove it or wire it with measured value and tests. | No dead interner state/code. |
+| R6-A07 | Dead/no-op code obscures real enforcement. Remove it where behavior is unchanged. | Clippy/tests plus targeted review. |
+| R6-A08 | Forty-four path-banner comments merely repeat filenames. Remove banners that carry no invariant or rationale. | Focused cleanup review. |
+
+## Items requiring verification
+
+These are not closed merely because the initial review could not prove them.
+Investigate them with focused tests or primary backend documentation and record
+one of: verified defect promoted to the backlog, verified-safe with evidence, or
+explicit PRD-backed deferral.
+
+| ID | Question |
+|----|----------|
+| R6-U01 | Does an empty configured bearer token create an authentication bypass or fail startup/requests closed on every transport? |
+| R6-U02 | Do the exact Redis/Falkor `MULTI`/`EXEC` commands used here provide rollback/atomic failure semantics for all write errors, or can partial effects commit? |
+| R6-U03 | Is the stored sled `Db` lifetime field required to keep trees valid, or is it dead ownership with hidden shutdown/flush consequences? |
+| R6-U04 | Is `intern_name` a downstream public API contract? Determine this before removal or signature changes. |
+
+## Confirmed deferrals
+
+The following may remain deferred only while the cited master-plan/PRD contract
+still applies. They do not excuse a current runtime visibility, security,
+durability, or correctness bug.
+
+| ID | Deferred scope | Authority |
+|----|----------------|-----------|
+| R1 | SSE/cache handoff loss window and reconcile loop | Master plan R1 / round-3 M3 |
+| D2 | Second ontology-pack demonstration | PRD §23.26, §24 |
+| D7 | Contradiction-resolution operation | PRD §23 #13 |
+| D9 | 100-user visibility fuzz and concurrent-region suites | PRD §23 #21/#22 |
+| D10 | Wire throughput fan-out/additive rollout testing | PRD §23 #23 |
+| D11 | Partition-and-heal live run | PRD §3 M5 AC |
+| D1-adapter | Deferred adapter portion of §23 coverage | Existing adapter/§24 scope; reconfirm exact citation during R6-B30 |
+
+## PRD §23 disposition at review time
+
+The review found criteria 4–12 and 16–17 met on the inspected baseline.
+Criteria 1–3, 14–15, 18–21, 24–25, and 27–30 were not met or only partially
+met. Criteria 13, 22, 23, and 26 were treated as explicit deferrals. R6-B30
+must replace this coarse disposition with a line-by-line matrix citing the
+exact executable evidence for every criterion.
+
+## Validation observed on the baseline
+
+Passed:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --features exocortex-adapter-sdk/testing --no-fail-fast`
+  (235 passed, 2 ignored)
+- `cargo deny check` (duplicate-version warnings only)
+- `cargo xtask kernel-purity`
+- `cargo xtask fingerprint` (`e1f7d17b…`)
+- `cargo xtask gen-schemas`
+- `cargo xtask gen-playbook` (299 words)
+- `cargo xtask no-llm`
+- `cargo xtask proto-sync`
+- `cargo xtask signing-hygiene`
+- `cargo xtask wire-standalone`
+- `cargo xtask bench` (search p99 approximately 762µs; k-hop p99
+  approximately 373µs)
+- `cargo xtask write-path-parity`
+- `cargo xtask dead-enforcement`
+- `cargo xtask auth-coverage`
+- `cargo xtask artifact-equivalence`
+
+Failed or unavailable:
+
+- `cargo xtask storage-conformance` failed because
+  `org_round_trip_is_byte_faithful_across_storage_instances` assumes unordered
+  relationships appear at index zero. The isolated test failed the same way.
+- The gate attempts `cargo test --features integration -p exocortex-storage
+  --test integration_live --no-run`, but the `integration_live` target does not
+  exist. Restore a real live-Falkor conformance target.
+- `FALKOR_URL` was unset, so no live Falkor suite ran.
+- Docker/chaos validation did not run.
+
+## Recommended implementation order
+
+1. Fail-closed secrets/authentication and visibility enforcement (R6-B01–B05,
+   B19, B25–B26).
+2. Storage atomicity, fencing, rollback, WAL/backup durability, and adapter
+   parity (R6-B08–B10, B12, B14–B18, B20).
+3. Cache/SSE/reasoning correctness and production lifecycle wiring
+   (R6-B06–B07, B11, B13, B21–B24).
+4. CI, gates, publishing, and complete §23 traceability (R6-B27–B30).
+5. Advisories and verified disposition of R6-U01–U04.
+6. Full validation, then repeated strict whole-project review/remediation until
+   no verified actionable finding remains.
+
