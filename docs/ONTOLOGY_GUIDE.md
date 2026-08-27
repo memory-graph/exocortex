@@ -1,5 +1,7 @@
 # The Exocortex Ontology Development Guide
 
+![An ontology pack as an engineering blueprint — typed nodes, typed edges, and derivation rules on a drafting grid](../images/ontology-guide.jpeg)
+
 How to design, write, ship, and evolve an ontology pack for Exocortex.
 The short version: the ontology is a Rust crate. You write a `pack!`
 block, the kernel compiles and validates it, every surface (MCP tool
