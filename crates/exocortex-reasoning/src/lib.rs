@@ -9,6 +9,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
 
+pub mod acceptance;
 pub mod engine;
 pub mod explain;
 pub mod rules;

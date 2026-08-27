@@ -4,7 +4,7 @@
 //! The kernel defines the shape of a `Memory`, a `Relationship`, and the rules
 //! by which one may enter the graph. It defines *no* concrete `MemoryType`,
 //! `EntityType`, or named relationship kind — those come from packs
-//! (see `exocortex-pack-dev-v1`). See PRD §7.
+//! (supplied by linked ontology-pack crates). See PRD §7.
 //!
 //! # Invariants enforced here
 //! - R-Pk1..R-Pk5 pack constraints (see `pack::registry`)

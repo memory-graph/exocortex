@@ -384,3 +384,11 @@ proto-sync-guarded copy).
   cannot close §23.27. R6-B30-27 remains open to add versioned temporal
   assertions while preserving current-row reads; this conflict is recorded
   rather than weakening the PRD or falsely treating overwrite as append.
+- **Pack omission is a runtime assembly failure, not a linker failure.** PRD
+  §23.25 says omitting dev-v1 must fail to link because kernel constants are
+  unbound. The current inventory design intentionally discovers packs at
+  process startup; kernel constants are numeric handles and therefore cannot
+  create an unresolved linker symbol. An omitted pack builds successfully and
+  `load_registered_packs` then fails closed with `UnboundKernelConstant`.
+  R6-B30-25 remains open for the literal link-time contract; the strengthened
+  kernel gate separately proves the kernel never depends on or names dev-v1.

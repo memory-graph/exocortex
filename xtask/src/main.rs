@@ -68,6 +68,10 @@ enum Cmd {
     ArtifactEquivalence,
     /// PRD §23: validate the authoritative 30-row requirement-to-evidence matrix.
     AcceptanceCoverage,
+    /// PRD §23.1/#3: one entrypoint selects every mode and each runs all rules.
+    DeploymentAcceptance,
+    /// PRD §23.2: non-Rust ontology catalogues are generated from the pack.
+    OntologySurfaces,
 }
 
 fn main() -> Result<()> {
@@ -88,7 +92,57 @@ fn main() -> Result<()> {
         Cmd::AuthCoverage => auth_coverage(),
         Cmd::ArtifactEquivalence => artifact_equivalence(),
         Cmd::AcceptanceCoverage => acceptance_coverage(),
+        Cmd::DeploymentAcceptance => deployment_acceptance(),
+        Cmd::OntologySurfaces => ontology_surfaces(),
     }
+}
+
+fn deployment_acceptance() -> Result<()> {
+    run(
+        &["build", "-p", "exocortex-client", "-p", "exocortex-server"],
+        &[],
+    )?;
+    let bin_dir = std::path::Path::new("target/debug").canonicalize()?;
+    for mode in ["mcp-client", "mcp-standalone", "backend-node"] {
+        let output = std::process::Command::new("scripts/exocortex")
+            .args(["--mode", mode, "--verify-rules"])
+            .env("EXOCORTEX_BIN_DIR", &bin_dir)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "deployment mode {mode} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout)?;
+        anyhow::ensure!(
+            stdout.contains(&format!("rules-ok mode={mode} count=9")),
+            "deployment mode {mode} did not execute all nine rules: {stdout}"
+        );
+    }
+    println!("deployment-acceptance ok: one artifact selected 3 modes; each executed 9 rules");
+    Ok(())
+}
+
+fn ontology_surfaces() -> Result<()> {
+    gen_playbook(false)?;
+    let pack = exocortex_pack_dev_v1::pack_def();
+    let playbook = std::fs::read_to_string("crates/exocortex-client/src/playbook/v1_0_0.md")?;
+    let authored: Vec<_> = pack
+        .kinds
+        .iter()
+        .filter(|kind| kind.id.is_kernel() || kind.id.local_part() < 0x4000)
+        .collect();
+    for name in authored.iter().map(|kind| &kind.display_name) {
+        anyhow::ensure!(
+            playbook.contains(name.as_str()),
+            "generated playbook omitted pack-owned ontology name `{name}`"
+        );
+    }
+    println!(
+        "ontology-surfaces ok: authoritative non-Rust catalogue covers {} kinds from the Rust pack",
+        authored.len()
+    );
+    Ok(())
 }
 
 fn acceptance_coverage() -> Result<()> {
@@ -302,6 +356,12 @@ fn gen_schemas(write: bool) -> Result<()> {
 /// appears in the kernel's dependency graph. HTTP clients (`reqwest`) are
 /// legitimate in server/client crates but must never reach the kernel.
 fn kernel_purity() -> Result<()> {
+    let pack_coupling = gates::kernel_pack_coupling_violations(std::path::Path::new("."))?;
+    anyhow::ensure!(
+        pack_coupling.is_empty(),
+        "kernel-purity FAILED: {}",
+        pack_coupling.join("; ")
+    );
     for crate_name in [
         "exocortex-kernel",
         "exocortex-adapter-sdk",
@@ -334,6 +394,7 @@ fn bench() -> Result<()> {
     let cargo = std::env::var("CARGO")?.trim().to_string();
     for (pkg, bench) in [
         ("exocortex-cache", "search"),
+        ("exocortex-cache", "updates"),
         ("exocortex-reasoning", "khop"),
     ] {
         println!("==> cargo bench -p {pkg} --bench {bench}");
@@ -345,7 +406,7 @@ fn bench() -> Result<()> {
             "SLO gate FAILED for {bench} (R-Lat1); see the p50/p99 lines above"
         );
     }
-    println!("bench ok: both SLO gates green (R-Lat1)");
+    println!("bench ok: search, update/hydration, and reasoning SLO gates green (R-Lat1)");
     Ok(())
 }
 

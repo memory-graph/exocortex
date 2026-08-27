@@ -27,6 +27,9 @@ enum Mode {
 #[derive(Debug, Parser)]
 #[command(name = "exocortex-node", version)]
 struct Args {
+    /// Internal acceptance probe: execute all nine rules in this artifact.
+    #[arg(long, hide = true)]
+    verify_rules: bool,
     /// Deployment mode.
     #[arg(long, value_enum, default_value = "mcp-standalone")]
     mode: Mode,
@@ -114,7 +117,16 @@ fn main() -> anyhow::Result<()> {
 
     // Force-link the pack so its inventory registration runs in this binary.
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
-    let _ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
+    let ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
+    if args.verify_rules {
+        exocortex_reasoning::acceptance::verify_nine_catalogued_rules(&ontology)
+            .map_err(anyhow::Error::msg)?;
+        println!(
+            "rules-ok mode={} count=9",
+            std::env::var("EXOCORTEX_DEPLOYMENT_MODE").unwrap_or_else(|_| "backend-node".into())
+        );
+        return Ok(());
+    }
 
     // BR2 one-shot modes: org backup/restore against the selected
     // storage, then exit (no cluster, no serving).

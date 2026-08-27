@@ -22,3 +22,5 @@ cargo xtask dead-enforcement
 cargo xtask auth-coverage
 cargo xtask artifact-equivalence
 cargo xtask acceptance-coverage
+cargo xtask deployment-acceptance
+cargo xtask ontology-surfaces

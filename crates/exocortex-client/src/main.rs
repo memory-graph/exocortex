@@ -25,6 +25,9 @@ use exocortex_ops::VisibilityContext;
 #[derive(Debug, Parser)]
 #[command(name = "exocortex-mcp-client", version)]
 struct Args {
+    /// Internal acceptance probe: execute all nine rules in this artifact.
+    #[arg(long, hide = true)]
+    verify_rules: bool,
     /// Backend base URL (M5+). Omitted: standalone personal mode —
     /// writes buffer to the local WAL and are readable immediately and
     /// across restarts (SR-PRD F1-F5).
@@ -127,6 +130,15 @@ fn main() -> anyhow::Result<()> {
     // runs in this binary.
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
     let ontology: Arc<Ontology> = Arc::new(exocortex_kernel::pack::load_registered_packs()?);
+    if args.verify_rules {
+        exocortex_reasoning::acceptance::verify_nine_catalogued_rules(&ontology)
+            .map_err(anyhow::Error::msg)?;
+        println!(
+            "rules-ok mode={} count=9",
+            std::env::var("EXOCORTEX_DEPLOYMENT_MODE").unwrap_or_else(|_| "mcp-client".into())
+        );
+        return Ok(());
+    }
 
     // WAL + playbook home (D5: OS data home by default; --data-dir for
     // tests and multi-tenant setups).

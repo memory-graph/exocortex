@@ -112,11 +112,13 @@ jobs:
           for bin in exocortex-mcp-client exocortex-node exocortex-worker; do
             cp "target/${{ matrix.target }}/release/$bin" "dist/$DIST/"
           done
+          cp scripts/exocortex "dist/$DIST/exocortex"
           cp README.md LICENSE "dist/$DIST/"
           cat > "dist/$DIST/README-install.txt" <<EOF
           Exocortex $TAG (${{ matrix.target }})
 
           Binaries:
+            exocortex             one entrypoint: --mode mcp-client|mcp-standalone|backend-node
             exocortex-mcp-client  local MCP server (personal quickstart — see README)
             exocortex-node        backend node (team/org mode)
             exocortex-worker      adapter host (external sources)
@@ -180,15 +182,15 @@ jobs:
           src="$(find "$tmp" -maxdepth 2 -name exocortex-mcp-client -exec dirname {} \; | head -1)"
           dest="${CARGO_HOME:-$HOME/.cargo}/bin"
           mkdir -p "$dest"
-          for bin in exocortex-mcp-client exocortex-node exocortex-worker; do
+          for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
             install -m 0755 "$src/$bin" "$dest/$bin" 2>/dev/null || cp "$src/$bin" "$dest/$bin"
           done
           case ":$PATH:" in
             *":$dest:"*) ;;
             *) echo "note: add $dest to PATH" ;;
           esac
-          echo "installed: exocortex-mcp-client, exocortex-node, exocortex-worker"
-          echo "next: exocortex-mcp-client --org my-org --user me   (see README quickstart)"
+          echo "installed: exocortex, exocortex-mcp-client, exocortex-node, exocortex-worker"
+          echo "next: exocortex --mode mcp-standalone --org my-org --user me"
           EOF
           chmod +x dist/install.sh
       - name: Create/attach release

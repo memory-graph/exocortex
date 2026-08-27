@@ -114,6 +114,8 @@ cargo xtask dead-enforcement      # §2.2 invariant/security fns have live calle
 cargo xtask auth-coverage         # §2.3 every endpoint rejects unauthenticated calls
 cargo xtask artifact-equivalence  # §2.4 pack rules == engine; MCP result == registry
 cargo xtask acceptance-coverage   # §23 requirement-to-test/gate matrix is complete and current
+cargo xtask deployment-acceptance # §23 one entrypoint / every mode / all nine rules
+cargo xtask ontology-surfaces     # §23 non-Rust ontology catalogues derive from the Rust pack
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these on push; the toolchain

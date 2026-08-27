@@ -1,0 +1,35 @@
+#!/bin/sh
+# One shipped entrypoint for all PRD §23.1 deployment modes.
+set -eu
+
+mode=""
+case "${1:-}" in
+  --mode)
+    [ "$#" -ge 2 ] || { echo "--mode requires a value" >&2; exit 2; }
+    mode="$2"
+    shift 2
+    ;;
+  --mode=*)
+    mode=${1#--mode=}
+    shift
+    ;;
+  *)
+    echo "usage: exocortex --mode mcp-client|mcp-standalone|backend-node [options]" >&2
+    exit 2
+    ;;
+esac
+
+bin_dir=${EXOCORTEX_BIN_DIR:-"$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"}
+export EXOCORTEX_DEPLOYMENT_MODE="$mode"
+case "$mode" in
+  mcp-client|mcp-standalone)
+    exec "$bin_dir/exocortex-mcp-client" "$@"
+    ;;
+  backend-node)
+    exec "$bin_dir/exocortex-node" --mode backend-node "$@"
+    ;;
+  *)
+    echo "unknown deployment mode: $mode" >&2
+    exit 2
+    ;;
+esac

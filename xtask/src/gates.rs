@@ -155,6 +155,25 @@ pub(crate) fn dependency_tree_violations(crate_name: &str, tree: &str) -> Vec<St
     violations
 }
 
+pub(crate) fn kernel_pack_coupling_violations(root: &Path) -> Result<Vec<String>> {
+    let kernel = root.join("crates/exocortex-kernel");
+    let mut files = vec![kernel.join("Cargo.toml")];
+    walk_rust_files(&kernel.join("src"), &mut files)?;
+    let mut violations = Vec::new();
+    for path in files {
+        let source = std::fs::read_to_string(&path)?;
+        for needle in ["exocortex-pack-dev-v1", "exocortex_pack_dev_v1"] {
+            if source.contains(needle) {
+                violations.push(format!(
+                    "{} names the dev-v1 pack directly",
+                    path.strip_prefix(root).unwrap_or(&path).display()
+                ));
+            }
+        }
+    }
+    Ok(violations)
+}
+
 pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
     const HEADER: &str = "criterion\tstatus\trequirement\texecutable_evidence\tcommand\ttracking";
     let path = root.join("docs/acceptance/section-23.tsv");
@@ -526,6 +545,22 @@ mod tests {
         ]
         .join("\n");
         assert!(dependency_tree_violations("exocortex-worker", &worker_tree).is_empty());
+    }
+
+    #[test]
+    fn kernel_pack_independence_rejects_a_direct_dev_v1_name_fixture() {
+        let root = fixture("kernel-pack-name");
+        write(
+            &root,
+            "crates/exocortex-kernel/Cargo.toml",
+            "[dependencies]\nexocortex-pack-dev-v1 = \"1\"\n",
+        );
+        write(
+            &root,
+            "crates/exocortex-kernel/src/lib.rs",
+            "use exocortex_pack_dev_v1::MemoryType;\n",
+        );
+        assert_eq!(kernel_pack_coupling_violations(&root).unwrap().len(), 2);
     }
 
     #[test]
