@@ -86,7 +86,7 @@ async fn get_status_and_body(addr: std::net::SocketAddr, path: &str) -> (String,
 async fn since_lsn_replays_buffered_deltas_in_order() {
     let node = cluster(16);
     for lsn in 1..=3u64 {
-        node.publish_envelope(envelope(&node, lsn as u8, lsn));
+        let _ = node.admit_and_publish(envelope(&node, lsn as u8, lsn));
     }
     let addr = serve(node.clone(), exocortex_server::sse::SseAuth::OptionalToken).await;
 
@@ -109,7 +109,7 @@ async fn since_lsn_older_than_buffer_answers_409() {
     // Capacity 2: envelopes 4 and 5 evict 1..3.
     let node = cluster(2);
     for lsn in 1..=5u64 {
-        node.publish_envelope(envelope(&node, lsn as u8, lsn));
+        let _ = node.admit_and_publish(envelope(&node, lsn as u8, lsn));
     }
     let addr = serve(node.clone(), exocortex_server::sse::SseAuth::OptionalToken).await;
 
@@ -129,14 +129,92 @@ async fn since_lsn_older_than_buffer_answers_409() {
 #[tokio::test(flavor = "multi_thread")]
 async fn required_token_mode_answers_401_without_token() {
     let node = cluster(4);
-    node.publish_envelope(envelope(&node, 1, 1));
+    let _ = node.admit_and_publish(envelope(&node, 1, 1));
     let addr = serve(node.clone(), exocortex_server::sse::SseAuth::RequiredToken).await;
 
     let (status, body) = get_status_and_body(addr, "/v1/changes?since_lsn=0").await;
     assert_eq!(status, "401", "R-Sec7: {body}");
 
+    // An EMPTY token value is no token either — fail closed.
+    let (status, _) = get_status_and_body(addr, "/v1/changes?token=&since_lsn=0").await;
+    assert_eq!(status, "401", "empty token is rejected");
+
     let (status, _) = get_status_and_body(addr, "/v1/changes?token=t&since_lsn=0").await;
     assert_eq!(status, "200", "token-bearing subscriber is served");
+}
+
+/// CS1 (audit): on a backend-node router the SSE feed is merged INSIDE the
+/// bearer layer, and a query `?token=` is never treated as proof of
+/// identity — presence of a bearer header is.
+#[tokio::test(flavor = "multi_thread")]
+async fn backend_router_rejects_token_query_without_bearer() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let node = ClusterNode::new(storage, "auth-node".into(), onto.fingerprint, HMAC_KEY);
+    let cluster = Arc::new(node);
+    let _ = cluster.admit_and_publish(envelope(&cluster, 1, 1));
+
+    let (cache, _rx) = exocortex_cache::LocalCache::new(1024);
+    let ctx = Arc::new(exocortex_ops::OpContext {
+        visibility_ctx: exocortex_ops::operations::ops_vc(
+            "org",
+            "backend",
+            exocortex_kernel::Visibility::Org,
+        ),
+        storage: Arc::new(exocortex_storage::InMemoryStorage::new(onto.clone()))
+            as Arc<dyn exocortex_storage::Storage>,
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
+
+        ontology: None,
+    });
+    let bind = exocortex_server::http_bind::HttpBind::new(ctx, "secret-bearer".into());
+    let sse = exocortex_server::sse::sse_router(
+        cluster.clone(),
+        exocortex_server::sse::SseAuth::RequiredToken,
+    );
+    let app = bind.router(Some(sse));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // Any non-empty ?token= value WITHOUT a bearer header: 401 (the pinned
+    // defect asserted 200 here for a token that was never provisioned).
+    let (status, body) = get_status_and_body(addr, "/v1/changes?token=forged&since_lsn=0").await;
+    assert_eq!(
+        status, "401",
+        "CS1: token query is not authentication: {body}"
+    );
+    let (status, _) = get_status_and_body(addr, "/v1/changes?token=&since_lsn=0").await;
+    assert_eq!(status, "401", "CS1: empty token without bearer is rejected");
+
+    // With the bearer header the subscriber is served (token selects the
+    // per-client key; presence still required in RequiredToken mode).
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    sock.write_all(
+        format!("GET /v1/changes?token=t&since_lsn=0 HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer secret-bearer\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(1), sock.read_to_end(&mut buf)).await;
+    let raw = String::from_utf8_lossy(&buf);
+    let status = raw
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default();
+    assert_eq!(
+        status, "200",
+        "bearer-authenticated subscriber served: {raw}"
+    );
 }
 
 #[test]
@@ -147,7 +225,7 @@ fn envelope_lsn_extraction_feeds_the_floor_check() {
         "empty ring bridges any since_lsn"
     );
     for lsn in 1..=3u64 {
-        node.publish_envelope(envelope(&node, lsn as u8, lsn));
+        let _ = node.admit_and_publish(envelope(&node, lsn as u8, lsn));
     }
     assert!(matches!(node.replay_since(0), exocortex_cluster::Replay::Fresh(v) if v.len() == 3));
     assert!(matches!(node.replay_since(2), exocortex_cluster::Replay::Fresh(v) if v.len() == 1));

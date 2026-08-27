@@ -56,6 +56,10 @@ pub struct AdapterConfig {
     pub node_id: String,
     /// §18.6 source flavor: `"iceberg" | "delta" | "parquet-dir" | "custom"`.
     pub source_flavor: String,
+    /// D8 (agent-instructions PRD §3.8): producer kind declared at
+    /// registration. Adapters default to `Custom`; a docs or analytics
+    /// adapter overrides. Servers reject `Unspecified`.
+    pub producer_kind: exocortex_wire::ingest::v1::ProducerKind,
     /// Wire Visibility discriminant ceiling (§17).
     pub ceiling: i32,
     /// Backend IngestService endpoint (`http://host:port`).
@@ -83,6 +87,7 @@ impl AdapterConfig {
             adapter_id: format!("{producer_id}-adapter"),
             node_id: format!("{producer_id}-node"),
             source_flavor: "custom".into(),
+            producer_kind: exocortex_wire::ingest::v1::ProducerKind::Custom,
             ceiling: 3,
             backend_url: backend_url.into(),
             hmac_key: [0u8; 32],
@@ -249,14 +254,24 @@ impl AdapterSession {
         let fingerprint = fp.try_into().map_err(|v: Vec<u8>| SdkError::InvalidUnit {
             detail: format!("server fingerprint is {} bytes, expected 32", v.len()),
         })?;
+        let mut registration = exocortex_wire::ingest::v1::RegisterSourceRequest {
+            org_id: config.org_id.clone(),
+            source_uri: config.source_uri.clone(),
+            producer_id: config.producer_id.clone(),
+            ceiling: config.ceiling,
+            source_flavor: config.source_flavor.clone(),
+            producer_kind: config.producer_kind.into(),
+            producer: Some(exocortex_wire::ingest::v1::ProducerIdentity {
+                node_id: config.node_id.clone(),
+                agent_id: String::new(),
+                adapter_id: config.adapter_id.clone(),
+                hmac_signature: vec![],
+                client_metadata: None,
+            }),
+        };
+        exocortex_wire::signing::sign_registration(&config.hmac_key, &mut registration);
         let registered = client
-            .register_source(exocortex_wire::ingest::v1::RegisterSourceRequest {
-                org_id: config.org_id.clone(),
-                source_uri: config.source_uri.clone(),
-                producer_id: config.producer_id.clone(),
-                ceiling: config.ceiling,
-                source_flavor: config.source_flavor.clone(),
-            })
+            .register_source(registration)
             .await?
             .into_inner()
             .ceiling;

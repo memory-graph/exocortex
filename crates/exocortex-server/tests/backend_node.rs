@@ -100,18 +100,15 @@ async fn backend_nodes_serve_http_grpc_and_gossip_converges() {
 
     // SSE router mounted: the feed answers on the same listener. Read only
     // the first bytes — the stream is open-ended, so `read_to_end` would
-    // block forever by design.
+    // block forever by design. CS1 (audit): the route sits behind the
+    // bearer layer like every other op, so the header must ride along.
     {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut sock = tokio::net::TcpStream::connect(node_a.local_addr)
             .await
             .unwrap();
         let req = format!(
-            "GET /v1/changes?token=test-bearer HTTP/1.1
-Host: {}
-Connection: close
-
-",
+            "GET /v1/changes?token=test-bearer HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer test-bearer\r\nConnection: close\r\n\r\n",
             node_a.local_addr
         );
         sock.write_all(req.as_bytes()).await.unwrap();

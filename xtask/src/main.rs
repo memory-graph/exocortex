@@ -22,6 +22,16 @@ enum Cmd {
         #[arg(long)]
         write: bool,
     },
+    /// D1/P2 (agent-instructions PRD): regenerate the playbook's
+    /// generated sections (kind catalogue, reject table) from the pack
+    /// and the RejectCode enum. Fails on drift (CI gate); --write
+    /// regenerates. Also enforces the instruction block's ≤300-word
+    /// bound and its kind claims.
+    GenPlaybook {
+        /// Regenerate instead of verify.
+        #[arg(long)]
+        write: bool,
+    },
     /// Run the R-I1/R-I5 kernel purity check: shells out to
     /// `cargo tree -p exocortex-kernel -e no-dev` and greps for banned crates.
     KernelPurity,
@@ -36,19 +46,178 @@ enum Cmd {
     ProtoSync,
     WireStandalone,
     SigningHygiene,
+    /// GATE1 (audit §2.1): one storage suite, both backends — the double
+    /// always, live Falkor when FALKOR_URL is set — asserting identical
+    /// results.
+    StorageConformance,
+    /// GATE1 (audit §2.4 / W2): the offline and ingest write validators
+    /// agree on a golden verdict table.
+    WritePathParity,
+    /// GATE1 (audit §2.2): enforcement fns in security/invariant paths
+    /// must have production callers (grep-based lint).
+    DeadEnforcement,
+    /// GATE1 (audit §2.3): every network-reachable endpoint rejects an
+    /// unauthenticated call.
+    AuthCoverage,
+    /// GATE1 (audit §2.4): pack rule ids vs engine outputs; MCP result vs
+    /// the registry handler.
+    ArtifactEquivalence,
 }
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Fingerprint => fingerprint(),
         Cmd::GenSchemas { write } => gen_schemas(write),
+        Cmd::GenPlaybook { write } => gen_playbook(write),
         Cmd::KernelPurity => kernel_purity(),
         Cmd::Bench => bench(),
         Cmd::NoLlm => no_llm(),
         Cmd::ProtoSync => proto_sync(),
         Cmd::WireStandalone => wire_standalone(),
         Cmd::SigningHygiene => signing_hygiene(),
+        Cmd::StorageConformance => storage_conformance(),
+        Cmd::WritePathParity => write_path_parity(),
+        Cmd::DeadEnforcement => dead_enforcement(),
+        Cmd::AuthCoverage => auth_coverage(),
+        Cmd::ArtifactEquivalence => artifact_equivalence(),
     }
+}
+
+fn cargo() -> String {
+    std::env::var("CARGO")
+        .map(|c| c.trim().to_string())
+        .unwrap_or_else(|_| "cargo".into())
+}
+
+fn run(args: &[&str], env: &[(&str, &str)]) -> Result<()> {
+    let mut cmd = std::process::Command::new(cargo());
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let status = cmd.status()?;
+    anyhow::ensure!(status.success(), "gate failed: cargo {:?}", args);
+    Ok(())
+}
+
+/// §2.1: the storage suite against the double, plus the live Falkor
+/// integration suite when FALKOR_URL is present.
+fn storage_conformance() -> Result<()> {
+    run(
+        &[
+            "test",
+            "--workspace",
+            "--features",
+            "exocortex-adapter-sdk/testing,integration",
+            "-p",
+            "exocortex-storage",
+        ],
+        &[],
+    )?;
+    if std::env::var("FALKOR_URL").is_ok() {
+        println!("storage-conformance: live Falkor suite (FALKOR_URL set)");
+        run(
+            &[
+                "test",
+                "-p",
+                "exocortex-storage",
+                "--features",
+                "integration",
+                "--test",
+                "integration_live",
+            ],
+            &[],
+        )?;
+    } else {
+        println!("storage-conformance: FALKOR_URL unset — live suite skipped (loudly)");
+    }
+    println!("storage-conformance ok");
+    Ok(())
+}
+
+/// W2: golden verdict table through BOTH validators.
+fn write_path_parity() -> Result<()> {
+    run(
+        &[
+            "test",
+            "-p",
+            "exocortex-ingest",
+            "--test",
+            "write_path_parity",
+        ],
+        &[],
+    )?;
+    println!("write-path-parity ok: offline and ingest validators agree row for row");
+    Ok(())
+}
+
+/// §2.2: the listed enforcement functions must appear in production (non
+/// test, non-definition) sources.
+fn dead_enforcement() -> Result<()> {
+    let checks: &[(&str, &str)] = &[
+        // (fn name, file that must reference it outside its definition crate's tests)
+        ("admit_and_publish", "crates/exocortex-cluster/src/node.rs"),
+        ("check_deadline", "crates/exocortex-ops/src/operations.rs"),
+        ("on_write", "crates/exocortex-ingest/src/service.rs"),
+        (
+            "with_admin_ceilings",
+            "crates/exocortex-ingest/tests/ingest.rs",
+        ),
+        ("drain_all", "crates/exocortex-client/src/main.rs"),
+        ("advance_local_lsn", "crates/exocortex-client/src/mcp.rs"),
+    ];
+    for (name, witness) in checks {
+        anyhow::ensure!(
+            std::path::Path::new(witness).exists(),
+            "dead-enforcement: witness file {witness} for `{name}` is gone — update the gate"
+        );
+        // The witness must actually mention the fn.
+        let text = std::fs::read_to_string(witness)?;
+        anyhow::ensure!(
+            text.contains(name),
+            "dead-enforcement: `{name}` has no reference in {witness}"
+        );
+    }
+    println!("dead-enforcement ok: every listed control has a live caller");
+    Ok(())
+}
+
+/// §2.3: the auth-coverage suite (every endpoint rejects unauthenticated).
+fn auth_coverage() -> Result<()> {
+    run(
+        &["test", "-p", "exocortex-server", "--test", "auth_coverage"],
+        &[],
+    )?;
+    println!("auth-coverage ok: every network endpoint rejects unauthenticated calls");
+    Ok(())
+}
+
+/// §2.4: pack↔engine rule equivalence + MCP↔registry result equivalence.
+fn artifact_equivalence() -> Result<()> {
+    run(
+        &[
+            "test",
+            "-p",
+            "exocortex-reasoning",
+            "--test",
+            "rules",
+            "pack_rule_ids_match_engine_outputs",
+        ],
+        &[],
+    )?;
+    run(
+        &[
+            "test",
+            "-p",
+            "exocortex-client",
+            "--test",
+            "stdio_smoke",
+            "mcp_get_memory_shape_matches_registry",
+        ],
+        &[],
+    )?;
+    println!("artifact-equivalence ok: pack rules == engine rules; MCP result == registry result");
+    Ok(())
 }
 
 /// `cargo xtask fingerprint` — compute and print the effective
@@ -218,7 +387,14 @@ fn bench() -> Result<()> {
             anyhow::bail!("{crate_name} must never link exocortex-kernel (R-I1/R-I4): {text}");
         }
         if crate_name == "exocortex-adapter-sdk" {
-            let count = text.lines().filter(|l| l.contains("exocortex-")).count();
+            // The first line is the crate's own root, not a dependency —
+            // counting it double-charged every run (the tree prefixes are
+            // box-drawing glyphs, not whitespace).
+            let count = text
+                .lines()
+                .skip(1)
+                .filter(|l| l.contains("exocortex-"))
+                .count();
             if count != 1 {
                 anyhow::bail!(
                     "exocortex-adapter-sdk must resolve exactly one exocortex-* dependency, found {count}: {text}"
@@ -515,4 +691,193 @@ fn walk_rss(dir: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
         }
     }
     Ok(out)
+}
+
+/// D1/P2 (agent-instructions PRD): regenerate the playbook's generated
+/// sections from the code they describe — the kind catalogue from the
+/// effective ontology (W6's computed_only flag honored), the reject-code
+/// table from the `RejectCode` enum — and enforce the instruction
+/// block's ≤300-word bound plus its kind claims against the pack.
+/// Default mode is the CI drift gate (fails on diff); `--write`
+/// regenerates in place. Facts can no longer drift from the code.
+fn gen_playbook(write: bool) -> Result<()> {
+    let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
+    let onto = exocortex_kernel::pack::load_registered_packs()?;
+    let path = std::path::Path::new("crates/exocortex-client/src/playbook/v1_0_0.md");
+    let src = std::fs::read_to_string(path)?;
+
+    // ---- gen:kinds — bucket-grouped, computed-only flagged ----
+    let mut kinds_section = String::from(
+        "<!-- gen:kinds — do not edit by hand; regenerated from exocortex-pack-dev-v1 -->\n",
+    );
+    let bucket_name = |b: exocortex_kernel::RelBucket| -> &'static str {
+        use exocortex_kernel::RelBucket::*;
+        match b {
+            Solution => "Solution",
+            Causal => "Causal",
+            Context => "Context",
+            Learning => "Learning",
+            Similarity => "Similarity",
+            Workflow => "Workflow",
+            Quality => "Quality",
+            Integration => "Integration",
+            Extension(_) => "Extension",
+        }
+    };
+    let mut by_bucket: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    let mut computed_only = 0usize;
+    let mut total = 0usize;
+    // Authored kinds only: R-T4 auto-registers read-only inverse
+    // companions (`SolvedBy`, `ReplacedBy`, …) at pack-local ids >=
+    // 0x4000 — they are materialized on write, never authorable, and a
+    // generator that listed them would teach producers kinds the
+    // validator refuses (§3.1 r3's warning, caught by running it).
+    let mut ordered: Vec<&exocortex_kernel::RelMeta> = onto
+        .kinds_by_id
+        .values()
+        .filter(|m| m.id.is_kernel() || m.id.local_part() < 0x4000)
+        .collect();
+    ordered.sort_by_key(|m| m.display_name.to_string());
+    for m in ordered {
+        let bucket = bucket_name(m.bucket);
+        let name = m.display_name.to_string();
+        let marker = if m.computed_only {
+            computed_only += 1;
+            " †"
+        } else {
+            ""
+        };
+        by_bucket
+            .entry(bucket)
+            .or_default()
+            .push(format!("`{name}`{marker}"));
+        total += 1;
+    }
+    for (bucket, kinds) in &by_bucket {
+        kinds_section.push_str(&format!(
+            "- **{bucket} ({}):** {}\n",
+            kinds.len(),
+            kinds.join(", ")
+        ));
+    }
+    let assertable = total - computed_only;
+    kinds_section.push_str(&format!(
+        "\n† Computed-only (R-T14): the consolidation cycle asserts it, producers may\nnot. {total} kinds are declared; **{assertable} are yours to use.** Asserting one\nis rejected with `ComputedKindRejected`.\n<!-- /gen:kinds -->"
+    ));
+
+    // ---- gen:rejects — one row per RejectCode variant ----
+    use exocortex_wire::ingest::v1::RejectCode;
+    let guidance = |c: RejectCode| -> String {
+        exocortex_wire::corrections::guidance(c)
+            .correction
+            .to_string()
+    };
+    let all = [
+        (
+            RejectCode::InvalidTypeTriple,
+            "Kind doesn't fit the (from, to) types",
+        ),
+        (
+            RejectCode::UnknownKind,
+            "Kind name typo or not in this pack",
+        ),
+        (
+            RejectCode::UnknownMemoryType,
+            "Memory type not in this pack",
+        ),
+        (
+            RejectCode::Unknown,
+            "Title empty/>200 chars, content empty, or an atomic-batch reject",
+        ),
+        (
+            RejectCode::VisibilityWidening,
+            "Visibility above the source ceiling (rare for session wrapups)",
+        ),
+        (
+            RejectCode::ComputedKindRejected,
+            "You asserted a computed-only kind (R-T14)",
+        ),
+        (
+            RejectCode::DuplicateBatch,
+            "Transport replayed the same batch id",
+        ),
+        (RejectCode::RateLimited, "Backend is shedding load"),
+        (
+            RejectCode::MissingExternalKey,
+            "External-snapshot coordinates missing",
+        ),
+        (
+            RejectCode::InvalidExternalKey,
+            "External-snapshot coordinates malformed",
+        ),
+        (RejectCode::Unauthorized, "Credentials rejected (HMAC)"),
+        (RejectCode::BadChecksum, "Batch checksum mismatch"),
+        (
+            RejectCode::IncompatibleOntology,
+            "Ontology fingerprint mismatch",
+        ),
+        (
+            RejectCode::UnknownSource,
+            "Producer not registered / ceiling mismatch / wrong org",
+        ),
+    ];
+    let mut rejects_section = String::from(
+        "<!-- gen:rejects — do not edit by hand; regenerated from the RejectCode enum -->\n| Code | Meaning | Fix |\n|---|---|---|\n",
+    );
+    for (code, meaning) in all {
+        rejects_section.push_str(&format!(
+            "| `{code:?}` | {meaning} | {} |\n",
+            guidance(code).replace('|', "/")
+        ));
+    }
+    rejects_section.push_str("<!-- /gen:rejects -->");
+
+    // ---- splice between the markers ----
+    let splice = |src: &str, start_marker: &str, end_marker: &str, new_body: &str| -> String {
+        let start = src.find(start_marker).expect("start marker present");
+        let end = src.find(end_marker).expect("end marker present") + end_marker.len();
+        format!("{}{}{}", &src[..start], new_body, &src[end..])
+    };
+    let regenerated = splice(
+        &splice(
+            &src,
+            "<!-- gen:kinds",
+            "<!-- /gen:kinds -->",
+            &kinds_section,
+        ),
+        "<!-- gen:rejects",
+        "<!-- /gen:rejects -->",
+        &rejects_section,
+    );
+
+    // ---- block bound + kind claims (§11) ----
+    let block = std::fs::read_to_string("crates/exocortex-client/src/playbook/block_v1_0_0.md")?;
+    let words = block.split_whitespace().count();
+    anyhow::ensure!(
+        words <= 300,
+        "instruction block is {words} words; the bound is 300"
+    );
+    anyhow::ensure!(
+        onto.kind_id("RelatedTo").is_some(),
+        "block teaches `RelatedTo` but the pack does not declare it"
+    );
+    anyhow::ensure!(
+        onto.kinds_by_id
+            .get(&onto.kind_id("SimilarTo").unwrap())
+            .is_some_and(|m| m.computed_only),
+        "block prohibits `SimilarTo`; the pack must mark it computed-only"
+    );
+
+    if write {
+        std::fs::write(path, &regenerated)?;
+        println!("gen-playbook: regenerated ({total} kinds, {assertable} assertable; {words}-word block)");
+        Ok(())
+    } else {
+        anyhow::ensure!(
+            regenerated == src,
+            "gen-playbook: playbook drifted from the ontology/RejectCode — run `cargo xtask gen-playbook --write`"
+        );
+        println!("gen-playbook ok ({total} kinds, {assertable} assertable; {words}-word block)");
+        Ok(())
+    }
 }

@@ -38,6 +38,8 @@ pub struct PackKinds {
     pub contradicts: RelKindId,
     /// `Confirms` (Learning bucket).
     pub confirms: RelKindId,
+    /// `Modifies` (Context bucket; D5 file-lineage).
+    pub modifies: RelKindId,
 }
 
 use std::sync::OnceLock;
@@ -61,6 +63,7 @@ pub fn prime(onto: &exocortex_kernel::Ontology) {
         blocks: kind("Blocks"),
         contradicts: kind("Contradicts"),
         confirms: kind("Confirms"),
+        modifies: kind("Modifies"),
     });
 }
 
@@ -77,6 +80,10 @@ crepe::crepe! {
     @input
     #[derive(Debug)]
     pub struct TagFact(pub MemoryId, pub u32);
+
+    @input
+    #[derive(Debug)]
+    pub struct MemoryFact(pub MemoryId, pub u8);
 
     // ---- Outputs: derived facts ----
     @output
@@ -96,13 +103,13 @@ crepe::crepe! {
     pub struct TransitiveRequires(MemoryId, MemoryId);
     @output
     #[derive(Debug)]
-    pub struct CoOccurrenceAffinity(MemoryId, MemoryId);
+    pub struct SharedEntity(MemoryId, MemoryId, EntityId);
     @output
     #[derive(Debug)]
     pub struct ProblemSolutionBridge(MemoryId, MemoryId);
     @output
     #[derive(Debug)]
-    pub struct SimilarTagsAffinity(MemoryId, MemoryId);
+    pub struct SharedTag(MemoryId, MemoryId, u32);
     @output
     #[derive(Debug)]
     pub struct ImpliedSolves(MemoryId, MemoryId);
@@ -118,6 +125,9 @@ crepe::crepe! {
     @output
     #[derive(Debug)]
     pub struct SessionCohort(MemoryId, MemoryId);
+    @output
+    #[derive(Debug)]
+    pub struct SharedTarget(MemoryId, MemoryId);
 
     // R1: a memory that Solves another is a Solution.
     TypeFromSolves(a, SOLUTION_TYPE) <-
@@ -141,20 +151,22 @@ crepe::crepe! {
         Edge(a, b, k1), Edge(b, c, k2),
         (k1 == pk_ref().requires), (k2 == pk_ref().requires);
 
-    // R7: shared entities imply co-occurrence affinity.
-    CoOccurrenceAffinity(a, b) <-
-        EntityFact(a, e), EntityFact(b, e), (a != b);
+    // R7 (CR7): one fact per (pair, shared entity) — evaluate() folds
+    // them into per-pair counts; §14.2's confidence is shared_count/5.0
+    // for THAT pair, not the neighborhood edge count.
+    SharedEntity(a, b, e) <- EntityFact(a, e), EntityFact(b, e), (a != b);
 
     // R8: solutions of the same problem are bridged.
     ProblemSolutionBridge(x, y) <-
         Edge(x, p, kx), Edge(y, p, ky), (kx == SOLVES), (ky == SOLVES), (x != y);
 
-    // R9: shared tags imply affinity.
-    SimilarTagsAffinity(a, b) <-
-        TagFact(a, t), TagFact(b, t), (a != b);
+    // R9 (CR7): one fact per (pair, shared tag); folded into counts.
+    SharedTag(a, b, t) <- TagFact(a, t), TagFact(b, t), (a != b);
 
-    // D1: `Fix Fixes Problem` implies `Fix Solves Problem`.
-    ImpliedSolves(a, b) <- Edge(a, b, k), (k == FIXES);
+    // D1: `Fix Fixes Problem` implies `Fix Solves Problem` — guarded on
+    // the source memory being a Fix, exactly as the pack's D1 declares
+    // (KP1: the hand-copy had dropped the guard).
+    ImpliedSolves(a, b) <- Edge(a, b, k), (k == FIXES), MemoryFact(a, FIX_TYPE);
 
     // D2: BuildsOn transitivity.
     TransitiveBuildsOn(a, c) <-
@@ -171,8 +183,30 @@ crepe::crepe! {
         Edge(a, b, k1), Edge(b, c, k2),
         (k1 == pk_ref().contradicts), (k2 == pk_ref().confirms);
 
+    // D5: file-lineage propagation — two memories Modifying the same
+    // target share it (KP1: the pack declared D5 and the engine never
+    // implemented it).
+    SharedTarget(a, b) <-
+        Edge(a, f, k1), Edge(b, f, k2),
+        (k1 == pk_ref().modifies), (k2 == pk_ref().modifies), (a != b);
+
     // D6: session cohort.
     SessionCohort(m, s) <- Edge(m, s, k), (k == IN_SESSION);
+}
+
+/// CR7: pair facts (one per shared item) -> per-pair shared counts, in
+/// sorted order. Called by the writeback, where §14.2 confidence is
+/// computed — the fixpoint itself stays lean (§10.7 step 6 budget).
+pub fn pair_counts(mut pairs: Vec<(MemoryId, MemoryId)>) -> Vec<(MemoryId, MemoryId, u32)> {
+    pairs.sort_unstable();
+    let mut out: Vec<(MemoryId, MemoryId, u32)> = Vec::with_capacity(pairs.len());
+    for (a, b) in pairs {
+        match out.last_mut() {
+            Some(last) if last.0 == a && last.1 == b => last.2 += 1,
+            _ => out.push((a, b, 1)),
+        }
+    }
+    out
 }
 
 fn pk_ref() -> &'static PackKinds {
@@ -192,11 +226,12 @@ pub struct Derived {
     pub transitive_depends_on: Vec<(MemoryId, MemoryId)>,
     /// R5 pairs.
     pub transitive_requires: Vec<(MemoryId, MemoryId)>,
-    /// R7 pairs.
+    /// R7 pair facts, one per (pair, shared entity). Fold into per-pair
+    /// counts with [`pair_counts`] where confidence is computed (CR7).
     pub co_occurrence_affinity: Vec<(MemoryId, MemoryId)>,
     /// R8 pairs.
     pub problem_solution_bridge: Vec<(MemoryId, MemoryId)>,
-    /// R9 pairs.
+    /// R9 pair facts, one per (pair, shared tag); fold with [`pair_counts`].
     pub similar_tags_affinity: Vec<(MemoryId, MemoryId)>,
     /// D1 pairs.
     pub implied_solves: Vec<(MemoryId, MemoryId)>,
@@ -208,6 +243,8 @@ pub struct Derived {
     pub contradiction_propagates: Vec<(MemoryId, MemoryId)>,
     /// D6 pairs.
     pub session_cohort: Vec<(MemoryId, MemoryId)>,
+    /// D5 pairs.
+    pub shared_target: Vec<(MemoryId, MemoryId)>,
 }
 
 impl Derived {
@@ -230,25 +267,32 @@ impl Derived {
 }
 
 /// Run the fixpoint over the given facts. `prime` must have been called.
-pub fn evaluate(edges: Vec<Edge>, entities: Vec<EntityFact>, tags: Vec<TagFact>) -> Derived {
+pub fn evaluate(
+    edges: Vec<Edge>,
+    entities: Vec<EntityFact>,
+    tags: Vec<TagFact>,
+    memories: Vec<MemoryFact>,
+) -> Derived {
     let mut rt = Crepe::new();
     rt.extend(edges);
     rt.extend(entities);
     rt.extend(tags);
+    rt.extend(memories);
     let (
         type_from_solves,
         type_from_fixes,
         type_from_causes,
         transitive_depends_on,
         transitive_requires,
-        co_occurrence_affinity,
+        shared_entity,
         problem_solution_bridge,
-        similar_tags_affinity,
+        shared_tag,
         implied_solves,
         transitive_builds_on,
         indirect_blocker,
         contradiction_propagates,
         session_cohort,
+        shared_target,
     ) = rt.run();
     macro_rules! pairs {
         ($s:expr) => {
@@ -261,13 +305,14 @@ pub fn evaluate(edges: Vec<Edge>, entities: Vec<EntityFact>, tags: Vec<TagFact>)
         type_from_causes: pairs!(type_from_causes),
         transitive_depends_on: pairs!(transitive_depends_on),
         transitive_requires: pairs!(transitive_requires),
-        co_occurrence_affinity: pairs!(co_occurrence_affinity),
+        co_occurrence_affinity: shared_entity.into_iter().map(|x| (x.0, x.1)).collect(),
         problem_solution_bridge: pairs!(problem_solution_bridge),
-        similar_tags_affinity: pairs!(similar_tags_affinity),
+        similar_tags_affinity: shared_tag.into_iter().map(|x| (x.0, x.1)).collect(),
         implied_solves: pairs!(implied_solves),
         transitive_builds_on: pairs!(transitive_builds_on),
         indirect_blocker: pairs!(indirect_blocker),
         contradiction_propagates: pairs!(contradiction_propagates),
         session_cohort: pairs!(session_cohort),
+        shared_target: pairs!(shared_target),
     }
 }

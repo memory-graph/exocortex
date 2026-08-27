@@ -10,6 +10,11 @@ pub enum Provenance {
     Asserted {
         /// Author identity (user or agent).
         author: SmolStr,
+        /// D8 (agent-instructions PRD §3.8): the declared producer kind,
+        /// stored at registration and stamped on every assertion. `None`
+        /// on rows predating the field; reads back as "custom".
+        #[serde(default)]
+        producer_kind: Option<ProducerKind>,
     },
     /// Materialized by a Crepe rule; `evidence` is the supporting edge set.
     Derived {
@@ -54,6 +59,29 @@ pub enum ComputedProducer {
     EntityCoOccurrence,
     /// Two memories from the same session_id.
     SessionCoOccurrence,
+}
+
+/// D8: the closed producer-kind set, mirrored from the wire enum. The
+/// kernel owns the stored shape; the wire owns the transport shape; the
+/// two are held in sync by a unit test in this crate's test suite
+/// (values, not names — the wire enum is prost-generated).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub enum ProducerKind {
+    /// Registration rejected it; stored rows never carry it. The serde
+    /// default exists so old rows (missing the field) read back as
+    /// `Custom`-equivalent, per PRD §3.8.
+    #[default]
+    Unspecified,
+    /// A coding-agent harness (Claude Code, Codex, Cursor).
+    CodingAgent,
+    /// A research/planning agent.
+    ResearchAgent,
+    /// A docs-site adapter.
+    DocsAdapter,
+    /// An analytics-table adapter.
+    AnalyticsAdapter,
+    /// Anything else; the escape hatch.
+    Custom,
 }
 
 /// External-system coordinates carried on every ingested assertion (R-T16a).

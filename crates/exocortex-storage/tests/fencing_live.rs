@@ -44,6 +44,7 @@ fn mem(seed: u8) -> Memory {
         visibility: Visibility::Org,
         provenance: Provenance::Asserted {
             author: "fence".into(),
+            producer_kind: None,
         },
         context: MemoryContext {
             timestamp: Utc::now(),

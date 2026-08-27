@@ -127,7 +127,11 @@ impl InMemoryStorage {
         let mut store = self.inner.rels.lock().unwrap();
         let mut r = r.clone();
         r.lsn = exocortex_kernel::LSN::new_backend(lsn);
-        store.entry(r.id).or_default().push(r.clone());
+        // ST7/ST8 (audit): overwrite in place — one current row per id, the
+        // same semantics the FalkorDB adapter's MERGE gives. The double's
+        // old per-id version stack was a model the production backend does
+        // not have.
+        store.insert(r.id, vec![r.clone()]);
         drop(store);
         let _ = self.feed.send(Invalidation::RelationshipUpserted {
             id: r.id,
@@ -153,7 +157,10 @@ impl Storage for InMemoryStorage {
         let mut m = m.clone();
         m.lsn = exocortex_kernel::LSN::new_backend(lsn);
         let id = m.id;
-        store.entry(id).or_default().push(m);
+        // ST7/ST8 (audit): overwrite in place — one current row per id,
+        // matching the FalkorDB adapter's MERGE and the trait's "current
+        // versions" streaming contract.
+        store.insert(id, vec![m]);
         drop(store);
         let _ = self.feed.send(Invalidation::MemoryUpserted { id, lsn });
         Ok(CommitRecord {
@@ -168,14 +175,79 @@ impl Storage for InMemoryStorage {
         ms: &[Memory],
         rs: &[Relationship],
     ) -> Result<Vec<CommitRecord>, StorageError> {
-        let mut out = Vec::new();
+        // ST6 (audit): all-or-nothing — stage every write (including R-T4
+        // inverse companions) onto cloned maps and swap only when every
+        // row resolved. A mid-batch failure leaves the store untouched.
+        let mut staged_m: HashMap<MemoryId, Vec<Memory>> =
+            self.inner.memories.lock().unwrap().clone();
+        let mut staged_r: HashMap<RelationshipId, Vec<Relationship>> =
+            self.inner.rels.lock().unwrap().clone();
+        let mut records = Vec::with_capacity(ms.len() + rs.len());
+        let mut invalidations = Vec::new();
+        let base_lsn = self.lsn.load(Ordering::SeqCst);
+        let mut next = base_lsn;
         for m in ms {
-            out.push(self.upsert_memory(m).await?);
+            next += 1;
+            let mut m = m.clone();
+            m.lsn = exocortex_kernel::LSN::new_backend(next);
+            staged_m.insert(m.id, vec![m.clone()]);
+            invalidations.push(Invalidation::MemoryUpserted {
+                id: m.id,
+                lsn: next,
+            });
+            records.push(CommitRecord {
+                lsn: next,
+                committed_at: Utc::now(),
+                node_id: None,
+                edge_id: None,
+            });
         }
         for r in rs {
-            out.push(self.upsert_relationship(r).await?);
+            next += 1;
+            let mut r = r.clone();
+            r.lsn = exocortex_kernel::LSN::new_backend(next);
+            staged_r.insert(r.id, vec![r.clone()]);
+            invalidations.push(Invalidation::RelationshipUpserted {
+                id: r.id,
+                from: r.from,
+                to: r.to,
+                kind: r.kind,
+                lsn: next,
+            });
+            records.push(CommitRecord {
+                lsn: next,
+                committed_at: Utc::now(),
+                node_id: None,
+                edge_id: None,
+            });
+            // R-T4: write `k'(b,a)` in the same batch.
+            if let Some(mut inv) = exocortex_kernel::materialize_inverse(&self.inner.ontology, &r) {
+                next += 1;
+                inv.lsn = exocortex_kernel::LSN::new_backend(next);
+                staged_r.insert(inv.id, vec![inv.clone()]);
+                invalidations.push(Invalidation::RelationshipUpserted {
+                    id: inv.id,
+                    from: inv.from,
+                    to: inv.to,
+                    kind: inv.kind,
+                    lsn: next,
+                });
+                records.push(CommitRecord {
+                    lsn: next,
+                    committed_at: Utc::now(),
+                    node_id: None,
+                    edge_id: None,
+                });
+            }
         }
-        Ok(out)
+        // Publish the LSN frontier, then swap staged maps in atomically.
+        self.lsn.store(next, Ordering::SeqCst);
+        *self.inner.memories.lock().unwrap() = staged_m;
+        *self.inner.rels.lock().unwrap() = staged_r;
+        for inv in invalidations {
+            let _ = self.feed.send(inv);
+        }
+        Ok(records)
     }
     async fn delete_memory(&self, id: &MemoryId) -> Result<CommitRecord, StorageError> {
         let lsn = self.next_lsn();
@@ -217,12 +289,29 @@ impl Storage for InMemoryStorage {
     async fn delete_relationship(&self, id: &RelationshipId) -> Result<CommitRecord, StorageError> {
         let lsn = self.next_lsn();
         let mut store = self.inner.rels.lock().unwrap();
+        // ST11 (audit): publish the invalidation like every other write —
+        // relationship deletions must reach the change feed.
+        let mut closed = false;
         if let Some(h) = store.get_mut(id) {
             if let Some(last) = h.last_mut() {
-                last.valid_until = Some(Utc::now());
-                last.lsn = exocortex_kernel::LSN::new_backend(lsn);
+                if last.valid_until.is_none() {
+                    last.valid_until = Some(Utc::now());
+                    last.lsn = exocortex_kernel::LSN::new_backend(lsn);
+                    closed = true;
+                }
             }
         }
+        drop(store);
+        if !closed {
+            // ST9 parity: a no-op delete is an error, never a silent success.
+            return Err(StorageError::Backend(format!(
+                "delete_relationship: {:02x?} not found or already closed",
+                id.0
+            )));
+        }
+        let _ = self
+            .feed
+            .send(Invalidation::RelationshipDeleted { id: *id, lsn });
         Ok(CommitRecord {
             lsn,
             committed_at: Utc::now(),
@@ -254,7 +343,13 @@ impl Storage for InMemoryStorage {
         else {
             return Ok(None);
         };
-        if m.visibility as u8 > vc.max_visibility as u8
+        // R-T11 parity with the Falkor adapter: a Public row reads as Org
+        // for scope decisions (ST3/ST4).
+        let effective = match m.visibility {
+            Visibility::Public => Visibility::Org,
+            other => other,
+        };
+        if effective > vc.max_visibility
             || (m.visibility == Visibility::Private
                 && m.context.user_id.as_deref() != Some(vc.user_id.as_str()))
         {
@@ -288,16 +383,23 @@ impl Storage for InMemoryStorage {
         let rels = self.inner.rels.lock().unwrap();
         let valid =
             |vf: DateTime<Utc>, vu: &Option<DateTime<Utc>>| vf <= t && vu.map_or(true, |v| v > t);
+        // ST12 (audit): evaluate validity against the CURRENT version only
+        // (the historical `any()` counted an id if ANY version was valid, so
+        // a deleted memory stayed counted forever). Visibility follows
+        // R-T11: Public reads as Org, so every row is in scope at the
+        // snapshot's Org-level view (parity with the Falkor count).
         Ok(GraphSnapshot {
             as_of: t,
             backend_lsn: self.lsn.load(Ordering::SeqCst),
             memory_count: store
                 .values()
-                .filter(|h| h.iter().any(|m| valid(m.valid_from, &m.valid_until)))
+                .filter_map(|h| h.last())
+                .filter(|m| valid(m.valid_from, &m.valid_until))
                 .count() as u64,
             relationship_count: rels
                 .values()
-                .filter(|h| h.iter().any(|r| valid(r.valid_from, &r.valid_until)))
+                .filter_map(|h| h.last())
+                .filter(|r| valid(r.valid_from, &r.valid_until))
                 .count() as u64,
         })
     }
@@ -307,12 +409,13 @@ impl Storage for InMemoryStorage {
         at: DateTime<Utc>,
     ) -> Result<Option<Memory>, StorageError> {
         let store = self.inner.memories.lock().unwrap();
-        Ok(store.get(id).and_then(|h| {
-            h.iter()
-                .rev()
-                .find(|m| m.valid_from <= at && m.valid_until.is_none_or(|v| v > at))
-                .cloned()
-        }))
+        // ST7 (audit): the double overwrites in place, so exactly one row
+        // per id exists — the same semantics the FalkorDB adapter serves.
+        Ok(store
+            .get(id)
+            .and_then(|h| h.last())
+            .filter(|m| m.valid_from <= at && m.valid_until.is_none_or(|v| v > at))
+            .cloned())
     }
     async fn query_cypher(&self, _q: &CypherQuery) -> Result<ResultSet, StorageError> {
         Err(StorageError::Backend(
@@ -320,13 +423,15 @@ impl Storage for InMemoryStorage {
         ))
     }
     async fn stream_all_memories(&self) -> BoxStream<'_, Result<Memory, StorageError>> {
+        // ST8 (audit): current versions only — one row per id, matching the
+        // FalkorDB pagers and the trait contract.
         let all: Vec<_> = self
             .inner
             .memories
             .lock()
             .unwrap()
             .values()
-            .flat_map(|h| h.iter().cloned().map(Ok))
+            .filter_map(|h| h.last().cloned().map(Ok))
             .collect();
         Box::pin(futures::stream::iter(all))
     }
@@ -337,7 +442,7 @@ impl Storage for InMemoryStorage {
             .lock()
             .unwrap()
             .values()
-            .flat_map(|h| h.iter().cloned().map(Ok))
+            .filter_map(|h| h.last().cloned().map(Ok))
             .collect();
         Box::pin(futures::stream::iter(all))
     }
@@ -423,7 +528,23 @@ impl Storage for InMemoryStorage {
         rs: &[Relationship],
         lease: &OwnerLease,
     ) -> Result<Vec<CommitRecord>, StorageError> {
-        self.check_lease_current(lease)?;
+        // ST5 (audit): the fencing check and the commit are one unit on
+        // the double — the check runs under the lease-table lock, then the
+        // staged batch swaps in atomically (no per-row await windows).
+        let current = {
+            let leases = self.inner.leases.lock().unwrap();
+            matches!(
+                leases.get(&lease.key),
+                Some(held)
+                    if held.token == lease.fencing_token.as_str()
+                        && held.expires_at > Utc::now()
+            )
+        };
+        if !current {
+            return Err(StorageError::FencedWriteRejected {
+                lease_epoch: lease.epoch,
+            });
+        }
         self.upsert_batch(ms, rs).await
     }
     async fn delete_memory_fenced(

@@ -148,5 +148,8 @@ fn malformed_hmac_key_fails_loudly() {
         .unwrap();
     assert!(!out.status.success(), "bad hex must fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("HMAC key"), "names the problem: {stderr}");
+    assert!(
+        stderr.contains("64 hex chars"),
+        "names the problem (shared decode_hex32): {stderr}"
+    );
 }

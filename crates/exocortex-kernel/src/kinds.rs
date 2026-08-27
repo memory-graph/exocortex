@@ -83,4 +83,9 @@ pub struct RelMeta {
     pub bidirectional: bool,
     /// Strength applied when an `EdgeHint` omits strength.
     pub default_strength: f32,
+    /// R-T14 (audit W6): kinds produced exclusively by backend computation
+    /// (Dreams). The ingest boundary rejects producer assertions of these;
+    /// the marker lives HERE, in the ontology, not as a string literal in
+    /// a consumer crate.
+    pub computed_only: bool,
 }

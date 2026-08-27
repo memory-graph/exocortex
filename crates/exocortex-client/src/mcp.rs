@@ -32,20 +32,32 @@ pub struct ExocortexMcp {
     /// Offline write buffer (§5.2): present → `end_session` buffers locally
     /// and answers `sync_pending: true`.
     wal: Option<Arc<wal::Wal>>,
-    /// Effective ontology (draft→memory resolution on the offline path).
-    ontology: Option<Arc<exocortex_kernel::Ontology>>,
+    /// Effective ontology (draft→memory resolution on the offline path,
+    /// and the preflight rulebook on every path).
+    ontology: Arc<exocortex_kernel::Ontology>,
+    /// §4.8: the client-minted conversation id. The client process spans
+    /// the whole harness conversation (stdio servers launch per session),
+    /// so this id IS the session grouping key unless the caller passes an
+    /// explicit one (deliberate multi-agent sharing).
+    process_session_id: String,
 }
 
 impl ExocortexMcp {
     /// Build the server over a cache.
-    pub fn new(org: smol_str::SmolStr, cache: Arc<LocalCache>, vc: VisibilityContext) -> Self {
+    pub fn new(
+        org: smol_str::SmolStr,
+        cache: Arc<LocalCache>,
+        vc: VisibilityContext,
+        ontology: Arc<exocortex_kernel::Ontology>,
+    ) -> Self {
         Self {
             org,
             cache,
             vc,
             end_session: None,
             wal: None,
-            ontology: None,
+            ontology,
+            process_session_id: uuid::Uuid::now_v7().simple().to_string(),
         }
     }
 
@@ -55,15 +67,16 @@ impl ExocortexMcp {
         self
     }
 
-    /// Attach the offline WAL + ontology (M3 offline write path).
-    pub fn with_offline_wal(
-        mut self,
-        wal: Arc<wal::Wal>,
-        ontology: Arc<exocortex_kernel::Ontology>,
-    ) -> Self {
+    /// Attach the offline WAL (M3 offline write path). The ontology is
+    /// always present (constructor), so this only adds the buffer.
+    pub fn with_offline_wal(mut self, wal: Arc<wal::Wal>) -> Self {
         self.wal = Some(wal);
-        self.ontology = Some(ontology);
         self
+    }
+
+    /// §4.8: the process-minted conversation id (test surface).
+    pub fn process_session_id(&self) -> &str {
+        &self.process_session_id
     }
 }
 
@@ -81,50 +94,20 @@ fn default_limit() -> u32 {
     20
 }
 
-/// Output for `exocortex.search_memories`.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct SearchMemoriesOutput {
-    /// Ranked memories.
-    pub memories: Vec<ScoredMemory>,
-    /// Read stamp (R-M7): local + backend LSN frontiers.
-    pub snapshot_version: SnapshotVersion,
-}
-
-/// One scored memory.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct ScoredMemory {
-    /// The memory id (hex).
-    pub id: String,
-    /// Title.
-    pub title: String,
-    /// Memory type name in the effective ontology.
-    pub memory_type: String,
-    /// §14.1 relevance score.
-    pub score: f32,
-}
-
-/// Snapshot version stamp (R-M7).
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct SnapshotVersion {
-    /// Local WAL frontier.
-    pub local_lsn: u64,
-    /// Backend commits observed.
-    pub backend_lsn: u64,
-}
-
-/// Decode 32 hex chars into a 16-byte id.
-fn unhex32(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for i in 0..16 {
-        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
-}
-
 impl ExocortexMcp {
+    /// IN10 (audit): the registry OpContext — the same typed handler the
+    /// HTTP bind dispatches serves this MCP surface (CR-9). The storage is
+    /// the no-backend shim: interactive reads are cache-served.
+    fn registry_ctx(&self) -> std::sync::Arc<exocortex_ops::OpContext> {
+        std::sync::Arc::new(exocortex_ops::OpContext {
+            visibility_ctx: self.vc.clone(),
+            storage: std::sync::Arc::new(crate::no_backend::NoBackendStorage),
+            cache: self.cache.clone(),
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
+            ontology: Some(self.ontology.clone()),
+        })
+    }
+
     /// `exocortex.search_memories` (§7.12; p50 500µs / p99 3ms).
     #[tool(
         name = "exocortex.search_memories",
@@ -135,40 +118,36 @@ impl ExocortexMcp {
         #[tool(param)] query: String,
         #[tool(param)] limit: Option<u32>,
     ) -> Result<String, String> {
-        let limit = limit.unwrap_or(20).min(500);
-        let hits = self.cache.search(&self.org, &query, limit, &self.vc);
-        let memories = hits
+        // IN10 (audit): dispatch through the ONE registry handler — the
+        // same implementation and output shape HTTP serves (CR-9).
+        let entry = exocortex_ops::entries()
             .into_iter()
-            .map(|(m, score)| ScoredMemory {
-                id: {
-                    use std::fmt::Write as _;
-                    let mut hex = String::with_capacity(32);
-                    for b in m.id.0 {
-                        let _ = write!(hex, "{b:02x}");
-                    }
-                    hex
-                },
-                title: m.title.to_string(),
-                memory_type: format!("type:{}", m.memory_type),
-                score,
+            .find(|e| e.mcp_tool_name == "exocortex.search_memories")
+            .expect("search_memories registered");
+        let out = (entry.handler)(
+            &self.registry_ctx(),
+            serde_json::to_value(exocortex_ops::operations::SearchInput {
+                query,
+                limit: limit.unwrap_or(20),
             })
-            .collect();
-        let version = self
-            .cache
-            .version(&self.org)
-            .unwrap_or(exocortex_cache::CacheVersion {
-                local_lsn: 0,
-                backend_lsn: 0,
-                published_at: std::time::Instant::now(),
-            });
-        let out = SearchMemoriesOutput {
-            memories,
-            snapshot_version: SnapshotVersion {
-                local_lsn: version.local_lsn,
-                backend_lsn: version.backend_lsn,
-            },
-        };
-        serde_json::to_string(&out).map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        // R-M7: the client surface adds the version stamp AROUND the
+        // registry shape (inner object stays byte-identical).
+        let version = self.cache.version(&self.org);
+        let mut v = serde_json::to_value(&out).map_err(|e| e.to_string())?;
+        if let serde_json::Value::Object(map) = &mut v {
+            map.insert(
+                "snapshot_version".into(),
+                serde_json::json!({
+                    "local_lsn": version.map(|x| x.local_lsn).unwrap_or(0),
+                    "backend_lsn": version.map(|x| x.backend_lsn).unwrap_or(0),
+                }),
+            );
+        }
+        serde_json::to_string(&v).map_err(|e| e.to_string())
     }
 
     /// `exocortex.get_memory` (registry op, client-side over the cache).
@@ -177,25 +156,21 @@ impl ExocortexMcp {
         description = "Fetch one memory by hex id from the local org graph."
     )]
     pub async fn get_memory(&self, #[tool(param)] id: String) -> Result<String, String> {
-        let bytes = unhex32(&id).ok_or_else(|| "id must be 32 hex chars".to_string())?;
-        let mid = exocortex_kernel::MemoryId(bytes);
-        match self.cache.get_memory(&self.org, &mid, &self.vc) {
-            Some(m) => {
-                #[derive(Serialize)]
-                struct Out {
-                    id: String,
-                    title: String,
-                    memory_type: u8,
-                }
-                serde_json::to_string(&Out {
-                    id,
-                    title: m.title.to_string(),
-                    memory_type: m.memory_type,
-                })
-                .map_err(|e| e.to_string())
-            }
-            None => Ok(serde_json::json!({ "memory": null }).to_string()),
-        }
+        // IN10 (audit): registry dispatch — the hit AND the miss carry the
+        // registry's `{memory: ...}` shape (the hand-rolled path returned a
+        // flat object on hit and `{memory: null}` on miss).
+        let entry = exocortex_ops::entries()
+            .into_iter()
+            .find(|e| e.mcp_tool_name == "exocortex.get_memory")
+            .expect("get_memory registered");
+        let out = (entry.handler)(
+            &self.registry_ctx(),
+            serde_json::to_value(exocortex_ops::operations::GetMemoryInput { id })
+                .map_err(|e| e.to_string())?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
     /// `exocortex.find_related` (registry op, client-side over the cache).
@@ -208,48 +183,45 @@ impl ExocortexMcp {
         #[tool(param)] anchor: String,
         #[tool(param)] k: Option<u8>,
     ) -> Result<String, String> {
-        let bytes = unhex32(&anchor).ok_or_else(|| "anchor must be 32 hex chars".to_string())?;
-        let spec = exocortex_ops::TraversalSpec {
-            direction: exocortex_ops::Direction::Both,
-            kinds: Default::default(),
-            max_depth: k.unwrap_or(2).min(4),
-            max_nodes: 128,
-            visibility_ctx: self.vc.clone(),
-            as_of: None,
-        };
-        let hits = self
-            .cache
-            .traverse(&self.org, &exocortex_kernel::MemoryId(bytes), &spec);
-        let out: Vec<_> = hits
-            .iter()
-            .map(|m| {
-                use std::fmt::Write as _;
-                let mut hex = String::with_capacity(32);
-                for b in m.id.0 {
-                    let _ = write!(hex, "{b:02x}");
-                }
-                serde_json::json!({ "id": hex, "title": m.title.to_string() })
+        // IN10 (audit): registry dispatch — the registry's
+        // `{memories: [...]}` shape, never a bare array.
+        let entry = exocortex_ops::entries()
+            .into_iter()
+            .find(|e| e.mcp_tool_name == "exocortex.find_related")
+            .expect("find_related registered");
+        let out = (entry.handler)(
+            &self.registry_ctx(),
+            serde_json::to_value(exocortex_ops::operations::FindRelatedInput {
+                anchor,
+                k: k.unwrap_or(2),
             })
-            .collect();
+            .map_err(|e| e.to_string())?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
     /// `exocortex.end_session` (§13.6): wrapup batch submit. Online: gRPC
     /// Submit to the backend IngestService. Offline: WAL append with
-    /// `{ local_lsns, sync_pending: true }` (§5.2).
+    /// `{ local_lsns, sync_pending: true }` (§5.2). §4.8: an omitted
+    /// session id is stamped with the client-minted conversation id.
     #[tool(
         name = "exocortex.end_session",
-        description = "Submit a session wrapup: 1-5 memory drafts plus optional edge hints between them. Requires session_id and project_id."
+        description = "Submit a session wrapup: 1-5 memory drafts plus optional edges (by draft_key within the batch, or to_memory_id for an existing memory). session_id is optional — the client stamps its conversation id."
     )]
     pub async fn end_session(
         &self,
-        #[tool(param)] session_id: String,
+        #[tool(param)] session_id: Option<String>,
         #[tool(param)] project_id: String,
         #[tool(param)] memories: Vec<MemoryDraftInput>,
         #[tool(param)] edges: Vec<EdgeHintInput>,
     ) -> Result<String, String> {
         let args = EndSessionArgs {
-            session_id,
+            // §4.8: explicit id (deliberate sharing) wins; otherwise the
+            // process-minted conversation id groups every batch of this
+            // client process into one backend group.
+            session_id: Some(session_id.unwrap_or_else(|| self.process_session_id.clone())),
             project_id,
             memories,
             edges,
@@ -258,9 +230,9 @@ impl ExocortexMcp {
             let ack = tool.handle(args).await.map_err(|e| e.to_string())?;
             return serde_json::to_string(&ack).map_err(|e| e.to_string());
         }
-        if let (Some(wal), Some(ontology)) = (&self.wal, &self.ontology) {
+        if let Some(wal) = &self.wal {
             return self
-                .end_session_offline(wal, ontology, args)
+                .end_session_offline(wal, &self.ontology, args)
                 .map_err(|e| e.to_string());
         }
         Err(json_error("not-connected", "end_session requires --backend (gRPC submit) or the offline WAL; neither is configured"))
@@ -275,10 +247,21 @@ impl ExocortexMcp {
         args: EndSessionArgs,
     ) -> Result<String, String> {
         use exocortex_kernel::{MemoryDraft, MemoryId};
+        // §4.8: the MCP layer has already stamped the default id; an
+        // explicit one rides through untouched.
+        let session_id = args.session_id.clone().unwrap_or_default();
+        if session_id.is_empty() {
+            return Err(json_error("invalid-params", "session_id required"));
+        }
         if args.memories.is_empty() || args.memories.len() > 5 {
             return Err(json_error("invalid-params", "memories: expected 1..=5"));
         }
         let now = chrono::Utc::now();
+        // W1/IN7/CL1: capture the rebuild inputs BEFORE the loop consumes
+        // the drafts (content-bound batch id, keys, tags).
+        let batch_id = offline_batch_id(&session_id, &args.memories, &args.edges);
+        let draft_keys: Vec<String> = args.memories.iter().map(|m| m.draft_key.clone()).collect();
+        let tags: Vec<Vec<String>> = args.memories.iter().map(|m| m.tags.clone()).collect();
         let mut ids: Vec<(String, MemoryId)> = Vec::with_capacity(args.memories.len());
         let mut drafts: Vec<MemoryDraft> = Vec::with_capacity(args.memories.len());
         for m in args.memories {
@@ -300,6 +283,48 @@ impl ExocortexMcp {
                     ))
                 }
             };
+            // W2 (audit): the offline path runs the SAME kernel validator
+            // as ingest — title/content bounds, no-widening — so a batch
+            // cannot succeed or fail based on which transport carried it.
+            let context = exocortex_kernel::MemoryContext {
+                timestamp: now,
+                project_id: Some(args.project_id.clone().into()),
+                project_path: None,
+                team_id: None,
+                tenant_id: None,
+                session_id: Some(session_id.clone().into()),
+                user_id: Some(self.vc.user_id.clone()),
+                created_by: None,
+                files_involved: Default::default(),
+                languages: Default::default(),
+                frameworks: Default::default(),
+                technologies: Default::default(),
+                git_commit: None,
+                git_branch: None,
+                working_directory: None,
+                entities: Default::default(),
+                additional_metadata: serde_json::Value::Null,
+            };
+            let probe = MemoryDraft {
+                memory_type,
+                title: m.title.clone().into(),
+                content: m.content.clone(),
+                summary: None,
+                visibility,
+                context: context.clone(),
+                edge_hints: Default::default(),
+                external_key: None,
+            };
+            if let Err(e) = exocortex_kernel::validator::validate_draft(
+                ontology,
+                &probe,
+                exocortex_kernel::validator::SourceCeiling {
+                    source: "offline-wal",
+                    ceiling: exocortex_kernel::Visibility::Org,
+                },
+            ) {
+                return Err(json_error("validation", e.to_string()));
+            }
             let id = MemoryId::new_v7();
             let draft = MemoryDraft {
                 memory_type,
@@ -307,25 +332,7 @@ impl ExocortexMcp {
                 content: m.content,
                 summary: None,
                 visibility,
-                context: exocortex_kernel::MemoryContext {
-                    timestamp: now,
-                    project_id: Some(args.project_id.clone().into()),
-                    project_path: None,
-                    team_id: None,
-                    tenant_id: None,
-                    session_id: Some(args.session_id.clone().into()),
-                    user_id: Some(self.vc.user_id.clone()),
-                    created_by: None,
-                    files_involved: Default::default(),
-                    languages: Default::default(),
-                    frameworks: Default::default(),
-                    technologies: Default::default(),
-                    git_commit: None,
-                    git_branch: None,
-                    working_directory: None,
-                    entities: Default::default(),
-                    additional_metadata: serde_json::Value::Null,
-                },
+                context,
                 edge_hints: Default::default(),
                 external_key: None,
             };
@@ -333,7 +340,9 @@ impl ExocortexMcp {
             drafts.push(draft);
         }
         // Edge hints become typed hints against the assigned ids, attached to
-        // the draft named by from_draft_key.
+        // the draft named by from_draft_key. §4.5: a to_memory_id edge
+        // targets an EXISTING memory — the hex id is used directly and
+        // existence/triple is checked at commit (drain) time.
         for e in &args.edges {
             let Some(src) = ids.iter().position(|(k, _)| *k == e.from_draft_key) else {
                 return Err(json_error(
@@ -341,11 +350,37 @@ impl ExocortexMcp {
                     format!("edge references unknown draft_key `{}`", e.from_draft_key),
                 ));
             };
-            let Some((_, to)) = ids.iter().find(|(k, _)| *k == e.to_draft_key) else {
-                return Err(json_error(
-                    "invalid-params",
-                    format!("edge references unknown draft_key `{}`", e.to_draft_key),
-                ));
+            let to = if !e.to_memory_id.is_empty() {
+                let mut out = [0u8; 16];
+                let b = e.to_memory_id.as_bytes();
+                if b.len() != 32
+                    || !e.to_memory_id.chars().all(|c| c.is_ascii_hexdigit())
+                    || (0..16).any(|i| {
+                        u8::from_str_radix(
+                            std::str::from_utf8(&b[i * 2..i * 2 + 2]).unwrap_or("zz"),
+                            16,
+                        )
+                        .inspect(|v| out[i] = *v)
+                        .is_err()
+                    })
+                {
+                    return Err(json_error(
+                        "invalid-params",
+                        format!(
+                            "to_memory_id `{}` is not a 32-hex memory id",
+                            e.to_memory_id
+                        ),
+                    ));
+                }
+                MemoryId(out)
+            } else {
+                let Some((_, to)) = ids.iter().find(|(k, _)| *k == e.to_draft_key) else {
+                    return Err(json_error(
+                        "invalid-params",
+                        format!("edge references unknown draft_key `{}`", e.to_draft_key),
+                    ));
+                };
+                *to
             };
             let Some(kind) = ontology.kind_id(&e.kind) else {
                 return Err(json_error(
@@ -355,7 +390,7 @@ impl ExocortexMcp {
             };
             drafts[src].edge_hints.push(exocortex_kernel::EdgeHint {
                 kind,
-                to: *to,
+                to,
                 strength: if e.strength == 0.0 {
                     None
                 } else {
@@ -366,8 +401,11 @@ impl ExocortexMcp {
         }
         let memory_ids: Vec<MemoryId> = ids.into_iter().map(|(_, id)| id).collect();
         let local_lsn = wal
-            .append_batch(&args.session_id, drafts, memory_ids)
+            .append_batch_full(&session_id, drafts, memory_ids, batch_id, draft_keys, tags)
             .map_err(|e| json_error("wal-error", e.to_string()))?;
+        // CL6 (audit): publish the WAL frontier into the served snapshot so
+        // read-your-writes can observe it (R-M7).
+        self.cache.advance_local_lsn(&self.vc.org_id, local_lsn);
         #[derive(Serialize)]
         struct OfflineAck {
             local_lsns: Vec<u64>,
@@ -376,6 +414,63 @@ impl ExocortexMcp {
         serde_json::to_string(&OfflineAck {
             local_lsns: vec![local_lsn],
             sync_pending: true,
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    /// `exocortex.preflight_wrapup` (D2, §3.2): validate a proposed batch
+    /// locally — the SAME kernel rulebook end_session's self-preflight
+    /// and `IngestService::Submit` run (W2) — without writing. Returns
+    /// rejections with deterministic correction hints plus the
+    /// `unverified` list of server-only checks.
+    #[tool(
+        name = "exocortex.preflight_wrapup",
+        description = "Validate a proposed wrapup batch without writing: the same rules end_session enforces, answered locally with correction hints and an unverified list of server-only checks."
+    )]
+    pub async fn preflight_wrapup(
+        &self,
+        #[tool(param)] _project_id: String,
+        #[tool(param)] memories: Vec<MemoryDraftInput>,
+        #[tool(param)] edges: Vec<EdgeHintInput>,
+    ) -> Result<String, String> {
+        let cache = self.cache.clone();
+        let org = self.org.to_string();
+        let vc = self.vc.clone();
+        let result = crate::preflight::validate_batch(&self.ontology, &memories, &edges, |id| {
+            let mut out = [0u8; 16];
+            let b = id.as_bytes();
+            if b.len() != 32 {
+                return None;
+            }
+            for i in 0..16 {
+                out[i] =
+                    u8::from_str_radix(std::str::from_utf8(&b[i * 2..i * 2 + 2]).ok()?, 16).ok()?;
+            }
+            cache
+                .get_memory(&org, &exocortex_kernel::MemoryId(out), &vc)
+                .map(|m| m.memory_type)
+        });
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
+    /// `exocortex.playbook_version` (D3, §3.3): the compiled playbook
+    /// version plus content hashes — one version string governs the
+    /// playbook and the instruction block.
+    #[tool(
+        name = "exocortex.playbook_version",
+        description = "Report the compiled Agent Playbook version and the content hashes of the playbook and the CLAUDE.md/AGENTS.md instruction block."
+    )]
+    pub async fn playbook_version(&self) -> Result<String, String> {
+        #[derive(Serialize)]
+        struct VersionReport {
+            version: String,
+            playbook_hash: String,
+            block_hash: String,
+        }
+        serde_json::to_string(&VersionReport {
+            version: crate::playbook::PLAYBOOK_VERSION.into(),
+            playbook_hash: crate::playbook::playbook_hash(),
+            block_hash: crate::playbook::block_hash(),
         })
         .map_err(|e| e.to_string())
     }
@@ -402,7 +497,10 @@ impl ServerHandler for ExocortexMcp {
                 name: "exocortex-mcp-client".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
             },
-            instructions: Some("Exocortex local memory graph. Call exocortex.search_memories to query the org graph.".into()),
+            // D7 (§3.7): producer-neutral, both directions, ~40 words — the
+            // protocol-defined server description is the one instruction
+            // surface we control without user action.
+            instructions: Some("Exocortex typed memory graph. Read with exocortex.search_memories / exocortex.find_related. To write, submit with exocortex.end_session (1-5 typed memories, ≤200-char titles, edges by draft_key or memory id) — it validates locally and explains any rejection. exocortex.preflight_wrapup checks a batch without writing.".into()),
             ..Default::default()
         })
     }
@@ -422,6 +520,8 @@ impl ServerHandler for ExocortexMcp {
             Self::get_memory_tool_attr(),
             Self::find_related_tool_attr(),
             Self::end_session_tool_attr(),
+            Self::preflight_wrapup_tool_attr(),
+            Self::playbook_version_tool_attr(),
         ];
         for entry in exocortex_ops::entries() {
             let dispatchable = matches!(
@@ -455,10 +555,49 @@ impl ServerHandler for ExocortexMcp {
             "exocortex.get_memory" => Self::get_memory_tool_call(tcc).await,
             "exocortex.find_related" => Self::find_related_tool_call(tcc).await,
             "exocortex.end_session" => Self::end_session_tool_call(tcc).await,
+            "exocortex.preflight_wrapup" => Self::preflight_wrapup_tool_call(tcc).await,
+            "exocortex.playbook_version" => Self::playbook_version_tool_call(tcc).await,
             _other => Err(rmcp::Error::invalid_params(
                 "method not found (backend-only operations are served over HTTP)",
                 None,
             )),
         }
     }
+}
+
+/// Deterministic offline batch id (IN7): content-bound, so a drain retry
+/// (and a re-submitted wrapup with the same drafts) dedupes server-side.
+fn offline_batch_id(
+    session_id: &str,
+    memories: &[MemoryDraftInput],
+    edges: &[EdgeHintInput],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(session_id.as_bytes());
+    for m in memories {
+        hasher.update(m.draft_key.as_bytes());
+        hasher.update(&[0x1e]);
+        hasher.update(m.memory_type.as_bytes());
+        hasher.update(&[0x1e]);
+        hasher.update(m.title.as_bytes());
+        hasher.update(&[0x1e]);
+        hasher.update(m.content.as_bytes());
+        hasher.update(&[0x1e]);
+        hasher.update(m.visibility.as_bytes());
+        hasher.update(&[0x1e]);
+        for t in &m.tags {
+            hasher.update(t.as_bytes());
+            hasher.update(&[0x1f]);
+        }
+    }
+    for e in edges {
+        hasher.update(e.from_draft_key.as_bytes());
+        hasher.update(&[0x1e]);
+        hasher.update(e.to_draft_key.as_bytes());
+        hasher.update(&[0x1e]);
+        hasher.update(e.kind.as_bytes());
+        hasher.update(&[0x1e]);
+        hasher.update(&e.strength.to_le_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }

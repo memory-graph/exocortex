@@ -131,8 +131,12 @@ impl EntityExtractor {
                 // RegexSet gives set-level indices; recover the concrete
                 // match text with the per-pattern regex over the same input
                 // (deterministic because pattern order is fixed).
+                // IN9 (audit): find_iter collects EVERY occurrence of the
+                // pattern — `find` kept only the leftmost match, so a
+                // memory mentioning two files yielded one entity and
+                // find_by_entity silently missed the memory for the other.
                 let pat = pattern_of(type_idx, mi);
-                if let Some(m) = pat.find(&text) {
+                for m in pat.find_iter(&text) {
                     let raw = m.as_str().trim();
                     hits.push(raw.to_string());
                 }

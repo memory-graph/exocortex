@@ -29,6 +29,10 @@ pub mod cluster {
 /// workspace implementation shared by every producer and the server.
 pub mod signing;
 
+/// The one reject-guidance table (agent-instructions PRD §4.2): triage
+/// disposition + deterministic correction text for every `RejectCode`.
+pub mod corrections;
+
 /// `exocortex.sse.v1` — SSE change-feed events (§2.6.3).
 pub mod sse {
     /// Protocol buffers for `exocortex.sse.v1`.

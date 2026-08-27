@@ -28,6 +28,7 @@ fn meta(id: RelKindId, name: &'static str) -> RelMeta {
         inverse: None,
         bidirectional: false,
         default_strength: 0.8,
+        computed_only: false,
     }
 }
 

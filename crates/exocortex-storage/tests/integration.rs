@@ -63,6 +63,7 @@ fn mem(title: &str, mt: u8, vis: Visibility) -> Memory {
         visibility: vis,
         provenance: Provenance::Asserted {
             author: "it".into(),
+            producer_kind: None,
         },
         context: MemoryContext {
             timestamp: Utc::now(),
@@ -105,6 +106,7 @@ fn rel(from: MemoryId, to: MemoryId, kind: u32) -> Relationship {
         visibility: Visibility::Org,
         provenance: Provenance::Asserted {
             author: "it".into(),
+            producer_kind: None,
         },
         properties: exocortex_kernel::RelationshipProperties {
             strength: 0.8,
@@ -183,6 +185,7 @@ itest!(fingerprint_mismatch_aborts_startup, {
         inverse: None,
         bidirectional: false,
         default_strength: 0.5,
+        computed_only: false,
     });
     let onto2 = Arc::new(exocortex_kernel::Ontology::from_packs(vec![altered]).unwrap());
     let url = falkor_url().unwrap();

@@ -48,6 +48,10 @@ pub enum KernelError {
     MetadataTooLarge,
     /// Score out of [0.0, 1.0].
     ScoreOutOfRange(f32),
+    /// Two packs declare the same memory/entity type name (KP2: silently
+    /// re-resolving the shared name to the later pack's id made every
+    /// first-pack type triple evaluate against the wrong ids).
+    DuplicateTypeName(smol_str::SmolStr),
 }
 
 impl std::fmt::Display for KernelError {
@@ -73,6 +77,10 @@ impl std::fmt::Display for KernelError {
                 write!(f, "additional_metadata exceeds 8 KiB serialized (R-T10)")
             }
             KernelError::ScoreOutOfRange(v) => write!(f, "score {v} out of [0.0, 1.0]"),
+            KernelError::DuplicateTypeName(name) => write!(
+                f,
+                "two packs declare the memory/entity type name `{name}` (KP2)"
+            ),
         }
     }
 }

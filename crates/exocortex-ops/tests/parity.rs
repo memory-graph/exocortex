@@ -25,7 +25,10 @@ fn mem(title: &str) -> Memory {
         summary: None,
         tags: Default::default(),
         visibility: Visibility::Org,
-        provenance: Provenance::Asserted { author: "t".into() },
+        provenance: Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
         context: MemoryContext {
             timestamp: chrono::Utc::now(),
             project_id: None,
@@ -142,6 +145,8 @@ fn ctx_sync() -> (OpContext, Memory) {
             storage: Arc::new(storage),
             cache: Arc::new(cache),
             deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+
+            ontology: None,
         },
         m,
     )
@@ -179,10 +184,16 @@ async fn promote_visibility_writes_audit_record() {
 #[tokio::test]
 async fn accept_discovery_writes_audit_record_and_edge() {
     let (ctx, _m) = ctx_sync();
-    let a = mem("a");
-    let b = mem("b");
+    let onto = ontology();
+    let mut a = mem("a");
+    a.memory_type = 0; // Task (from-side is unconstrained for Causes)
+    let mut b = mem("b");
+    b.memory_type = 2; // Problem (to-side: Error | Problem)
     ctx.storage.upsert_memory(&a).await.unwrap();
     ctx.storage.upsert_memory(&b).await.unwrap();
+    // IN3: the caller-supplied kind is resolved and validated (R-T17):
+    // (Problem, Causes, Problem) is a legal triple; the committed edge
+    // carries the RESOLVED kind, never RelKindId(0).
     let out = exocortex_ops::operations::AcceptDiscoveryOp
         .handle(
             &ctx,
@@ -190,13 +201,43 @@ async fn accept_discovery_writes_audit_record_and_edge() {
                 discovery_id: "11111111-1111-1111-1111-111111111111".into(),
                 from: hex(&a.id),
                 to: hex(&b.id),
-                kind: "Solves".into(),
+                kind: "Causes".into(),
             },
         )
         .await
         .expect("accept");
     assert!(!out.edge_id.is_empty());
     assert!(out.audit_lsn > 0, "R-A2: acceptance is audited");
+    use futures::StreamExt as _;
+    let causes = onto.kind_id("Causes").expect("Causes registered");
+    let mut rs = ctx.storage.stream_all_relationships().await;
+    let mut mine = None;
+    while let Some(Ok(r)) = rs.next().await {
+        if r.kind == causes {
+            mine = Some(r);
+        }
+    }
+    let committed = mine.expect("edge committed with the resolved kind");
+    assert_eq!(
+        committed.from, a.id,
+        "IN3: the asserted edge, not its R-T4 inverse companion"
+    );
+
+    // An illegal triple is rejected (R-T17 now enforced here).
+    let err = exocortex_ops::operations::AcceptDiscoveryOp
+        .handle(
+            &ctx,
+            exocortex_ops::operations::AcceptDiscoveryInput {
+                discovery_id: "22222222-2222-2222-2222-222222222222".into(),
+                from: hex(&a.id),
+                to: hex(&b.id),
+                kind: "Solves".into(),
+            },
+        )
+        .await
+        .map(|o| o.audit_lsn)
+        .expect_err("illegal triple rejected");
+    assert!(matches!(err, exocortex_ops::OpError::BadInput(_)));
 }
 
 #[test]
@@ -218,6 +259,7 @@ async fn audit_ledger_is_org_scoped() {
     fn ctx_for(org: &str) -> OpContext {
         let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
         OpContext {
+            ontology: None,
             visibility_ctx: ops_vc(org, "alice", Visibility::Org),
             storage: Arc::new(InMemoryStorage::new(ontology())),
             cache: Arc::new(cache),
@@ -277,6 +319,7 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
     let author = "someone-else";
     m.provenance = Provenance::Asserted {
         author: author.into(),
+        producer_kind: None,
     };
     storage.upsert_memory(&m).await.unwrap();
 
@@ -285,6 +328,8 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
         storage: Arc::new(storage),
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+
+        ontology: None,
     };
     let err = exocortex_ops::operations::GetMemory
         .handle(
@@ -312,6 +357,8 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
         storage: Arc::new(storage2),
         cache: Arc::new(cache2),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+
+        ontology: None,
     };
     let out = exocortex_ops::operations::GetMemory
         .handle(
@@ -321,4 +368,200 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
         .await
         .expect("author reads own private memory");
     assert!(out.memory.is_some(), "cold-cache miss fills from storage");
+}
+
+/// IN2 (audit): promote_visibility loads through the caller-scoped read —
+/// a caller who cannot see another author's Private memory gets
+/// Unauthorized (and the row is unchanged), never a silent widening.
+#[tokio::test]
+async fn promote_visibility_denies_invisible_target() {
+    use exocortex_storage::Storage;
+    let onto = ontology();
+    let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
+    let storage = InMemoryStorage::new(onto.clone());
+
+    let mut m = mem("someone-elses-private");
+    m.visibility = Visibility::Private;
+    m.provenance = Provenance::Asserted {
+        author: "someone-else".into(),
+        producer_kind: None,
+    };
+    storage.upsert_memory(&m).await.unwrap();
+
+    let ctx = OpContext {
+        visibility_ctx: ops_vc("org", "alice", Visibility::Project),
+        storage: Arc::new(storage.clone()),
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+
+        ontology: None,
+    };
+    let err = exocortex_ops::operations::PromoteVisibilityOp
+        .handle(
+            &ctx,
+            PromoteVisibilityInput {
+                memory_id: hex(&m.id),
+                to: "org".into(),
+            },
+        )
+        .await
+        .map(|_| ())
+        .expect_err("IN2: invisible row must not be promotable");
+    assert!(
+        matches!(err, exocortex_ops::OpError::Unauthorized(_)),
+        "PermissionDenied surfaces as Unauthorized, got {err}"
+    );
+
+    // The stored row is unchanged.
+    let still = storage.get_memory(&m.id).await.unwrap().expect("row");
+    assert_eq!(still.visibility, Visibility::Private);
+    assert!(still.valid_until.is_none(), "no tombstone written");
+}
+
+/// IN11 (audit): a past deadline fails the operation with
+/// `DeadlineExceeded` — the variant was declared and HTTP-mapped but never
+/// constructed, so the REQUEST_TIMEOUT arm was unreachable.
+#[tokio::test]
+async fn expired_deadline_returns_deadline_exceeded() {
+    let onto = ontology();
+    let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
+    let ctx = OpContext {
+        visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        storage: Arc::new(InMemoryStorage::new(onto.clone())),
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() - chrono::Duration::seconds(1), // already spent
+
+        ontology: None,
+    };
+    let err = exocortex_ops::operations::GetMemory
+        .handle(
+            &ctx,
+            exocortex_ops::operations::GetMemoryInput {
+                id: hex(&MemoryId::new_v7()),
+            },
+        )
+        .await
+        .map(|_| ())
+        .expect_err("expired budget");
+    assert!(
+        matches!(err, exocortex_ops::OpError::DeadlineExceeded),
+        "got {err:?}"
+    );
+
+    // And a fresh per-request context passes the same check.
+    let fresh = OpContext::per_request(
+        ops_vc("org", "alice", Visibility::Org),
+        Arc::new(InMemoryStorage::new(onto)),
+        // rebuild cache handle
+        {
+            let (c2, _rx2) = LocalCache::new(16 * 1024 * 1024);
+            Arc::new(c2)
+        },
+        chrono::Duration::seconds(5),
+    );
+    fresh.check_deadline().expect("fresh budget is live");
+}
+
+/// D10b (§4.10a): the read path surfaces supersession. `get_memory`
+/// marks the stale memory with its successor; `search_memories` ranks
+/// the successor above the superseded hit even when the stale row
+/// scores higher on raw match.
+#[tokio::test]
+async fn superseded_state_is_visible_on_reads() {
+    use exocortex_kernel::{Relationship, RelationshipId, RelationshipProperties, LSN};
+
+    let onto = ontology();
+    let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
+    let mut stale = mem("Connection pool needs a server");
+    stale.id = MemoryId([1; 16]);
+    let mut fresh = mem("Connection pool works embedded");
+    fresh.id = MemoryId([2; 16]);
+    let mut snap = GraphSnapshot::empty();
+    snap.push_test_memory(stale.clone());
+    snap.push_test_memory(fresh.clone());
+    let kind = onto.kind_id("Replaces").unwrap();
+    let now = chrono::Utc::now();
+    snap.push_test_relationship(Relationship {
+        id: RelationshipId::derive(fresh.id, kind, stale.id, None),
+        kind,
+        from: fresh.id,
+        to: stale.id,
+        visibility: exocortex_kernel::Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
+        properties: RelationshipProperties {
+            strength: 0.9,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: now,
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: now,
+        valid_until: None,
+        recorded_at: now,
+        invalidated_by: None,
+        lsn: LSN::new_backend(1),
+    });
+    cache.publish("org", Arc::new(snap));
+    let ctx = OpContext {
+        visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        storage: Arc::new(InMemoryStorage::new(onto.clone())),
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        ontology: Some(onto),
+    };
+
+    // get_memory: the stale row names its successor.
+    let out = (exocortex_ops::entries()
+        .into_iter()
+        .find(|e| e.mcp_tool_name == "exocortex.get_memory")
+        .unwrap()
+        .handler)(
+        &ctx,
+        serde_json::to_value(exocortex_ops::operations::GetMemoryInput {
+            id: "01010101010101010101010101010101".into(),
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out["memory"]["superseded_by"].as_str(),
+        Some("02020202020202020202020202020202"),
+        "the stale memory names its successor: {out}"
+    );
+
+    // search: both hit "Connection pool"; the successor ranks first.
+    let out = (exocortex_ops::entries()
+        .into_iter()
+        .find(|e| e.mcp_tool_name == "exocortex.search_memories")
+        .unwrap()
+        .handler)(
+        &ctx,
+        serde_json::to_value(exocortex_ops::operations::SearchInput {
+            query: "Connection pool".into(),
+            limit: 10,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let hits = out["memories"].as_array().unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(
+        hits[0]["id"].as_str(),
+        Some("02020202020202020202020202020202"),
+        "successor outranks the superseded hit: {out}"
+    );
+    assert_eq!(
+        hits[1]["superseded_by"].as_str(),
+        Some("02020202020202020202020202020202")
+    );
 }

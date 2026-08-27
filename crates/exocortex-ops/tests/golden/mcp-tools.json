@@ -98,6 +98,118 @@
     "name": "exocortex.list_audit_records"
   },
   {
+    "description": "preflight_wrapup",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "PreflightEdgeHint": {
+          "description": "One proposed edge (§13.5 + §4.5 shape).",
+          "properties": {
+            "from_draft_key": {
+              "description": "Source draft key.",
+              "type": "string"
+            },
+            "kind": {
+              "description": "MUST match a registered kind display_name.",
+              "type": "string"
+            },
+            "strength": {
+              "default": 0.0,
+              "description": "0 = RelMeta default.",
+              "format": "float",
+              "type": "number"
+            },
+            "to_draft_key": {
+              "default": "",
+              "description": "Target draft key (within this batch) — or empty when `to_memory_id` is set.",
+              "type": "string"
+            },
+            "to_memory_id": {
+              "default": "",
+              "description": "§4.5: an EXISTING memory by 32-hex id (cross-batch edge).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "from_draft_key",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "PreflightMemoryDraft": {
+          "description": "One proposed memory draft (§13.5 shape; the client's MCP arg type re-exports this so the tool schema and the registry schema are ONE).",
+          "properties": {
+            "content": {
+              "description": "Free-text content.",
+              "type": "string"
+            },
+            "draft_key": {
+              "description": "Links edges within this batch.",
+              "type": "string"
+            },
+            "memory_type": {
+              "description": "MUST match a registered MemoryType label.",
+              "type": "string"
+            },
+            "tags": {
+              "default": [],
+              "description": "Lowercase tags (normalized at commit).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": {
+              "description": "1..=200 chars (R-T5).",
+              "type": "string"
+            },
+            "visibility": {
+              "description": "\"private\"|\"project\"|\"team\"|\"org\" (R-T6).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "content",
+            "draft_key",
+            "memory_type",
+            "title",
+            "visibility"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "Input for `preflight_wrapup`.",
+      "properties": {
+        "edges": {
+          "default": [],
+          "description": "Proposed edges.",
+          "items": {
+            "$ref": "#/definitions/PreflightEdgeHint"
+          },
+          "type": "array"
+        },
+        "memories": {
+          "description": "Proposed memory drafts.",
+          "items": {
+            "$ref": "#/definitions/PreflightMemoryDraft"
+          },
+          "type": "array"
+        },
+        "project_id": {
+          "default": "",
+          "description": "Project id (future context stamping; unused by validation).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "memories"
+      ],
+      "title": "PreflightWrapupInput",
+      "type": "object"
+    },
+    "name": "exocortex.preflight_wrapup"
+  },
+  {
     "description": "promote_visibility",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",

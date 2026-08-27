@@ -29,6 +29,7 @@ fn synth_memory(i: usize) -> Memory {
         visibility: Visibility::Org,
         provenance: Provenance::Asserted {
             author: "bench".into(),
+            producer_kind: None,
         },
         context: MemoryContext {
             timestamp: chrono::Utc::now(),
@@ -128,8 +129,12 @@ fn main() {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(1.0)
         .clamp(1.0, 3.0);
-    let ok =
-        p50 < Duration::from_micros(500).mul_f64(m) && p99 < Duration::from_millis(3).mul_f64(m);
+    // KP5 (audit): the budgets come from the kernel's typed Function
+    // surface — the bench cannot silently drift from the declared SLO.
+    use exocortex_kernel::functions::{Function, SearchMemories as SearchFn};
+    let p50_budget = Duration::from_micros(<SearchFn as Function>::P50_BUDGET_US as u64).mul_f64(m);
+    let p99_budget = Duration::from_micros(<SearchFn as Function>::P99_BUDGET_US as u64).mul_f64(m);
+    let ok = p50 < p50_budget && p99 < p99_budget;
     if m != 1.0 {
         println!("SLO budgets relaxed x{m} (SLO_MULTIPLIER)");
     }

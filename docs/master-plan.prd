@@ -1,8 +1,30 @@
 # Exocortex — Master Plan
 
-**Status:** Round 3 complete. No open items. Three review rounds closed
-(`docs/reviews/round-{1,2,3}-review.prd`); every accepted item carries
-a test that fails without it.
+**Status:** A-PRD shipped. **[2026-08-26, later]** The Agent
+Instructions PRD (rev 5, D1-D10 + the §4.5/§4.8/§4.9/§4.10 mechanics)
+landed as `exocortex-client 0.2.0` — worklist→code map in the Done
+table's A-PRD rows; gates green including the new `gen-playbook` drift
+gate (48 kinds / 47 assertable; the generator's authored-only filter is
+itself drift protection — the ontology registers 87 kinds including
+R-T4 companions the playbook must not teach). **Reopened** by a
+deployment-model review: `docs/bug-prd-standalone-readback.md` (SR-PRD)
+— the zero-setup mode's writes are durable but invisible to every read
+(three defects: no live write-back, no boot seeding, synthetic filler
+answering searches instead). F1-F5 ship as 0.2.1; the README flags the
+gap until they do.
+
+**Status (2026-08-26, earlier):** Round 3 complete. Reopened by a
+codebase-wide defect audit (`docs/bug-prd-codebase-audit.md`) — 70
+confirmed defects — and **closed the same day** (sweep rounds 4-5; see the
+Backlog statuses and the Done table). One intended ontology change landed
+with the fix set: the fingerprint moved `d8bcd004…4e8c` →
+`e1f7d17b…ddc9b2` because the pack now carries the R-T14 `computed_only`
+marker (W6; goldens and AGENTS.md updated in the same change). Five new
+seam gates (`storage-conformance`, `write-path-parity`,
+`dead-enforcement`, `auth-coverage`, `artifact-equivalence`) now cover the
+between-crate surface where every audit defect lived. Three review rounds
+closed (`docs/reviews/round-{1,2,3}-review.prd`); every accepted item
+carries a test that fails without it.
 
 **Purpose:** The authoritative, phased worklist for this repository. Each
 round of review findings gets its own `round-<n>-review.prd`; accepted
@@ -10,20 +32,30 @@ items are promoted into this file, tracked to done, and never silently
 dropped. Anything not listed here is either shipped or explicitly deferred
 to v2 in the PRD's own terms.
 
-**Current baseline (2026-08-25, post-round-3):** 138 tests / 0 failed
-across 68 suites (`cargo test --workspace --features
+**Current baseline (2026-08-26, post-A-PRD):** 213 tests / 1 flaky
+across 71 suites (`cargo test --workspace --features
 exocortex-adapter-sdk/testing` — the feature is mandatory: a lib canary
-fails any run that would leave the SDK's mock-driven suites dark). Full
-gate pipeline green on GitHub's runner and locally: fmt, clippy, deny,
-tests, kernel-purity (kernel tree + SDK single-dep + worker kernel-ban),
-fingerprint (`d8bcd004…4e8c`, stable), gen-schemas, no-llm, proto-sync
-(vendored wire protos + LICENSE), signing-hygiene, wire-standalone
-(version from cargo metadata), SLO benches. Live Falkor suites green
-(storage 7/7, cypher 6/6, fencing 3/3, cluster 6/6, SSE 1/1, cross-node
-2/2); the 3-node compose cluster converges after leader-kill in
-1290-1448ms across four observed runs (M5 AC < 2s). All 14 crates
-published at 0.1.0. Full detail: the MILESTONE_REPORT addenda and the
-round reviews.
+fails any run that would leave the SDK's mock-driven suites dark). The
+one failure is the known `sync.rs` 500ms SSE flake under full parallel
+load (pre-existing; passes on clean serial runs — and `e2e_chain`'s
+same-class window now shows the same behavior under union runs: 3/3
+green serially). Full gate pipeline green: fmt, clippy, deny, tests,
+kernel-purity, fingerprint (`e1f7d17b…ddc9b2`, unchanged through A-PRD),
+gen-schemas (7 operations — preflight_wrapup joined the registry),
+**gen-playbook (new: playbook facts vs pack + RejectCode; instruction
+block ≤ 300 words)**, no-llm, proto-sync, signing-hygiene,
+wire-standalone, plus the five seam gates. `exocortex-client` at 0.2.0;
+the other 13 crates at 0.1.0.
+
+**Post-audit baseline (2026-08-26, pre-A-PRD):** 194 tests / 0 failed
+across 70 suites; fingerprint `e1f7d17b…ddc9b2`; SLO benches green
+(search p50 ≈27µs; khop p50 ≈288µs against the 300µs budget); live
+Falkor suites 7/7 (storage), 6/6 (cypher), 3/3 (fencing), 6/6
+(cluster), SSE 1/1, cross-node 2/2; 3-node compose converges after
+leader-kill in 1290-1448ms (M5 AC < 2s).
+
+**Pre-audit baseline (2026-08-25, post-round-3):** 138 tests / 0 failed
+across 68 suites; fingerprint `d8bcd004…4e8c`.
 
 ## Initial build (M0–M8, shipped 2026-08)
 
@@ -47,7 +79,32 @@ each step (88 tests at completion).
 | ID | Item | Source | Status |
 |----|------|--------|--------|
 | R1 | M3 — backend cache-feed bridge loss windows (reseed/subscribe gap, no retry on fetch error, tight resubscribe flap); needs periodic reseed or LSN reconcile | round-3 review | Accepted v1 residue |
-| R2 | M6-M15 minors: cursor tmp-collision/no-fsync; checksum preimage separators; per-server-restart duplicate replays (in-memory dedup); golden-regen doc flag; `/health/cluster` leader semantics; B8 hex-rederivation guard note; WAL replay must rebuild+sign | round-3 review | Accepted v1 residue |
+| R2 | M6-M15 minors: cursor tmp-collision/no-fsync; checksum preimage separators; per-server-restart duplicate replays (in-memory dedup); golden-regen doc flag; `/health/cluster` leader semantics; B8 hex-rederivation guard note; WAL replay must rebuild+sign | round-3 review | Accepted v1 residue — **superseded in part**: WAL-replay clause folds into W1, duplicate-replay clause into W7 |
+| W1 | Offline WAL is never drained — `mark_synced`/`mark_failed` have no non-test callers; buffered writes never reach the backend and are acked `sync_pending: true` | `docs/bug-prd-codebase-audit.md` | **Done** — `exocortex-client/src/drain.rs` (fresh signing, R13 classify, stable batch ids); wired in `main.rs`; `wal_roundtrip.rs::wal_drain_settles_pending_entries` |
+| W2 | Three divergent write-path validators (kernel from-side-only, ingest own copy, offline path validates nothing); `§4` byte-identical-semantics violation | `docs/bug-prd-codebase-audit.md` | **Done** — kernel `validate_draft`/`validate_triple` own the rulebook; ingest + offline path call them; exhaustive `KernelError→RejectCode` map (compile-checked) |
+| W3 | Online ingest drops `MemoryContext.session_id` / `project_id` / `user_id` that the offline path stamps | `docs/bug-prd-codebase-audit.md` | **Done** — `session_id_of` stamps from `session://` URIs; `ingest.rs::session_source_stamps_session_id` |
+| W4 | `RejectRow.detail` discarded by `RejectionSummary`; the backend's own explanation never reaches the caller | `docs/bug-prd-codebase-audit.md` | **Done** — `RejectionSummary.detail` populated verbatim |
+| W5 | Relationship visibility hardcoded to `Project`, orphaning `org` memories at org read scope | `docs/bug-prd-codebase-audit.md` | **Done** — edge visibility = narrower endpoint (online path + WAL drain) |
+| W6 | R-T14's computed-only kind is a string literal in `exocortex-ingest`; the pack carries no marker | `docs/bug-prd-codebase-audit.md` | **Done** — `computed_only_kinds!` pack block + `RelMeta.computed_only`; ingest reads the ontology; fingerprint intentionally moved to `e1f7d17b…ddc9b2` (golden + AGENTS.md updated, reason recorded); `loads_correctly.rs::computed_only_marker_rides_the_ontology` |
+| W7 | Duplicate-batch dedup is in-memory only; structural-edge minting is not idempotent across restart | `docs/bug-prd-codebase-audit.md` | **Done** — `with_batches_file` persists the idempotency registry (JSONL); `ingest.rs::duplicate_replay_dedup_survives_restart` (structural edges were already idempotent via deterministic ids) |
+| **Phase A — network surface (itemised; nothing ships before these)** | | | |
+| CS1 | `/v1/changes` mounted outside the bearer-auth layer; any non-empty `?token=` value is accepted, so the SSE change feed is unauthenticated | audit §4 | **Done** — extra router merged INSIDE the bearer layer; empty token fails closed; `sse_replay.rs::backend_router_rejects_token_query_without_bearer`; also fixes the empty-ring-answers-current half via observed-LSN tracking |
+| WS1 | `RegisterSource` requires no HMAC and no bearer auth; any network peer can overwrite a producer's ceiling | audit §4 | **Done** — signed registrations (`signing::sign_registration`), every producer updated; `ingest.rs::unsigned_registration_is_unauthenticated` + flood test |
+| WS2 | Producers self-declare the ceiling they are then validated against, so R-I3 ceiling equality is dead enforcement | audit §4 | **Done** — `with_admin_ceilings` (admin value authoritative, over-ceiling rejected); re-registration never overwrites; SDK `CeilingMismatch` is live; `ingest.rs::admin_ceiling_caps_self_registration` + `re_registration_does_not_overwrite_ceiling` |
+| IN2 | `promote_visibility` reads the target with the unscoped `get_memory`, so a caller can widen a memory they may not see | audit §4 | **Done** — caller-scoped read; PermissionDenied → Unauthorized; `parity.rs::promote_visibility_denies_invisible_target` |
+| CL3 | MCP client panics on a short `--hmac-key` and substitutes an all-zero key on a malformed one | audit §4 | **Done** — one hardened `signing::decode_hex32` shared by client/worker/node; malformed key is a startup error (`stdio_smoke.rs::malformed_hmac_key_fails_startup`); CL4 `--auth-token` rides every call; CL5 synth data is standalone-only |
+| **Phases B-F — by subsystem (detail in `docs/bug-prd-codebase-audit.md`)** | | | |
+| ST1-ST12 | Storage: Falkor soft-delete invisible to readers, non-transactional batch commit, non-atomic lease ops, and 7 adapter/double divergences that invalidate every double-backed test | audit §4-§5 | **Done** — ST1/ST2 props_json sync + filtered-cursor paging; ST3/ST4 R-T11 ceilings + Rust-side visibility decisions; ST5/ST6 lease-gated LSN blocks + MULTI/EXEC batches; ST7-ST12 double parity (in-place upserts, current-version streams, untyped rel delete + ST11 invalidation, current-version state counts); `in_memory_props.rs` rewritten to shared semantics |
+| CR1-CR13 | Cache/reasoning: stale versions stay searchable, reseed resurrects deleted rows, search index desync, derived-edge id collisions, two dead rules, unbounded growth | audit §4-§5 | **Done** — CR1-CR6, CR8-CR10, CR13 (prior sweep) plus CR7 (per-pair shared-count confidence via count-carrying rule heads; §10.7 budget kept: the fold runs in writeback), CR11 (neighborhood + bounded-expansion harvest, posting-list filter, pair cap with drop counters), CR12 (per-rule evidence: transitive rows carry exactly their two hops; attribute rows carry none) |
+| CS2-CS8 | Cluster/server: peer admission has no caller, re-election lease fences nothing, replay-ring gap reported as current, decode errors dropped silently | audit §4-§5 | **Done** — CS2 `admit_and_publish` (bypass impossible), CS1 empty-ring TooOld + CS8 saturating arithmetic, CS4 leader gate fences Dreams, CS5 real supervision loop (restart budget, kill-on-drop, `port` file published), CS6 health LSNs from real frontiers, CS7 counted+logged decode errors. Full peer Redis transport remains v2 (M5 residue) |
+| IN1-IN14 | Ingest/ops/dreams: region-scoped lease authorises graph-wide merges, `accept_discovery` ignores kind, Dreams trigger cannot fire, MCP/HTTP violate CR-9 parity | audit §4-§5 | **Done** — IN1 region narrowing, IN3 kind resolution + R-T17, IN4 ingest wires `on_write` + region clock stamping (`round1_e2e.rs::write_counter_trigger_fires_a_cycle`), IN5 unscoreable cycles audited, IN6 extractor org, IN7 content-bound ids, IN8 base-strength decay, IN9 find_iter, IN10 MCP dispatches through registry handlers over a no-backend Storage shim (byte-identical output test), IN11 per-request deadlines + enforced `DeadlineExceeded`, IN12 audit errors propagate, IN13 stream acks + explicit status |
+| CL1-CL7 | Client/SDK/worker: synthetic snapshot always published, `batch_id` content-independent, read stamp hardwired to 0, `--auth-token` unused | audit §4-§5 | **Done** — CL1 tags durable in the WAL + drain, CL2 content-bound SDK batch ids (goldens regenerated), CL3/CL4/CL5 (above), CL6 `advance_local_lsn`, CL7 ontology labels on both Functions |
+| KP1-KP5 | Kernel/pack: pack rule text never compiled and already diverged from the engine, byte-measured title bounds, `F01` clamp bypassed by `Deserialize` | audit §4-§5 | **Done** — KP1 (D5 + D1 guard + gate test), KP2 (type-triple side remap with per-pack offsets + cross-pack duplicate-name rejection), KP3 char-count bounds, KP4 validated `F01` Deserialize, KP5 bench budgets read from `Function` constants + promote ceiling from `Action`; `pack_registration.rs` cross-pack tests |
+| WS3-WS5 | Wire: NaN strength persisted, `confidence == 0.0` silently rewritten, unknown `Visibility` discriminants coerced to the widest value | audit §5 | **Done** — WS3 (admit_and_publish, above); WS4 non-finite/out-of-range rejected (`nan_strength_rejected`); WS5 unknown discriminants rejected fail-closed (`unknown_visibility_discriminant_rejected`) |
+| GATE1 | Five proposed seam gates: `storage-conformance`, `write-path-parity`, `dead-enforcement`, `auth-coverage`, `artifact-equivalence` | audit §9 | **Done** — all five wired as `cargo xtask` commands (AGENTS.md gate list updated); each fails when its underlying suite fails |
+| A-PRD | Agent instructions & onboarding (playbook, preflight, grouping, producer kind, telemetry, maintenance loop) | `agent-instructions-prd.md` rev 5 | **Done** — D1-D10 shipped as `exocortex-client 0.2.0`; see the Done table's A-PRD row for the worklist-to-code map |
+| SR-PRD | Standalone read-back (F1-F5): materializer, live write-back, boot seeding, synthetic-seed removal, local D6 parity — the zero-setup mode write→read loop | `docs/bug-prd-standalone-readback.md` | Proposed — offline writes are durable but invisible to every read, in-session and cross-restart, while search returns synthetic filler. Ships as 0.2.1 |
+
 
 ## In progress
 
@@ -57,8 +114,39 @@ each step (88 tests at completion).
 
 ## Done
 
+All 70 audit defects were fixed with per-defect tests (fail-without-fix)
+cited in the Backlog rows above; the sweep summary and residual v2 items
+are recorded in the "Rounds 4-5" section below.
+
 | ID | Item | Closed by |
 |----|------|-----------|
+| **Rounds 4-5 (2026-08-26, audit sweep)** | | |
+| W1-W7 | Write-path parity defects (WAL drain, shared validators, session context, reject detail, edge visibility, computed-only marker, persistent dedup) | `drain.rs` + `wal.rs` + kernel `validate_draft`/`validate_triple`; `wal_roundtrip.rs`, `ingest.rs`, `write_path_parity.rs` |
+| Phase A (CS1/WS1/WS2/IN2/CL3) | Network surface: SSE behind bearer auth, signed registrations, admin ceilings, scoped promote, hardened key decoding | `http_bind.rs`, `sse.rs`, `signing.rs`; `sse_replay.rs`, `ingest.rs`, `parity.rs`, `stdio_smoke.rs` |
+| ST1-ST12 | Storage: soft-delete props_json sync, cursor paging, R-T11 ceilings, lease-gated LSN blocks, MULTI/EXEC batches, double parity | `falkor.rs`, `in_memory.rs`, `cypher.rs`; `in_memory_props.rs` (rewritten to shared semantics) |
+| CR1-CR13 | Cache/reasoning: upsert-replace, reseed filter, search-index fix, directional traverse, edge dedup, rule-scoped ids, D4/D5/D6 live, per-pair confidence, bounded attribute join, per-rule evidence, 2Q accounting | `cache/src/lib.rs`, `engine.rs`, `rules.rs`; `cache.rs`, `rules.rs` tests |
+| CS2-CS8 | Cluster/server: `admit_and_publish`, empty-ring TooOld, leader gate fences Dreams, supervision loop, health LSNs, decode counters | `node.rs`, `backend.rs`, `supervisor.rs`, `main.rs`; `sse_replay.rs`, supervisor tests |
+| IN1-IN14 | Ingest/ops/dreams: region narrowing, kind resolution, Dreams trigger wired, MCP registry dispatch, per-request deadlines, stream acks, entity find_iter | `service.rs`, `operations.rs`, `dreams/lib.rs`, `mcp.rs`, `no_backend.rs`; `round1_e2e.rs`, `parity.rs`, `stdio_smoke.rs` |
+| CL1-CL7 | Client/SDK: durable tags, content-bound batch ids (goldens regenerated), auth token wired, synth data gated, local LSN advances, ontology labels | `mcp.rs`, `split.rs`, `main.rs`; `wal_roundtrip.rs`, `stdio_smoke.rs`, `split.rs` tests |
+| KP1-KP5 | Kernel/pack: D5 + D1 guard + rule-set gate, cross-pack triple remap, char-count bounds, validated F01 Deserialize, budgets read from typed constants | `ontology.rs`, `validator.rs`, `memory.rs`, `actions.rs`, `functions.rs`; `pack_registration.rs` |
+| WS3-WS5 | Wire: peer admission bypass impossible, non-finite strength rejected, unknown visibility discriminants fail closed | `node.rs`, `service.rs`; cluster `rules.rs`, `ingest.rs` tests |
+| GATE1 | Five seam gates: `storage-conformance`, `write-path-parity`, `dead-enforcement`, `auth-coverage`, `artifact-equivalence` | `xtask/src/main.rs`; `write_path_parity.rs`, `auth_coverage.rs`, gate-named test suites |
+| TOOLING | Fixed pre-existing `xtask bench` bug: the SDK single-dependency check counted the crate's own root line (always failed) | `xtask/src/main.rs` |
+| **A-PRD (agent instructions, PRD rev 5)** | | |
+| D1 playbook | Versioned playbook compiled into the client, installed to `~/.exocortex/`, generated kind/reject tables + `xtask gen-playbook` drift gate (authored-only filter: 48 kinds / 47 assertable, companions excluded) | `client/src/playbook.rs` + `playbook/v1_0_0.md`; `xtask gen-playbook` (CI) |
+| D2 preflight | `preflight_wrapup` registered in OPS (one handler, MCP+HTTP+goldens), `end_session` self-preflights (r4), correction hints from the merged wire guidance table, `unverified` boundary list | `ops/src/preflight.rs` + `operations.rs`; `client/src/tools/end_session.rs`; `wire/src/corrections.rs` (adapter-sdk classify now thin); `ingest/tests/grouping.rs`, `client/tests/stdio_smoke.rs` |
+| D3 playbook_version | `{version, playbook_hash, block_hash}` MCP tool + ops entry | `client/src/ops_registrations.rs`, `client/src/mcp.rs` |
+| D4 appendices | Claude Code / Codex / Cursor first-party integration pages | `docs/agents/{claude-code,codex,cursor}.md` |
+| D5 install/verify | First-run playbook install + `--dump-playbook` `--dump-block` `--verify` (exit = red count) `--tail-audit` | `client/src/playbook.rs` + `main.rs` + `wal.rs::tail` |
+| D6 grouping | Per-flavor `GroupingRule` (session ⇒ Conversation + InSession); deterministic ids across restart; R-T4 companions; Dreams/reasoning/telemetry exclude structural rows | `ingest/src/grouping.rs` + commit path; `ingest/tests/grouping.rs` (two-batch + restart + non-session) |
+| D7 instructions | Producer-neutral two-direction server description | `client/src/mcp.rs` initialize |
+| D8 producer kind | Closed proto enum, UNSPECIFIED rejected at registration, unknown discriminants fail closed, first-registration-wins, stored on `Provenance::Asserted` | `proto/ingest.proto`, `ingest/src/service.rs` (SourceEntry), `kernel/src/provenance.rs` (ProducerKind); `ingest/tests/grouping.rs` |
+| D9 telemetry | Commit-path counters labeled producer_id/kind/playbook/client version + grouping counter | `ingest/src/service.rs` submit |
+| D10 maintenance loop | Derived confidence (`kernel::memory::derived_confidence`, supersession floor on commit), `superseded_by` on search/get with successor-ranked ordering, `similar_to` near-duplicate hints (0.92 ring, duplicate/replaces/contradicts) in the ack | `kernel/src/memory.rs`, `ops/src/operations.rs` + `cache/src/lib.rs::superseded_by`, `ingest/src/service.rs` (ring + floor); tests in `ingest/tests/grouping.rs`, `ops/tests/parity.rs` |
+| §4.5 cross-batch edges | `to_memory_id` on the wire + client + WAL; server resolves stored type, enforces R-T17, derives narrower-endpoint visibility, names unknown ids in rejections | `proto`, `end_session.rs`, `mcp.rs` offline path, `service.rs`; `ingest/tests/grouping.rs::cross_batch_edge_resolves_and_rejects` |
+| §4.8 client session ids | Process-minted conversation id stamped when the caller omits session_id; explicit override for deliberate sharing | `client/src/mcp.rs`; `stdio_smoke.rs::omitted_session_id_gets_process_minted_default` |
+| §4.4 client_metadata | Signed producer telemetry on registration + batch | `end_session.rs`, `drain.rs`, proto |
+| P9 release | `exocortex-client` 0.2.0 + README tool/flag/onboarding rewrite | `Cargo.toml`, `README.md` |
 | **Round 3** | | |
 | C1 | SDK integration suites live (workspace feature flag + canary failing dark runs) | `b150c0e`; canary test in adapter-sdk lib |
 | C2 | Worker fixture authenticates (key resolution + hard errors) + worker-binary e2e | worker main.rs; smoke.rs fixture test |
@@ -131,4 +219,5 @@ each step (88 tests at completion).
 | D9 | 100-user visibility fuzz + concurrent-region/CrossRegion suites | §23 #21/#22, round-2 H10 |
 | D10 | Wire-protocol throughput fan-out + additive-change rollout tests | §23 #23, round-2 H10 |
 | D11 | Partition-and-heal live run (leader-kill convergence OBSERVED: 4/4 in 1290-1448ms; the partition leg remains manual) | §3 M5 AC, round-2 H10 |
-| D12 | Round-3 accepted residue (R1/R2 above): bridge reconcile loop, cursor fsync, checksum preimage hardening, persistent batch-dedup, WAL replay rebuild | round-3 review M3/M6-M15 |
+| D12 | Round-3 accepted residue (R1/R2 above): bridge reconcile loop, cursor fsync, checksum preimage hardening, persistent batch-dedup, WAL replay rebuild — **superseded in part**: persistent batch-dedup closed by W7, WAL replay rebuild+sign closed by W1 (the drain signs fresh, never replays stored signatures) | round-3 review M3/M6-M15 |
+

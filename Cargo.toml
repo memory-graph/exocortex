@@ -125,7 +125,7 @@ exocortex-ops = { path = "crates/exocortex-ops", version = "0.1.0" }
 exocortex-dreams = { path = "crates/exocortex-dreams", version = "0.1.0" }
 exocortex-worker = { path = "crates/exocortex-worker", version = "0.1.0" }
 exocortex-server = { path = "crates/exocortex-server", version = "0.1.0" }
-exocortex-client = { path = "crates/exocortex-client", version = "0.1.0" }
+exocortex-client = { path = "crates/exocortex-client", version = "0.2.0" }
 
 [profile.release]
 lto            = "fat"

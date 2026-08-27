@@ -287,7 +287,7 @@ The adapter is a *client* of the Ingestion Protocol (§18.6). It does not ship u
 
 - **Freshness.** Wall time between a docs commit and the corresponding `IngestBatch` ack. Target: <2 minutes p99.
 - **Correctness.** Fraction of `IngestBatch`es that ack without a `reject`. Target: >99%. Rejects should always trace back to a frontmatter error in the docs repo.
-- **Reasoning payoff.** Fraction of sessions whose wrapup memories connect to at least one docs-derived memory via R7 or R9. Target: >30% within 3 months of deployment. Below this, the adapter is not earning its cache footprint.
+- **Reasoning payoff.** Fraction of sessions whose wrapup memories connect to at least one docs-derived memory via R7 or R9. Target: >30% at steady state. Below this, the adapter is not earning its cache footprint.
 - **No LLM regression.** Zero LLM calls originating from the adapter path. Enforced by `xtask no-llm` CI check.
 
 ## 9. Decision log

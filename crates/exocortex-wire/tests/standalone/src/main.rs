@@ -41,6 +41,7 @@ fn main() {
             agent_id: String::new(),
             adapter_id: String::new(),
             hmac_signature: vec![],
+            client_metadata: None,
         }),
     };
     signing::prepare_batch(&[3u8; 32], &mut batch);

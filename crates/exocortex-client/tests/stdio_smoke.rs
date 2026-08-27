@@ -296,3 +296,271 @@ fn mcp_tool_list_matches_registry() {
     assert!(!listed.iter().any(|t| t.contains("get_chain")));
     assert!(!listed.iter().any(|t| t.contains("explain_edge")));
 }
+
+/// CL5 (audit): with `--backend` configured the client never serves the
+/// fabricated synthetic snapshot — reads are honestly empty until real
+/// sync data arrives, not invented memories with plausible ids.
+#[test]
+fn backend_mode_search_returns_no_synthetic_memories() {
+    let dir = tempdir();
+    let mut c = Client::spawn_with(|cmd| {
+        cmd.args([
+            "--org",
+            "smoke",
+            "--user",
+            "tester",
+            "--backend",
+            "http://127.0.0.1:1", // unreachable by design; lazy connect
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+    });
+    c.send_all(&[
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "smoke-test", "version": "0" }
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "exocortex.search_memories",
+                "arguments": { "query": "auth", "limit": 5 }
+            }
+        }),
+    ]);
+    let _init = c.read_line();
+    let call = c.read_line();
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("content text");
+    let payload: serde_json::Value = serde_json::from_str(text).expect("payload JSON");
+    let memories = payload["memories"].as_array().expect("memories");
+    assert!(
+        memories.is_empty(),
+        "CL5: no fabricated rows with --backend set: {memories:?}"
+    );
+}
+
+/// CL3 (audit): a malformed --hmac-key aborts startup with a diagnostic
+/// instead of panicking (short) or silently signing with zeros (non-hex).
+#[test]
+fn malformed_hmac_key_fails_startup() {
+    for bad in ["deadbeef", &"z".repeat(64)] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-mcp-client"))
+            .args([
+                "--org",
+                "x",
+                "--backend",
+                "http://127.0.0.1:1",
+                "--hmac-key",
+                bad,
+            ])
+            .output()
+            .expect("run client");
+        assert!(
+            !out.status.success(),
+            "malformed --hmac-key {bad:?} must not start: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("hmac-key"),
+            "diagnostic names the flag: {stderr}"
+        );
+        assert!(
+            !stderr.contains("panicked"),
+            "no panic on short key: {stderr}"
+        );
+    }
+}
+
+/// IN10 (audit): the MCP read tools and the HTTP surface serve the SAME
+/// registry implementation — running one input through `entry.handler`
+/// and through the MCP server's typed method yields identical JSON for
+/// get_memory (the audit's pinned divergence: flat hit shape vs the
+/// registry's `{memory: ...}`).
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_get_memory_shape_matches_registry() {
+    use exocortex_cache::{GraphSnapshot, LocalCache};
+    use std::sync::Arc;
+
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let (cache, _rx) = LocalCache::new(64 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    let mut snap = GraphSnapshot::empty();
+    use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
+    let m = Memory {
+        id: MemoryId([9; 16]),
+        memory_type: onto.memory_type_id("Problem").unwrap(),
+        title: "shape witness".into(),
+        content: "c".into(),
+        summary: None,
+        tags: Default::default(),
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
+        context: MemoryContext {
+            timestamp: chrono::Utc::now(),
+            project_id: None,
+            project_path: None,
+            team_id: None,
+            tenant_id: None,
+            session_id: None,
+            user_id: None,
+            created_by: None,
+            files_involved: Default::default(),
+            languages: Default::default(),
+            frameworks: Default::default(),
+            technologies: Default::default(),
+            git_commit: None,
+            git_branch: None,
+            working_directory: None,
+            entities: Default::default(),
+            additional_metadata: serde_json::Value::Null,
+        },
+        importance: exocortex_kernel::memory::F01::new(0.5).unwrap(),
+        confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
+        effectiveness: None,
+        usage_count: 0,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        embedding: None,
+        lsn: LSN::new_backend(1),
+    };
+    let mid_hex = {
+        use std::fmt::Write as _;
+        let mut h = String::with_capacity(32);
+        for b in m.id.0 {
+            let _ = write!(h, "{b:02x}");
+        }
+        h
+    };
+    snap.push_test_memory(m);
+    cache.publish("org", Arc::new(snap));
+
+    let vc = exocortex_ops::VisibilityContext {
+        user_id: "u".into(),
+        org_id: "org".into(),
+        project_ids: Default::default(),
+        team_ids: Default::default(),
+        max_visibility: exocortex_kernel::Visibility::Org,
+    };
+    let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
+    let ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs().unwrap());
+    let server =
+        exocortex_client::mcp::ExocortexMcp::new("org".into(), cache.clone(), vc.clone(), ontology);
+
+    // MCP tool call (the binary's surface).
+    let mcp_out = server
+        .get_memory(mid_hex.clone())
+        .await
+        .expect("mcp get_memory");
+
+    // The registry handler directly (the HTTP surface's implementation).
+    let ctx = Arc::new(exocortex_ops::OpContext {
+        ontology: None,
+        visibility_ctx: vc,
+        storage: Arc::new(exocortex_client::no_backend::NoBackendStorage),
+        cache: cache.clone(),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+    });
+    let entry = exocortex_ops::entries()
+        .into_iter()
+        .find(|e| e.mcp_tool_name == "exocortex.get_memory")
+        .unwrap();
+    let reg_out = (entry.handler)(
+        &ctx,
+        serde_json::to_value(exocortex_ops::operations::GetMemoryInput { id: mid_hex }).unwrap(),
+    )
+    .await
+    .expect("registry handler");
+    let reg_json = serde_json::to_string(&reg_out).unwrap();
+
+    assert_eq!(
+        mcp_out, reg_json,
+        "IN10: MCP and registry produce byte-identical get_memory output"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&mcp_out).unwrap();
+    assert!(
+        parsed["memory"].is_object(),
+        "registry `{{memory: ...}}` shape on hit: {mcp_out}"
+    );
+    assert_eq!(parsed["memory"]["title"], "shape witness");
+}
+
+/// §4.8 (agent-instructions PRD): the client process owns session
+/// identity. An omitted session_id is stamped with the process-minted
+/// conversation id; an explicit one (deliberate sharing) rides through.
+#[tokio::test]
+async fn omitted_session_id_gets_process_minted_default() {
+    let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
+    let ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs().unwrap());
+    let dir = tempdir();
+    let (cache, _rx) = exocortex_cache::LocalCache::new(16 * 1024 * 1024);
+    let vc = exocortex_ops::VisibilityContext {
+        user_id: "u".into(),
+        org_id: "org".into(),
+        project_ids: Default::default(),
+        team_ids: Default::default(),
+        max_visibility: exocortex_kernel::Visibility::Org,
+    };
+    let wal = std::sync::Arc::new(exocortex_client::wal::Wal::open(&dir.join("wal")).unwrap());
+    let server = exocortex_client::mcp::ExocortexMcp::new(
+        "org".into(),
+        std::sync::Arc::new(cache),
+        vc,
+        ontology,
+    )
+    .with_offline_wal(wal.clone());
+
+    let draft = |k: &str| exocortex_client::tools::end_session::MemoryDraftInput {
+        draft_key: k.into(),
+        memory_type: "Fix".into(),
+        title: format!("Fixed {k}"),
+        content: "body in src/x.rs".into(),
+        visibility: "project".into(),
+        tags: vec![],
+    };
+    // Omitted session id: the process default is stamped.
+    server
+        .end_session(None, "p".into(), vec![draft("a")], vec![])
+        .await
+        .expect("offline write");
+    // Explicit id: rides through untouched (deliberate sharing).
+    server
+        .end_session(
+            Some("shared-conv".into()),
+            "p".into(),
+            vec![draft("b")],
+            vec![],
+        )
+        .await
+        .expect("offline write 2");
+
+    let tail = wal.tail(5);
+    assert_eq!(tail.len(), 2);
+    // Recover the session ids through the WAL entries themselves.
+    let entries = wal.pending_entries();
+    let ids: Vec<&str> = entries.iter().map(|e| e.session_id.as_str()).collect();
+    assert!(
+        ids.contains(&"shared-conv"),
+        "explicit id rides through: {ids:?}"
+    );
+    assert!(
+        ids.contains(&server.process_session_id()) && server.process_session_id() != "shared-conv",
+        "omitted id gets the process-minted default: {ids:?}"
+    );
+}

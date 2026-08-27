@@ -22,7 +22,10 @@ fn mem(title: &str, vis: Visibility, author: Option<&str>) -> Memory {
         summary: None,
         tags: ["rust"].into_iter().map(Into::into).collect(),
         visibility: vis,
-        provenance: Provenance::Asserted { author: "t".into() },
+        provenance: Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
         context: MemoryContext {
             timestamp: chrono::Utc::now(),
             project_id: None,
@@ -277,4 +280,205 @@ fn visibility_view_filters_private_by_author() {
     let low_titles: Vec<_> = snap.view(&low).map(|m| m.title.to_string()).collect();
     assert!(!low_titles.contains(&"orgnote".to_string()));
     assert!(low_titles.contains(&"mine".to_string()));
+}
+
+/// CR1 (audit): applying MemoryUpserted for an EXISTING id replaces the
+/// node — the stale version stops being searchable and a later delete
+/// removes the row for real.
+#[tokio::test]
+async fn upsert_replaces_stale_version() {
+    let onto = ontology();
+    let (cache, rx) = LocalCache::new(64 * 1024 * 1024);
+    let cache = std::sync::Arc::new(cache);
+    let storage = InMemoryStorage::new(onto);
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let store = storage.clone_dyn();
+        async move { cache.run(Arc::new(store), rx).await }
+    });
+    let a = mem("alpha-wide", Visibility::Org, None);
+    storage.upsert_memory(&a).await.unwrap();
+    cache.reseed_from_storage(&storage, &"org".into()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Re-upsert the SAME id with a new title (and a narrowed visibility,
+    // which search must respect).
+    let mut narrowed = a.clone();
+    narrowed.title = "alpha-renamed".into();
+    narrowed.visibility = Visibility::Private;
+    narrowed.context.user_id = Some("other".into());
+    storage.upsert_memory(&narrowed).await.unwrap();
+    cache
+        .submit(CacheWrite::Apply(
+            exocortex_storage::Invalidation::MemoryUpserted { id: a.id, lsn: 2 },
+        ))
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // The OLD key yields nothing (the stale node is gone, not merely
+    // shadowed); the NEW key yields exactly one hit at the new visibility.
+    let ctx = vc(Visibility::Org, "alice");
+    assert!(
+        cache.search("org", "alpha-wide", 10, &ctx).is_empty(),
+        "stale version no longer searchable"
+    );
+    let owner = vc(Visibility::Org, "other");
+    let hits = cache.search("org", "alpha-renamed", 10, &owner);
+    assert_eq!(hits.len(), 1, "exactly one node for the id: {hits:?}");
+    assert_eq!(hits[0].0.title, "alpha-renamed", "new version wins");
+    assert_eq!(hits[0].0.visibility, Visibility::Private);
+
+    // And a subsequent delete actually removes it — no orphan copies.
+    cache
+        .submit(CacheWrite::Apply(
+            exocortex_storage::Invalidation::MemoryDeleted { id: a.id, lsn: 3 },
+        ))
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let hits = cache.search("org", "alpha-renamed", 10, &owner);
+    assert!(hits.is_empty(), "no orphan copies survive the delete");
+    writer.abort();
+}
+
+/// CR2 (audit): reseed skips soft-deleted rows — a restart cannot
+/// resurrect deleted memories.
+#[tokio::test]
+async fn reseed_skips_deleted_rows() {
+    let onto = ontology();
+    let storage = InMemoryStorage::new(onto.clone());
+    let a = mem("alpha", Visibility::Org, None);
+    let b = mem("beta", Visibility::Org, None);
+    let _ = &onto;
+    storage.upsert_memory(&a).await.unwrap();
+    storage.upsert_memory(&b).await.unwrap();
+    storage.delete_memory(&a.id).await.unwrap();
+
+    let snap = GraphSnapshot::from_storage(&storage).await;
+    assert!(
+        snap.by_id.get(&a.id).is_none(),
+        "deleted row not resurrected"
+    );
+    assert!(snap.by_id.get(&b.id).is_some(), "live row present");
+}
+
+/// CR3 (audit): after a delete and fresh inserts (StableGraph reuses node
+/// indices), search returns the memory whose key matched — not a neighbor.
+#[tokio::test]
+async fn search_resolves_correct_node_after_index_reuse() {
+    let onto = ontology();
+    let (cache, rx) = LocalCache::new(64 * 1024 * 1024);
+    let cache = std::sync::Arc::new(cache);
+    let storage = InMemoryStorage::new(onto);
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let store = storage.clone_dyn();
+        async move { cache.run(Arc::new(store), rx).await }
+    });
+    let mut ids = Vec::new();
+    for t in ["w", "x", "y", "z"] {
+        let m = mem(t, Visibility::Org, None);
+        ids.push(m.id);
+        storage.upsert_memory(&m).await.unwrap();
+    }
+    cache.reseed_from_storage(&storage, &"org".into()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Delete the last, then insert two fresh rows (node indices get reused).
+    storage.delete_memory(&ids[3]).await.unwrap();
+    cache
+        .submit(CacheWrite::Apply(
+            exocortex_storage::Invalidation::MemoryDeleted { id: ids[3], lsn: 5 },
+        ))
+        .await;
+    for t in ["fresh-one", "fresh-two"] {
+        let m = mem(t, Visibility::Org, None);
+        storage.upsert_memory(&m).await.unwrap();
+        cache
+            .submit(CacheWrite::Apply(
+                exocortex_storage::Invalidation::MemoryUpserted { id: m.id, lsn: 6 },
+            ))
+            .await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let ctx = vc(Visibility::Org, "alice");
+    let hits = cache.search("org", "fresh-two", 10, &ctx);
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0].0.title.contains("fresh-two"),
+        "search returns the memory whose key matched: {:?}",
+        hits[0].0.title
+    );
+    writer.abort();
+}
+
+/// CR5 (audit): re-upserting the same RelationshipId replaces the edge —
+/// no parallel duplicates.
+#[tokio::test]
+async fn relationship_reupsert_does_not_duplicate() {
+    let onto = ontology();
+    let (cache, rx) = LocalCache::new(64 * 1024 * 1024);
+    let cache = std::sync::Arc::new(cache);
+    let storage = InMemoryStorage::new(onto.clone());
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let store = storage.clone_dyn();
+        async move { cache.run(Arc::new(store), rx).await }
+    });
+    let a = mem("alpha", Visibility::Org, None);
+    let b = mem("beta", Visibility::Org, None);
+    storage.upsert_memory(&a).await.unwrap();
+    storage.upsert_memory(&b).await.unwrap();
+    let rel = exocortex_kernel::Relationship {
+        id: exocortex_kernel::RelationshipId([7; 16]),
+        kind: onto.kind_id("RelatedTo").unwrap(),
+        from: a.id,
+        to: b.id,
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
+        properties: exocortex_kernel::RelationshipProperties {
+            strength: 0.5,
+            confidence: 0.5,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: chrono::Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        lsn: LSN::new_backend(1),
+    };
+    storage.upsert_relationship(&rel).await.unwrap();
+    cache.reseed_from_storage(&storage, &"org".into()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let inv = exocortex_storage::Invalidation::RelationshipUpserted {
+        id: rel.id,
+        from: rel.from,
+        to: rel.to,
+        kind: rel.kind,
+        lsn: 2,
+    };
+    cache.submit(CacheWrite::Apply(inv.clone())).await;
+    cache.submit(CacheWrite::Apply(inv)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let snap = cache.graphs_snapshot("org").expect("resident");
+    let count = snap
+        .petgraph
+        .edge_indices()
+        .filter_map(|eid| snap.petgraph.edge_weight(eid))
+        .filter(|w| w.id == rel.id)
+        .count();
+    assert_eq!(count, 1, "CR5: exactly one edge for the RelationshipId");
+    writer.abort();
 }

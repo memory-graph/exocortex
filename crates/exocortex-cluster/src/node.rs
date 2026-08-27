@@ -50,6 +50,11 @@ pub struct ClusterNode<S: Storage> {
     /// `since_lsn` is older than the buffer floor the server answers
     /// `409 Resync Required` instead of silently skipping deltas.
     replay: Mutex<VecDeque<InvalidationEnvelope>>,
+    /// CS1 (audit): whether this node has ever observed an envelope — an
+    /// empty ring alone must not read as "nothing ever happened".
+    observed_anything: std::sync::atomic::AtomicBool,
+    /// CS1 (audit): highest LSN ever observed (survives ring eviction).
+    max_observed_lsn: std::sync::atomic::AtomicU64,
     /// Ring capacity (default [`REPLAY_CAPACITY_DEFAULT`]).
     replay_cap: usize,
 }
@@ -85,6 +90,8 @@ impl<S: Storage + 'static> ClusterNode<S> {
             tx,
             replay: Mutex::new(VecDeque::with_capacity(REPLAY_CAPACITY_DEFAULT)),
             replay_cap: REPLAY_CAPACITY_DEFAULT,
+            observed_anything: std::sync::atomic::AtomicBool::new(false),
+            max_observed_lsn: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -96,14 +103,31 @@ impl<S: Storage + 'static> ClusterNode<S> {
 
     /// R-C6: envelopes with `backend_lsn > since_lsn`, oldest first.
     /// `Replay::TooOld` when `since_lsn + 1` precedes the buffer's oldest
-    /// entry — a gap the buffer can no longer bridge.
+    /// entry — a gap the buffer can no longer bridge. CS1 (audit): an
+    /// EMPTY ring is only bridgeable when nothing has ever been published
+    /// — a node that has observed envelopes but lost its ring answers
+    /// `TooOld` instead of "you are current", so a restarted load-balanced
+    /// peer can never silently drop a gap.
     pub fn replay_since(&self, since_lsn: u64) -> Replay {
         let ring = self.replay.lock().unwrap();
         let Some(oldest) = ring.front() else {
+            // Empty ring: fresh only if we have never observed anything.
+            if self
+                .observed_anything
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && since_lsn
+                    < self
+                        .max_observed_lsn
+                        .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Replay::TooOld;
+            }
             return Replay::Fresh(vec![]);
         };
         let floor = envelope_lsn(oldest);
-        if since_lsn + 1 < floor {
+        // CS8 (audit): saturating — since_lsn = u64::MAX must answer, not
+        // overflow-panic in debug or wrap in release.
+        if since_lsn.saturating_add(1) < floor {
             return Replay::TooOld;
         }
         Replay::Fresh(
@@ -123,6 +147,10 @@ impl<S: Storage + 'static> ClusterNode<S> {
             .front()
             .map(envelope_lsn)
             .unwrap_or(1)
+            .max(
+                self.max_observed_lsn
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            )
     }
 
     /// Track one envelope in the replay ring (LSN-ordered; the ring is
@@ -138,10 +166,25 @@ impl<S: Storage + 'static> ClusterNode<S> {
     /// Fan one envelope out through the hub AND the replay ring. This is
     /// the single publish path: whatever the hub serves, `?since_lsn`
     /// reconnects can replay (R-C6).
-    pub fn publish_envelope(&self, env: InvalidationEnvelope) {
+    fn publish_envelope(&self, env: InvalidationEnvelope) {
+        let lsn = envelope_lsn(&env);
+        self.observed_anything
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.max_observed_lsn
+            .fetch_max(lsn, std::sync::atomic::Ordering::SeqCst);
         self.record_replay(env.clone());
         metrics::counter!("exocortex_cluster_invalidations_published_total").increment(1);
         let _ = self.tx.send(env);
+    }
+
+    /// WS3/CS2 (audit): the ONLY public way to fan out an envelope from a
+    /// peer path. `publish_envelope` is private so future wiring cannot
+    /// bypass admission — an unadmitted envelope must never be signed with
+    /// this node's cluster key and served as authentic.
+    pub fn admit_and_publish(&self, env: InvalidationEnvelope) -> Result<(), ClusterError> {
+        self.admit(&env)?;
+        self.publish_envelope(env);
+        Ok(())
     }
 
     /// Join the cluster (§9.1): verify our own fingerprint is pinned, then
@@ -157,7 +200,18 @@ impl<S: Storage + 'static> ClusterNode<S> {
         let mut sub = self.storage.subscribe_invalidations(&region).await?;
         use futures::StreamExt;
         while let Some(inv) = sub.next().await {
-            let Ok(inv) = inv else { continue };
+            // CS7 (audit): a decode failure means the LSN sequence on this
+            // node is known-incomplete — count it, log it, and re-anchor
+            // (subscribers will gap-detect and reseed), never swallow it.
+            let inv = match inv {
+                Ok(inv) => inv,
+                Err(e) => {
+                    metrics::counter!("exocortex_cluster_invalidation_decode_errors_total")
+                        .increment(1);
+                    tracing::warn!(%e, "storage invalidation decode failed; change lost");
+                    continue;
+                }
+            };
             let env = self.envelope(inv);
             self.publish_envelope(env);
             // Peer fan-out over Redis pub-sub is wired at M5 server start

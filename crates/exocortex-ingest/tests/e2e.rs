@@ -8,7 +8,7 @@ use exocortex_ingest::IngestServer;
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::InMemoryStorage;
 use exocortex_wire::ingest::v1::{
-    ingest_service_server::IngestService, MemoryDraft, ProducerIdentity, RegisterSourceRequest,
+    ingest_service_server::IngestService, MemoryDraft, ProducerIdentity,
 };
 
 fn server() -> IngestServer<InMemoryStorage> {
@@ -39,13 +39,16 @@ fn row(key: &str, mt: &str, vis: i32) -> MemoryDraft {
 async fn fifty_row_batch_accepted_lsn_monotonic() {
     let srv = server();
     use tonic::Request;
-    srv.register_source(Request::new(RegisterSourceRequest {
-        org_id: "org".into(),
-        source_uri: "session://it".into(),
-        producer_id: "test-adapter".into(),
-        ceiling: 3,
-        source_flavor: "custom".into(),
-    }))
+    srv.register_source(Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://it",
+        "test-adapter",
+        3,
+        "custom",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    )))
     .await
     .unwrap();
 
@@ -71,12 +74,17 @@ async fn fifty_row_batch_accepted_lsn_monotonic() {
             agent_id: String::new(),
             adapter_id: String::new(),
             hmac_signature: vec![],
+
+            client_metadata: None,
         }),
     };
     exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
 
     let ack = srv.submit(Request::new(b)).await.unwrap().into_inner();
-    assert_eq!(ack.accepted, 50);
+    // D6: the session:// source groups — 50 memories + 50 InSession edges
+    // + 50 HasMember companions; the grouping node itself is structural
+    // and not counted in `accepted`.
+    assert_eq!(ack.accepted, 150);
     assert_eq!(ack.rejected, 0);
     assert!(ack.assigned_lsn >= 50, "monotonic LSN covers every row");
 }
@@ -85,13 +93,16 @@ async fn fifty_row_batch_accepted_lsn_monotonic() {
 async fn bad_triple_rejects_whole_batch_naming_the_key() {
     let srv = server();
     use tonic::Request;
-    srv.register_source(Request::new(RegisterSourceRequest {
-        org_id: "org".into(),
-        source_uri: "session://it2".into(),
-        producer_id: "test-adapter".into(),
-        ceiling: 3,
-        source_flavor: "custom".into(),
-    }))
+    srv.register_source(Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://it2",
+        "test-adapter",
+        3,
+        "custom",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    )))
     .await
     .unwrap();
 
@@ -118,12 +129,16 @@ async fn bad_triple_rejects_whole_batch_naming_the_key() {
             confidence: 0.0,
             context: String::new(),
             visibility: 3,
+
+            to_memory_id: String::new(),
         }],
         producer: Some(ProducerIdentity {
             node_id: "n".into(),
             agent_id: String::new(),
             adapter_id: String::new(),
             hmac_signature: vec![],
+
+            client_metadata: None,
         }),
     };
     exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
@@ -147,7 +162,7 @@ async fn bad_triple_rejects_whole_batch_naming_the_key() {
 async fn client_side_batch_size_gate() {
     use exocortex_client::tools::end_session::EndSessionArgs;
     let args = |n: usize| EndSessionArgs {
-        session_id: "s".into(),
+        session_id: Some("s".into()),
         project_id: "p".into(),
         memories: (0..n)
             .map(|i| exocortex_client::tools::end_session::MemoryDraftInput {
@@ -205,6 +220,8 @@ fn checksum_is_order_independent() {
                 agent_id: String::new(),
                 adapter_id: String::new(),
                 hmac_signature: vec![],
+
+                client_metadata: None,
             }),
         }
     };
@@ -233,13 +250,16 @@ async fn inverse_materialized_on_write() {
 
     let srv = server();
     use tonic::Request;
-    srv.register_source(Request::new(RegisterSourceRequest {
-        org_id: "org".into(),
-        source_uri: "session://inv".into(),
-        producer_id: "test-adapter".into(),
-        ceiling: 3,
-        source_flavor: "custom".into(),
-    }))
+    srv.register_source(Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://inv",
+        "test-adapter",
+        3,
+        "custom",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    )))
     .await
     .unwrap();
 
@@ -268,12 +288,16 @@ async fn inverse_materialized_on_write() {
                     confidence: 0.8,
                     context: String::new(),
                     visibility: 3,
+
+                    to_memory_id: String::new(),
                 }],
                 producer: Some(ProducerIdentity {
                     node_id: "n".into(),
                     agent_id: String::new(),
                     adapter_id: String::new(),
                     hmac_signature: vec![],
+
+                    client_metadata: None,
                 }),
             };
             exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
@@ -281,10 +305,14 @@ async fn inverse_materialized_on_write() {
         }
     };
 
-    // Authored Solves lands with its SolvedBy companion.
+    // Authored Solves lands with its SolvedBy companion. D6 adds the
+    // grouping rows (2 InSession + 2 HasMember) for the session:// source.
     let ack = submit("Solves", "inv-1").await;
     assert_eq!(ack.rejected, 0, "{:?}", ack.rejections);
-    assert_eq!(ack.accepted, 4, "2 memories + authored edge + companion");
+    assert_eq!(
+        ack.accepted, 8,
+        "2 memories + authored edge + companion + 4 grouping rows"
+    );
     let rels: Vec<_> = {
         let mut out = vec![];
         let mut rs = srv.storage.stream_all_relationships().await;
@@ -324,7 +352,7 @@ async fn inverse_materialized_on_write() {
     // storage layer (see `storage_inverse_idempotent` below).
     let ack2 = submit("Solves", "inv-2").await;
     assert_eq!(ack2.rejected, 0);
-    assert_eq!(ack2.accepted, 4);
+    assert_eq!(ack2.accepted, 8, "D6 grouping rows ride both submits");
 
     // Authored companions are rejected when authored directly: `SolvedBy`
     // has no type-triple registration, so the validator refuses it.
@@ -348,13 +376,16 @@ async fn computed_only_kind_rejected_at_ingest() {
     use tonic::Request;
 
     let srv = server();
-    srv.register_source(Request::new(RegisterSourceRequest {
-        org_id: "org".into(),
-        source_uri: "session://sim".into(),
-        producer_id: "test-adapter".into(),
-        ceiling: 3,
-        source_flavor: "custom".into(),
-    }))
+    srv.register_source(Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://sim",
+        "test-adapter",
+        3,
+        "custom",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    )))
     .await
     .unwrap();
 
@@ -380,12 +411,16 @@ async fn computed_only_kind_rejected_at_ingest() {
             confidence: 0.9,
             context: String::new(),
             visibility: 3,
+
+            to_memory_id: String::new(),
         }],
         producer: Some(ProducerIdentity {
             node_id: "n".into(),
             agent_id: String::new(),
             adapter_id: String::new(),
             hmac_signature: vec![],
+
+            client_metadata: None,
         }),
     };
     exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
@@ -423,7 +458,10 @@ async fn storage_inverse_idempotent() {
         from: a,
         to: b,
         visibility: Visibility::Org,
-        provenance: exocortex_kernel::Provenance::Asserted { author: "t".into() },
+        provenance: exocortex_kernel::Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
         properties: RelationshipProperties {
             strength: 0.9,
             confidence: 0.8,

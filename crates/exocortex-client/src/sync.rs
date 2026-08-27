@@ -41,6 +41,10 @@ pub enum SyncError {
 pub struct SseSyncConfig {
     /// Backend base URL (`http://host:port`).
     pub backend: String,
+    /// Bearer token for the backend's authenticated surfaces (R-Sec7;
+    /// audit CS1: `/v1/changes` sits behind the same auth layer as the op
+    /// surface). Sent as `Authorization: Bearer <token>`.
+    pub bearer: Option<String>,
     /// Cluster-shared HMAC key (R-Sec4).
     pub hmac_key: [u8; 32],
     /// Per-client SSE token + provisioned derived key (R-Sec5). When set,
@@ -64,6 +68,7 @@ impl SseSyncConfig {
     pub fn new(backend: impl Into<String>, hmac_key: [u8; 32], fingerprint: [u8; 32]) -> Self {
         Self {
             backend: backend.into(),
+            bearer: None,
             hmac_key,
             client_token: None,
             client_key: None,
@@ -277,8 +282,8 @@ pub async fn run_sse_sync(
         let mut gate = LsnGate::new(next_lsn);
         let mut reconnect_reason = "stream ended";
         {
-            let client = match es::ClientBuilder::for_url(&url).map_err(|e| e.to_string()) {
-                Ok(b) => b.read_timeout(cfg.stall_timeout).build(),
+            let mut builder = match es::ClientBuilder::for_url(&url).map_err(|e| e.to_string()) {
+                Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(%e, "sse client build failed; backing off");
                     tokio::time::sleep(backoff).await;
@@ -286,6 +291,18 @@ pub async fn run_sse_sync(
                     continue;
                 }
             };
+            if let Some(bearer) = &cfg.bearer {
+                match builder.header("authorization", &format!("Bearer {bearer}")) {
+                    Ok(b) => builder = b,
+                    Err(e) => {
+                        tracing::warn!(%e, "sse bearer header rejected; backing off");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(10));
+                        continue;
+                    }
+                }
+            }
+            let client = builder.read_timeout(cfg.stall_timeout).build();
             let mut stream = client.stream();
             while let Some(item) = stream.next().await {
                 match item {

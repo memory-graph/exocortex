@@ -21,6 +21,13 @@ pack! {
         Person, Project, Command, Package, Url, Variable,
     }
 
+    // W6 (audit): R-T14's computed-only kinds — Dreams is the only
+    // legitimate producer; the ingest boundary reads THIS marker, not a
+    // string literal.
+    computed_only_kinds! {
+        SimilarTo,
+    }
+
     kinds! {
         // Solution bucket (5) — kernel-const SOLVES is bound to `Solves`.
         Solves        => bucket: Solution,   inverse: SolvedBy,     bi: false, default_strength: 0.85, kernel_const: SOLVES,

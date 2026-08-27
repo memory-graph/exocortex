@@ -74,21 +74,6 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
-/// Decode 64 hex chars into a 32-byte key. Rejects wrong length or
-/// non-hex input instead of silently degrading.
-fn decode_hex32(hex: &str) -> anyhow::Result<[u8; 32]> {
-    if hex.len() != 64 {
-        anyhow::bail!("HMAC key must be 64 hex chars, got {}", hex.len());
-    }
-    let bytes: Result<Vec<u8>, _> = (0..32)
-        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
-        .collect();
-    let bytes = bytes.map_err(|e| anyhow::anyhow!("bad HMAC key hex: {e}"))?;
-    bytes
-        .try_into()
-        .map_err(|_| unreachable!("32 bytes collected"))
-}
-
 /// The fixture file format (documented for adapter authors):
 ///
 /// ```json
@@ -116,7 +101,7 @@ async fn run_fixture(args: Args) -> anyhow::Result<()> {
         .hmac_key
         .clone()
         .or_else(|| std::env::var("EXOCORTEX_HMAC_KEY").ok())
-        .map(|hex| decode_hex32(&hex))
+        .map(|hex| exocortex_wire::signing::decode_hex32(&hex).map_err(anyhow::Error::msg))
         .transpose()?
         .unwrap_or([0x42u8; 32]);
     let path = args
@@ -160,6 +145,7 @@ async fn run_fixture(args: Args) -> anyhow::Result<()> {
             confidence: r["confidence"].as_f64().unwrap_or(0.8) as f32,
             context: r["context"].as_str().unwrap_or_default().into(),
             visibility: r["visibility"].as_i64().unwrap_or(3) as i32,
+            to_memory_id: String::new(),
         });
     }
 
@@ -173,6 +159,7 @@ async fn run_fixture(args: Args) -> anyhow::Result<()> {
         adapter_id: format!("{producer}-adapter"),
         node_id: format!("{producer}-node"),
         source_flavor: "custom".into(),
+        producer_kind: exocortex_wire::ingest::v1::ProducerKind::AnalyticsAdapter,
         ceiling: 3,
         backend_url: args.backend.clone(),
         hmac_key,

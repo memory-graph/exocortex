@@ -33,7 +33,10 @@ fn mem(mt: u8, tags: &[&str], entities: &[u8]) -> Memory {
         summary: None,
         tags: tags.iter().map(|t| (*t).into()).collect(),
         visibility: Visibility::Org,
-        provenance: Provenance::Asserted { author: "t".into() },
+        provenance: Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
         context: MemoryContext {
             timestamp: chrono::Utc::now(),
             project_id: None,
@@ -87,6 +90,7 @@ fn rules_r1_through_r3_derive_types() {
         ],
         vec![],
         vec![],
+        vec![],
     );
     assert!(d.type_from_solves.contains(&(sol, solution_type)), "R1");
     assert!(d.type_from_fixes.contains(&(fixer, fix_type)), "R2");
@@ -95,6 +99,7 @@ fn rules_r1_through_r3_derive_types() {
     let cause = MemoryId::new_v7();
     let d3 = rules::evaluate(
         vec![edge(cause, problem, exocortex_kernel::kinds::CAUSES.0)],
+        vec![],
         vec![],
         vec![],
     );
@@ -125,6 +130,7 @@ fn rules_r4_r5_d2_d3_transitivity() {
         ],
         vec![],
         vec![],
+        vec![],
     );
     assert!(d.transitive_depends_on.contains(&(a, c)), "R4");
     assert!(d.transitive_requires.contains(&(a, c)), "R5");
@@ -147,6 +153,7 @@ fn rules_r7_r8_r9_affinity_and_bridge() {
         ],
         vec![EntityFact(sol1, e1), EntityFact(sol2, e1)],
         vec![TagFact(sol1, 7), TagFact(sol2, 7)],
+        vec![],
     );
     assert!(
         d.problem_solution_bridge
@@ -154,8 +161,12 @@ fn rules_r7_r8_r9_affinity_and_bridge() {
             .any(|(x, y)| (x, y) == (&sol1, &sol2)),
         "R8"
     );
-    assert!(d.co_occurrence_affinity.contains(&(sol1, sol2)), "R7");
-    assert!(d.similar_tags_affinity.contains(&(sol1, sol2)), "R9");
+    // CR7: the fold runs where confidence is computed; two memories
+    // sharing exactly one entity and one tag fold to count 1 each.
+    let r7 = rules::pair_counts(d.co_occurrence_affinity.clone());
+    assert!(r7.contains(&(sol1, sol2, 1)), "R7 folded: {r7:?}");
+    let r9 = rules::pair_counts(d.similar_tags_affinity.clone());
+    assert!(r9.contains(&(sol1, sol2, 1)), "R9 folded: {r9:?}");
 }
 
 #[test]
@@ -166,6 +177,8 @@ fn pack_rule_d1_subsumption_and_d6_session() {
     let session = MemoryId::new_v7();
     let m = MemoryId::new_v7();
 
+    let onto = ontology();
+    let fix_type = onto.memory_type_id("Fix").unwrap();
     let d = rules::evaluate(
         vec![
             edge(fix, err, exocortex_kernel::kinds::FIXES.0),
@@ -173,9 +186,27 @@ fn pack_rule_d1_subsumption_and_d6_session() {
         ],
         vec![],
         vec![],
+        vec![rules::MemoryFact(fix, fix_type)],
     );
     assert!(d.implied_solves.contains(&(fix, err)), "D1");
     assert!(d.session_cohort.contains(&(m, session)), "D6");
+
+    // KP1: the D1 guard is real — a non-Fix source memory does not derive
+    // Solves from a Fixes edge (matches the pack's rule text).
+    let not_fix = MemoryId::new_v7();
+    let d2 = rules::evaluate(
+        vec![edge(not_fix, err, exocortex_kernel::kinds::FIXES.0)],
+        vec![],
+        vec![],
+        vec![rules::MemoryFact(
+            not_fix,
+            onto.memory_type_id("Problem").unwrap(),
+        )],
+    );
+    assert!(
+        !d2.implied_solves.contains(&(not_fix, err)),
+        "D1 guard: only a Fix derives Solves"
+    );
 }
 
 #[tokio::test]
@@ -199,7 +230,10 @@ async fn adding_solves_rederives_type_within_same_commit() {
         from: a.id,
         to: b.id,
         visibility: Visibility::Org,
-        provenance: Provenance::Asserted { author: "t".into() },
+        provenance: Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
         properties: exocortex_kernel::RelationshipProperties {
             strength: 0.8,
             confidence: 0.8,
@@ -355,4 +389,244 @@ fn walk(dir: std::path::PathBuf) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+/// KP1 (audit): the pack's declared rule set and the engine's implemented
+/// rule set are the SAME set — the pack text is no longer a decoration the
+/// engine can silently drift from.
+#[test]
+fn pack_rule_ids_match_engine_outputs() {
+    let pack = exocortex_pack_dev_v1::pack_def();
+    let declared: std::collections::BTreeSet<&str> =
+        pack.rule_ids.iter().map(|s| s.as_str()).collect();
+    // The engine's writeback consumes one Derived field per pack rule —
+    // D5 (shared_target) included since the KP1 fix.
+    let implemented: std::collections::BTreeSet<&str> = [
+        "implied_solves",
+        "transitive_builds_on",
+        "indirect_blocker",
+        "contradiction_propagates",
+        "shared_target",
+        "session_cohort",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        declared, implemented,
+        "pack declares and engine implements different rule sets (KP1)"
+    );
+}
+
+/// CR7 (audit): §14.2 confidence per-pair. Two memories sharing 2 tags
+/// and no relationships get a derived R9 edge at 2/5 = 0.4 — the old code
+/// fed the neighborhood edge count (0 edges → 0.0).
+#[tokio::test]
+async fn derived_confidence_uses_per_pair_shared_count() {
+    let onto = ontology();
+    rules::prime(&onto);
+    let storage = InMemoryStorage::new(onto.clone());
+    let a = MemoryId::new_v7();
+    let b = MemoryId::new_v7();
+
+    // Two memories sharing exactly 2 tags, no edges.
+    let mem = |id: MemoryId| {
+        let mut m = base_memory_for_tags();
+        m.id = id;
+        m
+    };
+    let mut ma = mem(a);
+    ma.tags = ["shared1".into(), "shared2".into()].into_iter().collect();
+    let mut mb = mem(b);
+    mb.tags = ["shared1".into(), "shared2".into()].into_iter().collect();
+    storage.upsert_memory(&ma).await.unwrap();
+    storage.upsert_memory(&mb).await.unwrap();
+
+    let engine = ReasoningEngine::new(Arc::new(storage.clone_dyn()), 16, 2);
+    engine.k_hop_reason(a, 2).await;
+
+    use exocortex_storage::Storage;
+    use futures::StreamExt;
+    let mut rs = storage.stream_all_relationships().await;
+    let mut found = None;
+    while let Some(Ok(r)) = rs.next().await {
+        let pair = (r.from, r.to);
+        if pair == (a, b) || pair == (b, a) {
+            if let exocortex_kernel::Provenance::Derived { rule_id, .. } = &r.provenance {
+                if rule_id == "R9" {
+                    found = Some(r.properties.confidence);
+                }
+            }
+        }
+    }
+    let conf = found.expect("R9 edge derived");
+    assert!(
+        (conf - 0.4).abs() < 1e-4,
+        "CR7: 2 shared tags / 5.0 = 0.4, got {conf}"
+    );
+}
+
+fn base_memory_for_tags() -> exocortex_kernel::Memory {
+    use exocortex_kernel::*;
+    Memory {
+        id: MemoryId::new_v7(),
+        memory_type: 3,
+        title: "t".into(),
+        content: "c".into(),
+        summary: None,
+        tags: Default::default(),
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
+        context: MemoryContext {
+            timestamp: chrono::Utc::now(),
+            project_id: None,
+            project_path: None,
+            team_id: None,
+            tenant_id: None,
+            session_id: None,
+            user_id: None,
+            created_by: None,
+            files_involved: Default::default(),
+            languages: Default::default(),
+            frameworks: Default::default(),
+            technologies: Default::default(),
+            git_commit: None,
+            git_branch: None,
+            working_directory: None,
+            entities: Default::default(),
+            additional_metadata: serde_json::Value::Null,
+        },
+        importance: memory::F01::new(0.5).unwrap(),
+        confidence: memory::F01::new(0.8).unwrap(),
+        effectiveness: None,
+        usage_count: 0,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        embedding: None,
+        lsn: LSN::new_local(0),
+    }
+}
+
+/// CR11 (audit): 2,000 memories sharing one common tag inside a small
+/// neighborhood must not materialize a quadratic derived-edge blowup —
+/// the posting-list filter drops the high-frequency tag and the pass
+/// completes bounded.
+#[tokio::test]
+async fn common_tag_does_not_blow_up_derived_pairs() {
+    let onto = ontology();
+    let storage = InMemoryStorage::new(onto.clone());
+    // Seed + 300 memories all tagged "common" (above the 256 posting cap).
+    let seed = MemoryId::new_v7();
+    let mut ids = vec![seed];
+    for i in 0..300 {
+        let m = {
+            let mut m = base_memory_for_tags();
+            m.id = MemoryId::new_v7();
+            m.title = format!("m{i}").into();
+            m.tags = ["common".into()].into_iter().collect();
+            m
+        };
+        ids.push(m.id);
+        storage.upsert_memory(&m).await.unwrap();
+    }
+
+    let engine = ReasoningEngine::new(Arc::new(storage.clone_dyn()), 16, 2);
+    engine.k_hop_reason(seed, 2).await;
+
+    use exocortex_storage::Storage;
+    use futures::StreamExt;
+    let mut rs = storage.stream_all_relationships().await;
+    let mut r9 = 0usize;
+    while let Some(Ok(r)) = rs.next().await {
+        if let exocortex_kernel::Provenance::Derived { rule_id, .. } = &r.provenance {
+            if rule_id == "R9" {
+                r9 += 1;
+            }
+        }
+    }
+    assert_eq!(
+        r9, 0,
+        "CR11: high-frequency tag yields no R9 edges, got {r9}"
+    );
+    let _ = ids;
+}
+
+/// CR12 (audit): a transitive derivation's evidence is exactly its two
+/// supporting hops — not the whole k-hop neighborhood's edge list.
+#[tokio::test]
+async fn transitive_evidence_is_the_two_hops() {
+    let onto = ontology();
+    rules::prime(&onto);
+    let storage = InMemoryStorage::new(onto.clone());
+    let dep = onto.kind_id("DependsOn").unwrap();
+    let mk = |i: u8| {
+        let mut m = base_memory_for_tags();
+        m.id = MemoryId([i; 16]);
+        m.title = format!("n{i}").into();
+        m
+    };
+    let (a, b, c) = (mk(1), mk(2), mk(3));
+    for m in [&a, &b, &c] {
+        storage.upsert_memory(m).await.unwrap();
+    }
+    let rel = |from: MemoryId, to: MemoryId| {
+        use exocortex_kernel::*;
+        Relationship {
+            id: RelationshipId::derive(from, dep, to, None),
+            kind: dep,
+            from,
+            to,
+            visibility: Visibility::Org,
+            provenance: Provenance::Asserted {
+                author: "t".into(),
+                producer_kind: None,
+            },
+            properties: RelationshipProperties {
+                strength: 0.5,
+                confidence: 0.5,
+                context: None,
+                evidence_count: 1,
+                success_rate: None,
+                validation_count: 0,
+                counter_evidence_count: 0,
+                last_validated: chrono::Utc::now(),
+            },
+            description: None,
+            bidirectional: false,
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            recorded_at: chrono::Utc::now(),
+            invalidated_by: None,
+            lsn: LSN::new_backend(1),
+        }
+    };
+    storage.upsert_relationship(&rel(a.id, b.id)).await.unwrap();
+    storage.upsert_relationship(&rel(b.id, c.id)).await.unwrap();
+
+    let engine = ReasoningEngine::new(Arc::new(storage.clone_dyn()), 16, 2);
+    engine.k_hop_reason(a.id, 2).await;
+
+    use exocortex_storage::Storage;
+    use futures::StreamExt;
+    let mut rs = storage.stream_all_relationships().await;
+    let mut found = None;
+    while let Some(Ok(r)) = rs.next().await {
+        if let exocortex_kernel::Provenance::Derived { rule_id, evidence } = &r.provenance {
+            if rule_id == "R4" {
+                found = Some(evidence.clone());
+            }
+        }
+    }
+    let ev = found.expect("R4 transitive edge derived");
+    assert_eq!(ev.len(), 2, "CR12: exactly the two hops, got {ev:?}");
+    let hop1 = RelationshipId::derive(a.id, dep, b.id, None);
+    let hop2 = RelationshipId::derive(b.id, dep, c.id, None);
+    assert!(
+        ev.contains(&hop1) && ev.contains(&hop2),
+        "the two hops: {ev:?}"
+    );
 }

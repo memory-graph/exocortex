@@ -32,6 +32,7 @@ macro_rules! pack {
         kernel_min: $kernel_min:literal,
         memory_types! { $($mt:ident),* $(,)? }
         entity_types! { $($et:ident),* $(,)? }
+        $(computed_only_kinds! { $($ck:ident),* $(,)? })?
         kinds! { $($kentries:tt)* }
         type_triples! { $($tk:ident => $pair:tt),* $(,)? }
         crepe_rules! { $($crepe_src:tt)* }
@@ -121,8 +122,19 @@ macro_rules! pack {
                     inverse: None, // fixed up below
                     bidirectional: row.bidirectional,
                     default_strength: row.default_strength,
+                    computed_only: false,
                 });
             }
+            // W6 (audit): computed-only kinds are declared in the pack and
+            // carried on the ontology (R-T14) — never a string literal in
+            // a consumer crate.
+            $(
+                for k in kinds.iter_mut() {
+                    if matches!(k.display_name.as_str(), $( stringify!($ck) )|*) {
+                        k.computed_only = true;
+                    }
+                }
+            )*
             let id_by_name: ::std::collections::HashMap<::std::string::String, $crate::RelKindId> =
                 kinds.iter().map(|k| (k.display_name.to_string(), k.id)).collect();
             for k in kinds.iter_mut() {

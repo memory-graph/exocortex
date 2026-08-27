@@ -20,8 +20,14 @@ message RegisterSourceRequest {
   string     org_id        = 1;
   string     source_uri    = 2;
   string     producer_id   = 3;
-  Visibility ceiling       = 4;  // org-admin-configured, not adapter-configured (§18.2)
+  Visibility ceiling       = 4;  // requested; MUST NOT exceed the admin-configured value (§18.2 / audit WS2)
   string     source_flavor = 5;  // "session" | "iceberg" | "delta" | "parquet-dir" | "custom"
+  ProducerIdentity producer = 6; // HMAC over the registration fields (R-I8 / audit WS1): an
+                                 // unauthenticated RPC must not mutate the registry Submit depends on
+  // D8 (agent-instructions PRD §3.8): the closed producer-kind enum. A
+  // free string would persist typos into append-only provenance forever.
+  // Registration rejects UNSPECIFIED — every producer must declare.
+  ProducerKind producer_kind = 7;
 }
 message RegisterSourceResponse { Visibility ceiling = 1; }
 
@@ -64,6 +70,11 @@ message RelationshipDraft {
   float  confidence     = 5;   // 0.0..1.0
   string context        = 6;
   Visibility visibility = 7;   // ≤ ceiling
+  // §4.5 (agent-instructions PRD): cross-batch edge target — an EXISTING
+  // memory by 32-hex id. Mutually exclusive with to_draft_key: exactly one
+  // must be set. The server resolves the stored type and enforces R-T17
+  // against the from-draft's type.
+  string to_memory_id   = 8;
 }
 
 message ExternalSnapshotInfo {
@@ -91,6 +102,26 @@ message ProducerIdentity {
   string agent_id      = 2;   // optional; harness only
   string adapter_id    = 3;   // optional; adapter only
   bytes  hmac_signature= 4;   // over remainder of batch
+  // §4.4 (agent-instructions PRD): optional producer telemetry. Logged and
+  // counted (D9); zero behavior change. Old servers ignore it (proto3).
+  ClientMetadata client_metadata = 5;
+}
+
+message ClientMetadata {
+  string playbook_version = 1;  // D3 version string, e.g. "1.0.0"
+  string client_version   = 2;  // exocortex-client semver
+  string harness_hint     = 3;  // "claude-code" | "codex" | "cursor" | free
+}
+
+// D8: closed enum. UNSPECIFIED is rejected at registration; CUSTOM is the
+// escape hatch; a genuinely new kind is one additive enum value.
+enum ProducerKind {
+  PRODUCER_KIND_UNSPECIFIED = 0;
+  PRODUCER_KIND_CODING_AGENT   = 1;
+  PRODUCER_KIND_RESEARCH_AGENT = 2;
+  PRODUCER_KIND_DOCS_ADAPTER   = 3;
+  PRODUCER_KIND_ANALYTICS_ADAPTER = 4;
+  PRODUCER_KIND_CUSTOM         = 5;
 }
 
 message IngestAck {
@@ -99,11 +130,24 @@ message IngestAck {
   uint32 rejected      = 3;
   repeated RejectRow rejections = 4;
   uint64 assigned_lsn  = 5;
+  // §4.10b (agent-instructions PRD): advisory near-duplicate hints computed
+  // deterministically (embedding cosine) at commit. Non-blocking — the
+  // batch proceeds regardless; the producer decides whether to supersede.
+  repeated SimilarToHint similar_to = 6;
 }
 message RejectRow {
   string draft_key  = 1;   // producer-local, for triage
   RejectCode code   = 2;
   string detail     = 3;
+}
+message SimilarToHint {
+  string draft_key           = 1;  // the draft in THIS batch
+  string existing_memory_id  = 2;  // 32-hex id of the near neighbor
+  string existing_title      = 3;
+  // "replaces" (near-duplicate, same type), "contradicts" (near-duplicate,
+  // different type), "duplicate" (exact content match — the batch still
+  // committed; backend dedup handles byte-identical replays only).
+  string suggestion          = 4;
 }
 enum RejectCode {
   UNKNOWN               = 0;

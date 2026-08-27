@@ -96,6 +96,29 @@ pub async fn run_backend_node<S: Storage + 'static>(
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
+    // Op context + HTTP bind (needed early: the change-feed bridge stamps
+    // the health snapshot, CS6).
+    let ctx = Arc::new(OpContext {
+        visibility_ctx: exocortex_ops::operations::ops_vc(
+            &org,
+            "backend",
+            exocortex_kernel::Visibility::Org,
+        ),
+        storage: storage.clone() as Arc<dyn exocortex_storage::Storage>,
+        cache: cache.clone(),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
+        // D2: the backend serves preflight over HTTP (CR-9); the rulebook
+        // is the same ontology the ingest path validates against.
+        ontology: Some(ontology.clone()),
+    });
+    let bind = HttpBind::new(ctx, args.bearer_token.clone());
+    let health = bind.health_handle();
+    health.store(Arc::new(HealthSnapshot {
+        node_id: args.node_id.clone(),
+        hydrated,
+        ..Default::default()
+    }));
+
     // Change-feed bridge (§8.2/§9.1): storage invalidations flow into the
     // node's own cache writer, so the ops surface serves CURRENT data —
     // without this the backend's cache would be frozen at boot while
@@ -103,6 +126,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
     {
         let cache = cache.clone();
         let storage = storage.clone();
+        let health = health.clone();
         tokio::spawn(async move {
             let region = exocortex_storage::RegionKey {
                 org: "*".into(),
@@ -114,8 +138,35 @@ pub async fn run_backend_node<S: Storage + 'static>(
                     Ok(mut sub) => {
                         use futures::StreamExt;
                         while let Some(item) = sub.next().await {
-                            if let Ok(inv) = item {
-                                let _ = cache.submit(exocortex_cache::CacheWrite::Apply(inv)).await;
+                            match item {
+                                Ok(inv) => {
+                                    // CS6 (audit): the applied LSN is the
+                                    // node's sync frontier, and the highest
+                                    // observed LSN is the backend frontier
+                                    // (R-O6) — no more always-zero lag.
+                                    let lsn = exocortex_storage::Invalidation::lsn_of(&inv);
+                                    health.rcu(|h| {
+                                        let mut next = (**h).clone();
+                                        next.sync_lsn = next.sync_lsn.max(lsn);
+                                        next.backend_lsn = next.backend_lsn.max(lsn);
+                                        Arc::new(next)
+                                    });
+                                    let _ =
+                                        cache.submit(exocortex_cache::CacheWrite::Apply(inv)).await;
+                                }
+                                // CS7 (audit): a decode failure is a known
+                                // hole in this node's LSN sequence — count
+                                // it and log it, never swallow silently.
+                                Err(e) => {
+                                    metrics::counter!(
+                                        "exocortex_cluster_invalidation_decode_errors_total"
+                                    )
+                                    .increment(1);
+                                    tracing::warn!(
+                                        %e,
+                                        "cache bridge: invalidation decode failed; change lost"
+                                    );
+                                }
                             }
                         }
                     }
@@ -151,15 +202,21 @@ pub async fn run_backend_node<S: Storage + 'static>(
         tokio::spawn(async move { engine.run().await });
     }
 
-    // Dreams: the consolidation loop over the fire channel.
-    let dreams = Arc::new(exocortex_dreams::DreamsEngine::new(
-        storage.clone(),
-        exocortex_dreams::trigger::DreamsTrigger::default(),
-        0.01,
-        0.05,
-        true,
-        args.node_id.clone().into(),
-    ));
+    // Dreams: the consolidation loop over the fire channel. CS4 (audit):
+    // the elected leader gate makes the re-election lease fence something
+    // real — consolidation runs only on the node that holds it.
+    let leader_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dreams = Arc::new(
+        exocortex_dreams::DreamsEngine::new(
+            storage.clone(),
+            exocortex_dreams::trigger::DreamsTrigger::default(),
+            0.01,
+            0.05,
+            true,
+            args.node_id.clone().into(),
+        )
+        .with_leader_gate(leader_gate.clone()),
+    );
     {
         let engine = dreams.clone();
         tokio::spawn(async move { engine.run().await });
@@ -201,6 +258,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
     // Ingest: gRPC IngestService, embedding-enabled, reasoning-wired.
     let ingest = IngestServer::new(storage.clone(), ontology.clone(), args.cluster_secret)
         .with_reasoning(reasoning.clone())
+        .with_dreams(dreams.clone())
         .with_org(&org);
     #[cfg(feature = "fastembed")]
     let ingest = ingest.with_embedder(Arc::new(
@@ -208,23 +266,6 @@ pub async fn run_backend_node<S: Storage + 'static>(
     ));
 
     // One listener: gRPC routes + HTTP ops + SSE + observability.
-    let ctx = Arc::new(OpContext {
-        visibility_ctx: exocortex_ops::operations::ops_vc(
-            &org,
-            "backend",
-            exocortex_kernel::Visibility::Org,
-        ),
-        storage: storage.clone() as Arc<dyn exocortex_storage::Storage>,
-        cache: cache.clone(),
-        deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
-    });
-    let bind = HttpBind::new(ctx, args.bearer_token.clone());
-    let health = bind.health_handle();
-    health.store(Arc::new(HealthSnapshot {
-        node_id: args.node_id.clone(),
-        hydrated,
-        ..Default::default()
-    }));
 
     // R-O4 maintainers: a storage probe keeps `storage_ok` truthful, and
     // the reasoning worker reports liveness.
@@ -285,6 +326,9 @@ pub async fn run_backend_node<S: Storage + 'static>(
                 match storage.acquire_lease(&key, LEASE_TTL).await {
                     Ok(lease) => {
                         let mut epoch = lease.epoch;
+                        // CS4: the Dreams engine consolidates only while
+                        // this node is the elected leader.
+                        leader_gate.store(true, std::sync::atomic::Ordering::SeqCst);
                         metrics::counter!(
                             "exocortex_cluster_owner_lease_transitions_total",
                             "role" => "dreams"
@@ -311,13 +355,16 @@ pub async fn run_backend_node<S: Storage + 'static>(
                                 }
                                 Err(e) => {
                                     tracing::warn!(%e, "dreams lease lost; re-electing");
+                                    leader_gate.store(false, std::sync::atomic::Ordering::SeqCst);
                                     break;
                                 }
                             }
                         }
                     }
                     Err(_) => {
-                        // Another node holds it; health keeps observing.
+                        // Another node holds it; this node is a follower —
+                        // no Dreams work (CS4).
+                        leader_gate.store(false, std::sync::atomic::Ordering::SeqCst);
                         health.rcu(|h| {
                             let mut next = (**h).clone();
                             next.last_lease_tick = Some(chrono::Utc::now());

@@ -58,6 +58,6 @@ pub use kinds::{RelBucket, RelKindId, RelMeta};
 pub use memory::{normalize_tag, normalize_tags, Memory, MemoryContext};
 pub use ontology::Ontology;
 pub use pack::{PackDef, PackVersion};
-pub use provenance::{ExternalKey, ExternalSnapshot, Provenance};
+pub use provenance::{ExternalKey, ExternalSnapshot, ProducerKind, Provenance};
 pub use relationship::{materialize_inverse, Relationship, RelationshipProperties};
 pub use visibility::Visibility;

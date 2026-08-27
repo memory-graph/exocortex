@@ -15,4 +15,5 @@ serde_json  = { workspace = true }
 exocortex-kernel      = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
 exocortex-ops = { workspace = true }
+exocortex-wire = { workspace = true }
 schemars = { workspace = true }

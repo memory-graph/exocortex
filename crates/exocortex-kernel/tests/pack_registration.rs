@@ -101,6 +101,7 @@ fn fingerprint_is_order_independent_and_kind_sensitive() {
         inverse: None,
         bidirectional: false,
         default_strength: 0.5,
+        computed_only: false,
     };
     b.kinds.push(extra);
     // Identity: same def -> same fingerprint.
@@ -127,6 +128,103 @@ fn unbound_kernel_constant_rejected() {
     let err = Ontology::from_packs(vec![p]).unwrap_err();
     assert!(
         matches!(err, KernelError::UnboundKernelConstant(_)),
+        "got {err:?}"
+    );
+}
+
+/// KP2 (audit): a second pack's type triples must remap into ontology id
+/// space — the pack-side ids are declaration indices, the ontology assigns
+/// with a running offset. Before the fix, every triple in the second pack
+/// evaluated against the first pack's ids, so legitimate writes were
+/// rejected `InvalidTypeTriple` and first-pack types satisfied foreign
+/// triples.
+#[test]
+fn second_pack_triples_remap_into_ontology_space() {
+    let mut second = pack_def();
+    second.name = SmolStr::new_static("zz-second-pack");
+    // Fresh kind + fresh type names so nothing collides with dev-v1.
+    second.kinds = vec![exocortex_kernel::RelMeta {
+        id: exocortex_kernel::RelKindId(0x8000_0000 | 0x0300),
+        display_name: SmolStr::new_static("ZzKind"),
+        bucket: exocortex_kernel::RelBucket::Extension(2),
+        inverse: None,
+        bidirectional: false,
+        default_strength: 0.5,
+        computed_only: false,
+    }];
+    second.memory_type_names = vec![
+        SmolStr::new_static("ZzNote"),
+        SmolStr::new_static("ZzTicket"),
+    ];
+    second.entity_type_names = vec![SmolStr::new_static("ZzThing")];
+    let zz_kind = second.kinds[0].id;
+    // Pack-local ids: ZzNote=0, ZzTicket=1 (declaration indices).
+    second.type_triples = vec![exocortex_kernel::pack::TypeTriple {
+        kind: zz_kind,
+        from_types: Some(vec![0]),
+        to_types: Some(vec![1]),
+    }];
+
+    let onto = Ontology::from_packs(vec![pack_def(), second]).expect("two packs assemble");
+    let offset = onto
+        .memory_type_by_name
+        .get("ZzNote")
+        .copied()
+        .expect("ZzNote assigned an ontology id");
+    // The test pack's 5 memory types precede the second pack.
+    assert_eq!(offset, 5, "running offset across packs");
+
+    // The kind id is canonicalized to pack space; resolve it by name.
+    let zz_kind_onto = onto
+        .kinds_by_id
+        .values()
+        .find(|k| k.display_name == "ZzKind")
+        .unwrap()
+        .id;
+    let triple = &onto.triples_by_kind[&zz_kind_onto][0];
+    assert_eq!(
+        triple.from_types,
+        Some(vec![onto.memory_type_by_name["ZzNote"]]),
+        "from-side remapped into ontology space (KP2)"
+    );
+    assert_eq!(
+        triple.to_types,
+        Some(vec![onto.memory_type_by_name["ZzTicket"]]),
+        "to-side remapped into ontology space (KP2)"
+    );
+
+    // And the triple VALIDATES the pair it was declared for (the actual
+    // failure scenario: legitimate second-pack writes were rejected).
+    assert!(exocortex_kernel::validator::validate_triple(
+        &onto,
+        onto.memory_type_by_name["ZzNote"],
+        zz_kind_onto,
+        onto.memory_type_by_name["ZzTicket"],
+    )
+    .is_ok());
+    // While a dev-v1 type does NOT satisfy the foreign triple.
+    assert!(exocortex_kernel::validator::validate_triple(
+        &onto,
+        onto.memory_type_by_name["Fix"],
+        zz_kind_onto,
+        onto.memory_type_by_name["ZzTicket"],
+    )
+    .is_err());
+}
+
+/// KP2: duplicate memory-type names across packs are a registration error,
+/// never a silent last-writer-wins.
+#[test]
+fn duplicate_type_names_across_packs_rejected() {
+    let mut second = pack_def();
+    second.name = SmolStr::new_static("zz-dup-pack");
+    second.kinds.clear();
+    second.type_triples.clear();
+    second.memory_type_names = vec![SmolStr::new_static("Problem")]; // test-pack clash
+    second.entity_type_names = vec![];
+    let err = Ontology::from_packs(vec![pack_def(), second]).unwrap_err();
+    assert!(
+        matches!(err, KernelError::DuplicateTypeName(_)),
         "got {err:?}"
     );
 }

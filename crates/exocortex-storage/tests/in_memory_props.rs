@@ -33,6 +33,7 @@ fn base_memory(title: String, content: String, mt: u8, vis: u8) -> Memory {
         visibility: visibility(vis),
         provenance: Provenance::Asserted {
             author: "prop".into(),
+            producer_kind: None,
         },
         context: MemoryContext {
             timestamp: Utc::now(),
@@ -118,8 +119,12 @@ proptest! {
         });
     }
 
-    /// Bi-temporal round-trip: superseding a row keeps both versions
-    /// addressable via `valid_at` (§6.7 step 9).
+    /// Bi-temporal round-trip under the SHARED backend semantics (ST7,
+    /// audit): an upsert of the same id overwrites in place — one current
+    /// row per id, exactly what the FalkorDB adapter's MERGE serves. The
+    /// superseding version's valid window is what `valid_at` answers; the
+    /// superseded version is no longer addressable by time (that model was
+    /// a double-only fiction the production backend could not serve).
     #[test]
     fn bi_temporal_roundtrip_prop(
         content_a in "[a-z]{1,10}",
@@ -135,18 +140,35 @@ proptest! {
             let mut v1 = base_memory("p".into(), content_a.clone(), 2, 1);
             v1.valid_from = t0;
             v1.valid_until = Some(t1);
+            store.upsert_memory(&v1).await.unwrap();
+            // Current version is readable across its own window.
+            let at_t0 = store.valid_at(&v1.id, t0).await.unwrap().unwrap();
+            prop_assert_eq!(at_t0.content, content_a);
+            // Supersede in place: the surviving row's window governs.
             let mut v2 = v1.clone();
             v2.content = content_b.clone();
             v2.valid_from = t1;
             v2.valid_until = None;
-            store.upsert_memory(&v1).await.unwrap();
             store.upsert_memory(&v2).await.unwrap();
-            let at_t0 = store.valid_at(&v1.id, t0).await.unwrap().unwrap();
-            prop_assert_eq!(at_t0.content, content_a);
+            let superseded = store.valid_at(&v1.id, t0).await.unwrap();
+            prop_assert!(
+                superseded.is_none(),
+                "superseded version no longer addressable (ST7 shared semantics)"
+            );
             let at_t1 = store.valid_at(&v1.id, t1).await.unwrap().unwrap();
             prop_assert_eq!(at_t1.content, content_b);
             let before = store.valid_at(&v1.id, t0 - Duration::hours(1)).await.unwrap();
             prop_assert!(before.is_none());
+            // Streaming sees exactly one row per id (ST8).
+            use futures::StreamExt;
+            let mut rows = 0;
+            let mut ms = store.stream_all_memories().await;
+            while let Some(Ok(m)) = ms.next().await {
+                if m.id == v1.id {
+                    rows += 1;
+                }
+            }
+            prop_assert_eq!(rows, 1);
             Ok::<(), proptest::test_runner::TestCaseError>(())
         });
     }

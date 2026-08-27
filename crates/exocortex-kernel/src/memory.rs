@@ -7,8 +7,19 @@ use smol_str::SmolStr;
 use crate::{EntityId, MemoryId, Provenance, Visibility, LSN};
 
 /// A score clamped to [0.0, 1.0] at construction (used by §14).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// KP4 (audit): `Deserialize` funnels through `F01::new` — a hand-rolled
+/// impl rejects out-of-range and NaN values instead of reconstructing the
+/// raw inner f32 (which let a props_json `importance: 1000.0` pin every
+/// search result forever).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct F01(f32);
+
+impl<'de> Deserialize<'de> for F01 {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = f32::deserialize(d)?;
+        F01::new(v).map_err(serde::de::Error::custom)
+    }
+}
 impl F01 {
     /// Construct a clamped score; errors outside `[0.0, 1.0]`.
     pub fn new(v: f32) -> Result<Self, crate::KernelError> {
@@ -21,6 +32,12 @@ impl F01 {
     /// Read the raw score value.
     pub fn get(self) -> f32 {
         self.0
+    }
+    /// Order by the raw score.
+    pub fn partial_cmp_score(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -135,4 +152,53 @@ where
         }
     }
     out
+}
+
+/// D10a / §4.9 (agent-instructions PRD): evidence-derived confidence.
+///
+/// The prior deployment's optional, producer-reported `confidence` was a
+/// constant (0.8 on 117/117 memories) — an aspiration, not a signal.
+/// Exocortex never solicits the field; the backend derives it from
+/// evidence events:
+///  - the F01 default at commit (nothing yet observed),
+///  - `+step` per validation outcome that exercised the claim,
+///  - `-step` per counter-evidence event,
+///  - the floor the moment a live Replaces/Contradicts edge points at
+///    the memory (stale beliefs rank below their successors).
+///
+/// Constants live HERE — one definition, unit-tested — not as magic
+/// numbers in consumer crates. Validation/counter-evidence events wire
+/// in as the ops that produce them land; the supersession floor is live
+/// from the first committed supersession edge.
+pub fn derived_confidence(
+    superseded: bool,
+    validations: u32,
+    counter_evidence: u32,
+) -> crate::memory::F01 {
+    const BASE: f32 = 0.8;
+    const STEP: f32 = 0.05;
+    const FLOOR: f32 = 0.1;
+    let v = if superseded {
+        FLOOR
+    } else {
+        (BASE + validations as f32 * STEP - counter_evidence as f32 * STEP).clamp(FLOOR, 1.0)
+    };
+    crate::memory::F01::new(v).expect("clamped to [FLOOR, 1.0] ⊂ [0, 1]")
+}
+
+#[cfg(test)]
+mod confidence_tests {
+    use super::derived_confidence;
+
+    #[test]
+    fn base_step_and_floor() {
+        assert!((derived_confidence(false, 0, 0).get() - 0.8).abs() < 1e-6);
+        assert!((derived_confidence(false, 2, 0).get() - 0.9).abs() < 1e-6);
+        assert!((derived_confidence(false, 0, 2).get() - 0.7).abs() < 1e-6);
+        // Clamped, never negative or >1.
+        assert!((derived_confidence(false, 99, 0).get() - 1.0).abs() < 1e-6);
+        assert!((derived_confidence(false, 0, 99).get() - 0.1).abs() < 1e-6);
+        // Superseded: the floor regardless of history.
+        assert!((derived_confidence(true, 99, 0).get() - 0.1).abs() < 1e-6);
+    }
 }

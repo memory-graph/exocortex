@@ -171,9 +171,12 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         id: "stream_memories",
         read_only: true,
         required_params: &["after_lsn", "limit"],
+        // ST2 (audit): the row LSN the WHERE filters on is RETURNED so the
+        // pager advances the cursor from the same value it selected on —
+        // never from the (possibly stale) copy inside props_json.
         cypher: r#"
             MATCH (m:Memory) WHERE m.lsn > $after_lsn
-            RETURN m ORDER BY m.lsn ASC LIMIT $limit
+            RETURN m, m.lsn AS node_lsn ORDER BY m.lsn ASC LIMIT $limit
         "#,
     });
 
@@ -185,7 +188,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         // predicate excludes entity/MENTIONS edges, which have no LSN.
         cypher: r#"
             MATCH ()-[r]->() WHERE r.lsn > $after_lsn
-            RETURN r ORDER BY r.lsn ASC LIMIT $limit
+            RETURN r, r.lsn AS row_lsn ORDER BY r.lsn ASC LIMIT $limit
         "#,
     });
 
@@ -214,11 +217,14 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "soft_delete_memory",
         read_only: false,
-        required_params: &["id", "now", "lsn"],
+        // ST1 (audit): the serialized row (props_json) is rewritten in the
+        // same statement — every read path reconstructs the Memory from
+        // props_json, so the node properties and the row can never disagree.
+        required_params: &["id", "now", "lsn", "props_json"],
         cypher: r#"
             MATCH (m:Memory {id: $id})
             WHERE m.valid_until IS NULL
-            SET m.valid_until = $now, m.lsn = $lsn
+            SET m.valid_until = $now, m.lsn = $lsn, m.props_json = $props_json
             RETURN id(m) AS node_id
         "#,
     });
@@ -226,12 +232,25 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "soft_delete_relationship",
         read_only: false,
-        required_params: &["rel_id", "now", "lsn"],
+        // ST9 (audit): match by id WITHOUT pinning a relationship type — the
+        // adapter creates per-kind types and never `:RELATES`, so the old
+        // typed match was a guaranteed no-op reporting success. The edge's
+        // props_json is rewritten too (ST1 parity for edges).
+        required_params: &["rel_id", "now", "lsn", "props_json"],
         cypher: r#"
-            MATCH ()-[r:RELATES {id: $rel_id}]->()
-            WHERE r.valid_until IS NULL
-            SET r.valid_until = $now, r.lsn = $lsn
+            MATCH ()-[r]->() WHERE r.id = $rel_id AND r.valid_until IS NULL
+            SET r.valid_until = $now, r.lsn = $lsn, r.props_json = $props_json
             RETURN id(r) AS edge_id
+        "#,
+    });
+
+    reg!(Template {
+        id: "get_relationship_by_id",
+        read_only: true,
+        required_params: &["rel_id"],
+        cypher: r#"
+            MATCH ()-[r]->() WHERE r.id = $rel_id
+            RETURN r ORDER BY r.lsn DESC LIMIT 1
         "#,
     });
 

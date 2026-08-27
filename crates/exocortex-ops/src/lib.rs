@@ -9,6 +9,7 @@
 
 pub mod audit;
 pub mod operations;
+pub mod preflight;
 
 /// Client-facing shared types (§2.5 routes the client through ops; these
 /// re-exports let the client crate consume the visibility/delta vocabulary
@@ -20,6 +21,7 @@ use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Serialize};
 
 /// Operation context: the typed handles every operation runs against.
+#[derive(Clone)]
 pub struct OpContext {
     /// The caller's identity + visibility scope.
     pub visibility_ctx: exocortex_storage::VisibilityContext,
@@ -29,6 +31,47 @@ pub struct OpContext {
     pub cache: std::sync::Arc<exocortex_cache::LocalCache>,
     /// Deadline for this operation (R-R3 budget enforcement).
     pub deadline: chrono::DateTime<chrono::Utc>,
+    /// The effective ontology (D2 preflight's rulebook). `None` on
+    /// surfaces that never validate writes; the preflight operation
+    /// fails loudly rather than guessing when it is unset.
+    pub ontology: Option<std::sync::Arc<exocortex_kernel::Ontology>>,
+}
+
+impl OpContext {
+    /// IN11 (audit): a per-request context with a fresh R-R3 budget.
+    /// The backend used to build ONE shared context at startup, so every
+    /// request after the first 30s ran with an always-expired deadline —
+    /// and nothing read it.
+    pub fn per_request(
+        visibility_ctx: exocortex_storage::VisibilityContext,
+        storage: std::sync::Arc<dyn exocortex_storage::Storage>,
+        cache: std::sync::Arc<exocortex_cache::LocalCache>,
+        budget: chrono::Duration,
+    ) -> Self {
+        Self {
+            visibility_ctx,
+            storage,
+            cache,
+            deadline: chrono::Utc::now() + budget,
+            ontology: None,
+        }
+    }
+
+    /// Attach the effective ontology (preflight-capable surfaces).
+    pub fn with_ontology(mut self, ontology: std::sync::Arc<exocortex_kernel::Ontology>) -> Self {
+        self.ontology = Some(ontology);
+        self
+    }
+
+    /// R-R3: `DeadlineExceeded` once the budget is spent. Handlers call
+    /// this before doing work; it is cheap (a DateTime compare).
+    pub fn check_deadline(&self) -> Result<(), OpError> {
+        if chrono::Utc::now() > self.deadline {
+            Err(OpError::DeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Operation errors.

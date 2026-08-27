@@ -17,7 +17,7 @@
 use hmac::{Hmac, Mac};
 use prost::Message;
 
-use crate::ingest::v1::IngestBatch;
+use crate::ingest::v1::{IngestBatch, RegisterSourceRequest};
 
 type HmacSha256 = Hmac<sha2::Sha256>;
 
@@ -99,6 +99,97 @@ pub fn verify_signature(key: &[u8; 32], b: &IngestBatch) -> bool {
             expected.as_slice(),
             p.hmac_signature.as_slice(),
         ))
+}
+
+/// The bytes a registration signature covers: the encoded request with the
+/// signature field itself cleared. Audit WS1: `RegisterSource` mutates the
+/// same registry `Submit` authorizes against, so it carries the same
+/// producer identity + HMAC (R-I8) — presence of a signature is never proof
+/// on its own.
+fn unsigned_registration_bytes(r: &RegisterSourceRequest) -> Vec<u8> {
+    let mut unsigned = r.clone();
+    if let Some(p) = unsigned.producer.as_mut() {
+        p.hmac_signature = vec![];
+    }
+    unsigned.encode_to_vec()
+}
+
+/// HMAC-SHA256 over the registration request, stored on its producer
+/// identity. Idempotent: re-signing replaces the signature.
+pub fn sign_registration(key: &[u8; 32], r: &mut RegisterSourceRequest) {
+    let bytes = unsigned_registration_bytes(r);
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(&bytes);
+    if let Some(p) = r.producer.as_mut() {
+        p.hmac_signature = mac.finalize().into_bytes().to_vec();
+    }
+}
+
+/// Constant-time verification of a registration's producer signature.
+pub fn verify_registration(key: &[u8; 32], r: &RegisterSourceRequest) -> bool {
+    let Some(p) = &r.producer else {
+        return false;
+    };
+    if p.hmac_signature.is_empty() {
+        return false;
+    }
+    let bytes = unsigned_registration_bytes(r);
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(&bytes);
+    let expected = mac.finalize().into_bytes();
+    expected.len() == p.hmac_signature.len()
+        && bool::from(subtle::ConstantTimeEq::ct_eq(
+            expected.as_slice(),
+            p.hmac_signature.as_slice(),
+        ))
+}
+
+/// Convenience: build a signed registration request (producer side).
+/// D8: the producer kind is required — callers declare what they are.
+#[allow(clippy::too_many_arguments)]
+pub fn registration(
+    key: &[u8; 32],
+    org_id: &str,
+    source_uri: &str,
+    producer_id: &str,
+    ceiling: i32,
+    source_flavor: &str,
+    node_id: &str,
+    producer_kind: crate::ingest::v1::ProducerKind,
+) -> RegisterSourceRequest {
+    let mut r = RegisterSourceRequest {
+        org_id: org_id.into(),
+        source_uri: source_uri.into(),
+        producer_id: producer_id.into(),
+        ceiling,
+        source_flavor: source_flavor.into(),
+        producer_kind: producer_kind.into(),
+        producer: Some(crate::ingest::v1::ProducerIdentity {
+            node_id: node_id.into(),
+            agent_id: String::new(),
+            adapter_id: String::new(),
+            hmac_signature: vec![],
+            client_metadata: None,
+        }),
+    };
+    sign_registration(key, &mut r);
+    r
+}
+
+/// Decode 64 hex chars into a 32-byte key. Rejects wrong length or
+/// non-hex input instead of silently degrading (audit CL3: silently
+/// falling back to a known key would ship a credential bug). This is the
+/// one workspace implementation — binaries must not hand-roll copies.
+pub fn decode_hex32(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err(format!("key must be 64 hex chars, got {}", hex.len()));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2).ok_or("key truncated")?, 16)
+            .map_err(|e| format!("bad key hex: {e}"))?;
+    }
+    Ok(out)
 }
 
 fn canonical_memory(m: &crate::ingest::v1::MemoryDraft) -> String {
@@ -193,6 +284,7 @@ mod tests {
                 agent_id: "a".into(),
                 adapter_id: String::new(),
                 hmac_signature: vec![],
+                client_metadata: None,
             }),
         }
     }
@@ -278,6 +370,7 @@ mod tests {
         let base = batch(vec![draft("k1", "one")]);
         let mut with_rel = base.clone();
         with_rel.relationships = vec![crate::ingest::v1::RelationshipDraft {
+            to_memory_id: String::new(),
             from_draft_key: "k1".into(),
             to_draft_key: "k1".into(),
             kind: "Solves".into(),

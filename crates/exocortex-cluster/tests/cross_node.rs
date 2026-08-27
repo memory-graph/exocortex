@@ -48,6 +48,7 @@ fn mem(title: &str, n: u8) -> Memory {
         visibility: Visibility::Org,
         provenance: Provenance::Asserted {
             author: "cross".into(),
+            producer_kind: None,
         },
         context: MemoryContext {
             timestamp: chrono::Utc::now(),

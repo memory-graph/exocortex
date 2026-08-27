@@ -13,7 +13,6 @@ use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{InMemoryStorage, RegionKey, Storage};
 use exocortex_wire::ingest::v1::{
     ingest_service_server::IngestService, IngestBatch, MemoryDraft, ProducerIdentity,
-    RegisterSourceRequest,
 };
 
 const HMAC_KEY: [u8; 32] = [7u8; 32];
@@ -24,13 +23,16 @@ fn server(storage: Arc<InMemoryStorage>, onto: Arc<Ontology>) -> IngestServer<In
 
 async fn register(srv: &IngestServer<InMemoryStorage>, uri: &str) {
     use tonic::Request;
-    srv.register_source(Request::new(RegisterSourceRequest {
-        org_id: "org".into(),
-        source_uri: uri.into(),
-        producer_id: "e2e".into(),
-        ceiling: 3,
-        source_flavor: "custom".into(),
-    }))
+    srv.register_source(Request::new(exocortex_wire::signing::registration(
+        &HMAC_KEY,
+        "org",
+        uri,
+        "e2e",
+        3,
+        "custom",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    )))
     .await
     .unwrap();
 }
@@ -76,6 +78,7 @@ async fn submit(
             agent_id: String::new(),
             adapter_id: String::new(),
             hmac_signature: vec![],
+            client_metadata: None,
         }),
     };
     exocortex_wire::signing::prepare_batch(&HMAC_KEY, &mut b);
@@ -126,7 +129,8 @@ async fn dreams_cycle_over_ingested_data() {
         ],
     )
     .await;
-    assert_eq!(ack.accepted, 5, "{:?}", ack.rejections);
+    // D6: 5 memories + 5 InSession + 5 companions.
+    assert_eq!(ack.accepted, 15, "{:?}", ack.rejections);
 
     // Embeddings were stored (§7.5 backend-assigned).
     {
@@ -134,6 +138,11 @@ async fn dreams_cycle_over_ingested_data() {
         let mut ms = storage.stream_all_memories().await;
         let mut n = 0;
         while let Some(Ok(m)) = ms.next().await {
+            // D6: the grouping node is structural — deliberately NOT
+            // embedded (Dreams skips it).
+            if matches!(m.provenance, exocortex_kernel::Provenance::Derived { .. }) {
+                continue;
+            }
             assert!(m.embedding.is_some(), "ingest stored an embedding");
             n += 1;
         }
@@ -242,12 +251,16 @@ async fn session_wrapup_enqueues_reasoning_derived_edge() {
             confidence: 0.9,
             context: String::new(),
             visibility: 3,
+
+            to_memory_id: String::new(),
         }],
         producer: Some(ProducerIdentity {
             node_id: "n".into(),
             agent_id: String::new(),
             adapter_id: String::new(),
             hmac_signature: vec![],
+
+            client_metadata: None,
         }),
     };
     exocortex_wire::signing::prepare_batch(&HMAC_KEY, &mut b);
@@ -284,5 +297,79 @@ async fn session_wrapup_enqueues_reasoning_derived_edge() {
     assert!(
         derived_solves,
         "SessionWrapup enqueue landed a D1-derived Solves edge"
+    );
+}
+
+/// IN4 (audit): commits feed the Dreams write-counter trigger and the
+/// §12.2 predicate can actually fire — a tiny threshold, enough writes,
+/// a cycle runs. Before the fix `on_write` had no non-test caller and
+/// `seconds_since_last_cycle` was never stamped, so no cycle ever ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_counter_trigger_fires_a_cycle() {
+    let onto = Arc::new(Ontology::from_packs(vec![pack_def()]).unwrap());
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let srv = server(storage.clone(), onto.clone());
+    register(&srv, "session://trigger").await;
+
+    let dreams = Arc::new(exocortex_dreams::DreamsEngine::new(
+        storage.clone(),
+        exocortex_dreams::trigger::DreamsTrigger {
+            memory_threshold: 3, // tiny for the test
+            edge_threshold: 5000,
+            age_floor_days: 30,
+            min_interval_hours: 0, // no rate limit in-test
+        },
+        0.01,
+        0.05,
+        false,
+        "trigger-e2e".into(),
+    ));
+    {
+        let engine = dreams.clone();
+        tokio::spawn(async move { engine.run().await });
+    }
+    let srv = srv.with_dreams(dreams.clone());
+
+    for i in 0..3 {
+        let ack = submit(
+            &srv,
+            "session://trigger",
+            &format!("trigger-{i}"),
+            vec![draft(
+                &format!("t{i}"),
+                &format!("unique trigger body {i}"),
+                &format!("unique trigger body {i}"),
+            )],
+        )
+        .await;
+        // D6: memory + InSession + companion.
+        assert_eq!(ack.accepted, 3, "{:?}", ack.rejections);
+    }
+
+    // The predicate trips on the third commit; the run loop consolidates
+    // and resets the counters. Either state proves the wiring: the writes
+    // reached the trigger (previously nothing did).
+    let mut fired = false;
+    for _ in 0..100 {
+        if !dreams.counters.is_empty() || !dreams.last_cycle_at.is_empty() {
+            fired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(fired, "IN4: commits reached the Dreams trigger counters");
+    // The fire itself crossed the in-process channel (counters reset on
+    // completion, last_cycle_at stamped).
+    let mut completed = false;
+    for _ in 0..100 {
+        if !dreams.last_cycle_at.is_empty() {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        completed,
+        "IN4: a cycle ran and stamped the region clock (§12.2)"
     );
 }

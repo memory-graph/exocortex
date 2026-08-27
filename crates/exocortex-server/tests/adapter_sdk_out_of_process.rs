@@ -97,6 +97,7 @@ async fn fixture_adapter_completes_the_protocol_out_of_process() {
         adapter_id: "oop-fixture-adapter".into(),
         node_id: "oop-fixture-node".into(),
         source_flavor: "custom".into(),
+        producer_kind: exocortex_wire::ingest::v1::ProducerKind::Custom,
         ceiling: 3,
         backend_url: format!("http://{}", node.addr),
         hmac_key: [0x42u8; 32],

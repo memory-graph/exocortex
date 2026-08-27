@@ -43,6 +43,8 @@ jobs:
           [ "$a" = "$b" ] && echo "fingerprint stable: $a"
       - name: Schema drift (M7 goldens)
         run: cargo xtask gen-schemas
+      - name: playbook drift gate
+        run: cargo xtask gen-playbook
       - name: No LLM (R-D6/CR-19)
         run: cargo xtask no-llm
       - name: Proto sync (vendored wire protos)

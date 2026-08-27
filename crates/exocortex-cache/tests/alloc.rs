@@ -18,7 +18,10 @@ fn mem(title: &str) -> Memory {
         summary: None,
         tags: Default::default(),
         visibility: Visibility::Org,
-        provenance: Provenance::Asserted { author: "t".into() },
+        provenance: Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
         context: MemoryContext {
             timestamp: chrono::Utc::now(),
             project_id: None,

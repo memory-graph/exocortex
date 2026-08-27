@@ -10,6 +10,7 @@
 
 pub mod embedding;
 pub mod entities;
+pub mod grouping;
 pub mod service;
 
 pub use embedding::{Embedder, EmbedderRef, FakeEmbedder};

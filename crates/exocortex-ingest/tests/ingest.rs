@@ -62,6 +62,8 @@ fn batch(memories: Vec<MemoryDraft>) -> IngestBatch {
             agent_id: "agent".into(),
             adapter_id: String::new(),
             hmac_signature: vec![],
+
+            client_metadata: None,
         }),
     }
 }
@@ -73,13 +75,16 @@ fn sign(mut b: IngestBatch, key: [u8; 32]) -> IngestBatch {
 
 async fn registered(srv: &IngestServer<InMemoryStorage>, ceiling: i32) {
     use tonic::Request;
-    srv.register_source(Request::new(RegisterSourceRequest {
-        org_id: "org".into(),
-        source_uri: "session://s1".into(),
-        producer_id: "session-wrapup".into(),
+    srv.register_source(Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://s1",
+        "session-wrapup",
         ceiling,
-        source_flavor: "session".into(),
-    }))
+        "session",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    )))
     .await
     .unwrap();
 }
@@ -101,7 +106,8 @@ async fn e2e_valid_batch_accepted_with_monotonic_lsn() {
         .await
         .unwrap()
         .into_inner();
-    if ack.accepted != 3 {
+    // D6: 3 memories + 3 InSession edges + 3 HasMember companions.
+    if ack.accepted != 9 {
         panic!("rejections: {:#?}", ack.rejections);
     }
     assert!(ack.assigned_lsn > 0);
@@ -247,7 +253,8 @@ async fn external_batch_without_key_rejected_and_with_key_deterministic() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(ack2.accepted, 1);
+    // D6: memory + InSession edge + HasMember companion.
+    assert_eq!(ack2.accepted, 3);
 
     let id_a =
         exocortex_kernel::MemoryId::from_external("org", "session://s1", &[1u8; 16], b"row-1", 3);
@@ -269,7 +276,8 @@ async fn duplicate_batch_is_idempotent_replay() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(first.accepted, 1);
+    // D6: memory + InSession + companion.
+    assert_eq!(first.accepted, 3);
     let second = srv
         .submit(tonic::Request::new(b))
         .await
@@ -307,13 +315,16 @@ async fn source_ceilings_persist_across_restart() {
 
     {
         let srv = mk_server();
-        srv.register_source(Request::new(RegisterSourceRequest {
-            org_id: "org".into(),
-            source_uri: "session://persist".into(),
-            producer_id: "test-adapter".into(),
-            ceiling: 1, // Private only
-            source_flavor: "custom".into(),
-        }))
+        srv.register_source(Request::new(exocortex_wire::signing::registration(
+            &[5u8; 32],
+            "org",
+            "session://persist",
+            "test-adapter",
+            1, // Private only
+            "custom",
+            "test-node",
+            exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+        )))
         .await
         .unwrap();
         assert!(path.exists(), "ceiling registry written on registration");
@@ -366,22 +377,30 @@ async fn stored_memories_carry_extracted_entities() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(ack.accepted, 1);
+    // D6: memory + InSession + companion.
+    assert_eq!(ack.accepted, 3);
 
     let storage = &srv.storage;
     let mut n = 0;
     use futures::StreamExt;
     let mut ms = storage.stream_all_memories().await;
     while let Some(Ok(m)) = ms.next().await {
+        // D6: the grouping node is structural (Derived, no entities) —
+        // the producer-row assertions below apply to asserted rows only.
+        if matches!(m.provenance, exocortex_kernel::Provenance::Derived { .. }) {
+            continue;
+        }
         n += 1;
         assert!(
             !m.context.entities.is_empty(),
             "R-T18: backend extracted entities (content mentions src/auth.rs)"
         );
+        // D8: the registered producer kind (CodingAgent) rides the row.
         assert_eq!(
             m.provenance,
             exocortex_kernel::Provenance::Asserted {
-                author: "session-wrapup".into()
+                author: "session-wrapup".into(),
+                producer_kind: Some(exocortex_kernel::ProducerKind::CodingAgent),
             }
         );
     }
@@ -399,5 +418,358 @@ async fn ceiling_visibility_alone_is_not_widening() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(ack.accepted, 1, "narrower-than-ceiling is allowed");
+    // D6: memory + InSession + companion.
+    assert_eq!(ack.accepted, 3, "narrower-than-ceiling is allowed");
+}
+
+/// WS1 (audit): RegisterSource requires the producer HMAC — an
+/// unauthenticated caller can no longer overwrite registrations or
+/// LRU-evict every registered producer from the registry Submit consults.
+#[tokio::test]
+async fn unsigned_registration_is_unauthenticated() {
+    let srv = server();
+    let err = srv
+        .register_source(tonic::Request::new(RegisterSourceRequest {
+            org_id: "org".into(),
+            source_uri: "session://evil".into(),
+            producer_id: "attacker".into(),
+            ceiling: 3,
+            source_flavor: "custom".into(),
+            producer: None,
+            producer_kind: 5,
+        }))
+        .await;
+    assert!(err.is_err(), "unsigned registration rejected");
+
+    // A wrong key is rejected too (a present-but-invalid signature is not
+    // proof).
+    let mut forged = exocortex_wire::signing::registration(
+        &[9u8; 32],
+        "org",
+        "session://evil",
+        "attacker",
+        3,
+        "custom",
+        "attacker-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    );
+    forged.producer.as_mut().unwrap().hmac_signature = vec![1, 2, 3];
+    let err = srv.register_source(tonic::Request::new(forged)).await;
+    assert!(err.is_err(), "invalid signature rejected");
+}
+
+/// WS1: a flood of authenticated-but-distinct registrations cannot evict a
+/// legitimate producer's entry (registrations with fresh producer_ids are
+/// distinct keys; the point of this test is the LRU bound the audit
+/// describes — the eviction half is unreachable now that unsigned calls
+/// error before touching the registry).
+#[tokio::test]
+async fn legitimate_producer_survives_registration_flood() {
+    let srv = server();
+    registered(&srv, 3).await;
+    // Unsigned flood (the unauthenticated attack from the audit): every
+    // call errors without mutating the registry.
+    for i in 0..1100 {
+        let r = srv
+            .register_source(tonic::Request::new(RegisterSourceRequest {
+                org_id: "org".into(),
+                source_uri: format!("session://flood-{i}"),
+                producer_id: format!("attacker-{i}"),
+                ceiling: 3,
+                source_flavor: "custom".into(),
+                producer: None,
+                producer_kind: 5,
+            }))
+            .await;
+        assert!(r.is_err(), "flood call {i} rejected");
+    }
+    // The legitimate producer still submits.
+    let b = signed_batch(&srv, vec![draft("k", "Fix", 1)]);
+    let ack = srv
+        .submit(tonic::Request::new(b))
+        .await
+        .unwrap()
+        .into_inner();
+    // D6: memory + InSession + companion.
+    assert_eq!(ack.accepted, 3, "registered producer unaffected by flood");
+}
+
+/// WS1/WS2: re-registration never silently overwrites a different ceiling;
+/// the existing value is echoed so the producer's R-I3 check fires.
+#[tokio::test]
+async fn re_registration_does_not_overwrite_ceiling() {
+    let srv = server();
+    registered(&srv, 1).await; // Private
+    let echo = srv
+        .register_source(tonic::Request::new(exocortex_wire::signing::registration(
+            &[5u8; 32],
+            "org",
+            "session://s1",
+            "session-wrapup",
+            3, // requests ORG over an existing Private registration
+            "session",
+            "test-node",
+            exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(echo.ceiling, 1, "existing ceiling stands, not overwritten");
+
+    // And the batch at ORG now fails R-I3 instead of being widened.
+    let b = signed_batch(&srv, vec![draft("k", "Fix", 1)]);
+    let ack = srv
+        .submit(tonic::Request::new(b))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        ack.rejections
+            .iter()
+            .any(|r| r.code == RejectCode::UnknownSource as i32),
+        "ceiling mismatch surfaces: {:?}",
+        ack.rejections
+    );
+}
+
+/// WS2: an admin-configured ceiling is authoritative — the producer cannot
+/// register above it, and the configured value is what gets registered.
+#[tokio::test]
+async fn admin_ceiling_caps_self_registration() {
+    let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
+    let srv = IngestServer::new(
+        Arc::new(InMemoryStorage::new(onto.clone())),
+        onto,
+        [5u8; 32],
+    )
+    .with_admin_ceilings([(
+        ("org".into(), "session://s1".into(), "session-wrapup".into()),
+        exocortex_kernel::Visibility::Project,
+    )]);
+
+    // Over the admin ceiling: rejected.
+    let err = srv
+        .register_source(tonic::Request::new(exocortex_wire::signing::registration(
+            &[5u8; 32],
+            "org",
+            "session://s1",
+            "session-wrapup",
+            3,
+            "session",
+            "test-node",
+            exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+        )))
+        .await;
+    assert!(err.is_err(), "over-ceiling registration rejected");
+
+    // At or under the admin ceiling: registered at the ADMIN value (echoed
+    // back), so the SDK's equality check fires CeilingMismatch when the
+    // producer configured something narrower.
+    let echo = srv
+        .register_source(tonic::Request::new(exocortex_wire::signing::registration(
+            &[5u8; 32],
+            "org",
+            "session://s1",
+            "session-wrapup",
+            0, // requests Private; admin says Project
+            "session",
+            "test-node",
+            exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        echo.ceiling, 1,
+        "admin Project ceiling echoed, not the proposal"
+    );
+}
+
+/// WS5 (audit): unknown Visibility discriminants are rejected — the old
+/// fail-open coercion mapped 5, 99, -1 to PUBLIC silently.
+#[tokio::test]
+async fn unknown_visibility_discriminant_rejected() {
+    let srv = server();
+    let _ = srv
+        .register_source(tonic::Request::new(exocortex_wire::signing::registration(
+            &[5u8; 32],
+            "org",
+            "session://ws5",
+            "session-wrapup",
+            3,
+            "session",
+            "t",
+            exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+        )))
+        .await
+        .unwrap();
+    let mut b = batch(vec![draft("k", "Fix", 99)]);
+    b.org_id = "org".into();
+    b.source_uri = "session://ws5".into();
+    b.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
+    let ack = srv
+        .submit(tonic::Request::new(b))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        ack.rejections
+            .iter()
+            .any(|r| r.code == RejectCode::VisibilityWidening as i32),
+        "unknown discriminant rejected: {:?}",
+        ack.rejections
+    );
+}
+
+/// WS4 (audit): NaN strength is rejected, not persisted.
+#[tokio::test]
+async fn nan_strength_rejected() {
+    let srv = server();
+    let _ = srv
+        .register_source(tonic::Request::new(exocortex_wire::signing::registration(
+            &[5u8; 32],
+            "org",
+            "session://ws4",
+            "session-wrapup",
+            3,
+            "session",
+            "t",
+            exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+        )))
+        .await
+        .unwrap();
+    let mut memories = vec![draft("a", "Fix", 1), draft("b", "Problem", 1)];
+    for m in &mut memories {
+        m.title = m.title.clone();
+    }
+    let mut b = batch(memories);
+    b.org_id = "org".into();
+    b.source_uri = "session://ws4".into();
+    b.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    b.relationships = vec![exocortex_wire::ingest::v1::RelationshipDraft {
+        from_draft_key: "a".into(),
+        to_draft_key: "b".into(),
+        kind: "Fixes".into(),
+        strength: f32::NAN,
+        confidence: 0.5,
+        context: String::new(),
+        visibility: 1,
+
+        to_memory_id: String::new(),
+    }];
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
+    let ack = srv
+        .submit(tonic::Request::new(b))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ack.accepted, 0, "NaN strength must reject the batch");
+}
+
+/// W3 (audit): session-scoped sources stamp `MemoryContext.session_id`.
+#[tokio::test]
+async fn session_source_stamps_session_id() {
+    let srv = server();
+    // Register the s-42 source (the registry is keyed by source_uri).
+    let _ = srv
+        .register_source(tonic::Request::new(exocortex_wire::signing::registration(
+            &[5u8; 32],
+            "org",
+            "session://s-42",
+            "session-wrapup",
+            3,
+            "session",
+            "t",
+            exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+        )))
+        .await
+        .unwrap();
+    let mut b = signed_batch(&srv, vec![draft("k", "Fix", 1)]);
+    b.source_uri = "session://s-42".into();
+    // Re-sign: the checksum and signature cover source_uri.
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
+    let ack = srv
+        .submit(tonic::Request::new(b))
+        .await
+        .unwrap()
+        .into_inner();
+    // D6: memory + InSession + companion.
+    assert_eq!(ack.accepted, 3, "batch lands: {ack:?}");
+    use futures::StreamExt;
+    let mut ms = srv.storage.stream_all_memories().await;
+    let mut any = false;
+    while let Some(Ok(m)) = ms.next().await {
+        any = true;
+        assert_eq!(
+            m.context.session_id.as_deref(),
+            Some("s-42"),
+            "W3: online path stamps the session id"
+        );
+    }
+    assert!(any, "committed row present");
+}
+
+/// W7 (audit): the idempotency registry survives a restart. Submit a
+/// batch, rebuild the server over the same batches file, replay the
+/// identical batch — the answer is `DuplicateBatch`, not a second commit.
+#[tokio::test]
+async fn duplicate_replay_dedup_survives_restart() {
+    let dir = std::env::temp_dir().join(format!(
+        "exo-w7-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
+    let mk = || {
+        IngestServer::new(
+            Arc::new(InMemoryStorage::new(onto.clone())),
+            onto.clone(),
+            [5u8; 32],
+        )
+        .with_batches_file(dir.join("batches.jsonl"))
+    };
+
+    // Process #1: register, commit one batch.
+    let srv = mk();
+    registered(&srv, 3).await;
+    let b = signed_batch(&srv, vec![draft("k", "Fix", 1)]);
+    let ack = srv
+        .submit(tonic::Request::new(b.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    // D6: memory + InSession + companion.
+    assert_eq!(ack.accepted, 3);
+    drop(srv); // "restart"
+
+    // Process #2: same batch replays -> DuplicateBatch, nothing commits.
+    let srv2 = mk();
+    let replay = srv2
+        .submit(tonic::Request::new(b))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        replay
+            .rejections
+            .iter()
+            .any(|r| r.code == RejectCode::DuplicateBatch as i32),
+        "W7: restart keeps the dedup set: {:?}",
+        replay.rejections
+    );
+    use futures::StreamExt;
+    let storage = &srv2.storage;
+    let mut n = 0;
+    let mut ms = storage.stream_all_memories().await;
+    while let Some(Ok(_)) = ms.next().await {
+        n += 1;
+    }
+    assert_eq!(n, 0, "in-memory backend is fresh; nothing re-committed");
+    let _ = std::fs::remove_dir_all(&dir);
 }

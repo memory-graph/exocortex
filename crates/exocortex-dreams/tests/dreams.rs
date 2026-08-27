@@ -39,6 +39,7 @@ fn mem_with_embedding(i: usize, dup_of: Option<usize>, embedding: Vec<f32>) -> M
         visibility: Visibility::Org,
         provenance: Provenance::Asserted {
             author: "dreams".into(),
+            producer_kind: None,
         },
         context: MemoryContext {
             timestamp: chrono::Utc::now(),
@@ -417,7 +418,10 @@ async fn transitive_finder_proposes_only_open_indirect_pairs() {
                 evidence: vec![],
             }
         } else {
-            Provenance::Asserted { author: "t".into() }
+            Provenance::Asserted {
+                author: "t".into(),
+                producer_kind: None,
+            }
         },
         properties: RelationshipProperties {
             strength: 0.5,

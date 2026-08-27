@@ -57,8 +57,39 @@ impl Ontology {
         // untouched). With a single pack (v1) this is the identity mapping.
         let mut packs = packs;
         packs.sort_by(|a, b| a.name.cmp(&b.name));
+        // KP2 (audit): the pack! macro resolves `type_triples!` names
+        // through a PACK-LOCAL id map (the declaration index), while the
+        // ontology assigns type ids with a running offset across packs —
+        // so every triple in any pack after the first evaluated against
+        // the wrong ids. Remap the sides with the same per-pack offset
+        // the id assignment uses.
+        let mt_offsets: Vec<u8> = {
+            let mut v = Vec::with_capacity(packs.len());
+            let mut acc: u8 = 0;
+            for p in &packs {
+                v.push(acc);
+                acc = acc.saturating_add(p.memory_type_names.len() as u8);
+            }
+            v
+        };
+        // KP2: duplicate memory-type names (and separately entity-type
+        // names) across packs are a registration error, not a silent
+        // last-writer-wins. The two namespaces are distinct id spaces —
+        // a memory type may share a name with an entity type.
+        fn check<'a>(names: impl Iterator<Item = &'a SmolStr>) -> KernelResult<()> {
+            let mut seen = std::collections::HashSet::new();
+            for n in names {
+                if !seen.insert(n.clone()) {
+                    return Err(KernelError::DuplicateTypeName(n.clone()));
+                }
+            }
+            Ok(())
+        }
+        check(packs.iter().flat_map(|p| p.memory_type_names.iter()))?;
+        check(packs.iter().flat_map(|p| p.entity_type_names.iter()))?;
         for (i, p) in packs.iter_mut().enumerate() {
             let slot = (i as u32) << 16;
+            let mt_offset = mt_offsets[i];
             for k in p.kinds.iter_mut() {
                 if !k.id.is_kernel() {
                     k.id = RelKindId(0x8000_0000 | slot | k.id.local_part());
@@ -73,6 +104,17 @@ impl Ontology {
                 if !t.kind.is_kernel() {
                     t.kind = RelKindId(0x8000_0000 | slot | t.kind.local_part());
                 }
+                // KP2: triple sides carry pack-local ids; shift them into
+                // ontology space with this pack's offset.
+                let remap = |side: &mut Option<Vec<u8>>| {
+                    if let Some(xs) = side {
+                        for x in xs {
+                            *x = mt_offset.saturating_add(*x);
+                        }
+                    }
+                };
+                remap(&mut t.from_types);
+                remap(&mut t.to_types);
             }
         }
 

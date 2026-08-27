@@ -99,13 +99,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --features exocortex-adapter-sdk/testing
 cargo deny check
 cargo xtask kernel-purity   # kernel purity + SDK single-dep + worker kernel-ban
-cargo xtask fingerprint     # must be byte-stable: d8bcd004…4e8c
+cargo xtask fingerprint     # must be byte-stable: e1f7d17b…ddc9b2 (W6: pack now carries the R-T14 computed_only marker)
 cargo xtask gen-schemas     # schema drift vs goldens
+cargo xtask gen-playbook    # playbook facts drift vs pack + RejectCode; block <= 300 words
 cargo xtask no-llm
 cargo xtask proto-sync      # vendored wire protos match proto/
 cargo xtask signing-hygiene # one batch-signing impl; no unsigned submitters
 cargo xtask wire-standalone # packaged wire builds standalone
 cargo xtask bench           # SLO gates (search, k-hop)
+cargo xtask storage-conformance   # §2.1 one suite, double + live Falkor (FALKOR_URL)
+cargo xtask write-path-parity     # W2  offline + ingest validators agree (golden table)
+cargo xtask dead-enforcement      # §2.2 invariant/security fns have live callers
+cargo xtask auth-coverage         # §2.3 every endpoint rejects unauthenticated calls
+cargo xtask artifact-equivalence  # §2.4 pack rules == engine; MCP result == registry
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these on push; the toolchain

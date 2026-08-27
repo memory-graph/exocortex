@@ -18,6 +18,7 @@ exocortex-wire = { workspace = true }
 exocortex-storage = { workspace = true }
 exocortex-cache = { workspace = true }
 exocortex-reasoning = { workspace = true }
+exocortex-dreams = { workspace = true }
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
 prost = { workspace = true }
@@ -26,6 +27,7 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 blake3 = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 smol_str = { workspace = true }
 chrono = { workspace = true }
@@ -53,5 +55,4 @@ blake3 = { workspace = true }
 prost = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
 futures = { workspace = true }
-exocortex-dreams = { workspace = true }
 exocortex-reasoning = { workspace = true }

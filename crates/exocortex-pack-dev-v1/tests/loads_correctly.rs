@@ -110,3 +110,26 @@ fn golden_fingerprint_is_pinned() {
         "ontology drift: regenerate the golden file deliberately"
     );
 }
+
+/// W6 (audit): the computed-only marker is a pack declaration consumed
+/// through the ontology — SimilarTo sets it, nothing else does.
+#[test]
+fn computed_only_marker_rides_the_ontology() {
+    let onto = exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap();
+    let similar = onto
+        .kinds_by_id
+        .values()
+        .find(|k| k.display_name == "SimilarTo")
+        .expect("SimilarTo registered");
+    assert!(similar.computed_only, "SimilarTo is computed-only (R-T14)");
+    let others: Vec<_> = onto
+        .kinds_by_id
+        .values()
+        .filter(|k| k.computed_only && k.display_name != "SimilarTo")
+        .map(|k| k.display_name.to_string())
+        .collect();
+    assert!(
+        others.is_empty(),
+        "no other dev-v1 kind is computed-only: {others:?}"
+    );
+}

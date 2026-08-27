@@ -38,12 +38,18 @@ pub struct GraphSnapshot {
     /// The tag interner (R-M4).
     pub interner: std::sync::Arc<lasso::ThreadedRodeo>,
     /// Precomputed lowercase search keys (title + tags), one per node in
-    /// node-index order, packed into ONE contiguous arena for cache-friendly
+    /// arena-append order, packed into ONE contiguous arena for cache-friendly
     /// scans on the read hot path.
     pub search_arena: String,
     /// Byte offset of each key inside `search_arena` (key i spans
-    /// offsets[i]..offsets[i+1] or arena end).
+    /// offsets[i]..offsets[i+1] or arena end), in arena-append order.
     pub search_offsets: Vec<u32>,
+    /// The node each arena key belongs to, parallel to `search_offsets`
+    /// (CR3: keyed by arena slot, resolved to a NodeIndex per entry — never
+    /// assumed to equal the node index, which StableGraph reuses).
+    pub search_nodes: Vec<NodeIndex>,
+    /// Relationship id -> edge index (CR5: upserts replace, deletes O(1)).
+    pub by_rel_id: DashMap<RelationshipId, petgraph::stable_graph::EdgeIndex>,
     /// This client's local WAL frontier.
     pub last_local_lsn: u64,
     /// Backend commits observed so far.
@@ -104,6 +110,8 @@ impl GraphSnapshot {
             interner: Arc::new(lasso::ThreadedRodeo::new()),
             search_arena: String::new(),
             search_offsets: Vec::new(),
+            search_nodes: Vec::new(),
+            by_rel_id: DashMap::new(),
             last_local_lsn: 0,
             last_backend_lsn: 0,
             built_at: chrono::Utc::now(),
@@ -127,7 +135,13 @@ impl GraphSnapshot {
     }
 
     /// Insert a memory (copy-on-write helper); returns the node index.
+    /// CR1 (audit): this is an UPSERT — a re-inserted id replaces the prior
+    /// node instead of adding a parallel one, so stale versions never stay
+    /// searchable and a later delete actually removes the row.
     fn insert_memory(&mut self, m: Memory) -> NodeIndex {
+        if self.by_id.contains_key(&m.id) {
+            self.remove_memory(&m.id);
+        }
         self.est_bytes += Self::estimate(&m);
         for e in &m.context.entities {
             self.by_entity.entry(*e).or_default().push(m.id);
@@ -140,10 +154,14 @@ impl GraphSnapshot {
             let spur = self.interner.get_or_intern(tag.as_str());
             self.by_tag.entry(spur).or_default().union_with_lsb(&m);
         }
+        // CR3: the arena slot records the node it belongs to; StableGraph
+        // may reuse freed node indices, so the slot index is never assumed
+        // to equal the node index.
         self.search_offsets.push(self.search_arena.len() as u32);
         self.search_arena.push_str(&Self::search_key(&m));
         self.search_arena.push(NL);
         let ix = self.petgraph.add_node(m.clone());
+        self.search_nodes.push(ix);
         self.by_id.insert(m.id, ix);
         ix
     }
@@ -163,45 +181,48 @@ impl GraphSnapshot {
                     }
                 }
             }
-            // Blank the removed key in place (arena stays append-only).
-            let from = self.search_offsets.get(ix.index()).copied().unwrap_or(0) as usize;
-            let to = self
-                .search_offsets
-                .get(ix.index() + 1)
-                .copied()
-                .unwrap_or(self.search_arena.len() as u32) as usize;
-            if from < to && to <= self.search_arena.len() {
-                let bytes = unsafe_blank(&mut self.search_arena, from, to);
-                let _ = bytes;
+            // Blank the removed key in place (arena stays append-only). The
+            // slot is found through the CR3 parallel array — the node index
+            // it holds may not equal the slot index.
+            if let Some(slot) = self.search_nodes.iter().position(|n| *n == ix) {
+                let from = self.search_offsets.get(slot).copied().unwrap_or(0) as usize;
+                let to = self
+                    .search_offsets
+                    .get(slot + 1)
+                    .copied()
+                    .unwrap_or(self.search_arena.len() as u32) as usize;
+                if from < to && to <= self.search_arena.len() {
+                    let _ = unsafe_blank(&mut self.search_arena, from, to);
+                }
             }
             self.petgraph.remove_node(ix);
         }
     }
 
     /// Insert a relationship between existing memories.
+    /// CR5 (audit): an UPSERT — a re-upserted RelationshipId replaces the
+    /// prior edge's weight instead of adding a parallel duplicate edge.
     fn insert_relationship(&mut self, r: Relationship) {
         if let (Some(a), Some(b)) = (self.by_id.get(&r.from), self.by_id.get(&r.to)) {
+            if let Some(existing) = self.by_rel_id.get(&r.id) {
+                if let Some(w) = self.petgraph.edge_weight_mut(*existing) {
+                    self.est_bytes = self.est_bytes.saturating_sub(256);
+                    self.est_bytes += 256;
+                    *w = r;
+                    return;
+                }
+            }
             self.est_bytes += 256;
-            self.petgraph.add_edge(*a, *b, r);
+            let eid = self.petgraph.add_edge(*a, *b, r.clone());
+            self.by_rel_id.insert(r.id, eid);
         }
     }
 
     fn remove_relationship(&mut self, id: &RelationshipId) {
-        let mut hit = None;
-        for ix in self.petgraph.node_indices() {
-            for e in self.petgraph.edges(ix) {
-                if e.weight().id == *id {
-                    hit = Some(e.id());
-                    break;
-                }
+        if let Some((_, eid)) = self.by_rel_id.remove(id) {
+            if self.petgraph.remove_edge(eid).is_some() {
+                self.est_bytes = self.est_bytes.saturating_sub(256);
             }
-            if hit.is_some() {
-                break;
-            }
-        }
-        if let Some(eid) = hit {
-            self.petgraph.remove_edge(eid);
-            self.est_bytes = self.est_bytes.saturating_sub(256);
         }
     }
 
@@ -231,19 +252,37 @@ impl GraphSnapshot {
         self.insert_memory(m);
     }
 
+    /// Test/bench support: insert a relationship directly.
+    #[doc(hidden)]
+    pub fn push_test_relationship(&mut self, r: Relationship) {
+        self.insert_relationship(r);
+    }
+
     /// Build a snapshot from storage streams (shared by reseed and tests).
+    /// CR2 (audit): soft-deleted rows never enter the snapshot — a row is
+    /// live only while `valid_until` is unset (or in the future) and it has
+    /// no `invalidated_by`, so a restart cannot resurrect deleted memories
+    /// or Dreams-merged duplicates.
     pub async fn from_storage<S: Storage>(storage: &S) -> Self {
         use futures::StreamExt;
+        let now = chrono::Utc::now();
+        let live = |valid_until: &Option<chrono::DateTime<chrono::Utc>>| {
+            valid_until.is_none_or(|v| v > now)
+        };
         let mut snap = Self::empty();
         let mut ms = storage.stream_all_memories().await;
         while let Some(Ok(m)) = ms.next().await {
-            snap.insert_memory(m);
+            if m.invalidated_by.is_none() && live(&m.valid_until) {
+                snap.insert_memory(m);
+            }
         }
         let mut frontier = 0u64;
         let mut rs = storage.stream_all_relationships().await;
         while let Some(Ok(r)) = rs.next().await {
             frontier = frontier.max(r.lsn.value);
-            snap.insert_relationship(r);
+            if r.invalidated_by.is_none() && live(&r.valid_until) {
+                snap.insert_relationship(r);
+            }
         }
         for m in snap.petgraph.node_weights() {
             frontier = frontier.max(m.lsn.value);
@@ -382,6 +421,7 @@ impl LocalCache {
         let Some(g) = self.graphs.get(&org) else {
             return;
         };
+        let old_bytes = g.load_full().est_bytes;
         let mut next = clone_snapshot(&g.load_full());
         match inv {
             Invalidation::MemoryUpserted { id, lsn } => {
@@ -414,7 +454,18 @@ impl LocalCache {
                 next.last_backend_lsn = next.last_backend_lsn.max(lsn);
             }
         }
+        let new_bytes = next.est_bytes;
         g.store(Arc::new(next));
+        // CR13 (audit): the invalidation path reconciles the 2Q byte
+        // accounting exactly like Reseed does, and re-runs admission so
+        // the budget is enforced on a long-running node (the early returns
+        // in the re-reference branches previously skipped the check).
+        {
+            let mut tq = self.tq.lock();
+            tq.bytes = tq.bytes.saturating_sub(old_bytes);
+            tq.bytes += new_bytes;
+        }
+        self.admit(&org);
     }
 
     fn org_of_write(&self) -> Option<SmolStr> {
@@ -426,33 +477,29 @@ impl LocalCache {
         let mut tq = self.tq.lock();
         if tq.am.contains(org) {
             tq.am.put(org.clone(), ());
-            drop(tq);
             metrics::counter!("exocortex_2q_admission_events_total", "decision" => "promote_am")
                 .increment(1);
-            return;
-        }
-        if tq.a1out.contains(org) {
+        } else if tq.a1out.contains(org) {
             tq.am.put(org.clone(), ());
             tq.a1out.pop(org);
-            drop(tq);
             metrics::counter!("exocortex_2q_admission_events_total", "decision" => "ghost_hit")
                 .increment(1);
-            return;
-        }
-        if tq.a1in.contains(org) {
+        } else if tq.a1in.contains(org) {
             // Re-reference while still in A1in: promote to Am (2Q
             // semantics). This also guarantees repeated publishes never
             // duplicate the A1in entry.
             tq.a1in.retain(|o| o != org);
             tq.am.put(org.clone(), ());
-            drop(tq);
             metrics::counter!("exocortex_2q_admission_events_total", "decision" => "promote_am")
                 .increment(1);
-            return;
+        } else {
+            tq.a1in.push_back(org.clone());
+            metrics::counter!("exocortex_2q_admission_events_total", "decision" => "admit_a1in")
+                .increment(1);
         }
-        tq.a1in.push_back(org.clone());
-        metrics::counter!("exocortex_2q_admission_events_total", "decision" => "admit_a1in")
-            .increment(1);
+        // CR13 (audit): the budget check runs on EVERY admission — a
+        // long-running node whose org is already resident still enforces
+        // the byte budget after invalidations grow the snapshot.
         while tq.bytes > self.budget {
             if let Some(evicted) = tq.a1in.pop_front() {
                 tq.a1out.put(evicted.clone(), ());
@@ -487,6 +534,39 @@ impl LocalCache {
         Some(m)
     }
 
+    /// D10b (§4.10a): the memory that supersedes `id`, when a live
+    /// `Replaces`/`Contradicts` edge points at it. The successor is the
+    /// edge's SOURCE (successor --Replaces--> stale); the auto-registered
+    /// `ReplacedBy` companion (stale --> successor) is checked too, so
+    /// either direction of storage yields the same answer.
+    pub fn superseded_by(
+        &self,
+        org: &str,
+        id: &MemoryId,
+        vc: &VisibilityContext,
+        supersedes_kinds: &[exocortex_kernel::RelKindId],
+    ) -> Option<Memory> {
+        let g = self.graphs.get(org)?;
+        let snap = g.load_full();
+        let node = *snap.by_id.get(id)?;
+        for e in snap
+            .petgraph
+            .edges_directed(node, petgraph::Direction::Incoming)
+        {
+            let er = e.weight();
+            if supersedes_kinds.contains(&er.kind)
+                && (er.visibility as u8) <= (vc.max_visibility as u8)
+            {
+                if let Some(m) = snap.petgraph.node_weight(e.source()) {
+                    if snap.visible(m, vc) {
+                        return Some(m.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Bounded BFS traversal over the snapshot (§8.4).
     pub fn traverse(&self, org: &str, from: &MemoryId, spec: &TraversalSpec) -> Vec<Memory> {
         let Some(g) = self.graphs.get(org) else {
@@ -503,29 +583,44 @@ impl LocalCache {
             if out.len() >= spec.max_nodes as usize {
                 break;
             }
-            for e in snap.petgraph.edges(n) {
-                let er = e.weight();
+            // CR4 (audit): the iterator follows the spec's direction — the
+            // old code only ever walked outgoing edges, so `In` always
+            // returned empty and `Both` was textually `Out`. The hop takes
+            // the endpoint that is not `n`.
+            let mut visit = |other: petgraph::stable_graph::NodeIndex,
+                             er: &exocortex_kernel::Relationship| {
                 if !spec.kinds.is_empty() && !spec.kinds.contains(&er.kind) {
-                    continue;
+                    return;
                 }
                 if er.visibility as u8 > spec.visibility_ctx.max_visibility as u8 {
-                    continue;
+                    return;
                 }
-                let dst = match spec.direction {
-                    Direction::Out => e.target(),
-                    Direction::In => e.source(),
-                    Direction::Both => e.target(),
-                };
-                if !seen.insert(dst) {
-                    continue;
+                if !seen.insert(other) {
+                    return;
                 }
-                if let Some(m) = snap.petgraph.node_weight(dst) {
+                if let Some(m) = snap.petgraph.node_weight(other) {
                     if snap.visible(m, &spec.visibility_ctx) {
                         out.push(m.clone());
                     }
                 }
                 if d + 1 < spec.max_depth {
-                    queue.push_back((dst, d + 1));
+                    queue.push_back((other, d + 1));
+                }
+            };
+            if matches!(spec.direction, Direction::Out | Direction::Both) {
+                for e in snap
+                    .petgraph
+                    .edges_directed(n, petgraph::Direction::Outgoing)
+                {
+                    visit(e.target(), e.weight());
+                }
+            }
+            if matches!(spec.direction, Direction::In | Direction::Both) {
+                for e in snap
+                    .petgraph
+                    .edges_directed(n, petgraph::Direction::Incoming)
+                {
+                    visit(e.source(), e.weight());
                 }
             }
         }
@@ -558,22 +653,35 @@ impl LocalCache {
         }
         let arena = snap.search_arena.as_str();
         let offsets = &snap.search_offsets;
+        let nodes = &snap.search_nodes;
         let mut from = 0usize;
         let mut last_idx: Option<usize> = None;
         while let Some(rel) = arena[from..].find(q.as_str()) {
             let pos = from + rel;
-            let idx = match offsets.binary_search(&(pos as u32)) {
+            let slot = match offsets.binary_search(&(pos as u32)) {
                 Ok(i) => i,
                 Err(i) => i.saturating_sub(1),
             };
-            if last_idx != Some(idx) {
-                last_idx = Some(idx);
-                let ix = NodeIndex::new(idx);
+            if last_idx != Some(slot) {
+                last_idx = Some(slot);
+                // CR3: resolve the arena slot to its node through the
+                // parallel array — the slot index is not the node index.
+                let Some(&ix) = nodes.get(slot) else {
+                    from = pos + q.len();
+                    if from >= arena.len() {
+                        break;
+                    }
+                    continue;
+                };
                 if let Some(m) = snap.petgraph.node_weight(ix) {
                     if snap.visible(m, vc) {
                         // §14.1: base match + explicit relationship count *
                         // 0.30 + Σ inferred confidence * 0.15 + importance *
-                        // 0.50 + recency 0.10.
+                        // 0.50 + recency 0.10. CR10 (audit): only Asserted
+                        // edges are explicit; Derived/Computed/Extracted all
+                        // count as inferred, weighted by confidence, so a
+                        // Dreams SimilarTo pass cannot masquerade as human
+                        // assertions at 0.30 each.
                         let mut explicit = 0.0f32;
                         let mut inferred = 0.0f32;
                         for e in snap
@@ -581,11 +689,18 @@ impl LocalCache {
                             .edges_directed(ix, petgraph::Direction::Outgoing)
                         {
                             let er = e.weight();
-                            if matches!(er.provenance, exocortex_kernel::Provenance::Derived { .. })
-                            {
-                                inferred += er.properties.confidence * 0.15;
-                            } else {
-                                explicit += 1.0;
+                            match &er.provenance {
+                                exocortex_kernel::Provenance::Asserted { .. } => explicit += 1.0,
+                                exocortex_kernel::Provenance::Derived { .. }
+                                | exocortex_kernel::Provenance::Computed { .. }
+                                | exocortex_kernel::Provenance::Extracted { .. } => {
+                                    inferred += er.properties.confidence * 0.15
+                                }
+                                // Never persists (R-T16); counted as nothing.
+                                exocortex_kernel::Provenance::Proposed { .. }
+                                | exocortex_kernel::Provenance::ExternalSnapshot(_) => {
+                                    explicit += 1.0
+                                }
                             }
                         }
                         let age_days = (now - m.recorded_at).num_days().max(0) as f32;
@@ -655,6 +770,21 @@ impl LocalCache {
         self.admit(&org.into());
     }
 
+    /// CL6 (audit): advance the served snapshot's local WAL frontier so
+    /// the R-M7 read stamp (`snapshot_version.local_lsn`) reflects offline
+    /// writes. Readers polling `local_lsn >= n` for read-your-writes now
+    /// observe the value the offline ack handed back.
+    pub fn advance_local_lsn(&self, org: &str, local_lsn: u64) {
+        if let Some(g) = self.graphs.get(org) {
+            let cur = g.load_full();
+            if local_lsn > cur.last_local_lsn {
+                let mut next = clone_snapshot(&cur);
+                next.last_local_lsn = local_lsn;
+                g.store(Arc::new(next));
+            }
+        }
+    }
+
     /// Submit a writer message (tests + client wiring).
     pub async fn submit(&self, w: CacheWrite) {
         let _ = self.writer.send(w).await;
@@ -709,6 +839,8 @@ fn clone_snapshot(src: &GraphSnapshot) -> GraphSnapshot {
         interner: src.interner.clone(),
         search_arena: src.search_arena.clone(),
         search_offsets: src.search_offsets.clone(),
+        search_nodes: src.search_nodes.clone(),
+        by_rel_id: src.by_rel_id.clone(),
         last_local_lsn: src.last_local_lsn,
         last_backend_lsn: src.last_backend_lsn,
         built_at: chrono::Utc::now(),

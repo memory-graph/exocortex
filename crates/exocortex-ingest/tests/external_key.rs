@@ -10,7 +10,7 @@ use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{InMemoryStorage, Storage};
 use exocortex_wire::ingest::v1::{
     ingest_service_server::IngestService, ExternalKey, ExternalSnapshotInfo, IngestBatch,
-    MemoryDraft, ProducerIdentity, RegisterSourceRequest, RejectCode,
+    MemoryDraft, ProducerIdentity, RejectCode,
 };
 
 fn server() -> IngestServer<InMemoryStorage> {
@@ -71,18 +71,23 @@ fn batch(snapshot: &ExternalSnapshotInfo, memories: Vec<MemoryDraft>) -> IngestB
             agent_id: String::new(),
             adapter_id: String::new(),
             hmac_signature: vec![],
+
+            client_metadata: None,
         }),
     })
 }
 
 async fn registered(srv: &IngestServer<InMemoryStorage>) {
-    srv.register_source(tonic::Request::new(RegisterSourceRequest {
-        org_id: "org".into(),
-        source_uri: "iceberg://cat/db/orders".into(),
-        producer_id: "external-sync".into(),
-        ceiling: 3,
-        source_flavor: "external".into(),
-    }))
+    srv.register_source(tonic::Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "iceberg://cat/db/orders",
+        "external-sync",
+        3,
+        "external",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    )))
     .await
     .unwrap();
 }
@@ -312,15 +317,18 @@ async fn pinned_org_rejects_foreign_batches() {
         ack.rejections
     );
 
-    // Foreign registration errors.
+    // Foreign registration errors (signed, so the org guard is what fires).
     let err = srv
-        .register_source(tonic::Request::new(RegisterSourceRequest {
-            org_id: "evil-org".into(),
-            source_uri: "custom://x".into(),
-            producer_id: "p".into(),
-            ceiling: 3,
-            source_flavor: "custom".into(),
-        }))
+        .register_source(tonic::Request::new(exocortex_wire::signing::registration(
+            &[5u8; 32],
+            "evil-org",
+            "custom://x",
+            "p",
+            3,
+            "custom",
+            "test-node",
+            exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+        )))
         .await;
     assert!(err.is_err(), "foreign org registration rejected");
 

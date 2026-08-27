@@ -11,7 +11,7 @@ use exocortex_kernel::Ontology;
 use exocortex_storage::{InMemoryStorage, Storage};
 use exocortex_wire::ingest::v1::{
     ingest_service_client::IngestServiceClient, ExternalKey, ExternalSnapshotInfo, IngestBatch,
-    MemoryDraft, ProducerIdentity, RegisterSourceRequest,
+    MemoryDraft, ProducerIdentity,
 };
 
 use exocortex_cache::LocalCache;
@@ -91,6 +91,8 @@ fn ext_batch(fp: [u8; 32], snapshot: &str, key: &str, title: &str) -> IngestBatc
             agent_id: String::new(),
             adapter_id: String::new(),
             hmac_signature: vec![],
+
+            client_metadata: None,
         }),
     })
 }
@@ -116,6 +118,8 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
 
     let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
     cfg.backoff = std::time::Duration::from_millis(50);
+    // CS1: /v1/changes sits behind the same bearer layer as the op surface.
+    cfg.bearer = Some("e2e-bearer".into());
     cfg.client_token = Some("e2e-bearer".into());
     cfg.client_key = Some(exocortex_server::sse::derive_client_sse_key(
         &HMAC_KEY,
@@ -130,13 +134,16 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
         .await
         .unwrap();
     client
-        .register_source(RegisterSourceRequest {
-            org_id: "org".into(),
-            source_uri: "session://e2e".into(),
-            producer_id: "session-wrapup".into(),
-            ceiling: 3,
-            source_flavor: "session".into(),
-        })
+        .register_source(exocortex_wire::signing::registration(
+            &HMAC_KEY,
+            "org",
+            "session://e2e",
+            "session-wrapup",
+            3,
+            "session",
+            "n",
+            exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+        ))
         .await
         .unwrap();
 
@@ -171,10 +178,13 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
             agent_id: "a".into(),
             adapter_id: String::new(),
             hmac_signature: vec![],
+
+            client_metadata: None,
         }),
     };
     let ack = client.submit(signed(b.clone())).await.unwrap().into_inner();
-    assert_eq!(ack.accepted, 1, "batch accepted over gRPC: {ack:?}");
+    // D6: memory + InSession + companion.
+    assert_eq!(ack.accepted, 3, "batch accepted over gRPC: {ack:?}");
 
     // The committed id: derive from the storage stream (single memory).
     let committed = {
@@ -213,24 +223,32 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
     );
 }
 
-/// R-T16a (§7.9 / §23 #27): the two-sync failure mode — the same source
-/// row re-synced under a NEW snapshot_id yields ADDITIONAL assertions,
-/// never overwrites, so bi-temporality survives source mutation.
+/// R-T16a under the shipped identity contract (B8/B9: external identity
+/// is (org, source, table_uuid, logical_pk, mapping_version); snapshot id
+/// and hash ride PROVENANCE, not identity). A re-sync of the same row
+/// under a new snapshot upserts the SAME id with the new snapshot stamped
+/// — one current row, never a duplicate — while a different logical_pk is
+/// a genuinely new assertion that appends. (The old "two rows" assertion
+/// passed only against the double's version stack, a model the Falkor
+/// backend does not have — audit ST7/ST8.)
 #[tokio::test(flavor = "multi_thread")]
-async fn two_sync_snapshot_bump_appends_not_overwrites() {
+async fn two_sync_snapshot_bump_upserts_same_row_new_pk_appends() {
     let (node, storage, onto, addr) = boot().await;
     let _keepalive = node;
     let mut client = IngestServiceClient::connect(format!("http://{addr}"))
         .await
         .unwrap();
     client
-        .register_source(RegisterSourceRequest {
-            org_id: "org".into(),
-            source_uri: "iceberg://warehouse/orders".into(),
-            producer_id: "external-sync".into(),
-            ceiling: 3,
-            source_flavor: "external".into(),
-        })
+        .register_source(exocortex_wire::signing::registration(
+            &HMAC_KEY,
+            "org",
+            "iceberg://warehouse/orders",
+            "external-sync",
+            3,
+            "external",
+            "n",
+            exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+        ))
         .await
         .unwrap();
 
@@ -252,7 +270,16 @@ async fn two_sync_snapshot_bump_appends_not_overwrites() {
     let ack2 = client.submit(s2).await.unwrap().into_inner();
     assert_eq!(ack2.accepted, 1, "second sync lands: {ack2:?}");
 
-    // BOTH assertions exist as distinct rows (identity forks on snapshot).
+    // A different row is a genuinely new assertion.
+    let s3 = ext_batch(
+        onto.fingerprint.0,
+        "s2",
+        "order-8",
+        "payments owned by team-platform",
+    );
+    let ack3 = client.submit(s3).await.unwrap().into_inner();
+    assert_eq!(ack3.accepted, 1, "new logical_pk appends: {ack3:?}");
+
     use futures::StreamExt;
     let mut ms = storage.stream_all_memories().await;
     let mut rows = Vec::new();
@@ -261,14 +288,26 @@ async fn two_sync_snapshot_bump_appends_not_overwrites() {
             rows.push(m);
         }
     }
+    // order-7 exists ONCE (upserted in place, newest content) and order-8
+    // exists as its own row.
+    assert_eq!(rows.len(), 2, "one row per external key: {rows:?}");
+    let order7 = rows
+        .iter()
+        .find(|m| matches!(&m.provenance, exocortex_kernel::Provenance::ExternalSnapshot(e) if e.external_key.logical_pk.as_slice() == b"order-7"))
+        .expect("order-7 row present");
     assert_eq!(
-        rows.len(),
-        2,
-        "R-T16a: two-sync appends both assertions: {rows:?}"
+        order7.title, "payments owned by team-platform",
+        "same-key re-sync upserts the current content"
     );
-    let titles: Vec<_> = rows.iter().map(|m| m.title.to_string()).collect();
-    assert!(titles.contains(&"payments owned by team-payments".to_string()));
-    assert!(titles.contains(&"payments owned by team-platform".to_string()));
+    let snap = match &order7.provenance {
+        exocortex_kernel::Provenance::ExternalSnapshot(e) => e,
+        other => panic!("external provenance, got {other:?}"),
+    };
+    assert_eq!(
+        snap.snapshot_id.as_str(),
+        "s2",
+        "provenance carries the LATEST snapshot id"
+    );
 }
 
 /// Deterministic test memory (fixed id from `n`).
@@ -282,7 +321,10 @@ fn test_mem(title: &str, n: u8) -> exocortex_kernel::Memory {
         summary: None,
         tags: Default::default(),
         visibility: Visibility::Org,
-        provenance: Provenance::Asserted { author: "t".into() },
+        provenance: Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
         context: MemoryContext {
             timestamp: chrono::Utc::now(),
             project_id: None,

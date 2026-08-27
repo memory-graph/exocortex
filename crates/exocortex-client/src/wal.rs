@@ -40,6 +40,20 @@ pub struct WalEntry {
     pub memory_ids: Vec<MemoryId>,
     /// Current state.
     pub state: WalState,
+    /// Stable batch id (W1/IN7): derived from the CONTENT at append time,
+    /// so a drain retry hits the server's (producer_id, batch_id)
+    /// idempotency entry instead of double-committing. Older entries
+    /// without one derive it at drain time.
+    #[serde(default)]
+    pub batch_id: String,
+    /// Draft keys parallel to `memories` (W1: needed to rebuild edge
+    /// references on drain).
+    #[serde(default)]
+    pub draft_keys: Vec<String>,
+    /// Tags parallel to `memories` (CL1: the offline path must not
+    /// silently drop the harness-supplied tags before they are durable).
+    #[serde(default)]
+    pub tags: Vec<Vec<String>>,
 }
 
 /// Errors surfaced by the WAL.
@@ -55,6 +69,24 @@ pub enum WalError {
 
 /// The `wal_max_bytes` default (§16: 100 MB).
 pub const WAL_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+/// One `--tail-audit` row (D5): the developer-facing projection of a WAL
+/// entry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TailRow {
+    /// The entry's local LSN.
+    pub local_lsn: u64,
+    /// When it was written (first draft's context timestamp).
+    pub recorded_at: String,
+    /// Still Pending (not yet drained to a backend).
+    pub pending: bool,
+    /// Stable batch id (IN7).
+    pub batch_id: String,
+    /// Drafts in the batch.
+    pub memory_count: usize,
+    /// Their producer-local keys.
+    pub draft_keys: Vec<String>,
+}
 
 /// Sled-backed write-ahead log.
 pub struct Wal {
@@ -101,6 +133,27 @@ impl Wal {
         memories: Vec<MemoryDraft>,
         memory_ids: Vec<MemoryId>,
     ) -> Result<u64, WalError> {
+        self.append_batch_full(
+            session_id,
+            memories,
+            memory_ids,
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    /// Append with the stable batch id and the rebuild inputs the drain
+    /// needs (draft keys + tags; W1/IN7/CL1).
+    pub fn append_batch_full(
+        &self,
+        session_id: &str,
+        memories: Vec<MemoryDraft>,
+        memory_ids: Vec<MemoryId>,
+        batch_id: String,
+        draft_keys: Vec<String>,
+        tags: Vec<Vec<String>>,
+    ) -> Result<u64, WalError> {
         let local_lsn = self
             .tree
             .last()
@@ -117,6 +170,9 @@ impl Wal {
             memories,
             memory_ids,
             state: WalState::Pending,
+            batch_id,
+            draft_keys,
+            tags,
         };
         let bytes = encode_entry(&entry).map_err(WalError::Io)?;
         if self.used_bytes() + bytes.len() as u64 > self.max_bytes {
@@ -149,6 +205,55 @@ impl Wal {
             .filter_map(|v| decode_entry(&v).ok())
             .filter(|e| e.state == WalState::Pending)
             .count()
+    }
+
+    /// Every `Pending` entry in local-LSN order (W1: the drain input).
+    pub fn pending_entries(&self) -> Vec<WalEntry> {
+        self.tree
+            .iter()
+            .values()
+            .flatten()
+            .filter_map(|v| decode_entry(&v).ok())
+            .filter(|e| e.state == WalState::Pending)
+            .collect()
+    }
+
+    /// D5 `--tail-audit`: the N most recent entries (newest first),
+    /// pending + settled, with the fields a developer scanning "did my
+    /// wrapup fire?" needs. Undecodable entries are listed by LSN rather
+    /// than skipped (W-audit-§2.5: errors that erase themselves).
+    pub fn tail(&self, n: usize) -> Vec<TailRow> {
+        let mut rows: Vec<TailRow> = Vec::new();
+        for item in self.tree.iter().rev() {
+            if rows.len() >= n {
+                break;
+            }
+            let Ok((k, v)) = item else { continue };
+            let lsn = u64::from_be_bytes(k.as_ref().try_into().unwrap_or([0u8; 8]));
+            match decode_entry(&v) {
+                Ok(e) => rows.push(TailRow {
+                    local_lsn: lsn,
+                    recorded_at: e
+                        .memories
+                        .first()
+                        .map(|m| m.context.timestamp.to_rfc3339())
+                        .unwrap_or_else(|| "unknown".into()),
+                    pending: e.state == WalState::Pending,
+                    batch_id: e.batch_id,
+                    memory_count: e.memories.len(),
+                    draft_keys: e.draft_keys,
+                }),
+                Err(err) => rows.push(TailRow {
+                    local_lsn: lsn,
+                    recorded_at: "undecodable".into(),
+                    pending: true,
+                    batch_id: format!("decode error: {err}"),
+                    memory_count: 0,
+                    draft_keys: vec![],
+                }),
+            }
+        }
+        rows
     }
 
     /// Transition an entry Pending -> Synced (R-M11).
@@ -198,6 +303,20 @@ fn decode_entry(bytes: &[u8]) -> Result<WalEntry, String> {
     }
     let json = bytes.get(5..).ok_or("short wal entry")?;
     serde_json::from_slice(json).map_err(|x| x.to_string())
+}
+
+impl Wal {
+    /// Test-only: every entry's (local_lsn, state) in LSN order.
+    #[doc(hidden)]
+    pub fn states_for_test(&self) -> Vec<(u64, WalState)> {
+        self.tree
+            .iter()
+            .values()
+            .flatten()
+            .filter_map(|v| decode_entry(&v).ok())
+            .map(|e| (e.local_lsn, e.state))
+            .collect()
+    }
 }
 
 #[cfg(test)]

@@ -111,22 +111,29 @@ pub async fn audit_range(
         read_only: true,
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
     };
-    if let Ok(rs) = ctx.storage.query_cypher(&q).await {
-        if !rs.rows.is_empty() {
-            return Ok(rs.rows);
+    // IN12 (audit): a storage ERROR propagates — silently substituting the
+    // process-local ledger presented an incomplete range as authoritative
+    // with HTTP 200. An `Ok` empty result IS authoritative (nothing in
+    // range); the volatile ledger only answers for non-Falkor backends.
+    match ctx.storage.query_cypher(&q).await {
+        Ok(rs) => Ok(rs.rows),
+        Err(exocortex_storage::StorageError::Backend(_)) => {
+            // The double (InMemoryStorage) does not implement Cypher —
+            // fall through to the volatile ledger there.
+            let ledger = LEDGER.lock().unwrap();
+            Ok(ledger
+                .as_ref()
+                .and_then(|m| m.get(org))
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|r| r.lsn > since_lsn)
+                        .map(|r| serde_json::to_value(r).unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default())
         }
+        Err(e) => Err(crate::OpError::Storage(e.to_string())),
     }
-    let ledger = LEDGER.lock().unwrap();
-    Ok(ledger
-        .as_ref()
-        .and_then(|m| m.get(org))
-        .map(|rows| {
-            rows.iter()
-                .filter(|r| r.lsn > since_lsn)
-                .map(|r| serde_json::to_value(r).unwrap_or_default())
-                .collect()
-        })
-        .unwrap_or_default())
 }
 
 use std::collections::HashMap;

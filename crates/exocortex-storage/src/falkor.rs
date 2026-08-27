@@ -167,6 +167,17 @@ fn unhex(s: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
+/// R-T11 (audit ST3): v1 read paths treat `Public` as `Org`, so an
+/// Org-or-wider caller fetches at the widest internal ceiling; narrower
+/// callers fetch at their own scope.
+fn fetch_ceiling(max: Visibility) -> u8 {
+    if max >= Visibility::Org {
+        Visibility::Public as u8
+    } else {
+        max as u8
+    }
+}
+
 impl FalkorStorage {
     /// Connect, then pin the ontology fingerprint (fail fast on mismatch,
     /// R-D5).
@@ -443,6 +454,203 @@ impl FalkorStorage {
             edge_id,
         })
     }
+
+    /// Build the fully-substituted, parameterized text for one template
+    /// (same substitution rules as `run_template`) WITHOUT executing it —
+    /// the batch path queues these inside one MULTI/EXEC.
+    fn build_query_text(
+        &self,
+        template_id: &str,
+        params: &serde_json::Value,
+    ) -> Result<String, StorageError> {
+        let t = cypher::TEMPLATES.get(template_id).ok_or_else(|| {
+            StorageError::Backend(format!("unregistered cypher template: {template_id}"))
+        })?;
+        let map = params_to_map(params)?;
+        let mut text = t.cypher.to_string();
+        if let Some(depth) = params.get("max_depth").and_then(|v| v.as_u64()) {
+            text = text.replace("$max_depth", &format!("{depth}"));
+        }
+        if let Some(kind) = params.get("kind_label").and_then(|v| v.as_str()) {
+            if !self
+                .ontology
+                .kinds_by_id
+                .values()
+                .any(|k| k.display_name == kind)
+            {
+                return Err(StorageError::Backend(
+                    "kind_label not in ontology allowlist".into(),
+                ));
+            }
+            text = text.replace("__KIND_TYPE__", kind);
+        }
+        if map.is_empty() {
+            Ok(text)
+        } else {
+            let kv: Vec<String> = map.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            Ok(format!("CYPHER {} {}", kv.join(" "), text))
+        }
+    }
+
+    /// Allocate a contiguous block of `n` LSNs. When `lease` is present
+    /// the allocation itself is fenced (ST5): an atomic Lua gate on the
+    /// lease token + TTL — without a passing gate no row in the batch can
+    /// obtain an LSN, so a stale owner cannot commit.
+    async fn next_lsn_block(
+        &self,
+        n: usize,
+        lease: Option<&OwnerLease>,
+    ) -> Result<std::ops::Range<u64>, StorageError> {
+        if n == 0 {
+            return Ok(0..0);
+        }
+        let start = match lease {
+            None => {
+                let s: u64 = self
+                    .redis
+                    .clone()
+                    .incr(&self.lsn_key, n as u64)
+                    .await
+                    .map_err(|e| StorageError::Backend(e.to_string()))?;
+                s + 1 - n as u64
+            }
+            Some(lease) => {
+                let key_str = serde_json::to_string(&lease.key).unwrap();
+                let redis_key = format!("exocortex:lease:{key_str}");
+                let end: i64 = redis::Script::new(
+                    r#"
+                    if redis.call('GET', KEYS[2]) == ARGV[1]
+                       and redis.call('TTL', KEYS[2]) > 0 then
+                        return redis.call('INCRBY', KEYS[1], ARGV[2])
+                    else
+                        return -1
+                    end
+                    "#,
+                )
+                .key(&self.lsn_key)
+                .key(&redis_key)
+                .arg(lease.fencing_token.as_str())
+                .arg(n as i64)
+                .invoke_async(&mut self.redis.clone())
+                .await
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+                if end < 0 {
+                    return Err(StorageError::FencedWriteRejected {
+                        lease_epoch: lease.epoch,
+                    });
+                }
+                end as u64 + 1 - n as u64
+            }
+        };
+        Ok(start..start + n as u64)
+    }
+
+    /// The transactional batch (ST6): every row — memories, relationships,
+    /// and their R-T4 inverse companions — commits inside ONE MULTI/EXEC
+    /// over the FalkorDB Redis connection, so a mid-batch connection
+    /// failure rolls the whole batch back instead of leaving a partial
+    /// commit. LSNs are block-allocated up front.
+    async fn upsert_batch_inner(
+        &self,
+        ms: &[Memory],
+        rs: &[Relationship],
+        lease: Option<&OwnerLease>,
+    ) -> Result<Vec<CommitRecord>, StorageError> {
+        // R-T4 inverse companions join the same transaction.
+        let mut all_rels: Vec<Relationship> = Vec::with_capacity(rs.len() * 2);
+        let mut seen: std::collections::HashSet<RelationshipId> = rs.iter().map(|r| r.id).collect();
+        for r in rs {
+            all_rels.push(r.clone());
+            if let Some(inv) = exocortex_kernel::materialize_inverse(&self.ontology, r) {
+                if seen.insert(inv.id) {
+                    all_rels.push(inv);
+                }
+            }
+        }
+
+        let total = ms.len() + all_rels.len();
+        let block = self.next_lsn_block(total, lease).await?;
+        let now = Utc::now();
+
+        let mut queries = Vec::with_capacity(total);
+        let mut records = Vec::with_capacity(total);
+        let mut invalidations = Vec::with_capacity(total);
+        let mut next = block.start;
+
+        for m in ms {
+            let mt_label = self
+                .ontology
+                .memory_type_names
+                .get(m.memory_type as usize)
+                .ok_or_else(|| {
+                    StorageError::Backend(format!("bad memory_type {}", m.memory_type))
+                })?;
+            let params = self.memory_params(m, next, mt_label);
+            queries.push(self.build_query_text("upsert_memory", &params)?);
+            invalidations.push(Invalidation::MemoryUpserted {
+                id: m.id,
+                lsn: next,
+            });
+            records.push(CommitRecord {
+                lsn: next,
+                committed_at: now,
+                node_id: None,
+                edge_id: None,
+            });
+            next += 1;
+        }
+        for r in &all_rels {
+            let kind_label = self.kind_label(r.kind)?;
+            let params = serde_json::json!({
+                "rel_id": hex(&r.id.0),
+                "from": hex(&r.from.0),
+                "to": hex(&r.to.0),
+                "kind_label": kind_label,
+                "props_json": FalkorStorage::props_json(r, next),
+                "visibility": r.visibility as u8,
+                "valid_from": r.valid_from.to_rfc3339(),
+                "valid_until": r.valid_until.map(|t| t.to_rfc3339()),
+                "invalidated_by": r.invalidated_by.map(|id| hex(&id.0)),
+                "recorded_at": r.recorded_at.to_rfc3339(),
+                "lsn": next,
+            });
+            queries.push(self.build_query_text("upsert_relationship", &params)?);
+            invalidations.push(Invalidation::RelationshipUpserted {
+                id: r.id,
+                from: r.from,
+                to: r.to,
+                kind: r.kind,
+                lsn: next,
+            });
+            records.push(CommitRecord {
+                lsn: next,
+                committed_at: now,
+                node_id: None,
+                edge_id: None,
+            });
+            next += 1;
+        }
+
+        if !queries.is_empty() {
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            for q in &queries {
+                pipe.cmd("GRAPH.QUERY")
+                    .arg(&self.graph)
+                    .arg(q)
+                    .arg("--compact");
+            }
+            let _: Vec<i64> = pipe
+                .query_async(&mut self.redis.clone())
+                .await
+                .map_err(|e| StorageError::Backend(format!("batch commit failed: {e}")))?;
+        }
+
+        for inv in invalidations {
+            self.publish(inv).await;
+        }
+        Ok(records)
+    }
 }
 
 #[async_trait]
@@ -480,24 +688,26 @@ impl Storage for FalkorStorage {
         ms: &[Memory],
         rs: &[Relationship],
     ) -> Result<Vec<CommitRecord>, StorageError> {
-        // Single FalkorDB transaction: MULTI/EXEC over the FalkorDB Redis
-        // connection. On any per-row failure, the whole batch rolls back.
-        let mut out = Vec::with_capacity(ms.len() + rs.len());
-        for m in ms {
-            out.push(self.upsert_memory(m).await?);
-        }
-        for r in rs {
-            out.push(self.upsert_relationship(r).await?);
-        }
-        Ok(out)
+        self.upsert_batch_inner(ms, rs, None).await
     }
 
     async fn delete_memory(&self, id: &MemoryId) -> Result<CommitRecord, StorageError> {
         // Soft delete: set `valid_until = now()`; do not remove the node.
         let lsn = self.next_lsn().await?;
         let now = Utc::now();
+        // ST1 (audit): rewrite the serialized row too — every read path
+        // reconstructs the Memory from props_json, so the node properties
+        // and the row can never disagree.
+        let props_json = match self.get_memory(id).await? {
+            Some(mut m) => {
+                m.valid_until = Some(now);
+                FalkorStorage::props_json(&m, lsn)
+            }
+            None => String::new(),
+        };
         let params = serde_json::json!({
             "id": hex(&id.0), "now": now.to_rfc3339(), "lsn": lsn,
+            "props_json": props_json,
         });
         self.run_template("soft_delete_memory", &params, false)
             .await?;
@@ -525,11 +735,54 @@ impl Storage for FalkorStorage {
     async fn delete_relationship(&self, id: &RelationshipId) -> Result<CommitRecord, StorageError> {
         let lsn = self.next_lsn().await?;
         let now = Utc::now();
+        // ST9 (audit): fetch by id (untyped match — the adapter never
+        // creates `:RELATES` edges), patch the serialized row, and error
+        // when no live row matched instead of reporting a successful no-op.
+        let params = serde_json::json!({
+            "rel_id": hex(&id.0),
+        });
+        let rows = self
+            .run_template("get_relationship_by_id", &params, true)
+            .await?;
+        let props = rows.first().and_then(|r| r.first()).and_then(|v| match v {
+            FalkorValue::Edge(e) => e.properties.get("props_json").cloned(),
+            _ => None,
+        });
+        let live = props
+            .as_ref()
+            .map(|p| !matches!(p, FalkorValue::None))
+            .unwrap_or(false);
+        if !live {
+            return Err(StorageError::Backend(format!(
+                "delete_relationship: {} not found",
+                hex(&id.0)
+            )));
+        }
+        let FalkorValue::String(json_str) = props.expect("live implies string props_json") else {
+            return Err(StorageError::Backend("bad rel props_json".into()));
+        };
+        let mut r: Relationship = serde_json::from_str(&json_str)
+            .map_err(|e| StorageError::Backend(format!("bad rel props_json: {e}")))?;
+        if r.valid_until.is_some() {
+            return Err(StorageError::Backend(format!(
+                "delete_relationship: {} already closed",
+                hex(&id.0)
+            )));
+        }
+        r.valid_until = Some(now);
         let params = serde_json::json!({
             "rel_id": hex(&id.0), "now": now.to_rfc3339(), "lsn": lsn,
+            "props_json": FalkorStorage::props_json(&r, lsn),
         });
-        self.run_template("soft_delete_relationship", &params, false)
+        let rows = self
+            .run_template("soft_delete_relationship", &params, false)
             .await?;
+        if rows.is_empty() {
+            return Err(StorageError::Backend(format!(
+                "delete_relationship: {} not found",
+                hex(&id.0)
+            )));
+        }
         self.publish(Invalidation::RelationshipDeleted { id: *id, lsn })
             .await;
         Ok(CommitRecord {
@@ -541,9 +794,12 @@ impl Storage for FalkorStorage {
     }
 
     async fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>, StorageError> {
+        // R-T11 (audit ST3): `Public` is treated as `Org` on v1 read paths —
+        // fetch at the widest internal ceiling so a Public row is readable
+        // instead of invisible.
         let params = serde_json::json!({
             "id": hex(&id.0),
-            "max_visibility": Visibility::Org as u8,
+            "max_visibility": Visibility::Public as u8,
         });
         let rows = self.run_template("get_memory_by_id", &params, true).await?;
         match rows.first().and_then(|r| r.first()) {
@@ -556,18 +812,25 @@ impl Storage for FalkorStorage {
         id: &MemoryId,
         vc: &crate::VisibilityContext,
     ) -> Result<Option<Memory>, StorageError> {
-        // Template filters at the caller's ceiling; the Private-authorship
-        // resolution (§17.2) re-checks above the seam.
+        // ST4 (audit): fetch at the widest internal ceiling and apply the
+        // visibility decision in Rust — an existing-but-forbidden row is
+        // PermissionDenied (R-MT4), never a silent None.
         let params = serde_json::json!({
             "id": hex(&id.0),
-            "max_visibility": vc.max_visibility as u8,
+            "max_visibility": Visibility::Public as u8,
         });
         let rows = self.run_template("get_memory_by_id", &params, true).await?;
         match rows.first().and_then(|r| r.first()) {
             Some(v) if !matches!(v, FalkorValue::None) => {
                 let m = memory_from_value(v)?;
-                if m.visibility == Visibility::Private
-                    && m.context.user_id.as_deref() != Some(vc.user_id.as_str())
+                // R-T11: a Public row reads as Org for scope decisions.
+                let effective = match m.visibility {
+                    Visibility::Public => Visibility::Org,
+                    other => other,
+                };
+                if effective > vc.max_visibility
+                    || (m.visibility == Visibility::Private
+                        && m.context.user_id.as_deref() != Some(vc.user_id.as_str()))
                 {
                     return Err(StorageError::PermissionDenied);
                 }
@@ -607,7 +870,9 @@ impl Storage for FalkorStorage {
         let params = serde_json::json!({
             "from": hex(&from.0), "kind_labels": kinds,
             "max_depth": spec.max_depth, "max_nodes": spec.max_nodes,
-            "max_visibility": spec.visibility_ctx.max_visibility as u8,
+            // R-T11: Public reads as Org, so an Org-scoped traversal fetches
+            // at the widest internal ceiling (ST3 parity with the double).
+            "max_visibility": fetch_ceiling(spec.visibility_ctx.max_visibility),
         });
         let rows = self.run_template("traverse_bounded", &params, true).await?;
         let mut out: Vec<Memory> = Vec::new();
@@ -634,7 +899,7 @@ impl Storage for FalkorStorage {
         }
         let params = serde_json::json!({
             "entity_id": hex(&entity.0), "limit": filter.limit,
-            "max_visibility": filter.visibility_ctx.max_visibility as u8,
+            "max_visibility": fetch_ceiling(filter.visibility_ctx.max_visibility),
         });
         let rows = self.run_template("find_by_entity", &params, true).await?;
         let mut out = Vec::new();
@@ -650,7 +915,7 @@ impl Storage for FalkorStorage {
 
     async fn get_state_at(&self, t: DateTime<Utc>) -> Result<GraphSnapshot, StorageError> {
         let params = serde_json::json!({
-            "at": t.to_rfc3339(), "max_visibility": Visibility::Org as u8,
+            "at": t.to_rfc3339(), "max_visibility": Visibility::Public as u8,
         });
         let mem_rows = self.run_template("count_state_at", &params, true).await?;
         let rel_rows = self
@@ -683,7 +948,7 @@ impl Storage for FalkorStorage {
     ) -> Result<Option<Memory>, StorageError> {
         let params = serde_json::json!({
             "id": hex(&id.0), "at": at.to_rfc3339(),
-            "max_visibility": Visibility::Org as u8,
+            "max_visibility": Visibility::Public as u8,
         });
         let rows = self.run_template("valid_at", &params, true).await?;
         match rows.first().and_then(|r| r.first()) {
@@ -725,16 +990,28 @@ impl Storage for FalkorStorage {
             if rows.is_empty() {
                 break;
             }
+            // ST2 (audit): advance from the node LSN the query FILTERED on
+            // (returned as the second column), never the possibly-stale
+            // copy inside props_json — and never loop when a page fails to
+            // advance the cursor.
+            let mut advanced = false;
             for row in &rows {
+                if let Some(FalkorValue::I64(n)) = row.get(1) {
+                    if (*n as u64) > cursor {
+                        cursor = *n as u64;
+                        advanced = true;
+                    }
+                }
                 if let Some(v) = row.first() {
                     match memory_from_value(v) {
-                        Ok(m) => {
-                            cursor = cursor.max(m.lsn.value);
-                            all.push(Ok(m));
-                        }
+                        Ok(m) => all.push(Ok(m)),
                         Err(e) => all.push(Err(e)),
                     }
                 }
+            }
+            if !advanced {
+                tracing::warn!(cursor, "memory stream page did not advance; stopping");
+                break;
             }
         }
         Box::pin(futures::stream::iter(all))
@@ -759,7 +1036,14 @@ impl Storage for FalkorStorage {
             if rows.is_empty() {
                 break;
             }
+            let mut advanced = false;
             for row in &rows {
+                if let Some(FalkorValue::I64(n)) = row.get(1) {
+                    if (*n as u64) > cursor {
+                        cursor = *n as u64;
+                        advanced = true;
+                    }
+                }
                 if let Some(v) = row.first() {
                     let props = match v {
                         FalkorValue::Edge(e) => e.properties.get("props_json").cloned(),
@@ -767,16 +1051,17 @@ impl Storage for FalkorStorage {
                     };
                     if let Some(FalkorValue::String(json_str)) = props {
                         match serde_json::from_str::<Relationship>(&json_str) {
-                            Ok(r) => {
-                                cursor = cursor.max(r.lsn.value);
-                                all.push(Ok(r));
-                            }
+                            Ok(r) => all.push(Ok(r)),
                             Err(e) => all.push(Err(StorageError::Backend(format!(
                                 "bad rel props_json: {e}"
                             )))),
                         }
                     }
                 }
+            }
+            if !advanced {
+                tracing::warn!(cursor, "rel stream page did not advance; stopping");
+                break;
             }
         }
         Box::pin(futures::stream::iter(all))
@@ -812,21 +1097,27 @@ impl Storage for FalkorStorage {
             .await
             .map_err(|e| StorageError::Backend(e.to_string()))?;
         let token = format!("{}:{}", self.node_id, epoch);
-        let ok: bool = self
-            .redis
-            .clone()
-            .set_nx(&redis_key, &token)
-            .await
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
-        if !ok {
+        // ST10 (audit): acquisition is ONE atomic command (SET NX EX) — the
+        // old SET NX followed by a separate EXPIRE left an immortal lease
+        // whenever the process died between the two.
+        let ok: Option<String> = redis::Script::new(
+            r#"
+            if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then
+                return ARGV[1]
+            else
+                return nil
+            end
+            "#,
+        )
+        .key(&redis_key)
+        .arg(&token)
+        .arg(ttl.as_secs().max(1) as i64)
+        .invoke_async(&mut self.redis.clone())
+        .await
+        .map_err(|e| StorageError::Backend(e.to_string()))?;
+        if ok.is_none() {
             return Err(StorageError::Backend("lease held by another node".into()));
         }
-        let _: () = self
-            .redis
-            .clone()
-            .expire(&redis_key, ttl.as_secs() as i64)
-            .await
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
         let now = Utc::now();
         Ok(OwnerLease {
             key: key.clone(),
@@ -842,47 +1133,53 @@ impl Storage for FalkorStorage {
     async fn renew_lease(&self, lease: &OwnerLease) -> Result<OwnerLease, StorageError> {
         let key_str = serde_json::to_string(&lease.key).unwrap();
         let redis_key = format!("exocortex:lease:{key_str}");
-        let held: Option<String> = self
-            .redis
-            .clone()
-            .get(&redis_key)
-            .await
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
-        match held {
-            Some(t) if t == lease.fencing_token.as_str() => {
-                let ttl = (lease.expires_at - lease.acquired_at).to_std().unwrap();
-                let _: () = self
-                    .redis
-                    .clone()
-                    .expire(&redis_key, ttl.as_secs() as i64)
-                    .await
-                    .map_err(|e| StorageError::Backend(e.to_string()))?;
-                Ok(OwnerLease {
-                    expires_at: Utc::now() + chrono::Duration::from_std(ttl).unwrap(),
-                    ..lease.clone()
-                })
-            }
-            _ => Err(StorageError::Backend("lease lost (token mismatch)".into())),
+        // ST10: compare-and-EXPIRE — atomic, so a renew can neither extend a
+        // lease another node just re-acquired nor trust a GET-then-EXPIRE
+        // window.
+        let ttl = (lease.expires_at - lease.acquired_at).to_std().unwrap();
+        let renewed: i64 = redis::Script::new(
+            r#"
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('EXPIRE', KEYS[1], ARGV[2])
+            else
+                return -1
+            end
+            "#,
+        )
+        .key(&redis_key)
+        .arg(lease.fencing_token.as_str())
+        .arg(ttl.as_secs().max(1) as i64)
+        .invoke_async(&mut self.redis.clone())
+        .await
+        .map_err(|e| StorageError::Backend(e.to_string()))?;
+        if renewed < 0 {
+            return Err(StorageError::Backend("lease lost (token mismatch)".into()));
         }
+        Ok(OwnerLease {
+            expires_at: Utc::now() + chrono::Duration::from_std(ttl).unwrap(),
+            ..lease.clone()
+        })
     }
 
     async fn release_lease(&self, lease: OwnerLease) -> Result<(), StorageError> {
         let key_str = serde_json::to_string(&lease.key).unwrap();
         let redis_key = format!("exocortex:lease:{key_str}");
-        let held: Option<String> = self
-            .redis
-            .clone()
-            .get(&redis_key)
-            .await
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
-        if held.as_deref() == Some(lease.fencing_token.as_str()) {
-            let _: () = self
-                .redis
-                .clone()
-                .del(&redis_key)
-                .await
-                .map_err(|e| StorageError::Backend(e.to_string()))?;
-        }
+        // ST10: compare-and-DELETE — the old GET-then-DEL could delete a
+        // lease another node re-acquired between the two commands.
+        let _: i64 = redis::Script::new(
+            r#"
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            else
+                return 0
+            end
+            "#,
+        )
+        .key(&redis_key)
+        .arg(lease.fencing_token.as_str())
+        .invoke_async(&mut self.redis.clone())
+        .await
+        .map_err(|e| StorageError::Backend(e.to_string()))?;
         Ok(())
     }
 
@@ -892,8 +1189,15 @@ impl Storage for FalkorStorage {
         rs: &[Relationship],
         lease: &OwnerLease,
     ) -> Result<Vec<CommitRecord>, StorageError> {
+        // ST5 (audit): the fence gates the LSN allocation itself (atomic
+        // Lua: lease token + TTL must hold for the INCRBY), the batch
+        // commits as ONE MULTI/EXEC unit, and the lease is re-checked after
+        // the commit — a stale owner's rows can no longer land one
+        // round-trip at a time after the pre-flight check.
         self.check_lease_current(lease).await?;
-        self.upsert_batch(ms, rs).await
+        let out = self.upsert_batch_inner(ms, rs, Some(lease)).await?;
+        self.check_lease_current(lease).await?;
+        Ok(out)
     }
 
     async fn delete_memory_fenced(
@@ -998,19 +1302,29 @@ impl FalkorStorage {
     }
 
     /// R-C3 fencing check: the lease key must still hold this lease's
-    /// token. A missing key (expiry/release) or a different token
-    /// (re-election bumped the epoch) means the caller is a stale owner —
-    /// reject before any row commits.
+    /// token AND a positive TTL (ST10: an immortal key from an interrupted
+    /// acquire must never pass). A missing key (expiry/release) or a
+    /// different token (re-election bumped the epoch) means the caller is a
+    /// stale owner — reject before any row commits.
     async fn check_lease_current(&self, lease: &OwnerLease) -> Result<(), StorageError> {
         let key_str = serde_json::to_string(&lease.key).unwrap();
         let redis_key = format!("exocortex:lease:{key_str}");
-        let held: Option<String> = self
-            .redis
-            .clone()
-            .get(&redis_key)
-            .await
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
-        if held.as_deref() == Some(lease.fencing_token.as_str()) {
+        let ok: i64 = redis::Script::new(
+            r#"
+            local t = redis.call('GET', KEYS[1])
+            if t == ARGV[1] and redis.call('TTL', KEYS[1]) > 0 then
+                return 1
+            else
+                return 0
+            end
+            "#,
+        )
+        .key(&redis_key)
+        .arg(lease.fencing_token.as_str())
+        .invoke_async(&mut self.redis.clone())
+        .await
+        .map_err(|e| StorageError::Backend(e.to_string()))?;
+        if ok == 1 {
             Ok(())
         } else {
             Err(StorageError::FencedWriteRejected {

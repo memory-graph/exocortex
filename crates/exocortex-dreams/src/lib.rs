@@ -94,8 +94,19 @@ pub enum PruneReason {
 pub struct DreamsEngine<S: Storage> {
     /// Durable storage (data + leases).
     pub storage: Arc<S>,
+    /// CS4 (audit): the backend re-election leader gate. When set, this
+    /// engine runs consolidation ONLY while its node holds the elected
+    /// `LeaseKey::Dreams{org, "*:*"}` lease — the reported leader and the
+    /// node performing owner-only work are the same node, so a leader kill
+    /// actually moves Dreams ownership.
+    pub leader_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Per-region write counters.
     pub counters: DashMap<RegionKey, RegionWriteCounters>,
+    /// IN4 (audit): per-region last-cycle timestamp — the source
+    /// `seconds_since_last_cycle` is stamped from. Without it the field
+    /// stayed 0 forever and the trigger predicate was unconditionally
+    /// false in the running node.
+    pub last_cycle_at: DashMap<RegionKey, chrono::DateTime<chrono::Utc>>,
     /// Trigger thresholds.
     pub dreams_trigger: DreamsTrigger,
     /// ΔR regression tolerance (default 0.01).
@@ -118,6 +129,13 @@ pub struct DreamsEngine<S: Storage> {
 
 impl<S: Storage + 'static> DreamsEngine<S> {
     /// Build the engine with §12.2 defaults.
+    /// Attach the re-election leader gate (see field docs).
+    pub fn with_leader_gate(mut self, gate: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.leader_gate = Some(gate);
+        self
+    }
+
+    /// Build the engine over `storage` (§12).
     pub fn new(
         storage: Arc<S>,
         dreams_trigger: DreamsTrigger,
@@ -128,8 +146,10 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     ) -> Self {
         let (tx_fire, rx_fire) = mpsc::channel(1024);
         Self {
+            leader_gate: None,
             storage,
             counters: DashMap::new(),
+            last_cycle_at: DashMap::new(),
             dreams_trigger,
             tolerance,
             hairball_tolerance,
@@ -146,8 +166,17 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     /// R-Dr13: counters are NOT reset here — completion resets them, so a
     /// failed cycle never loses its write counts.
     pub async fn on_write(&self, region: RegionKey) {
+        let now = chrono::Utc::now();
+        // IN4: anchor the region's clock at first observation; cycles
+        // re-stamp it on completion.
+        let anchor = *self
+            .last_cycle_at
+            .entry(region.clone())
+            .or_insert(now)
+            .value();
         let mut e = self.counters.entry(region.clone()).or_default();
         e.memories_since_last_cycle += 1;
+        e.seconds_since_last_cycle = (now - anchor).num_seconds().max(0) as u64;
         if self.dreams_trigger.should_fire(&e) {
             let snap = *e;
             drop(e);
@@ -173,6 +202,11 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             if let Some(mut c) = self.counters.get_mut(&region) {
                 if *c == fired_at {
                     *c = RegionWriteCounters::default();
+                    // IN4: the region's clock restarts on completion.
+                    self.last_cycle_at
+                        .entry(region.clone())
+                        .and_modify(|t| *t = chrono::Utc::now())
+                        .or_insert_with(chrono::Utc::now);
                 }
             }
         }
@@ -183,6 +217,13 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     /// ride the fenced paths so a stale owner can never commit (R-C3).
     #[instrument(skip(self))]
     pub async fn try_consolidate(&self, region: &RegionKey) -> anyhow::Result<ConsolidationResult> {
+        // CS4: a follower (lost re-election) performs no consolidation,
+        // even before contending on the region lease.
+        if let Some(gate) = &self.leader_gate {
+            if !gate.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(anyhow::anyhow!("not the elected leader"));
+            }
+        }
         let lease_key = LeaseKey::Dreams {
             org: region.org.clone(),
             region: format!("{}:{}", region.project, region.memory_type).into(),
@@ -204,7 +245,21 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         region: &RegionKey,
     ) -> anyhow::Result<ConsolidationResult> {
         let anchors = self.select_anchors(region).await?;
-        let mcr2_before = self.score_with(&anchors)?;
+        // IN5 (audit): a region with fewer than two anchors cannot be
+        // scored — that is a no-op cycle, not an error (erroring here
+        // aborted after nothing had committed but before any audit).
+        let mcr2_before = match self.score_with(&anchors) {
+            Ok(v) => v,
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<crate::mcr2::MCR2Error>(),
+                    Some(crate::mcr2::MCR2Error::TooFew(_))
+                ) =>
+            {
+                return self.empty_result(region, lease, anchors.len() as u32).await;
+            }
+            Err(e) => return Err(e),
+        };
         let sparsity_before = self.sparsity(region).await?;
 
         let mut res = ConsolidationResult {
@@ -259,7 +314,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             }
         }
         for a in &anchors {
-            self.strengthen(&mut res, a, lease).await?;
+            self.strengthen(&mut res, region, lease).await?;
             self.prune(&mut res, a).await?;
         }
         res.memories_output = (res.memories_input as usize - res.merged.len()).max(0) as u32;
@@ -281,7 +336,22 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             .into_iter()
             .filter(|a| !res.merged.contains(&a.id))
             .collect();
-        res.mcr2_after = self.score_with(&remaining)?;
+        // IN5 (audit): a post-cycle set too small to score is NOT an error
+        // — the merge already committed, and erroring skipped the audit
+        // record, the regression check, and the rollback. Carry the
+        // before-score forward and record ΔR as unavailable.
+        res.mcr2_after = match self.score_with(&remaining) {
+            Ok(score) => score,
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<crate::mcr2::MCR2Error>(),
+                    Some(crate::mcr2::MCR2Error::TooFew(_))
+                ) =>
+            {
+                res.mcr2_before.clone()
+            }
+            Err(e) => return Err(e),
+        };
         res.sparsity_after = self.sparsity(region).await?;
         res.completed_at = chrono::Utc::now();
 
@@ -311,7 +381,10 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let mut rows: Vec<(chrono::DateTime<chrono::Utc>, MemoryWithEmbedding)> = Vec::new();
         let mut ms = self.storage.stream_all_memories().await;
         while let Some(Ok(m)) = ms.next().await {
-            if m.memory_type != region.memory_type {
+            // IN1 (audit): the write set must be a subset of what the held
+            // lease covers — scope by the region's org and project too,
+            // not just memory_type.
+            if !in_region(&m, region) {
                 continue;
             }
             if let Some(emb) = &m.embedding {
@@ -344,15 +417,21 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let mut edges = Vec::new();
         let mut ms = self.storage.stream_all_memories().await;
         while let Some(Ok(m)) = ms.next().await {
+            if !in_region(&m, region) {
+                continue; // IN1: sparsity measures the region, not the graph
+            }
             nodes.push((m.id, m.memory_type));
         }
         drop(ms);
+        let members: std::collections::HashSet<exocortex_kernel::MemoryId> =
+            nodes.iter().map(|(id, _)| *id).collect();
         let mut rs = self.storage.stream_all_relationships().await;
         while let Some(Ok(r)) = rs.next().await {
-            edges.push((r.from, r.to, r.kind.0, 0u64, r.properties.confidence));
+            if members.contains(&r.from) && members.contains(&r.to) {
+                edges.push((r.from, r.to, r.kind.0, 0u64, r.properties.confidence));
+            }
         }
         drop(rs);
-        let _ = region;
         // §11.6.1: the similarity bucket never counts toward out-degrees.
         Ok(compute_sparsity(&nodes, &edges, 32, similar_to_kind()))
     }
@@ -394,14 +473,28 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     async fn strengthen(
         &self,
         res: &mut ConsolidationResult,
-        _a: &MemoryWithEmbedding,
+        region: &RegionKey,
         lease: &exocortex_storage::OwnerLease,
     ) -> anyhow::Result<()> {
         use futures::StreamExt;
         let now = chrono::Utc::now();
         let mut updates = Vec::new();
+        // IN1: only edges with BOTH endpoints inside the leased region.
+        let mut member_ids: std::collections::HashSet<exocortex_kernel::MemoryId> =
+            std::collections::HashSet::new();
+        {
+            let mut ms = self.storage.stream_all_memories().await;
+            while let Some(Ok(m)) = ms.next().await {
+                if in_region(&m, region) {
+                    member_ids.insert(m.id);
+                }
+            }
+        }
         let mut rs = self.storage.stream_all_relationships().await;
         while let Some(Ok(mut r)) = rs.next().await {
+            if !member_ids.contains(&r.from) || !member_ids.contains(&r.to) {
+                continue;
+            }
             if matches!(r.provenance, Provenance::Computed { .. }) {
                 continue;
             }
@@ -409,9 +502,13 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 continue; // one evidence bump per cycle, not per anchor
             }
             r.properties.evidence_count += 1;
+            // IN8 (audit): the stored field is the BASE strength — the
+            // §14.3 decay/success derivation applies at READ time, so
+            // repeated cycles can no longer compound the decay into the
+            // base and monotonically weaken every edge. Un-decay first.
             let age_days = (now - r.recorded_at).num_days().max(0) as f32;
             r.properties.strength = effective_strength(
-                r.properties.strength,
+                r.properties.strength / decay_factor(age_days).max(f32::EPSILON),
                 r.properties.evidence_count,
                 r.properties.success_rate.unwrap_or(1.0),
                 age_days,
@@ -693,4 +790,82 @@ fn similar_to_kind() -> Option<exocortex_kernel::RelKindId> {
             .ok()
             .and_then(|onto| onto.kind_id("SimilarTo"))
     })
+}
+
+/// IN1 (audit): a memory belongs to the region when its type matches AND
+/// its tenant scope matches (org; project when the region pins one —
+/// `*` means unconstrained).
+fn in_region(m: &exocortex_kernel::Memory, region: &RegionKey) -> bool {
+    if m.memory_type != region.memory_type {
+        return false;
+    }
+    if let (false, Some(t)) = (region.org == "*", m.context.tenant_id.as_deref()) {
+        if t != region.org.as_str() {
+            return false;
+        }
+    }
+    if let (false, Some(p)) = (region.project == "*", m.context.project_id.as_deref()) {
+        if p != region.project.as_str() {
+            return false;
+        }
+    }
+    true
+}
+
+/// The §14.3 age-decay factor alone (IN8: un-decay the stored base).
+fn decay_factor(age_days: f32) -> f32 {
+    (1.0 - 0.01 * age_days).max(0.5)
+}
+
+impl<S: Storage + 'static> DreamsEngine<S> {
+    /// IN5: an unscoreable region completes as a no-op cycle with its
+    /// audit record — never a silent error.
+    async fn empty_result(
+        &self,
+        region: &RegionKey,
+        lease: &exocortex_storage::OwnerLease,
+        n: u32,
+    ) -> anyhow::Result<ConsolidationResult> {
+        let res = ConsolidationResult {
+            session_id: format!("dream:{}", uuid::Uuid::new_v4()).into(),
+            user_id: None,
+            started_at: chrono::Utc::now(),
+            completed_at: chrono::Utc::now(),
+            region: region.clone(),
+            memories_input: n,
+            memories_output: n,
+            mcr2_before: crate::mcr2::MCR2Value {
+                delta_r: 0.0,
+                total_rate: 0.0,
+                class_rates: Default::default(),
+                compact_rate: 0.0,
+                n_memories: 0,
+                embedding_model: crate::mcr2::EmbeddingModelId::bge_small(),
+                computed_at: chrono::Utc::now(),
+            },
+            mcr2_after: crate::mcr2::MCR2Value {
+                delta_r: 0.0,
+                total_rate: 0.0,
+                class_rates: Default::default(),
+                compact_rate: 0.0,
+                n_memories: 0,
+                embedding_model: crate::mcr2::EmbeddingModelId::bge_small(),
+                computed_at: chrono::Utc::now(),
+            },
+            sparsity_before: self.sparsity(region).await?,
+            sparsity_after: self.sparsity(region).await?,
+            merged: vec![],
+            abstracted: vec![],
+            pruned: vec![],
+            strengthened: vec![],
+            rewired: vec![],
+            similar_edges: vec![],
+            owner_node_id: self.node_id.clone(),
+            lease_epoch: lease.epoch,
+            regression: false,
+            hairball_regression: false,
+        };
+        self.write_audit(&res).await?;
+        Ok(res)
+    }
 }

@@ -48,6 +48,12 @@ pub struct MemoryJson {
     pub memory_type: u8,
     /// Visibility label.
     pub visibility: String,
+    /// D10b (§4.10a): the hex id of this memory's SUCCESSOR, when a live
+    /// `Replaces`/`Contradicts` edge points at it. Stale beliefs are
+    /// marked where every reader already looks; absent means not
+    /// superseded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 fn unhex(s: &str) -> Result<MemoryId, OpError> {
@@ -82,7 +88,25 @@ fn mem_json(m: &Memory) -> MemoryJson {
         title: m.title.to_string(),
         memory_type: m.memory_type,
         visibility: format!("{:?}", m.visibility),
+        superseded_by: None,
     }
+}
+
+/// D10b: resolve a memory's successor through the local cache. Kind ids
+/// come from the context's ontology (both surfaces attach it); without
+/// one, the annotation degrades to absent — never wrong.
+fn superseded_by(ctx: &OpContext, org: &str, id: &MemoryId) -> Option<String> {
+    let kinds = ctx.ontology.as_ref()?;
+    let supersedes: Vec<exocortex_kernel::RelKindId> = ["Replaces", "Contradicts"]
+        .iter()
+        .filter_map(|n| kinds.kind_id(n))
+        .collect();
+    if supersedes.is_empty() {
+        return None;
+    }
+    ctx.cache
+        .superseded_by(org, id, &ctx.visibility_ctx, &supersedes)
+        .map(|m| hex32(&m.id.0))
 }
 
 #[async_trait]
@@ -102,6 +126,8 @@ impl Operation for FindRelated {
         "/v1/find_related"
     }
     async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        // IN11 (audit): R-R3 budget is enforced, not declared.
+        ctx.check_deadline()?;
         let anchor = unhex(&input.anchor)?;
         let spec = TraversalSpec {
             direction: exocortex_storage::Direction::Both,
@@ -167,6 +193,8 @@ impl Operation for GetMemory {
         "/v1/get_memory"
     }
     async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        // IN11 (audit): R-R3 budget is enforced, not declared.
+        ctx.check_deadline()?;
         let id = unhex(&input.id)?;
         let org = ctx.visibility_ctx.org_id.to_string();
         // Cache first (zero-cost hit). On a miss, distinguish the three
@@ -176,12 +204,18 @@ impl Operation for GetMemory {
         // case (R-C8).
         if let Some(m) = ctx.cache.get_memory(&org, &id, &ctx.visibility_ctx) {
             return Ok(GetMemoryOutput {
-                memory: Some(mem_json(&m)),
+                memory: Some(MemoryJson {
+                    superseded_by: superseded_by(ctx, &org, &id),
+                    ..mem_json(&m)
+                }),
             });
         }
         match ctx.storage.get_memory_for(&id, &ctx.visibility_ctx).await {
             Ok(Some(m)) => Ok(GetMemoryOutput {
-                memory: Some(mem_json(&m)),
+                memory: Some(MemoryJson {
+                    superseded_by: superseded_by(ctx, &org, &id),
+                    ..mem_json(&m)
+                }),
             }),
             Ok(None) => Ok(GetMemoryOutput { memory: None }),
             Err(exocortex_storage::StorageError::PermissionDenied) => Err(OpError::Unauthorized(
@@ -246,17 +280,32 @@ impl Operation for SearchMemoriesOp {
         "/v1/search_memories"
     }
     async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        // IN11 (audit): R-R3 budget is enforced, not declared.
+        ctx.check_deadline()?;
         let org = ctx.visibility_ctx.org_id.to_string();
-        let hits = ctx.cache.search(
+        let mut hits = ctx.cache.search(
             &org,
             &input.query,
             input.limit.min(500),
             &ctx.visibility_ctx,
         );
-        Ok(SearchOutput {
-            memories: hits.iter().map(|(m, _)| mem_json(m)).collect(),
-            scores: hits.iter().map(|(_, s)| *s).collect(),
-        })
+        // D10b: mark superseded hits and rank them below their
+        // successors — a stale belief never outranks its correction.
+        let mut annotated: Vec<(MemoryJson, f32)> = Vec::with_capacity(hits.len());
+        for (m, score) in hits.drain(..) {
+            let sup = superseded_by(ctx, &org, &m.id);
+            let rank = if sup.is_some() { score * 0.1 } else { score };
+            annotated.push((
+                MemoryJson {
+                    superseded_by: sup,
+                    ..mem_json(&m)
+                },
+                rank,
+            ));
+        }
+        annotated.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let (memories, scores): (Vec<_>, Vec<_>) = annotated.into_iter().unzip();
+        Ok(SearchOutput { memories, scores })
     }
 }
 
@@ -311,6 +360,8 @@ impl Operation for PromoteVisibilityOp {
         "/v1/promote_visibility"
     }
     async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        // IN11 (audit): R-R3 budget is enforced, not declared.
+        ctx.check_deadline()?;
         let id = unhex(&input.memory_id)?;
         let to = match input.to.as_str() {
             "project" => Visibility::Project,
@@ -318,12 +369,29 @@ impl Operation for PromoteVisibilityOp {
             "org" => Visibility::Org,
             other => return Err(OpError::BadInput(format!("cannot promote to {other}"))),
         };
-        let mut m = ctx
-            .storage
-            .get_memory(&id)
-            .await
-            .map_err(|e| OpError::Storage(e.to_string()))?
-            .ok_or(OpError::NotFound)?;
+        // KP5 (audit): the R-T11a ceiling this op enforces comes from the
+        // kernel's typed Action surface — the only place it is declared.
+        use exocortex_kernel::actions::Action as _;
+        let max = exocortex_kernel::actions::PromoteVisibility::REQUIRED_VISIBILITY_CEILING;
+        if to > max {
+            return Err(OpError::BadInput(format!(
+                "promotion capped at {max:?} (R-T11a)"
+            )));
+        }
+        // IN2 (audit): load through the CALLER-SCOPED read. The unscoped
+        // `get_memory` reads at the historical Org ceiling, so a caller who
+        // cannot even see the row could otherwise widen it to the whole org.
+        // Matching GetMemory: an invisible row is Unauthorized, not absent.
+        let mut m = match ctx.storage.get_memory_for(&id, &ctx.visibility_ctx).await {
+            Ok(Some(m)) => m,
+            Ok(None) => return Err(OpError::NotFound),
+            Err(exocortex_storage::StorageError::PermissionDenied) => {
+                return Err(OpError::Unauthorized(
+                    "caller may not read this memory".into(),
+                ))
+            }
+            Err(e) => return Err(OpError::Storage(e.to_string())),
+        };
         if to < m.visibility {
             return Err(OpError::BadInput("promotion only widens".into()));
         }
@@ -415,21 +483,49 @@ impl Operation for AcceptDiscoveryOp {
     async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
         let from = unhex(&input.from)?;
         let to = unhex(&input.to)?;
+        // IN3 (audit): resolve the CALLER-SUPPLIED kind through the
+        // effective ontology — the old code silently wrote RelKindId(0) for
+        // every acceptance — and run the same R-T17 triple validation the
+        // ingest path uses.
+        let ontology = effective_ontology();
+        let kind = ontology
+            .kind_id(&input.kind)
+            .ok_or_else(|| OpError::BadInput(format!("unknown kind `{}`", input.kind)))?;
+        if input.kind == "SimilarTo" {
+            return Err(OpError::BadInput(
+                "SimilarTo is computed-only (R-T14); accept a discovery instead".into(),
+            ));
+        }
+        let from_mem = ctx
+            .storage
+            .get_memory(&from)
+            .await
+            .map_err(|e| OpError::Storage(e.to_string()))?
+            .ok_or(OpError::NotFound)?;
+        let to_mem = ctx
+            .storage
+            .get_memory(&to)
+            .await
+            .map_err(|e| OpError::Storage(e.to_string()))?
+            .ok_or(OpError::NotFound)?;
+        exocortex_kernel::validator::validate_triple(
+            ontology,
+            from_mem.memory_type,
+            kind,
+            to_mem.memory_type,
+        )
+        .map_err(|e| OpError::BadInput(format!("R-T17: {e}")))?;
         // R-Dr1/R-Dr2: acceptance produces an ASSERTED edge whose context
         // references the discovery id.
         let rel = exocortex_kernel::Relationship {
-            id: RelationshipId::derive(
-                from,
-                exocortex_kernel::RelKindId(0),
-                to,
-                Some(&input.discovery_id),
-            ),
-            kind: exocortex_kernel::RelKindId(0),
+            id: RelationshipId::derive(from, kind, to, Some(&input.discovery_id)),
+            kind,
             from,
             to,
             visibility: ctx.visibility_ctx.max_visibility,
             provenance: exocortex_kernel::Provenance::Asserted {
                 author: ctx.visibility_ctx.user_id.clone(),
+                producer_kind: None,
             },
             properties: exocortex_kernel::RelationshipProperties {
                 strength: 0.5,
@@ -547,3 +643,96 @@ pub fn ops_vc(org: &str, user: &str, max: Visibility) -> VisibilityContext {
         max_visibility: max,
     }
 }
+
+/// The effective ontology for op-side kind resolution (IN3). Loaded once;
+/// the registry server assembles the same pack set at boot.
+fn effective_ontology() -> &'static std::sync::Arc<exocortex_kernel::Ontology> {
+    static ONTO: std::sync::OnceLock<std::sync::Arc<exocortex_kernel::Ontology>> =
+        std::sync::OnceLock::new();
+    ONTO.get_or_init(|| {
+        std::sync::Arc::new(
+            exocortex_kernel::pack::load_registered_packs().expect("registered packs assemble"),
+        )
+    })
+}
+
+/// D2 (agent-instructions PRD §3.2): `preflight_wrapup` — validate a
+/// proposed batch without writing. Registered HERE (not in the client)
+/// so every surface — the client's MCP dispatch, the backend's HTTP
+/// bind, the schema goldens — enumerates the ONE handler running the
+/// ONE kernel rulebook (W2).
+#[derive(Default)]
+pub struct PreflightWrapupOp;
+
+/// Input for `preflight_wrapup`.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct PreflightWrapupInput {
+    /// Project id (future context stamping; unused by validation).
+    #[serde(default)]
+    pub project_id: String,
+    /// Proposed memory drafts.
+    pub memories: Vec<crate::preflight::PreflightMemoryDraft>,
+    /// Proposed edges.
+    #[serde(default)]
+    pub edges: Vec<crate::preflight::PreflightEdgeHint>,
+}
+
+#[async_trait]
+impl Operation for PreflightWrapupOp {
+    type Input = PreflightWrapupInput;
+    type Output = crate::preflight::PreflightResult;
+    fn name(&self) -> &'static str {
+        "preflight_wrapup"
+    }
+    fn mcp_tool_name(&self) -> &'static str {
+        "exocortex.preflight_wrapup"
+    }
+    fn http_method(&self) -> http::Method {
+        http::Method::POST
+    }
+    fn http_path(&self) -> &'static str {
+        "/v1/preflight_wrapup"
+    }
+    async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        ctx.check_deadline()?;
+        let ontology = ctx.ontology.clone().ok_or_else(|| {
+            OpError::Other(
+                "preflight requires the effective ontology (surface misconfiguration)".into(),
+            )
+        })?;
+        let cache = ctx.cache.clone();
+        let org = ctx.visibility_ctx.org_id.to_string();
+        let vc = ctx.visibility_ctx.clone();
+        Ok(crate::preflight::validate_batch(
+            &ontology,
+            &input.memories,
+            &input.edges,
+            |id| {
+                let mut out = [0u8; 16];
+                let b = id.as_bytes();
+                if b.len() != 32 {
+                    return None;
+                }
+                for i in 0..16 {
+                    match u8::from_str_radix(std::str::from_utf8(&b[i * 2..i * 2 + 2]).ok()?, 16) {
+                        Ok(v) => out[i] = v,
+                        Err(_) => return None,
+                    }
+                }
+                cache
+                    .get_memory(&org, &exocortex_kernel::MemoryId(out), &vc)
+                    .map(|m| m.memory_type)
+            },
+        ))
+    }
+}
+
+register_operation!(
+    PreflightWrapupOp,
+    "preflight_wrapup",
+    "exocortex.preflight_wrapup",
+    POST,
+    "/v1/preflight_wrapup",
+    PreflightWrapupInput,
+    crate::preflight::PreflightResult
+);

@@ -201,7 +201,7 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
     let mut seen = false;
     while tokio::time::Instant::now() < deadline {
-        cluster.publish_envelope(cluster.envelope(Invalidation::MemoryUpserted {
+        let _ = cluster.admit_and_publish(cluster.envelope(Invalidation::MemoryUpserted {
             id: m.id,
             lsn: commit.lsn,
         }));
@@ -282,7 +282,7 @@ async fn per_client_sse_hmac_verifies_with_derived_key() {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
     let mut seen = false;
     while tokio::time::Instant::now() < deadline {
-        cluster.publish_envelope(cluster.envelope(Invalidation::MemoryUpserted {
+        let _ = cluster.admit_and_publish(cluster.envelope(Invalidation::MemoryUpserted {
             id: m.id,
             lsn: commit.lsn,
         }));
@@ -334,7 +334,10 @@ fn test_memory(title: &str, n: u8) -> exocortex_kernel::Memory {
         summary: None,
         tags: Default::default(),
         visibility: Visibility::Org,
-        provenance: Provenance::Asserted { author: "t".into() },
+        provenance: Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
         context: MemoryContext {
             timestamp: chrono::Utc::now(),
             project_id: None,
@@ -421,7 +424,7 @@ async fn deterministic_replay_probe() {
         let m = test_memory(&format!("replay-{lsn}"), lsn as u8);
         let commit = storage.upsert_memory(&m).await.unwrap();
         assert_eq!(commit.lsn, lsn);
-        cluster.publish_envelope(cluster.envelope(Invalidation::MemoryUpserted {
+        let _ = cluster.admit_and_publish(cluster.envelope(Invalidation::MemoryUpserted {
             id: m.id,
             lsn: commit.lsn,
         }));

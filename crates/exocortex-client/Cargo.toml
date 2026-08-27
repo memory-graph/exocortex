@@ -1,7 +1,7 @@
 # crates/exocortex-client/Cargo.toml
 [package]
 name    = "exocortex-client"
-version.workspace = true
+version = "0.2.0" # P9: the agent-instructions release
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,6 +13,8 @@ serde_json = { workspace = true }
 schemars = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+inventory = { workspace = true }
+http = { workspace = true }
 blake3 = { workspace = true }
 bincode = { workspace = true}
 anyhow = { workspace = true }
@@ -30,13 +32,17 @@ exocortex-pack-dev-v1 = { workspace = true }
 exocortex-kernel = { workspace = true }
 exocortex-wire = { workspace = true }
 tonic = { workspace = true }
+async-stream = { workspace = true }
 exocortex-cache = { workspace = true }
+exocortex-storage = { workspace = true } # IN10: registry dispatch needs the Storage trait
 exocortex-reasoning = { workspace = true }
 exocortex-ops = { workspace = true }
+exocortex-adapter-sdk = { workspace = true }  # W1: reuse the R13 classify table, not a second copy
 rmcp = { workspace = true }
 sled = { workspace = true }
 eventsource-client = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 metrics = { workspace = true }
 subtle = { workspace = true }
 
@@ -45,7 +51,8 @@ name = "exocortex-mcp-client"
 path = "src/main.rs"
 
 [dev-dependencies]
-exocortex-storage = { workspace = true }
+exocortex-ingest = { workspace = true }
+tonic = { workspace = true }
 exocortex-cluster = { workspace = true }
 exocortex-server = { workspace = true }
 axum = { workspace = true }

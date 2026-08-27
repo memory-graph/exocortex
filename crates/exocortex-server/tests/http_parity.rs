@@ -27,7 +27,10 @@ fn mem(title: &str, n: u8) -> Memory {
         summary: None,
         tags: Default::default(),
         visibility: Visibility::Org,
-        provenance: Provenance::Asserted { author: "t".into() },
+        provenance: Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        },
         context: MemoryContext {
             timestamp: chrono::Utc::now(),
             project_id: None,
@@ -119,6 +122,8 @@ async fn every_operation_answers_over_http_with_auth() {
         storage: storage.clone() as Arc<dyn exocortex_storage::Storage>,
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        // D2: preflight needs the effective rulebook.
+        ontology: Some(ontology()),
     });
 
     let bind = HttpBind::new(ctx.clone(), "secret-token".into());
@@ -134,6 +139,20 @@ async fn every_operation_answers_over_http_with_auth() {
             "find_related" => serde_json::json!({ "anchor": hex(&a.id), "k": 2 }),
             "get_memory" => serde_json::json!({ "id": hex(&a.id) }),
             "search_memories" => serde_json::json!({ "query": "parity", "limit": 5 }),
+            // D2: a small valid batch (Problem + Fix + Fixes edge).
+            "preflight_wrapup" => serde_json::json!({
+                "project_id": "p",
+                "memories": [
+                    { "draft_key": "p", "memory_type": "Problem", "title": "Pool exhausted",
+                      "content": "c", "visibility": "project", "tags": [] },
+                    { "draft_key": "f", "memory_type": "Fix", "title": "Fixed pool exhaustion",
+                      "content": "c", "visibility": "project", "tags": [] }
+                ],
+                "edges": [
+                    { "from_draft_key": "f", "to_draft_key": "p", "to_memory_id": "",
+                      "kind": "Fixes", "strength": 0.9 }
+                ]
+            }),
             "promote_visibility" => {
                 serde_json::json!({ "memory_id": hex(&b.id), "to": "org" })
             }

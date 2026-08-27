@@ -83,8 +83,10 @@ impl HttpBind {
     }
 
     /// Assemble the router: every registered operation at its
-    /// `(method, path)`, auth-gated, plus the observability endpoints and
-    /// (optionally) the SSE change feed.
+    /// `(method, path)`, plus any `extra` router (the SSE change feed),
+    /// auth-gated together (R-Sec7 / audit CS1: the feed was previously
+    /// merged in AFTER the auth layer, leaving `/v1/changes` unauthenticated),
+    /// then the observability endpoints.
     pub fn router(&self, extra: Option<Router>) -> Router {
         let mut ops = Router::new();
         for entry in entries() {
@@ -95,8 +97,15 @@ impl HttpBind {
                 ops.route(entry.http_path, post(handler))
             };
         }
+        // The bearer layer must cover every mounted route — ops and the
+        // SSE feed alike — before the merge with the unauthenticated
+        // observability endpoints.
+        let mut protected = ops;
+        if let Some(extra) = extra {
+            protected = protected.merge(extra);
+        }
         let bearer = self.bearer.clone();
-        ops = ops.layer(middleware::from_fn(move |req, next| {
+        let protected = protected.layer(middleware::from_fn(move |req, next| {
             auth(req, next, bearer.clone())
         }));
 
@@ -198,11 +207,7 @@ impl HttpBind {
                 }),
             );
 
-        let mut router = ops.merge(obs);
-        if let Some(extra) = extra {
-            router = router.merge(extra);
-        }
-        router
+        protected.merge(obs)
     }
 }
 
@@ -247,7 +252,13 @@ fn op_route(
        + Send
        + 'static {
     move |query: axum::extract::RawQuery, body: axum::body::Bytes| {
-        let ctx = ctx.clone();
+        // IN11 (audit): every request gets its OWN budget. The shared
+        // startup context gave request #2 an already-expired deadline (and
+        // nothing read it, so the REQUEST_TIMEOUT mapping was unreachable).
+        let ctx = Arc::new(OpContext {
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
+            ..(*ctx).clone()
+        });
         Box::pin(async move {
             let input: serde_json::Value = if body.is_empty() {
                 query_to_json(query.0.as_deref().unwrap_or(""))

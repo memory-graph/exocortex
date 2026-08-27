@@ -94,7 +94,31 @@ pub fn split_unit(
             org_id: String::new(),           // stamped by the session
             source_uri: String::new(),       // stamped by the session
             producer_id: producer_id.into(), // R11 id component
-            batch_id: format!("{producer_id}:{}:{}", unit.batch_id_seed, *index),
+            // CL2 (audit): the id is CONTENT-bound — the same unit split
+            // differently (budget change, retry after crash) must never
+            // dedupe against a batch with different rows; the canonical
+            // checksum covers exactly the rows below, so it is the content
+            // identity. The (producer, seed, index) prefix keeps ids
+            // distinct across units and re-splits of identical content.
+            batch_id: {
+                let content = exocortex_wire::signing::canonical_checksum(&IngestBatch {
+                    org_id: String::new(),
+                    source_uri: String::new(),
+                    producer_id: producer_id.into(),
+                    batch_id: String::new(),
+                    mapping_version: String::new(),
+                    ontology_fingerprint: Vec::new(),
+                    ceiling: 0,
+                    checksum: String::new(),
+                    observed_at: None,
+                    recorded_at: None,
+                    snapshot: unit.snapshot.clone(),
+                    memories: memories.clone(),
+                    relationships: relationships.clone(),
+                    producer: None,
+                });
+                format!("{producer_id}:{}:{}:{content}", unit.batch_id_seed, *index)
+            },
             mapping_version: String::new(), // stamped by the caller pre-submit
             ontology_fingerprint: Vec::new(),
             ceiling: 0,
@@ -109,6 +133,7 @@ pub fn split_unit(
                 agent_id: String::new(),
                 adapter_id: String::new(),
                 hmac_signature: vec![],
+                client_metadata: None,
             }),
         };
         *index += 1;
@@ -238,6 +263,7 @@ fn component_bytes(
             agent_id: String::new(),
             adapter_id: String::new(),
             hmac_signature: vec![0u8; 32], // a real signature's width
+            client_metadata: None,
         }),
     };
     Ok(b.encoded_len())
@@ -294,6 +320,7 @@ mod tests {
             confidence: 0.5,
             context: String::new(),
             visibility: 3,
+            to_memory_id: String::new(),
         }
     }
 
@@ -387,8 +414,28 @@ mod tests {
             b.iter().map(|x| x.batch_id.clone()).collect::<Vec<_>>(),
             "same unit -> byte-identical ids (R11)"
         );
-        assert_eq!(a[0].batch_id, "p:seed-1:0");
-        assert_eq!(a[1].batch_id, "p:seed-1:1");
+        // CL2: ids are content-bound — prefix pins (producer, seed, index),
+        // suffix is the canonical checksum of the batch's rows.
+        assert!(
+            a[0].batch_id.starts_with("p:seed-1:0:"),
+            "{}",
+            a[0].batch_id
+        );
+        assert!(
+            a[1].batch_id.starts_with("p:seed-1:1:"),
+            "{}",
+            a[1].batch_id
+        );
+        assert_ne!(a[0].batch_id, a[1].batch_id);
+
+        // Different content under the same seed+index gets a different id:
+        // a re-split under a bigger budget packs all rows into batch 0, so
+        // its membership (and therefore its id) differs from the tight
+        // budget's batch 0 — the old content-free id would have deduped
+        // them and silently dropped the extra rows (CL2).
+        let c = split_unit("p", &u, 4000).unwrap();
+        assert_eq!(c.len(), 1);
+        assert_ne!(c[0].batch_id, a[0].batch_id);
     }
 
     #[test]

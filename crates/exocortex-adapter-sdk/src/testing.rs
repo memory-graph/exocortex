@@ -174,11 +174,13 @@ impl IngestService for MockService {
                 rejected: 0,
                 rejections: vec![],
                 assigned_lsn: 1,
+                similar_to: vec![],
             })),
             MockSubmit::RejectRows(code, detail) => Ok(Response::new(IngestAck {
                 batch_id: batch.batch_id,
                 accepted: 0,
                 rejected: batch.memories.len() as u32,
+                similar_to: vec![],
                 rejections: batch
                     .memories
                     .iter()

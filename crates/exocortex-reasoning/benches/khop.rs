@@ -44,13 +44,13 @@ fn main() {
 
     // Warm-up.
     for _ in 0..20 {
-        let _ = rules::evaluate(edges.clone(), entities.clone(), tags.clone());
+        let _ = rules::evaluate(edges.clone(), entities.clone(), tags.clone(), vec![]);
     }
 
     let mut samples = Vec::with_capacity(500);
     for _ in 0..500 {
         let t0 = Instant::now();
-        let derived = rules::evaluate(edges.clone(), entities.clone(), tags.clone());
+        let derived = rules::evaluate(edges.clone(), entities.clone(), tags.clone(), vec![]);
         let dt = t0.elapsed();
         assert!(derived.total() > 0);
         samples.push(dt);

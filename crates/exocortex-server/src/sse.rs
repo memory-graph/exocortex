@@ -23,6 +23,12 @@ use exocortex_storage::Storage;
 /// Whether `/v1/changes` demands a per-client token (R-Sec5).
 /// `backend-node` requires one; `mcp-standalone` (loopback-only) keeps
 /// the cluster-key default.
+///
+/// The token is a per-client KEY SELECTOR, not an authentication
+/// mechanism: when this router is mounted through `HttpBind::router` the
+/// bearer middleware authenticates the subscriber first (R-Sec7 / audit
+/// CS1). The `RequiredToken` presence check below only guards mounts that
+/// carry no auth layer of their own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SseAuth {
     /// Token-less subscribers still receive cluster-key-signed envelopes.
@@ -62,7 +68,12 @@ async fn handler<S: Storage + 'static>(
         for pair in qs.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
                 match k {
-                    "token" => token = Some(v.to_string()),
+                    "token" => {
+                        // Fail closed: an empty value (`?token=`) is no token.
+                        if !v.is_empty() {
+                            token = Some(v.to_string());
+                        }
+                    }
                     "since_lsn" => since_lsn = v.parse::<u64>().ok(),
                     _ => {}
                 }

@@ -21,15 +21,17 @@ pub fn validate_draft(
     draft: &MemoryDraft,
     ceiling: SourceCeiling,
 ) -> KernelResult<()> {
-    // R-T5
-    if draft.title.is_empty() || draft.title.len() > 200 {
+    // R-T5 — KP3 (audit): the bounds are CHARACTERS, matching the spec and
+    // the error text; measuring bytes rejected every valid non-ASCII title
+    // of legal length and silently dropped the write.
+    if draft.title.is_empty() || draft.title.chars().count() > 200 {
         return Err(KernelError::TitleBounds);
     }
     if draft.content.is_empty() {
         return Err(KernelError::EmptyContent);
     }
     if let Some(s) = &draft.summary {
-        if s.len() > 500 {
+        if s.chars().count() > 500 {
             return Err(KernelError::SummaryBounds);
         }
     }
@@ -71,4 +73,35 @@ fn matches_triple(t: &crate::pack::TypeTriple, from: u8, to: Option<u8>) -> bool
         (Some(xs), Some(v)) => xs.contains(&v),
     };
     from_ok && to_ok
+}
+
+/// W2 (audit): the ONE type-triple check, both sides required. Ingest and
+/// every other write path call this — the peer-draft deferral inside
+/// `validate_draft`'s from-side pass was from-side-only enforcement.
+pub fn validate_triple(
+    onto: &Ontology,
+    from_type: u8,
+    kind: crate::RelKindId,
+    to_type: u8,
+) -> KernelResult<()> {
+    let triples = onto
+        .triples_by_kind
+        .get(&kind)
+        .ok_or(KernelError::UnknownKind(kind))?;
+    let ok = triples.iter().any(|t| {
+        let from_ok = t
+            .from_types
+            .as_deref()
+            .is_none_or(|xs| xs.contains(&from_type));
+        let to_ok = t.to_types.as_deref().is_none_or(|xs| xs.contains(&to_type));
+        from_ok && to_ok
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(KernelError::InvalidTypeTriple {
+            kind,
+            from: from_type,
+        })
+    }
 }

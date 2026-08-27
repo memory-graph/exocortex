@@ -28,6 +28,7 @@ fn mem(title: &str) -> Memory {
         visibility: Visibility::Org,
         provenance: Provenance::Asserted {
             author: "sse".into(),
+            producer_kind: None,
         },
         context: MemoryContext {
             timestamp: chrono::Utc::now(),

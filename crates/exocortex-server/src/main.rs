@@ -92,18 +92,30 @@ fn main() -> anyhow::Result<()> {
                 args.falkordb_module.clone(),
             )?;
             let port = supervisor::free_port()?;
+            let data_home = data_home()?;
             let cfg = supervisor::SupervisorConfig {
                 redis_server_bin: bin,
                 falkordb_module: module,
-                data_dir: data_home()?,
+                port_file: Some(data_home.join("port")),
+                data_dir: data_home,
                 port,
                 max_restarts: 3,
             };
-            let server = supervisor::spawn_supervised(&cfg)?;
+            let mut server = supervisor::spawn_supervised(&cfg)?;
             tracing::info!(port = server.port, "exocortex-node mcp-standalone ready");
-            // Serve until interrupted; the supervisor owns the child lifetime.
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(1));
+            // CS5 (audit): a REAL supervision loop — try_wait, restart
+            // within the policy, exit non-zero when the budget is spent.
+            // (Drop kills the child, so the parent never orphans it.)
+            let outcome: anyhow::Result<()> = (|| {
+                server.supervise(&cfg)?;
+                Ok(())
+            })();
+            match outcome {
+                Ok(()) => unreachable!("supervise only returns on give-up"),
+                Err(e) => {
+                    tracing::error!(%e, "supervision gave up; exiting");
+                    std::process::exit(1);
+                }
             }
         }
         Mode::BackendNode => backend_node_main(args),
@@ -129,7 +141,8 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
         // public dev key on a typo would ship a known-key node.
         let cluster_secret = match args.cluster_secret.as_deref() {
             None => [0x42u8; 32],
-            Some(hex) => decode_hex32(hex)?,
+            Some(hex) => exocortex_wire::signing::decode_hex32(hex)
+                .map_err(|e| anyhow::anyhow!("--cluster-secret: {e}"))?,
         };
         let bearer_token = resolve_bearer(&args)?;
         let node_id = args
@@ -193,20 +206,6 @@ async fn serve_forever<S: exocortex_storage::Storage + 'static>(
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-}
-
-/// Decode 64 hex chars into a 32-byte key. Length-checked FIRST so a
-/// short input errors instead of panicking on the slice (round-3 M2).
-fn decode_hex32(hex: &str) -> Result<[u8; 32], anyhow::Error> {
-    if hex.len() != 64 {
-        anyhow::bail!("--cluster-secret must be 64 hex chars, got {}", hex.len());
-    }
-    let bytes = (0..32)
-        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
-        .collect::<Result<Vec<_>, _>>()?;
-    bytes
-        .try_into()
-        .map_err(|_| unreachable!("32 bytes collected"))
 }
 
 /// R-Sec7: the op surface never ships a default credential. Release

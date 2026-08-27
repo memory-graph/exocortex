@@ -259,3 +259,16 @@ pub enum StorageBackendId {
     /// The in-memory test double.
     InMemory,
 }
+
+impl Invalidation {
+    /// The backend LSN of the commit that produced this invalidation
+    /// (CS6: every variant carries one).
+    pub fn lsn_of(&self) -> u64 {
+        match self {
+            Invalidation::MemoryUpserted { lsn, .. }
+            | Invalidation::MemoryDeleted { lsn, .. }
+            | Invalidation::RelationshipUpserted { lsn, .. }
+            | Invalidation::RelationshipDeleted { lsn, .. } => *lsn,
+        }
+    }
+}
