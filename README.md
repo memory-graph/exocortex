@@ -28,13 +28,22 @@
 **The open-source Palantir: the ontology, in-house.** By
 [MemoryGraph](https://github.com/memory-graph).
 
-Your coding agent starts every session from nothing. What you taught it
-yesterday — the fix that worked, the decision and why, the command that
-unblocked the build — is gone today, for you and for everyone else on
-the team. Exocortex is where that knowledge lives instead: your agents
-write the distilled outcome of every session into a typed,
-provenance-stamped graph, and every later session reads it back in
-microseconds.
+Every serious agent stack grows a memory layer, and the default answer
+is prose in a vector store — embed the notes, recall by similarity. It
+demos well and degrades from there: near-duplicates pile up, nothing in
+the pile knows what anything *means*, no fact can say why it is
+believed, and the more you store the worse retrieval gets. Memory that
+has to compound for years cannot be a pile of prose. It has to be
+structured.
+
+Exocortex is agent memory backed by an ontology and a typed graph.
+Every captured fact is a typed node; every connection is a typed,
+weighted, provenance-stamped edge; every read is a traversal with a
+microsecond budget. That is the substrate context engineering actually
+needs: the prompt gets assembled from what your org demonstrably knows
+— the fix, the decision and its reason, the edge that says *this
+solution solves that problem* — not from whatever a similarity search
+surfaced first.
 
 Palantir Foundry's core product is not a data lake or a set of dashboards.
 It is the *Ontology* — a governed, typed, versioned semantic layer over an
@@ -44,12 +53,18 @@ three because of three years of governed Objects and Links, not any
 single query.
 
 Exocortex is that ontology as a single Rust binary, under an OSS license,
-fed by your coding agents instead of a data team. Claude Code, Codex,
-Cursor, any MCP client writes to it and reads from it — so what your org
-learns in one session is what it knows in the next. The ontology's shape
-(type-tagged memories + a typed edge vocabulary, not per-type payload
-schemas) was validated by our prior memory-graph deployment; Exocortex
-is that idea as one fast, governed binary.
+fed by your agents, your documents, and — coming — your analytics tables,
+instead of a data team. Claude Code, Codex, Cursor, any MCP client writes
+to it and reads from it — so what your org learns in one session is what
+it knows in the next. Documents feed the same graph through
+`exocortex-adapter-mintlify`, the reference Ingestion Protocol adapter:
+authors tag a page with `exocortex:` frontmatter and it lands as typed
+memories, deterministically — no LLM anywhere in the loop. Analytics
+tables join the same way through the planned S3 Tables / Iceberg
+adapter. The ontology's shape (type-tagged memories + a typed edge
+vocabulary, not per-type payload schemas) was validated by our prior
+memory-graph deployment; Exocortex is that idea as one fast, governed
+binary.
 
 | Foundry | Exocortex |
 |---|---|
@@ -221,7 +236,7 @@ authenticated HTTP.
 
 This is the product. Everything else exists to serve it.
 
-- **Memories are Objects.** 13 memory types covering work state (Task,
+- **Memories are the nodes.** 13 memory types covering work state (Task,
   Problem, Solution, Fix, Error), code substance (CodePattern, Command,
   FileContext, Workflow), environment (Project, Technology), session
   material (Conversation), and an escape hatch (General). Each type is a
@@ -253,9 +268,31 @@ This is the product. Everything else exists to serve it.
   clusters regions of the graph, merges near-duplicates, prunes stale
   material, and proposes — never writes — cross-domain connections a
   single developer wouldn't spot. Accepting a proposal is the audited
-  `accept_discovery` action. Every cycle is measured against two
-  independent metrics (MCR² embedding separation and graph sparsity);
-  regressions are flagged and rolled back.
+  `accept_discovery` action. Every cycle is scored before and after by
+  two independent metrics — **MCR²** and graph sparsity — and a cycle
+  that regresses either is flagged and rolled back.
+
+  MCR² (*rate reduction*, from Yu & Ma's group, NeurIPS 2020) answers
+  one question with a number: *how many bits do the type labels save
+  you?* Each memory type should occupy a tight region of embedding
+  space, and the regions should stay far apart — so merging true
+  duplicates tightens a type's region (score up), while over-merging
+  or blur between types collapses them together (score down).
+
+  ```
+    ΔR falling — the graph collapses     ΔR rising — the graph holds
+
+     x o . o x . o x o                    o o o    x x x    . . .
+     o . x o . x o . x                    o o o    x x x    . . .
+     x o . o x . o x o                    o o o    x x x    . . .
+
+        o = Problem    x = Fix    . = Solution
+  ```
+
+  It is a diagnostic, never a training objective: no model inside
+  Exocortex is optimized against it — it exists so "last night's
+  consolidation left the graph better organized" is a measured claim,
+  not a vibes claim. (Theory, lineage, and limits: PRD §11.)
 - **Kernel + extension packs.** The ontology kernel (types, provenance,
   visibility, actions, functions, rules) is load-bearing and universal.
   Domains ship as packs: v1 includes `exocortex-pack-dev-v1` for the
