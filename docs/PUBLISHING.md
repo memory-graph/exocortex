@@ -107,6 +107,11 @@ provider before constructing that listener. Transitive workspace consumers
 enable both supported providers, so Rustls cannot infer one from the unified
 feature set at runtime.
 
+`exocortex-client` directly depends on Hyper and Hyper-Rustls for its SSE
+subscriber. The client owns the incremental SSE framing so it can reject an
+oversized event while bytes arrive; the former eventsource helper buffered an
+entire attacker-controlled event before application admission could run.
+
 The optional `exocortex-ingest/fastembed` feature exact-pins fastembed 5.2 and
 does not enable its Hugging Face downloader. Releases package five files from
 `Xenova/bge-small-en-v1.5` commit

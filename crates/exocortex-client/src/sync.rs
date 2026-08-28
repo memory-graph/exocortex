@@ -11,9 +11,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use eventsource_client as es;
-use eventsource_client::Client as _;
 use futures::StreamExt;
+use hyper::body::HttpBody as _;
 use prost::Message;
 
 use exocortex_cache::{CacheWrite, LocalCache};
@@ -31,6 +30,117 @@ struct ClientGraphSnapshot {
 enum DecodedEvent {
     Change(Invalidation, u64),
     Reseed(ClientGraphSnapshot, u64),
+}
+
+#[derive(Debug)]
+enum SseFrame {
+    Activity,
+    Event { event_type: String, data: String },
+}
+
+#[derive(Debug)]
+enum SseReadError {
+    ResyncRequired,
+    Other(String),
+}
+
+struct BoundedSseParser {
+    line: Vec<u8>,
+    event_type: String,
+    data: String,
+    pending_cr: bool,
+    max_data_bytes: usize,
+}
+
+impl BoundedSseParser {
+    fn new(max_data_bytes: usize) -> Self {
+        Self {
+            line: Vec::new(),
+            event_type: String::new(),
+            data: String::new(),
+            pending_cr: false,
+            max_data_bytes,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<SseFrame>, String> {
+        let mut frames = Vec::new();
+        for &byte in bytes {
+            if self.pending_cr {
+                self.pending_cr = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' => {
+                    self.finish_line(&mut frames)?;
+                    self.pending_cr = true;
+                }
+                b'\n' => self.finish_line(&mut frames)?,
+                _ => {
+                    if self.line.len() >= self.max_data_bytes.saturating_add(16) {
+                        return Err("SSE line exceeds the encoded event ceiling".into());
+                    }
+                    self.line.push(byte);
+                }
+            }
+        }
+        Ok(frames)
+    }
+
+    fn finish_line(&mut self, frames: &mut Vec<SseFrame>) -> Result<(), String> {
+        let line = std::mem::take(&mut self.line);
+        if line.is_empty() {
+            if !self.data.is_empty() || !self.event_type.is_empty() {
+                frames.push(SseFrame::Event {
+                    event_type: std::mem::take(&mut self.event_type),
+                    data: std::mem::take(&mut self.data),
+                });
+            }
+            return Ok(());
+        }
+        if line[0] == b':' {
+            frames.push(SseFrame::Activity);
+            return Ok(());
+        }
+        let (field, value) = line.iter().position(|byte| *byte == b':').map_or(
+            (line.as_slice(), &[][..]),
+            |separator| {
+                let value = &line[separator + 1..];
+                (
+                    &line[..separator],
+                    value.strip_prefix(b" ").unwrap_or(value),
+                )
+            },
+        );
+        match field {
+            b"event" => {
+                self.event_type = std::str::from_utf8(value)
+                    .map_err(|_| "SSE event type is not UTF-8")?
+                    .to_owned();
+            }
+            b"data" => {
+                let separator = usize::from(!self.data.is_empty());
+                let next_len = self
+                    .data
+                    .len()
+                    .checked_add(separator)
+                    .and_then(|len| len.checked_add(value.len()))
+                    .ok_or("SSE event size overflow")?;
+                if next_len > self.max_data_bytes {
+                    return Err("SSE data exceeds the encoded event ceiling".into());
+                }
+                if separator != 0 {
+                    self.data.push('\n');
+                }
+                self.data
+                    .push_str(std::str::from_utf8(value).map_err(|_| "SSE data is not UTF-8")?);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 /// Errors surfaced by the subscriber.
@@ -181,7 +291,11 @@ fn decode_event(
     fingerprint: &[u8; 32],
     payload: &str,
 ) -> Result<DecodedEvent, SyncError> {
-    let raw = b64_decode(payload).ok_or_else(|| SyncError::BadPayload("base64".into()))?;
+    let raw = exocortex_wire::transport::base64_decode_bounded(
+        payload,
+        exocortex_wire::limits::MAX_SSE_EVENT_DATA_BYTES,
+    )
+    .ok_or_else(|| SyncError::BadPayload("base64 or encoded event size".into()))?;
     let env = InvalidationEnvelope::decode(raw.as_slice())
         .map_err(|e| SyncError::BadPayload(e.to_string()))?;
     verify_envelope(hmac_key, fingerprint, &env)?;
@@ -348,6 +462,90 @@ impl LsnGate {
     }
 }
 
+fn bounded_sse_stream(
+    url: String,
+    bearer: Option<String>,
+    stall_timeout: Duration,
+) -> impl futures::Stream<Item = Result<SseFrame, SseReadError>> {
+    async_stream::stream! {
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
+        let client = hyper::Client::builder().build::<_, hyper::Body>(connector);
+        let mut request = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(&url)
+            .header(hyper::header::ACCEPT, "text/event-stream")
+            .header(hyper::header::CACHE_CONTROL, "no-cache")
+            .header("x-exocortex-sse-version", exocortex_wire::SSE_EVENT_VERSION.to_string());
+        if let Some(token) = bearer {
+            request = request.header(hyper::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let request = match request.body(hyper::Body::empty()) {
+            Ok(request) => request,
+            Err(error) => {
+                yield Err(SseReadError::Other(format!("invalid SSE request: {error}")));
+                return;
+            }
+        };
+        let response = match tokio::time::timeout(stall_timeout, client.request(request)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                yield Err(SseReadError::Other(format!("SSE request failed: {error}")));
+                return;
+            }
+            Err(_) => {
+                yield Err(SseReadError::Other("SSE response headers timed out".into()));
+                return;
+            }
+        };
+        if response.status() == hyper::StatusCode::CONFLICT {
+            yield Err(SseReadError::ResyncRequired);
+            return;
+        }
+        if !response.status().is_success() {
+            yield Err(SseReadError::Other(format!(
+                "SSE backend returned HTTP {}",
+                response.status()
+            )));
+            return;
+        }
+        yield Ok(SseFrame::Activity);
+        let mut body = response.into_body();
+        let mut parser = BoundedSseParser::new(
+            exocortex_wire::limits::MAX_SSE_EVENT_DATA_BYTES,
+        );
+        loop {
+            let chunk = match tokio::time::timeout(stall_timeout, body.data()).await {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(error))) => {
+                    yield Err(SseReadError::Other(format!("SSE body failed: {error}")));
+                    return;
+                }
+                Ok(None) => return,
+                Err(_) => {
+                    yield Err(SseReadError::Other("SSE stream stalled".into()));
+                    return;
+                }
+            };
+            match parser.push(&chunk) {
+                Ok(frames) => {
+                    for frame in frames {
+                        yield Ok(frame);
+                    }
+                }
+                Err(error) => {
+                    yield Err(SseReadError::Other(error));
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Run the reconnecting subscriber until the process exits. Each connection
 /// applies envelopes through the gate; gaps and stalls both trigger a
 /// resubscribe from the last applied LSN (R-C6), invoking `resync` first
@@ -367,40 +565,10 @@ pub async fn run_sse_sync(
         let mut gate = LsnGate::new(next_lsn);
         let reconnect_reason;
         {
-            let mut builder = match es::ClientBuilder::for_url(&url).map_err(|e| e.to_string()) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(%e, "sse client build failed; backing off");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(10));
-                    continue;
-                }
-            };
-            let sse_version = exocortex_wire::SSE_EVENT_VERSION.to_string();
-            builder = match builder.header("x-exocortex-sse-version", &sse_version) {
-                Ok(builder) => builder,
-                Err(error) => {
-                    tracing::warn!(%error, "SSE version header rejected; backing off");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(10));
-                    continue;
-                }
-            };
-            if let Some(bearer) = &cfg.bearer {
-                match builder.header("authorization", &format!("Bearer {bearer}")) {
-                    Ok(b) => builder = b,
-                    Err(e) => {
-                        tracing::warn!(%e, "sse bearer header rejected; backing off");
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(10));
-                        continue;
-                    }
-                }
-            }
-            let client = builder.read_timeout(cfg.stall_timeout).build();
-            let mut stream = client.stream();
-            let reconcile = tokio::time::sleep(cfg.reconcile_interval);
-            tokio::pin!(reconcile);
+            let stream = bounded_sse_stream(url, cfg.bearer.clone(), cfg.stall_timeout);
+            tokio::pin!(stream);
+            let mut reconcile_deadline =
+                (!needs_seed).then(|| tokio::time::Instant::now() + cfg.reconcile_interval);
             loop {
                 let gap_deadline = gate.gap_deadline(cfg.gap_timeout);
                 let gap_timer = async move {
@@ -412,8 +580,16 @@ pub async fn run_sse_sync(
                     }
                 };
                 tokio::pin!(gap_timer);
+                let armed_reconcile_deadline = reconcile_deadline;
+                let reconcile_timer = async move {
+                    match armed_reconcile_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => futures::future::pending::<()>().await,
+                    }
+                };
+                tokio::pin!(reconcile_timer);
                 let item = tokio::select! {
-                    _ = &mut reconcile => {
+                    _ = &mut reconcile_timer => {
                         needs_seed = true;
                         reconnect_reason = "periodic authoritative reconciliation";
                         break;
@@ -439,10 +615,6 @@ pub async fn run_sse_sync(
                     reconnect_reason = "stream ended before publication";
                     break;
                 };
-                // `eventsource-client` does not promise a separate
-                // `Connected` item for every HTTP/SSE response shape. Any
-                // successfully parsed SSE item proves that authentication,
-                // status handling, and stream framing completed.
                 if item.is_ok() {
                     if let Some(ready) = &cfg.connection_ready {
                         ready.notify_one();
@@ -451,11 +623,11 @@ pub async fn run_sse_sync(
                 match item {
                     // R-C5: heartbeats/connect anchors prove transport-level
                     // activity; silence still trips `read_timeout` below.
-                    Ok(es::SSE::Connected(_)) | Ok(es::SSE::Comment(_)) => {}
-                    Ok(es::SSE::Event(ev)) => {
-                        if ev.event_type == "inv" {
+                    Ok(SseFrame::Activity) => {}
+                    Ok(SseFrame::Event { event_type, data }) => {
+                        if event_type == "inv" {
                             let verify_key = cfg.client_key.unwrap_or(cfg.hmac_key);
-                            match decode_event(&verify_key, &cfg.fingerprint, &ev.data) {
+                            match decode_event(&verify_key, &cfg.fingerprint, &data) {
                                 Ok(DecodedEvent::Change(inv, lsn)) => {
                                     let mut visibility_changed = false;
                                     for released in gate.push(lsn, inv) {
@@ -491,6 +663,8 @@ pub async fn run_sse_sync(
                                     next_lsn = lsn.saturating_add(1);
                                     gate = LsnGate::new(next_lsn);
                                     backoff = cfg.backoff;
+                                    reconcile_deadline =
+                                        Some(tokio::time::Instant::now() + cfg.reconcile_interval);
                                     if let Some(ready) = &cfg.hydration_ready {
                                         ready.notify_one();
                                     }
@@ -511,7 +685,7 @@ pub async fn run_sse_sync(
                             break;
                         }
                     }
-                    Err(es::Error::UnexpectedResponse(resp, _)) if resp.status() == 409 => {
+                    Err(SseReadError::ResyncRequired) => {
                         // R-C6: Resync Required -> targeted rehydration via
                         // the hook, then resume from the server's replay
                         // floor. Without advancing `next_lsn` the client
@@ -521,7 +695,7 @@ pub async fn run_sse_sync(
                         reconnect_reason = "409 resync";
                         break;
                     }
-                    Err(e) => {
+                    Err(SseReadError::Other(e)) => {
                         tracing::warn!(%e, "sse stream error");
                         needs_seed = true;
                         reconnect_reason = "stream error";
@@ -555,7 +729,31 @@ pub use exocortex_wire::transport::base64_decode as b64_decode;
 
 #[cfg(test)]
 mod tests {
-    use super::subscription_url;
+    use super::{subscription_url, BoundedSseParser, SseFrame};
+
+    #[test]
+    fn sse_parser_rejects_oversized_fragmented_data_before_event_completion() {
+        let mut parser = BoundedSseParser::new(8);
+        assert!(parser.push(b"event: inv\ndata: 1234").unwrap().is_empty());
+        let error = parser.push(b"56789\n").unwrap_err();
+        assert!(error.contains("ceiling"));
+    }
+
+    #[test]
+    fn sse_parser_preserves_fragmented_crlf_event_framing() {
+        let mut parser = BoundedSseParser::new(8);
+        assert!(parser
+            .push(b": hi\r")
+            .unwrap()
+            .iter()
+            .any(|frame| matches!(frame, SseFrame::Activity)));
+        let frames = parser.push(b"\nevent: inv\r\ndata: Zg==\r\n\r\n").unwrap();
+        assert!(matches!(
+            frames.as_slice(),
+            [SseFrame::Event { event_type, data }]
+                if event_type == "inv" && data == "Zg=="
+        ));
+    }
 
     #[test]
     fn subscription_url_never_contains_credentials() {

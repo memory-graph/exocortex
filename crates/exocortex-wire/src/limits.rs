@@ -16,6 +16,13 @@ pub const MAX_TAG_BYTES_PER_MEMORY: usize = 2048;
 pub const MAX_MEMORIES_PER_BATCH: usize = 256;
 /// Maximum relationships in one request/batch.
 pub const MAX_EDGES_PER_BATCH: usize = 64;
+/// Maximum JSON bytes in one authoritative SSE graph reseed.
+pub const MAX_SSE_RESEED_JSON_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum decoded protobuf envelope bytes. The fixed allowance covers all
+/// authenticated envelope and protobuf framing fields around the reseed JSON.
+pub const MAX_SSE_ENVELOPE_BYTES: usize = MAX_SSE_RESEED_JSON_BYTES + 4096;
+/// Maximum RFC 4648 bytes carried in one SSE `data` field.
+pub const MAX_SSE_EVENT_DATA_BYTES: usize = MAX_SSE_ENVELOPE_BYTES.div_ceil(3) * 4;
 
 /// Validate one memory's caller-controlled variable-width fields.
 pub fn validate_memory_fields(content: &str, tags: &[String]) -> Result<(), &'static str> {

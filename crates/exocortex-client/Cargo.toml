@@ -39,7 +39,8 @@ exocortex-ops = { workspace = true }
 exocortex-adapter-sdk = { workspace = true }  # W1: reuse the R13 classify table, not a second copy
 rmcp = { workspace = true }
 sled = { workspace = true }
-eventsource-client = { workspace = true }
+hyper = { workspace = true }
+hyper-rustls = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 metrics = { workspace = true }

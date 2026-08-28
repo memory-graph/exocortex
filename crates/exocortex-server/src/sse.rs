@@ -31,7 +31,7 @@ struct ClientGraphSnapshot {
 }
 
 const MAX_RESEED_ROWS: usize = 50_000;
-const MAX_RESEED_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RESEED_BYTES: usize = exocortex_wire::limits::MAX_SSE_RESEED_JSON_BYTES;
 const MAX_CONCURRENT_RESEEDS: usize = 2;
 const MAX_LIVE_STREAMS_GLOBAL: usize = 256;
 const MAX_LIVE_STREAMS_PER_PRINCIPAL: usize = 8;

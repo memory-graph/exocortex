@@ -33,6 +33,16 @@ pub fn base64_encode(data: &[u8]) -> String {
 
 /// Decode RFC 4648 standard base64, rejecting invalid padding or alphabet.
 pub fn base64_decode(value: &str) -> Option<Vec<u8>> {
+    base64_decode_bounded(value, usize::MAX)
+}
+
+/// Decode standard base64 only when the encoded input fits the caller's
+/// admission ceiling. The size check happens before any proportional
+/// allocation or alphabet work.
+pub fn base64_decode_bounded(value: &str, max_encoded_bytes: usize) -> Option<Vec<u8>> {
+    if value.len() > max_encoded_bytes {
+        return None;
+    }
     fn sextet(byte: u8) -> Option<u8> {
         match byte {
             b'A'..=b'Z' => Some(byte - b'A'),
@@ -127,7 +137,7 @@ pub fn validate_backend_url(url: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_decode, base64_encode, validate_backend_url};
+    use super::{base64_decode, base64_decode_bounded, base64_encode, validate_backend_url};
 
     #[test]
     fn base64_standard_vectors_and_padding_are_canonical() {
@@ -144,6 +154,15 @@ mod tests {
         for invalid in ["!!!", "Zg=", "Z===", "Zg=a"] {
             assert!(base64_decode(invalid).is_none(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn bounded_base64_rejects_before_decoding_over_limit_input() {
+        assert_eq!(
+            base64_decode_bounded("Zg==", 4).as_deref(),
+            Some(b"f".as_slice())
+        );
+        assert!(base64_decode_bounded("Zg==", 3).is_none());
     }
 
     #[test]
