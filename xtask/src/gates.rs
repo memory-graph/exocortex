@@ -1,17 +1,42 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-pub(crate) const DEAD_CONTROLS: &[(&str, &str)] = &[
-    ("admit_and_publish", "crates/exocortex-cluster/src/node.rs"),
-    ("check_deadline", "crates/exocortex-ops/src/operations.rs"),
-    ("on_writes_once", "crates/exocortex-ingest/src/service.rs"),
+pub(crate) const DEAD_CONTROLS: &[(&str, &str, Option<&str>)] = &[
+    (
+        "admit_and_publish",
+        "crates/exocortex-cluster/src/node.rs",
+        Some("self.admit_and_publish"),
+    ),
+    (
+        "check_deadline",
+        "crates/exocortex-ops/src/operations.rs",
+        Some("ctx.check_deadline"),
+    ),
+    (
+        "on_writes_once",
+        "crates/exocortex-ingest/src/service.rs",
+        Some("dreams.on_writes_once"),
+    ),
     (
         "new_with_admin_policies",
         "crates/exocortex-server/src/backend.rs",
+        Some("IngestServer::new_with_admin_policies"),
     ),
-    ("drain_all", "crates/exocortex-client/src/main.rs"),
-    ("advance_local_lsn", "crates/exocortex-client/src/mcp.rs"),
-    ("apply_local", "crates/exocortex-client/src/mcp.rs"),
+    (
+        "drain_all",
+        "crates/exocortex-client/src/main.rs",
+        Some("exocortex_client::drain::drain_all"),
+    ),
+    (
+        "advance_local_lsn",
+        "crates/exocortex-client/src/mcp.rs",
+        Some("self.cache.advance_local_lsn"),
+    ),
+    (
+        "apply_local",
+        "crates/exocortex-client/src/mcp.rs",
+        Some("self.cache.apply_local"),
+    ),
 ];
 
 fn llm_markers() -> Vec<String> {
@@ -118,17 +143,17 @@ pub(crate) fn validate_storage_target_listing(
 
 pub(crate) fn dead_enforcement_violations(
     root: &Path,
-    controls: &[(&str, &str)],
+    controls: &[(&str, &str, Option<&str>)],
 ) -> Result<Vec<String>> {
     let mut violations = Vec::new();
-    for (name, witness) in controls {
+    for (name, witness, qualified_call) in controls {
         let path = root.join(witness);
         if !path.is_file() {
             violations.push(format!("witness file {witness} for `{name}` is missing"));
             continue;
         }
         let source = std::fs::read_to_string(&path)?;
-        if !contains_reachable_production_call(&source, name) {
+        if !contains_reachable_production_call(&source, name, *qualified_call) {
             violations.push(format!(
                 "`{name}` has no executable production call in {witness}"
             ));
@@ -147,7 +172,11 @@ struct RustFunction {
     configured_out: bool,
 }
 
-fn contains_reachable_production_call(source: &str, name: &str) -> bool {
+fn contains_reachable_production_call(
+    source: &str,
+    name: &str,
+    qualified_call: Option<&str>,
+) -> bool {
     let source = strip_comments_and_strings(source);
     let functions = rust_functions(&source);
     let mut reachable = vec![false; functions.len()];
@@ -190,6 +219,13 @@ fn contains_reachable_production_call(source: &str, name: &str) -> bool {
             return false;
         }
         let body = &source[function.body_start..function.body_end];
+        if let Some(qualified_call) = qualified_call {
+            let compact = body
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            return compact.contains(&format!("{qualified_call}("));
+        }
         body.match_indices(&needle).any(|(relative, _)| {
             is_call_to(body, relative, target_is_method)
                 && !configured_out_at(body, relative)
@@ -925,7 +961,9 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
                     searchable.contains(needle),
                     "criterion {criterion} evidence symbol `{needle}` is absent from {relative}"
                 );
-                validate_executable_evidence(criterion, relative, needle, &source, columns[4])?;
+                validate_executable_evidence(
+                    root, criterion, relative, needle, &source, columns[3], columns[4],
+                )?;
             }
         }
     }
@@ -938,10 +976,12 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
 }
 
 fn validate_executable_evidence(
+    root: &Path,
     criterion: u8,
     relative: &str,
     needle: &str,
     source: &str,
+    all_evidence: &str,
     command: &str,
 ) -> Result<()> {
     if is_shell_source(relative, source) {
@@ -949,6 +989,10 @@ fn validate_executable_evidence(
         anyhow::ensure!(
             active.contains(needle),
             "criterion {criterion} evidence `{relative}::{needle}` exists only in shell comments or inert text"
+        );
+        anyhow::ensure!(
+            shell_evidence_is_executed(root, relative, all_evidence, command)?,
+            "criterion {criterion} shell evidence `{relative}::{needle}` is not exercised or inspected by `{command}`"
         );
         return Ok(());
     }
@@ -1038,6 +1082,41 @@ fn validate_executable_evidence(
     Ok(())
 }
 
+fn shell_evidence_is_executed(
+    root: &Path,
+    relative: &str,
+    all_evidence: &str,
+    command: &str,
+) -> Result<bool> {
+    if command.contains(relative) {
+        return Ok(true);
+    }
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let Some(position) = tokens.iter().position(|token| *token == "xtask") else {
+        return Ok(false);
+    };
+    let Some(gate) = tokens.get(position + 1) else {
+        return Ok(false);
+    };
+    let function = gate.replace('-', "_");
+    let locator = format!("xtask/src/main.rs::fn {function}()");
+    if !all_evidence.split(';').any(|item| item == locator) {
+        return Ok(false);
+    }
+    let source = std::fs::read_to_string(root.join("xtask/src/main.rs"))?;
+    let pattern = format!("fn {function}");
+    let Some(start) = source.find(&pattern) else {
+        return Ok(false);
+    };
+    let Some(open) = function_body_start(&source, start + pattern.len()) else {
+        return Ok(false);
+    };
+    let Some(close) = matching_brace(&source, open) else {
+        return Ok(false);
+    };
+    Ok(source[open..=close].contains(relative))
+}
+
 fn is_shell_source(relative: &str, source: &str) -> bool {
     relative.ends_with(".sh")
         || source
@@ -1075,9 +1154,50 @@ pub(crate) fn active_shell_commands(script: &str) -> Vec<String> {
         line
     }
 
+    fn heredoc(command: &str) -> Option<(String, bool)> {
+        let mut cursor = 0;
+        let marker = loop {
+            let relative = command[cursor..].find("<<")?;
+            let marker = cursor + relative;
+            if command.as_bytes().get(marker + 2) == Some(&b'<') {
+                cursor = marker + 3;
+                continue;
+            }
+            break marker;
+        };
+        let mut rest = &command[marker + 2..];
+        let strip_tabs = rest.starts_with('-');
+        if strip_tabs {
+            rest = &rest[1..];
+        }
+        rest = rest.trim_start();
+        let token = rest.split_whitespace().next()?;
+        let delimiter = if token.len() >= 2
+            && ((token.starts_with('\'') && token.ends_with('\''))
+                || (token.starts_with('"') && token.ends_with('"')))
+        {
+            &token[1..token.len() - 1]
+        } else {
+            token
+        };
+        (!delimiter.is_empty()).then(|| (delimiter.to_owned(), strip_tabs))
+    }
+
     let mut commands = Vec::new();
     let mut current = String::new();
+    let mut heredoc_body: Option<(String, bool)> = None;
     for line in script.lines() {
+        if let Some((delimiter, strip_tabs)) = &heredoc_body {
+            let candidate = if *strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if candidate == delimiter {
+                heredoc_body = None;
+            }
+            continue;
+        }
         let line = without_comment(line).trim();
         if line.is_empty() || line.starts_with("#!") {
             continue;
@@ -1089,7 +1209,9 @@ pub(crate) fn active_shell_commands(script: &str) -> Vec<String> {
         }
         current.push_str(fragment);
         if !continued {
-            commands.push(std::mem::take(&mut current));
+            let command = std::mem::take(&mut current);
+            heredoc_body = heredoc(&command);
+            commands.push(command);
         }
     }
     if !current.is_empty() {
@@ -1483,7 +1605,8 @@ mod tests {
             "fn fence() {} // fence() is definitely live\n",
         );
         let violations =
-            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")]).unwrap();
+            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs", None)])
+                .unwrap();
         assert_eq!(violations.len(), 1);
 
         write(
@@ -1492,20 +1615,52 @@ mod tests {
             "pub fn root(x: &Guard) { x.fence(); } fn fence() {}\n",
         );
         let violations =
-            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")]).unwrap();
+            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs", None)])
+                .unwrap();
         assert_eq!(
             violations.len(),
             1,
             "an unrelated method call must not make a same-named free control reachable"
         );
+
+        write(
+            &root,
+            "crates/example/src/lib.rs",
+            "struct Guard; impl Guard { fn fence(&self) {} } struct Other; impl Other { fn fence(&self) {} } pub fn root(other: &Other) { other.fence(); }\n",
+        );
+        assert_eq!(
+            dead_enforcement_violations(
+                &root,
+                &[("fence", "crates/example/src/lib.rs", Some("guard.fence"),)],
+            )
+            .unwrap()
+            .len(),
+            1,
+            "an unrelated receiver must not make a same-named method control reachable"
+        );
+        write(
+            &root,
+            "crates/example/src/lib.rs",
+            "struct Guard; impl Guard { fn fence(&self) {} } pub fn root(guard: &Guard) { guard.fence(); }\n",
+        );
+        assert!(dead_enforcement_violations(
+            &root,
+            &[("fence", "crates/example/src/lib.rs", Some("guard.fence"),)],
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
     fn dead_control_manifest_tracks_the_idempotent_dreams_boundary() {
-        assert!(
-            DEAD_CONTROLS.contains(&("on_writes_once", "crates/exocortex-ingest/src/service.rs"))
-        );
-        assert!(!DEAD_CONTROLS.contains(&("on_writes", "crates/exocortex-ingest/src/service.rs")));
+        assert!(DEAD_CONTROLS.contains(&(
+            "on_writes_once",
+            "crates/exocortex-ingest/src/service.rs",
+            Some("dreams.on_writes_once")
+        )));
+        assert!(!DEAD_CONTROLS
+            .iter()
+            .any(|(name, _, _)| *name == "on_writes"));
     }
 
     #[test]
@@ -1527,7 +1682,10 @@ mod tests {
             let root = fixture(name);
             write(&root, "crates/example/src/lib.rs", source);
             assert_eq!(
-                dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")])
+                dead_enforcement_violations(
+                    &root,
+                    &[("fence", "crates/example/src/lib.rs", None)],
+                )
                     .unwrap()
                     .len(),
                 1,
@@ -1541,11 +1699,12 @@ mod tests {
             "crates/example/src/lib.rs",
             "pub fn root() { helper(); }\nfn helper() { fence(); }\nfn fence() {}\n",
         );
-        assert!(
-            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")])
-                .unwrap()
-                .is_empty()
-        );
+        assert!(dead_enforcement_violations(
+            &root,
+            &[("fence", "crates/example/src/lib.rs", None)],
+        )
+        .unwrap()
+        .is_empty());
 
         let root = fixture("trait-entrypoint");
         write(
@@ -1554,7 +1713,7 @@ mod tests {
             "trait Api { fn submit(&self); } struct Server; impl Api for Server { fn submit(&self) { fence(); } } fn fence() {}\n",
         );
         assert!(
-            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")])
+            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs", None)],)
                 .unwrap()
                 .is_empty(),
             "public trait implementations are production entrypoints"
@@ -1567,7 +1726,7 @@ mod tests {
             "pub fn root() { helper([0; 32]); }\nfn helper(_key: [u8; 32]) { fence(); }\nfn fence() {}\n",
         );
         assert!(
-            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")])
+            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs", None)],)
                 .unwrap()
                 .is_empty(),
             "array-type semicolons are not function declaration terminators"
@@ -1580,7 +1739,7 @@ mod tests {
             "struct Marker<const N: usize>;\npub fn root() { let _ = helper(); }\nfn helper() -> Marker<{ fence() }> { Marker }\nconst fn fence() -> usize { 1 }\n",
         );
         assert_eq!(
-            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")])
+            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs", None)],)
                 .unwrap()
                 .len(),
             1,
@@ -1857,6 +2016,22 @@ mod tests {
             "#!/bin/sh\nshell_evidence=1\ntest \"$shell_evidence\" = 1\n",
         );
         assert!(validate_acceptance_matrix(&root).is_ok());
+        let unrelated_shell = shell_rows.replace("sh scripts/check", "sh scripts/unrelated");
+        write(&root, "docs/acceptance/section-23.tsv", &unrelated_shell);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "the recorded command must execute or inspect the cited shell artifact"
+        );
+        write(
+            &root,
+            "scripts/check",
+            "#!/bin/sh\ncat <<'EOF'\nshell_evidence\nEOF\n",
+        );
+        write(&root, "docs/acceptance/section-23.tsv", &shell_rows);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "heredoc body data must not satisfy executable shell evidence"
+        );
         write(&root, "docs/acceptance/section-23.tsv", &rows);
 
         write(
