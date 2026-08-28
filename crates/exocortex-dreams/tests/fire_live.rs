@@ -472,12 +472,13 @@ async fn stable_write_event_is_counted_once_after_an_ambiguous_retry() {
         age_floor_days: u32::MAX,
         min_interval_hours: 0,
     };
+    let event_id = format!("batch:{}", uuid::Uuid::new_v4());
     let first = queue
-        .record_write_once(&region, 3, 2, trigger, "node", "batch:event")
+        .record_write_once(&region, 3, 2, trigger, "node", &event_id)
         .await
         .unwrap();
     let retry = queue
-        .record_write_once(&region, 3, 2, trigger, "node", "batch:event")
+        .record_write_once(&region, 3, 2, trigger, "node", &event_id)
         .await
         .unwrap();
     assert!(matches!(
@@ -512,6 +513,72 @@ async fn stable_write_event_is_counted_once_after_an_ambiguous_retry() {
         .arg(format!("{key}:deferred"))
         .arg(format!("{key}:processing"))
         .arg(counter_key)
+        .arg(format!(
+            "exocortex:dreams:counters:{}:processed-events",
+            serde_json::to_string(&region).unwrap()
+        ))
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn interleaved_effect_retry_is_counted_once() {
+    let Some((client, mut queue, key)) = isolated_queue("interleaved-org").await else {
+        return;
+    };
+    let region = RegionKey {
+        org: "interleaved-org".into(),
+        project: "project".into(),
+        memory_type: 3,
+    };
+    let trigger = DreamsTrigger {
+        memory_threshold: u32::MAX,
+        edge_threshold: u32::MAX,
+        age_floor_days: u32::MAX,
+        min_interval_hours: 0,
+    };
+    let suffix = uuid::Uuid::new_v4();
+    let event_a = format!("effect-a:{suffix}");
+    let event_b = format!("effect-b:{suffix}");
+    for (event, memories, edges) in [(&event_a, 3, 2), (&event_b, 1, 1), (&event_a, 3, 2)] {
+        assert!(matches!(
+            queue
+                .record_write_once(&region, memories, edges, trigger, "node", event)
+                .await
+                .unwrap(),
+            RecordWriteOutcome::Accumulated(_)
+        ));
+    }
+
+    let mut inspect = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("second Redis connection");
+    let counter_key = format!(
+        "exocortex:dreams:counters:{}",
+        serde_json::to_string(&region).unwrap()
+    );
+    let values: (u32, u32) = redis::cmd("HMGET")
+        .arg(&counter_key)
+        .arg("memories")
+        .arg("edges")
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+    assert_eq!(values, (4, 3), "A/B/A must apply A exactly once");
+    let processed: u64 = redis::cmd("SCARD")
+        .arg(format!("{counter_key}:processed-events"))
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+    assert_eq!(processed, 2);
+    let _: u64 = redis::cmd("DEL")
+        .arg(&key)
+        .arg(format!("{key}:deferred"))
+        .arg(format!("{key}:processing"))
+        .arg(&counter_key)
+        .arg(format!("{counter_key}:processed-events"))
         .query_async(&mut inspect)
         .await
         .unwrap();

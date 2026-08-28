@@ -1370,6 +1370,32 @@ impl FalkorStorage {
         Ok(digest)
     }
 
+    async fn ensure_lease_current(&self, lease: &OwnerLease) -> Result<(), StorageError> {
+        let rows = self
+            .run_template(
+                "lease_is_current",
+                &serde_json::json!({
+                    "lease_key": serde_json::to_string(&lease.key)
+                        .map_err(|error| StorageError::Backend(error.to_string()))?,
+                    "token": lease.fencing_token.as_str(),
+                    "epoch": lease.epoch,
+                    "now_ms": Utc::now().timestamp_millis(),
+                }),
+                true,
+            )
+            .await?;
+        match rows.first().and_then(|row| row.first()) {
+            Some(FalkorValue::I64(1)) => Ok(()),
+            Some(FalkorValue::I64(0)) => Err(StorageError::FencedWriteRejected {
+                lease_epoch: lease.epoch,
+            }),
+            other => Err(StorageError::CorruptMetadata {
+                key: "lease current count",
+                detail: format!("expected 0 or 1, got {other:?}"),
+            }),
+        }
+    }
+
     fn proposal_params(proposal: &DiscoveryProposal) -> Result<serde_json::Value, StorageError> {
         Ok(serde_json::json!({
             "discovery_id": proposal.discovery_id,
@@ -3651,6 +3677,7 @@ impl Storage for FalkorStorage {
         lease: &OwnerLease,
     ) -> Result<(), StorageError> {
         let effect_digest = crate::trait_::dreams_settlement_effect_digest(discoveries)?;
+        self.ensure_lease_current(lease).await?;
         // Avoid allocating Redis LSNs for a durable no-op. A reused identity
         // with a different effect is corruption and fails closed.
         if let Some(stored) = self

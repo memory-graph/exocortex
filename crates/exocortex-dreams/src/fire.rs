@@ -37,16 +37,37 @@ local queue = KEYS[1]
 local counters = KEYS[2]
 local deferred = KEYS[3]
 local processing = KEYS[4]
-if redis.call('HGET', counters, 'last_write_event') == ARGV[14] then
+local processed_events = KEYS[5]
+local function require_type(key, expected)
+    local actual = redis.call('TYPE', key)['ok']
+    if actual ~= 'none' and actual ~= expected then
+        error('Dreams key has wrong type: expected ' .. expected)
+    end
+end
+require_type(queue, 'list')
+require_type(counters, 'hash')
+require_type(deferred, 'zset')
+require_type(processing, 'list')
+require_type(processed_events, 'set')
+local memory_raw = redis.call('HGET', counters, 'memories')
+local edge_raw = redis.call('HGET', counters, 'edges')
+local success_raw = redis.call('HGET', counters, 'last_success')
+if (memory_raw and not tonumber(memory_raw))
+    or (edge_raw and not tonumber(edge_raw))
+    or (success_raw and not tonumber(success_raw)) then
+    return redis.error_reply('Dreams counter metadata is not numeric')
+end
+if redis.call('SISMEMBER', processed_events, ARGV[14]) == 1 then
     return {
         tonumber(redis.call('HGET', counters, 'memories') or '0'),
         tonumber(redis.call('HGET', counters, 'edges') or '0'),
         0
     }
 end
-local memories = math.min(4294967295, redis.call('HINCRBY', counters, 'memories', ARGV[2]))
-local edges = math.min(4294967295, redis.call('HINCRBY', counters, 'edges', ARGV[3]))
-redis.call('HSET', counters, 'memories', memories, 'edges', edges, 'last_write_event', ARGV[14])
+local memories = math.min(4294967295, tonumber(memory_raw or '0') + tonumber(ARGV[2]))
+local edges = math.min(4294967295, tonumber(edge_raw or '0') + tonumber(ARGV[3]))
+redis.call('SADD', processed_events, ARGV[14])
+redis.call('HSET', counters, 'memories', memories, 'edges', edges)
 redis.call('HSETNX', counters, 'last_success', ARGV[6])
 local elapsed = math.max(0, tonumber(ARGV[6]) - tonumber(redis.call('HGET', counters, 'last_success')))
 local threshold = memories >= tonumber(ARGV[4]) or edges >= tonumber(ARGV[5]) or elapsed >= tonumber(ARGV[8])
@@ -421,9 +442,9 @@ impl RedisFireQueue {
             .await
     }
 
-    /// Record one stable durable ingest effect. Retrying the immediately
-    /// pending effect after an ambiguous Redis response returns the retained
-    /// counters without applying its deltas again.
+    /// Record one stable durable ingest effect. Every processed identity is
+    /// retained per region because outbox claims can interleave and an older
+    /// ambiguous delivery may retry after arbitrarily many newer effects.
     pub async fn record_write_once(
         &mut self,
         region: &RegionKey,
@@ -445,6 +466,7 @@ impl RedisFireQueue {
             .key(counter_key(region))
             .key(self.deferred_key.as_str())
             .key(self.processing_key.as_str())
+            .key(processed_event_key(region))
             .arg(DREAMS_QUEUE_MAX)
             .arg(memories)
             .arg(edges)
@@ -661,6 +683,10 @@ fn counter_key(region: &RegionKey) -> String {
         "exocortex:dreams:counters:{}",
         serde_json::to_string(region).expect("RegionKey serialization is infallible")
     )
+}
+
+fn processed_event_key(region: &RegionKey) -> String {
+    format!("{}:processed-events", counter_key(region))
 }
 
 #[cfg(test)]

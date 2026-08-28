@@ -2767,7 +2767,17 @@ itest!(dreams_cycle_settlement_is_atomic_and_idempotent, {
         .cycle_succeeded(&lease_key, &duplicate_cycle)
         .await
         .unwrap());
-    s.release_lease(lease).await.unwrap();
+    s.release_lease(lease.clone()).await.unwrap();
+    let current = s
+        .acquire_lease(&lease_key, StdDuration::from_secs(30))
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.settle_dreams_cycle_fenced(&cycle_id, std::slice::from_ref(&record), &lease)
+            .await,
+        Err(StorageError::FencedWriteRejected { .. })
+    ));
+    s.release_lease(current).await.unwrap();
 });
 
 itest!(demoted_owner_cannot_persist_a_discovery, {

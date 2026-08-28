@@ -267,6 +267,17 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "lease_is_current",
+        read_only: true,
+        required_params: &["lease_key", "token", "epoch", "now_ms"],
+        cypher: r#"
+            MATCH (lease:_ExocortexLease {lease_key: $lease_key, token: $token})
+            WHERE lease.epoch = $epoch AND lease.expires_at_ms > $now_ms
+            RETURN count(lease)
+        "#,
+    });
+
+    reg!(Template {
         id: "create_dreams_cycle_success_index",
         read_only: false,
         required_params: &[],

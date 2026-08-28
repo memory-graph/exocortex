@@ -2339,6 +2339,18 @@ mod atomic_fence_tests {
             .cycle_succeeded(&key, "cycle-duplicate")
             .await
             .unwrap());
+        storage.release_lease(lease.clone()).await.unwrap();
+        let current = storage
+            .acquire_lease(&key, std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage
+                .settle_dreams_cycle_fenced("cycle-a", std::slice::from_ref(&record), &lease,)
+                .await,
+            Err(StorageError::FencedWriteRejected { .. })
+        ));
+        storage.release_lease(current).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
