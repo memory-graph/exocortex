@@ -77,6 +77,7 @@ const CACHE_BRIDGE_BURST: usize = 256;
 const CACHE_RESEED_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const CACHE_RESEED_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const CACHE_AUTHORITATIVE_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const DISCOVERY_OUTBOX_REPAIR_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Cache-bridge recovery timing, injectable for deterministic regressions.
 #[doc(hidden)]
@@ -586,6 +587,23 @@ async fn run_backend_node_inner<S: Storage + 'static>(
         Arc::new(next)
     });
     let _ = start_consuming_tx.send(());
+
+    // Discovery creation and its change-feed publication cross two durable
+    // systems. The graph-resident outbox makes the creation atomic with the
+    // owner fence; this independent repair loop prevents transient Redis
+    // delivery failures from retrying an already-completed Dreams cycle.
+    {
+        let storage = storage.clone();
+        background_tasks.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(DISCOVERY_OUTBOX_REPAIR_INTERVAL);
+            loop {
+                interval.tick().await;
+                if let Err(error) = storage.repair_discovery_outbox().await {
+                    tracing::warn!(?error, "discovery outbox repair failed; retrying");
+                }
+            }
+        }));
+    }
 
     // Cluster: envelope signing + SSE fan-out.
     let cluster = Arc::new(ClusterNode::new(

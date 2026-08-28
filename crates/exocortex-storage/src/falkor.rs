@@ -1220,6 +1220,48 @@ impl FalkorStorage {
         }
     }
 
+    async fn discovery_is_durably_pending(
+        &self,
+        discovery: &DiscoveryRecord,
+    ) -> Result<bool, StorageError> {
+        let rows = self
+            .run_template(
+                "discovery_record_state",
+                &serde_json::json!({ "discovery_id": discovery.discovery_id }),
+                true,
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            return Ok(false);
+        };
+        let stored = match row.first() {
+            Some(FalkorValue::String(value)) => serde_json::from_str::<DiscoveryRecord>(value)
+                .map_err(|error| StorageError::CorruptMetadata {
+                    key: "discovery_record",
+                    detail: error.to_string(),
+                })?,
+            other => {
+                return Err(StorageError::CorruptMetadata {
+                    key: "discovery_record",
+                    detail: format!("expected string, found {other:?}"),
+                })
+            }
+        };
+        if stored != *discovery {
+            return Err(StorageError::ProposalMismatch);
+        }
+        match row.get(1) {
+            Some(FalkorValue::I64(value)) if *value >= 0 => {}
+            other => {
+                return Err(StorageError::CorruptMetadata {
+                    key: "discovery_outbox_lsn",
+                    detail: format!("expected non-negative integer, found {other:?}"),
+                })
+            }
+        }
+        Ok(matches!(row.get(2), Some(FalkorValue::Bool(false))))
+    }
+
     fn memory_params(&self, m: &Memory, lsn: u64, mt_label: &str) -> serde_json::Value {
         let attribute_keys = m
             .tags
@@ -2527,7 +2569,22 @@ impl Storage for FalkorStorage {
                 lease_epoch: lease.epoch,
             });
         }
-        self.store_discovery(discovery).await
+        match self.store_discovery(discovery).await {
+            Ok(()) => Ok(()),
+            Err(error) if self.discovery_is_durably_pending(discovery).await? => {
+                tracing::warn!(
+                    discovery_id = %discovery.discovery_id,
+                    ?error,
+                    "discovery committed; publication remains in the durable outbox"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn repair_discovery_outbox(&self) -> Result<(), StorageError> {
+        self.drain_discovery_outbox().await
     }
 
     async fn get_discovery(

@@ -2368,12 +2368,25 @@ itest!(discovery_outbox_retries_after_live_publication_failure, {
         discovery_cycle_id: "retry-cycle".into(),
         discovered_at: Utc::now(),
     };
+    let lease = storage
+        .acquire_lease(
+            &LeaseKey::Dreams {
+                org: region.org.clone(),
+                region: format!("{}:{}", region.project, region.memory_type).into(),
+            },
+            StdDuration::from_secs(60),
+        )
+        .await
+        .unwrap();
     storage.fail_next_publish_for_testing();
-    assert!(storage.store_discovery(&record).await.is_err());
+    storage
+        .store_discovery_fenced(&record, &lease)
+        .await
+        .expect("durable fenced creation settles even when publication is pending");
     assert_eq!(
         storage.get_discovery(&record.discovery_id).await.unwrap(),
         Some(record.clone()),
-        "publication failure does not roll back the durable outbox record"
+        "publication failure neither rolls back nor duplicates the durable outbox record"
     );
 
     let url = falkor_url().unwrap();

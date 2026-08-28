@@ -215,6 +215,12 @@ pub trait Storage: Send + Sync + 'static {
             "fenced discovery records unsupported".into(),
         ))
     }
+    /// Retry delivery of durable discovery-outbox rows. A delivery failure is
+    /// never allowed to turn an already-committed owner-fenced Dreams cycle
+    /// into failed work; production runtimes call this repair seam repeatedly.
+    async fn repair_discovery_outbox(&self) -> crate::Result<()> {
+        Ok(())
+    }
     /// Load one durable unasserted discovery by id.
     async fn get_discovery(&self, discovery_id: &str) -> crate::Result<Option<DiscoveryRecord>> {
         let _ = discovery_id;
