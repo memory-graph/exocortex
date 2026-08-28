@@ -54,6 +54,121 @@ async fn http_get(addr: std::net::SocketAddr, path: &str, bearer: Option<&str>) 
     )
 }
 
+#[tokio::test]
+async fn cache_bridge_retries_failed_fetch_before_advancing_sync_health() {
+    use exocortex_kernel::{Provenance, Relationship, RelationshipId, RelationshipProperties};
+    use exocortex_storage::{Direction, Invalidation, TraversalSpec};
+
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto));
+    let from = acceptance_memory(1, false);
+    let to = acceptance_memory(2, false);
+    storage
+        .upsert_batch(&[from.clone(), to.clone()], &[])
+        .await
+        .unwrap();
+    let (cache, writer_rx) = exocortex_cache::LocalCache::new(64 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let storage = storage.clone();
+        async move { cache.run(storage, writer_rx).await }
+    });
+    cache
+        .reseed_from_storage(&*storage, &"org".into())
+        .await
+        .unwrap();
+
+    let relationship = Relationship {
+        id: RelationshipId([0x54; 16]),
+        kind: exocortex_kernel::kinds::SOLVES,
+        from: from.id,
+        to: to.id,
+        visibility: exocortex_kernel::Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "bridge-test".into(),
+            producer_kind: None,
+        },
+        properties: RelationshipProperties {
+            strength: 0.5,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: chrono::Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        lsn: exocortex_kernel::LSN::new_local(0),
+    };
+    let health = Arc::new(arc_swap::ArcSwap::from_pointee(
+        exocortex_server::http_bind::HealthSnapshot::default(),
+    ));
+    let bridge = tokio::spawn({
+        let cache = cache.clone();
+        let health = health.clone();
+        let invalidation = Invalidation::RelationshipUpserted {
+            id: relationship.id,
+            from: relationship.from,
+            to: relationship.to,
+            kind: relationship.kind,
+            lsn: 54,
+        };
+        async move {
+            exocortex_server::backend::apply_cache_invalidation_with_retry(
+                &cache,
+                &health,
+                invalidation,
+                Duration::from_millis(1),
+            )
+            .await;
+        }
+    });
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while health.load().backend_lsn < 54 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("observed frontier advances before hydration succeeds");
+    assert_eq!(health.load().sync_lsn, 0, "failed fetch is not applied");
+
+    storage.upsert_relationship(&relationship).await.unwrap();
+    tokio::time::timeout(Duration::from_millis(250), bridge)
+        .await
+        .expect("same invalidation retries")
+        .unwrap();
+    assert_eq!(health.load().sync_lsn, 54);
+    let visible =
+        exocortex_ops::operations::ops_vc("org", "test", exocortex_kernel::Visibility::Org);
+    let reached = cache.traverse(
+        "org",
+        &from.id,
+        &TraversalSpec {
+            max_depth: 1,
+            direction: Direction::Out,
+            kinds: vec![relationship.kind].into(),
+            max_nodes: 8,
+            visibility_ctx: visible,
+            as_of: None,
+        },
+    );
+    assert_eq!(
+        reached.iter().map(|memory| memory.id).collect::<Vec<_>>(),
+        vec![to.id]
+    );
+    writer.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn backend_nodes_serve_http_grpc_and_gossip_converges() {
     let onto = Arc::new(

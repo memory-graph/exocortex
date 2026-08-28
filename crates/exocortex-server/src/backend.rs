@@ -105,6 +105,41 @@ impl<S: Storage> BackendNode<S> {
     }
 }
 
+/// Apply one observed backend invalidation to the node-local cache. The
+/// backend frontier advances immediately, while the sync frontier advances
+/// only after the cache writer acknowledges an atomic publication. Hydration
+/// failures retry the same item, preserving feed order and making lag honest.
+#[doc(hidden)]
+pub async fn apply_cache_invalidation_with_retry(
+    cache: &LocalCache,
+    health: &arc_swap::ArcSwap<HealthSnapshot>,
+    invalidation: exocortex_storage::Invalidation,
+    retry_delay: Duration,
+) {
+    let lsn = exocortex_storage::Invalidation::lsn_of(&invalidation);
+    health.rcu(|current| {
+        let mut next = (**current).clone();
+        next.backend_lsn = next.backend_lsn.max(lsn);
+        Arc::new(next)
+    });
+    loop {
+        match cache.apply_invalidation(invalidation.clone()).await {
+            Ok(()) => {
+                health.rcu(|current| {
+                    let mut next = (**current).clone();
+                    next.sync_lsn = next.sync_lsn.max(lsn);
+                    Arc::new(next)
+                });
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, lsn, "cache invalidation apply failed; retrying");
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+    }
+}
+
 /// Run a backend node over any storage until the runtime shuts the task
 /// down. Never returns under normal operation.
 pub async fn run_backend_node<S: Storage + 'static>(
@@ -187,19 +222,13 @@ pub async fn run_backend_node<S: Storage + 'static>(
                         while let Some(item) = sub.next().await {
                             match item {
                                 Ok(inv) => {
-                                    // CS6 (audit): the applied LSN is the
-                                    // node's sync frontier, and the highest
-                                    // observed LSN is the backend frontier
-                                    // (R-O6) — no more always-zero lag.
-                                    let lsn = exocortex_storage::Invalidation::lsn_of(&inv);
-                                    health.rcu(|h| {
-                                        let mut next = (**h).clone();
-                                        next.sync_lsn = next.sync_lsn.max(lsn);
-                                        next.backend_lsn = next.backend_lsn.max(lsn);
-                                        Arc::new(next)
-                                    });
-                                    let _ =
-                                        cache.submit(exocortex_cache::CacheWrite::Apply(inv)).await;
+                                    apply_cache_invalidation_with_retry(
+                                        &cache,
+                                        &health,
+                                        inv,
+                                        Duration::from_millis(100),
+                                    )
+                                    .await;
                                 }
                                 // CS7 (audit): a decode failure is a known
                                 // hole in this node's LSN sequence — count

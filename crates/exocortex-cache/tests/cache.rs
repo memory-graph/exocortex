@@ -178,18 +178,19 @@ async fn relationship_fetch_failure_does_not_advance_backend_lsn() {
         .await
         .unwrap();
     let before = cache.version("org").unwrap().backend_lsn;
-    cache
-        .submit(CacheWrite::Apply(
-            exocortex_storage::Invalidation::RelationshipUpserted {
-                id: exocortex_kernel::RelationshipId([0xEE; 16]),
-                from: MemoryId([1; 16]),
-                to: MemoryId([2; 16]),
-                kind: exocortex_kernel::RelKindId(1),
-                lsn: 99,
-            },
-        ))
+    let result = cache
+        .apply_invalidation(exocortex_storage::Invalidation::RelationshipUpserted {
+            id: exocortex_kernel::RelationshipId([0xEE; 16]),
+            from: MemoryId([1; 16]),
+            to: MemoryId([2; 16]),
+            kind: exocortex_kernel::RelKindId(1),
+            lsn: 99,
+        })
         .await;
-    cache.flush().await;
+    assert!(
+        result.is_err(),
+        "failed hydration is acknowledged as failure"
+    );
     assert_eq!(
         cache.version("org").unwrap().backend_lsn,
         before,

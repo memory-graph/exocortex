@@ -584,6 +584,15 @@ pub enum CacheWrite {
         /// The change-feed event to apply.
         Invalidation,
     ),
+    /// Apply one invalidation and report whether its snapshot publication
+    /// completed. Backend health/retry wiring uses this acknowledgement so an
+    /// observed feed item is never mistaken for an applied generation.
+    ApplyAcknowledged {
+        /// The change-feed event to apply.
+        invalidation: Invalidation,
+        /// Completion result after the containing microbatch is published.
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Publish a freshly rebuilt snapshot for an org.
     Reseed {
         /// Target org.
@@ -601,6 +610,13 @@ pub enum CacheWrite {
     /// Deterministic test/readiness barrier: acknowledged after all earlier
     /// writer messages have been applied.
     Barrier(tokio::sync::oneshot::Sender<()>),
+}
+
+type ApplyAck = tokio::sync::oneshot::Sender<Result<(), String>>;
+
+struct PendingApply {
+    invalidation: Invalidation,
+    ack: Option<ApplyAck>,
 }
 
 impl LocalCache {
@@ -645,7 +661,17 @@ impl LocalCache {
             for msg in messages {
                 match msg {
                     CacheWrite::Apply(inv) => {
-                        pending.push(inv);
+                        pending.push(PendingApply {
+                            invalidation: inv,
+                            ack: None,
+                        });
+                        continue;
+                    }
+                    CacheWrite::ApplyAcknowledged { invalidation, ack } => {
+                        pending.push(PendingApply {
+                            invalidation,
+                            ack: Some(ack),
+                        });
                         continue;
                     }
                     CacheWrite::Reseed { org, snapshot, ack } => {
@@ -694,22 +720,45 @@ impl LocalCache {
         }
     }
 
-    async fn apply_pending<S: Storage>(&self, storage: &S, pending: &mut Vec<Invalidation>) {
+    async fn apply_pending<S: Storage>(&self, storage: &S, pending: &mut Vec<PendingApply>) {
         if !pending.is_empty() {
-            self.apply_batch(storage, std::mem::take(pending)).await;
+            let pending = std::mem::take(pending);
+            let invalidations = pending
+                .iter()
+                .map(|pending| pending.invalidation.clone())
+                .collect();
+            let error = self
+                .apply_batch(storage, invalidations)
+                .await
+                .err()
+                .map(|error| error.to_string());
+            for pending in pending {
+                if let Some(ack) = pending.ack {
+                    let result = error.as_ref().map_or(Ok(()), |error| Err(error.clone()));
+                    let _ = ack.send(result);
+                }
+            }
         }
     }
 
     /// Copy-on-write apply of one invalidation. Readers holding the old
     /// snapshot continue to see it until they release their Arc.
-    async fn apply_batch<S: Storage>(&self, storage: &S, invalidations: Vec<Invalidation>) {
+    async fn apply_batch<S: Storage>(
+        &self,
+        storage: &S,
+        invalidations: Vec<Invalidation>,
+    ) -> exocortex_storage::Result<()> {
         // v1 caches exactly one org per client (§17); invalidations target it.
-        let Some(org) = self.org_of_write() else {
-            return;
-        };
-        let Some(g) = self.graphs.get(&org) else {
-            return;
-        };
+        let org = self.org_of_write().ok_or_else(|| {
+            exocortex_storage::StorageError::Backend(
+                "cache invalidation has no resident org graph".into(),
+            )
+        })?;
+        let g = self.graphs.get(&org).ok_or_else(|| {
+            exocortex_storage::StorageError::Backend(
+                "cache invalidation target was evicted before publication".into(),
+            )
+        })?;
         let mut delta = Vec::new();
         for inv in invalidations {
             match inv {
@@ -723,7 +772,7 @@ impl LocalCache {
                         }
                         Err(e) => {
                             tracing::warn!(?e, "invalidation fetch failed");
-                            return;
+                            return Err(e);
                         }
                     }
                     delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
@@ -741,11 +790,13 @@ impl LocalCache {
                             tracing::warn!(
                                 "relationship invalidation row missing; LSN not advanced"
                             );
-                            return;
+                            return Err(exocortex_storage::StorageError::Backend(
+                                "relationship invalidation row missing".into(),
+                            ));
                         }
                         Err(error) => {
                             tracing::warn!(?error, "relationship invalidation fetch failed");
-                            return;
+                            return Err(error);
                         }
                     }
                     delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
@@ -773,12 +824,14 @@ impl LocalCache {
                 }
                 Invalidation::GraphReseed { .. } => {
                     tracing::warn!("graph reseed reached cache apply path; LSN not advanced");
-                    continue;
+                    return Err(exocortex_storage::StorageError::Backend(
+                        "graph reseed must use the atomic reseed path".into(),
+                    ));
                 }
             }
         }
         if delta.is_empty() {
-            return;
+            return Ok(());
         }
         let (old_bytes, new_bytes) = g.publish_delta(delta, &self.full_snapshot_clones);
         self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
@@ -795,6 +848,7 @@ impl LocalCache {
             }
         }
         self.admit(&org);
+        Ok(())
     }
 
     fn org_of_write(&self) -> Option<SmolStr> {
@@ -1209,6 +1263,19 @@ impl LocalCache {
     /// Submit a writer message (tests + client wiring).
     pub async fn submit(&self, w: CacheWrite) {
         let _ = self.writer.send(w).await;
+    }
+
+    /// Apply one invalidation and wait for the exact cache publication that
+    /// covers it. A failed storage hydration is returned to the caller for
+    /// retry/reseed instead of consuming the feed item as successful.
+    pub async fn apply_invalidation(&self, invalidation: Invalidation) -> Result<(), String> {
+        let (ack, done) = tokio::sync::oneshot::channel();
+        self.writer
+            .send(CacheWrite::ApplyAcknowledged { invalidation, ack })
+            .await
+            .map_err(|_| "cache writer stopped before invalidation enqueue".to_string())?;
+        done.await
+            .map_err(|_| "cache writer stopped before invalidation acknowledgement".to_string())?
     }
 
     /// Wait until the single writer has applied every previously submitted
