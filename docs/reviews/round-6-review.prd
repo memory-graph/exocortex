@@ -1,8 +1,8 @@
 # Exocortex v1 — Round 6 Whole-Project Review
 
-**Status:** RELEASE BLOCKED pending R6-R182's complete final gate matrix and
-fresh strict review. R6-R180, R6-R181, and R6-R183 are implementation-complete;
-all earlier findings remain closed.
+**Status:** RELEASE BLOCKED pending R6-R182's complete final gate matrix and a
+fresh strict review. R6-R180, R6-R181, R6-R183, and R6-R184 are
+implementation-complete; all earlier findings remain closed.
 
 **Review baseline:** `f7bf463aa4a77ac719c485bfe713541d79edeab1`
 (2026-08-27). Scope was the entire tracked repository: 199 files, of which
@@ -698,6 +698,27 @@ the clean-image acquisition failure that makes exact FastEmbed 5.2 necessary,
 the maintained offline constructor it supplies, and the direct artifact-hash
 dependency. Master-plan R6-R79 and R6-R178 now label their 3.14/rc.4 and interim
 hf-hub evidence as historical and point to R6-R181's current release contract.
+
+### R6-R184 — Crush fallback test exits only in the full workspace matrix
+
+The exact mandatory workspace test command twice made
+`falls_back_from_sep_2575_discovery_for_crush` lose its child stdout, while five
+exact isolated repetitions passed. The harness currently discards child stderr,
+so the authoritative matrix exposes a deterministic concurrency-sensitive
+failure without the evidence needed to distinguish product startup failure from
+test interference. Closure requires preserving the child diagnostic, fixing the
+evidenced cause without weakening or globally serializing unrelated tests, and
+making the exact full workspace command pass.
+
+R6-R184 is closed by matching the executable regression to Crush's actual
+fallback state machine: the test now waits for the legacy `-32601` response
+before sending initialize, initialized, and tools/list. The prior version
+pipelined initialize while the server was still pre-initialization, making the
+test timing-dependent under the full workspace load even though the real host
+does not perform that invalid handshake. Child exit status and stderr are now
+retained in failures. Ten focused repetitions pass, followed by the exact
+mandatory workspace feature matrix with no serialization or weakened
+assertion (this commit).
 
 ### Historical pre-R176 closure evidence (superseded)
 

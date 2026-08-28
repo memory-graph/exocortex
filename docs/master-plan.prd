@@ -1,10 +1,11 @@
 # Exocortex — Master Plan
 
 **Status (2026-08-28, Round 6):** RELEASE BLOCKED pending R6-R182's complete
-final gate matrix and fresh strict whole-project review. R6-R180's live
+final gate matrix and a fresh strict whole-project review. R6-R180's live
 no-zombie Dreams proof, R6-R181's immutable offline model sidecar, and R6-R183's
-dependency-deviation reconciliation are complete; R6-R176 through R6-R179 and
-all earlier findings remain closed.
+dependency-deviation reconciliation are complete; the R6-R184 test-harness
+race is repaired; R6-R176 through R6-R179 and all earlier findings remain
+closed.
 
 **Status (2026-08-27):** Palantir-expansion PRD drafted
 (`docs/prd/exocortex-palantir-expansion-prd.md`, rev 2) — five post-v1
@@ -454,6 +455,7 @@ idea:
 | R6-R181 | Strict release convergence: pin, verify, and stamp the production embedding model at an immutable revision | Codex | Done — release fetch, Docker BuildKit, and runtime independently verify all five BGE-small files at Hugging Face commit `ea104dac…f3e3`; FastEmbed constructs offline, vectors stamp the full commit, the probe enforces a golden output prefix, corrupt/mutable/weakened negative regressions pass, and a no-cache image plus its distroless runtime both execute the probe |
 | R6-R182 | Strict release convergence advisory: make the authoritative Round 6 closure state internally consistent | Codex | In progress — label historical closure evidence and align review/master status only after R6-R180/R181, gates, and fresh strict review are clean |
 | R6-R183 | Strict release convergence: reconcile the FastEmbed 5.2 migration with the authoritative PRD and historical plan evidence | Codex | Done — milestone deviation 16 records why clean production startup requires exact fastembed 5.2 without editing the PRD; R6-R79 and R6-R178 now distinguish their superseded dependency/acquisition evidence from R6-R181's current offline sidecar |
+| R6-R184 | Full-gate reliability: diagnose and repair the Crush SEP-2575 fallback child exit that reproduces only under the full workspace test command | Codex | Done — the regression now models Crush's real two-phase fallback by waiting for `server/discover` method-not-found before initialize, retains child status/stderr diagnostics, passes 10 focused repetitions, and passes the exact full workspace feature matrix without global serialization (this commit) |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence

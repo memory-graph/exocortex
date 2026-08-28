@@ -16,7 +16,7 @@ impl Client {
         let child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn exocortex-mcp-client");
         Self { child }
@@ -33,13 +33,27 @@ impl Client {
     }
 
     fn read_line(&mut self) -> serde_json::Value {
-        let stdout = self.child.stdout.as_mut().expect("stdout");
         let mut line = String::new();
         let mut byte = [0u8; 1];
         loop {
             use std::io::Read;
-            if stdout.read(&mut byte).unwrap() == 0 {
-                panic!("server closed stdout");
+            let read = self
+                .child
+                .stdout
+                .as_mut()
+                .expect("stdout")
+                .read(&mut byte)
+                .unwrap();
+            if read == 0 {
+                let status = self.child.wait().expect("reap closed MCP server");
+                let mut stderr = String::new();
+                self.child
+                    .stderr
+                    .as_mut()
+                    .expect("stderr")
+                    .read_to_string(&mut stderr)
+                    .expect("read MCP server stderr");
+                panic!("server closed stdout with {status}: {stderr}");
             }
             if byte[0] == b'\n' {
                 break;
@@ -156,17 +170,29 @@ fn falls_back_from_sep_2575_discovery_for_crush() {
     let mut c = Client::spawn_with(|cmd| {
         cmd.args(["--data-dir", dir.to_str().unwrap()]);
     });
-    c.send_all(&[
-        serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
-            "params": {
-                "_meta": {
-                    "io.modelcontextprotocol/clientCapabilities": { "roots": { "listChanged": true } },
-                    "io.modelcontextprotocol/clientInfo": { "name": "crush", "version": "v0.91.2" },
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28"
-                }
+    // Crush waits for the legacy method-not-found response before beginning
+    // the normal MCP handshake. Preserve that phase boundary: feeding an
+    // initialize request while the server is still pre-initialization makes
+    // the test exercise an invalid pipelined handshake instead of the host's
+    // fallback behavior.
+    c.send_all(&[serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/clientCapabilities": { "roots": { "listChanged": true } },
+                "io.modelcontextprotocol/clientInfo": { "name": "crush", "version": "v0.91.2" },
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28"
             }
-        }),
+        }
+    })]);
+
+    let discover = c.read_line();
+    assert_eq!(
+        discover["error"]["code"], -32601,
+        "SEP-2575 legacy fallback signal: {discover}"
+    );
+
+    c.send_all(&[
         serde_json::json!({
             "jsonrpc": "2.0", "id": 2, "method": "initialize",
             "params": {
@@ -180,12 +206,6 @@ fn falls_back_from_sep_2575_discovery_for_crush() {
         }),
         serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }),
     ]);
-
-    let discover = c.read_line();
-    assert_eq!(
-        discover["error"]["code"], -32601,
-        "SEP-2575 legacy fallback signal: {discover}"
-    );
 
     let init = c.read_line();
     assert!(
