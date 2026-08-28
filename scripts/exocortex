@@ -65,13 +65,18 @@ case "$mode" in
     : "${EXOCORTEX_HMAC_KEY:=$(random_hex)}"
     : "${EXOCORTEX_AUTH_TOKEN:=$(random_hex)}"
     export EXOCORTEX_CLUSTER_SECRET EXOCORTEX_HMAC_KEY EXOCORTEX_AUTH_TOKEN
+    archive_runtime="$bin_dir/standalone-runtime"
     installed_runtime="$bin_dir/../share/exocortex/standalone"
-    if [ -z "${EXOCORTEX_REDIS_SERVER:-}" ] && [ -x "$installed_runtime/redis-server" ]; then
-      EXOCORTEX_REDIS_SERVER="$installed_runtime/redis-server"
+    resolved_runtime="$installed_runtime"
+    if [ -x "$archive_runtime/redis-server" ] && [ -f "$archive_runtime/falkordb.so" ]; then
+      resolved_runtime="$archive_runtime"
+    fi
+    if [ -z "${EXOCORTEX_REDIS_SERVER:-}" ] && [ -x "$resolved_runtime/redis-server" ]; then
+      EXOCORTEX_REDIS_SERVER="$resolved_runtime/redis-server"
       export EXOCORTEX_REDIS_SERVER
     fi
-    if [ -z "${EXOCORTEX_FALKORDB_MODULE:-}" ] && [ -f "$installed_runtime/falkordb.so" ]; then
-      EXOCORTEX_FALKORDB_MODULE="$installed_runtime/falkordb.so"
+    if [ -z "${EXOCORTEX_FALKORDB_MODULE:-}" ] && [ -f "$resolved_runtime/falkordb.so" ]; then
+      EXOCORTEX_FALKORDB_MODULE="$resolved_runtime/falkordb.so"
       export EXOCORTEX_FALKORDB_MODULE
     fi
     if [ -n "$standalone_data_dir" ]; then

@@ -457,9 +457,15 @@ fn validate_standalone_release(
         "installer must atomically install supported runtimes and report the Intel limitation"
     );
     anyhow::ensure!(
-        wrapper.contains("installed_runtime=\"$bin_dir/../share/exocortex/standalone\"")
+        wrapper.contains("archive_runtime=\"$bin_dir/standalone-runtime\"")
+            && wrapper.contains("installed_runtime=\"$bin_dir/../share/exocortex/standalone\"")
             && wrapper.contains("EXOCORTEX_FALKORDB_MODULE"),
-        "installed wrapper must resolve the packaged standalone runtime"
+        "wrapper must resolve both extracted-archive and installed standalone runtimes"
+    );
+    anyhow::ensure!(
+        !release.contains("EXOCORTEX_REDIS_SERVER=\"dist/$DIST/standalone-runtime")
+            && !release.contains("EXOCORTEX_FALKORDB_MODULE=\"dist/$DIST/standalone-runtime"),
+        "release live validation must exercise archive-native runtime discovery"
     );
     anyhow::ensure!(
         live_test.contains("EXOCORTEX_WRAPPER")

@@ -132,8 +132,6 @@ jobs:
             model_dir=$(find "dist/$DIST/models" -mindepth 1 -maxdepth 1 -type d | head -1)
             EXOCORTEX_BIN_DIR="dist/$DIST" \
               EXOCORTEX_WRAPPER="dist/$DIST/exocortex" \
-              EXOCORTEX_REDIS_SERVER="dist/$DIST/standalone-runtime/redis-server" \
-              EXOCORTEX_FALKORDB_MODULE="dist/$DIST/standalone-runtime/falkordb.so" \
               EXOCORTEX_BGE_SMALL_MODEL_DIR="$model_dir" \
               sh scripts/test-standalone-live.sh
           fi
@@ -141,23 +139,24 @@ jobs:
           Exocortex $TAG (${{ matrix.target }})
 
           Binaries:
-            exocortex             one entrypoint: --mode mcp-client|backend-node
-            exocortex-mcp-client  local MCP server (personal quickstart — see README)
+            exocortex             one entrypoint (supported modes below)
+            exocortex-mcp-client  MCP client (offline buffer or external backend)
             exocortex-node        backend node (team/org mode)
             exocortex-worker      adapter host (external sources)
 
-          Add to PATH (e.g. ~/.local/bin or /usr/local/bin) and run:
-            exocortex-mcp-client --org my-org --user me
+          Add this directory to PATH (e.g. ~/.local/bin or /usr/local/bin).
           EOF
           if [ "${{ matrix.standalone }}" = true ]; then
             cat >> "dist/$DIST/README-install.txt" <<EOF
 
-          This artifact includes the verified Redis/Falkor runtime. Run:
+          Supported modes: mcp-client, mcp-standalone, backend-node.
+          This artifact includes the verified Redis/Falkor runtime. Start with:
             exocortex --mode mcp-standalone --org my-org --user me
           EOF
           else
             cat >> "dist/$DIST/README-install.txt" <<EOF
 
+          Supported modes: mcp-client, backend-node.
           mcp-standalone is unavailable in this macOS Intel artifact because
           upstream FalkorDB publishes embedded runtimes only for Linux x64 and
           macOS arm64. Client and backend-node modes remain supported.

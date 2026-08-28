@@ -18,10 +18,17 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
     let client_args = dir.join("client-args");
     let fake_node = dir.join("exocortex-node");
     let fake_client = dir.join("exocortex-mcp-client");
+    let runtime_dir = dir.join("standalone-runtime");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let redis_server = runtime_dir.join("redis-server");
+    let falkor_module = runtime_dir.join("falkordb.so");
+    std::fs::write(&redis_server, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::write(&falkor_module, "fixture").unwrap();
     std::fs::write(
         &fake_node,
         format!(
-            "#!/bin/sh\nruntime=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --standalone-runtime-file ]; then runtime=$2; shift 2; else shift; fi\ndone\nprintf \"EXOCORTEX_BACKEND='http://127.0.0.1:43119'\\nEXOCORTEX_SSE_KEY='0000000000000000000000000000000000000000000000000000000000000000'\\n\" > \"$runtime\"\ntouch '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\nruntime=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --standalone-runtime-file ]; then runtime=$2; shift 2; else shift; fi\ndone\nprintf '%s\\n%s\\n' \"$EXOCORTEX_REDIS_SERVER\" \"$EXOCORTEX_FALKORDB_MODULE\" > '{}.runtime'\nprintf \"EXOCORTEX_BACKEND='http://127.0.0.1:43119'\\nEXOCORTEX_SSE_KEY='0000000000000000000000000000000000000000000000000000000000000000'\\n\" > \"$runtime\"\ntouch '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            marker.display(),
             marker.display()
         ),
     )
@@ -36,10 +43,8 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
     .unwrap();
     std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::set_permissions(&fake_client, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&redis_server, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_exocortex-mcp-client"))
-        .parent()
-        .unwrap();
     let wrapper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/exocortex");
     let mut child = Command::new(wrapper)
         .args([
@@ -52,7 +57,7 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
             "--data-dir",
             dir.to_str().unwrap(),
         ])
-        .env("EXOCORTEX_BIN_DIR", bin_dir)
+        .env("EXOCORTEX_BIN_DIR", &dir)
         .env("EXOCORTEX_STANDALONE_NODE_BIN", &fake_node)
         .env("EXOCORTEX_STANDALONE_CLIENT_BIN", &fake_client)
         .stdin(Stdio::piped())
@@ -84,6 +89,15 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
     assert!(child.wait().unwrap().success());
     let args = std::fs::read_to_string(client_args).unwrap();
     assert!(args.contains("--backend http://127.0.0.1:43119"), "{args}");
+    let resolved_runtime = std::fs::read_to_string(marker.with_extension("runtime")).unwrap();
+    assert_eq!(
+        resolved_runtime.lines().collect::<Vec<_>>(),
+        [
+            redis_server.to_str().unwrap(),
+            falkor_module.to_str().unwrap()
+        ],
+        "an extracted archive must resolve its sibling runtime without overrides"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 

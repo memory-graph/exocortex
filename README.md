@@ -163,20 +163,23 @@ standalone Falkor runtime; macOS Intel supports client and team/backend modes
 because upstream publishes no Intel embedded runtime. No Rust toolchain or
 protoc is needed.
 
-**From source** (any platform; needs Rust 1.85+ and `protoc`):
+**Client only from Cargo** (any platform; needs Rust 1.85+ and `protoc`):
 
 ```sh
 cargo install --git https://github.com/memory-graph/exocortex --bin exocortex-mcp-client
 ```
 
-or from a checkout:
+That command installs only `exocortex-mcp-client`; it does not install the
+`exocortex` standalone wrapper or its Falkor runtime. For standalone from a
+checkout:
 
 ```sh
 git clone https://github.com/memory-graph/exocortex
 cd exocortex
 cargo build --release -p exocortex-client -p exocortex-server
-# use scripts/exocortex; source builds require --redis-server-bin and
-# --falkordb-module (or their EXOCORTEX_* environment equivalents)
+EXOCORTEX_REDIS_SERVER=/path/to/redis-server \
+EXOCORTEX_FALKORDB_MODULE=/path/to/falkordb.so \
+  scripts/exocortex --mode mcp-standalone --org my-org --user me
 ```
 
 ### 2. Register with your agent
