@@ -1,10 +1,10 @@
 # Exocortex — Master Plan
 
-**Status (2026-08-28, Round 6):** RELEASE BLOCKED. Post-closure current-image
-Docker verification promoted R6-R176: the pinned slim builder lacks the
-`pkg-config`/OpenSSL toolchain required by FastEmbed's Linux dependency graph.
-All earlier Round 6 findings remain closed; release closure awaits R6-R176,
-the full gate matrix, current-image chaos evidence, and a fresh strict review.
+**Status (2026-08-28, Round 6):** RELEASE BLOCKED pending final gates and
+strict review. Post-closure current-image verification promoted and closed
+R6-R176 through R6-R179: clean image construction, owner-only chaos policies,
+real production-model startup, and authenticated failover polling now have
+executable evidence. All earlier Round 6 findings remain closed.
 
 **Status (2026-08-27):** Palantir-expansion PRD drafted
 (`docs/prd/exocortex-palantir-expansion-prd.md`, rev 2) — five post-v1
@@ -446,10 +446,10 @@ idea:
 | R6-R173 | Strict convergence advisory: reclaim completed publication payloads | Codex | Done — token-fenced completion removes serialized payloads; live raw-field assertion proves the marker remains key-sized (`6b46c76`) |
 | R6-R174 | Strict convergence advisory: prove live zero-output settlement | Codex | Done — two independent Falkor clients prove first empty settlement commits and its replay is a durable no-op (`6b46c76`) |
 | R6-R175 | Strict convergence advisory: prove reasoning-level zero-output settlement | Codex | Done — a durable no-output pass settles before relevant graph state changes; same-key replay derives nothing while a distinct key proves the later state is derivable (`ce3a956`) |
-| R6-R176 | Post-closure release verification: make the pinned FastEmbed Docker builder self-sufficient and prove a clean current-image build before chaos validation | Codex | In progress — clean `docker compose ... up -d --build` fails in `openssl-sys` because the pinned slim builder has neither `pkg-config` nor an discoverable OpenSSL development installation |
-| R6-R177 | Post-closure chaos verification: stage owner-only dev policies without embedding test credentials in the release image | Codex | In progress — the freshly rebuilt nodes correctly reject the compose harness's mode-0644 principal/source policy bind mounts, so no lease holder starts |
-| R6-R178 | Post-closure release verification: make the production FastEmbed model path boot in a clean image | Codex | In progress — after policy staging succeeds, fastembed 3.14/hf-hub 0.3 aborts model acquisition with `RelativeUrlWithoutBase`; no existing test instantiated the real production embedder |
-| R6-R179 | Post-closure chaos verification: authenticate detailed health polling | Codex | In progress — freshly rebuilt nodes are healthy, but the chaos script suppresses `/health/cluster` 401 responses because it never sends the bearer required by R6-B62 |
+| R6-R176 | Post-closure release verification: make the pinned FastEmbed Docker builder self-sufficient and prove a clean current-image build before chaos validation | Codex | Done — the digest-pinned Bookworm builder proves `pkg-config`/OpenSSL for `ort-sys`'s build-only downloader; release hardening rejects loss of that toolchain while the manifest gate pins Rustls model transport and the Rust-1.85 resolver boundary; a no-cache current-image build and embedded model execution pass |
+| R6-R177 | Post-closure chaos verification: stage owner-only dev policies without embedding test credentials in the release image | Codex | Done — pinned init service installs both policies as 0600/65532 into a named volume; all nodes wait and mount it read-only; negative gate rejects unsafe mode and direct bind mounts |
+| R6-R178 | Post-closure release verification: make the production FastEmbed model path boot in a clean image | Codex | Done — fastembed 5.2/hf-hub 0.4 Rustls path boots on Rust 1.85; `--verify-embedder` acquires, loads, and executes bge-small during image construction, whose verified cache ships in the image |
+| R6-R179 | Post-closure chaos verification: authenticate detailed health polling | Codex | Done — both polling loops derive the dev bearer from the policy fixture and send it in the Authorization header; negative gate rejects either omission; no-cache current-image failover passes node2 -> node1 in 1,393 ms |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence

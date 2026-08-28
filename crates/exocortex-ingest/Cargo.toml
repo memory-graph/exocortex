@@ -39,13 +39,13 @@ exocortex-pack-dev-v1 = { workspace = true }
 metrics = { workspace = true }
 lru = { workspace = true }
 fastembed = { workspace = true, optional = true }
-ort-sys = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
 
 [features]
 # Production embedding backend (bge-small via fastembed/ort). Off by default
 # so builds and CI do not fetch the ONNX runtime; backend deployments enable
 # it (§16 embedding backend default).
-fastembed = ["dep:fastembed", "dep:ort-sys"]
+fastembed = ["dep:fastembed", "dep:image"]
 
 [dev-dependencies]
 exocortex-client = { workspace = true }

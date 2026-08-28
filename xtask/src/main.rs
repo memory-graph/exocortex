@@ -128,6 +128,9 @@ fn deployment_acceptance() -> Result<()> {
         .map(|(path, source)| (path.as_str(), source.as_str()))
         .collect::<Vec<_>>();
     let dockerfile = std::fs::read_to_string("Dockerfile")?;
+    let workspace_manifest = std::fs::read_to_string("Cargo.toml")?;
+    let ingest_manifest = std::fs::read_to_string("crates/exocortex-ingest/Cargo.toml")?;
+    let chaos_script = std::fs::read_to_string("scripts/chaos-leader-kill.sh")?;
     let protoc_installer = std::fs::read_to_string("scripts/install-protoc.sh")?;
     let verify_release = std::fs::read_to_string("scripts/verify-release.sh")?;
     validate_release_hardening(
@@ -137,6 +140,9 @@ fn deployment_acceptance() -> Result<()> {
         &[&compose, &storage_compose],
     )?;
     validate_fastembed_release(&workflows, &dockerfile, &verify_release)?;
+    validate_fastembed_dependency_contract(&workspace_manifest, &ingest_manifest)?;
+    validate_chaos_compose(&compose)?;
+    validate_chaos_script(&chaos_script)?;
     run(
         &[
             "check",
@@ -330,6 +336,37 @@ fn validate_fastembed_release(
             .contains("cargo check -p exocortex-server --all-targets --features fastembed"),
         "verify-release must compile the exact production fastembed feature"
     );
+    anyhow::ensure!(
+        dockerfile.contains(
+            "HF_HOME=/opt/exocortex/models /repo/target/release/exocortex-node --verify-embedder",
+        ) && dockerfile.contains(
+            "COPY --from=build --chown=65532:65532 /opt/exocortex/models /opt/exocortex/models",
+        ) && dockerfile.contains("ENV HF_HOME=/opt/exocortex/models"),
+        "Docker image must execute the production embedder and carry its verified model cache"
+    );
+    Ok(())
+}
+
+fn validate_fastembed_dependency_contract(
+    workspace_manifest: &str,
+    ingest_manifest: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        workspace_manifest.contains(
+            "fastembed = { version = \"=5.2.0\", default-features = false, features = [\"ort-download-binaries\", \"hf-hub-rustls-tls\"] }",
+        ),
+        "production FastEmbed must stay exact-pinned on the Rustls model-download path"
+    );
+    anyhow::ensure!(
+        workspace_manifest.contains("image = \"=0.25.5\"")
+            && !workspace_manifest.contains("ort-sys ="),
+        "production embedding dependencies must preserve the Rust 1.85 image boundary without a direct ort-sys resolver pin"
+    );
+    anyhow::ensure!(
+        ingest_manifest.contains("fastembed = [\"dep:fastembed\", \"dep:image\"]")
+            && !ingest_manifest.contains("ort-sys ="),
+        "ingest FastEmbed feature must carry the explicit Rust-1.85 image boundary and no direct ort-sys dependency"
+    );
     Ok(())
 }
 
@@ -460,6 +497,10 @@ fn validate_dockerfile(dockerfile: &str) -> Result<()> {
         dockerfile.contains("-p exocortex-server --bin exocortex-node --features fastembed"),
         "Dockerfile must build exocortex-node with the production fastembed feature"
     );
+    anyhow::ensure!(
+        dockerfile.contains("RUN command -v pkg-config && pkg-config --exists openssl"),
+        "Dockerfile FastEmbed builder must prove the ort-sys native-TLS build toolchain before compiling"
+    );
     Ok(())
 }
 
@@ -519,6 +560,47 @@ fn validate_compose_files(compose_files: &[&str]) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn validate_chaos_compose(compose: &str) -> Result<()> {
+    const PRINCIPAL_INSTALL: &str =
+        "install -m 0600 -o 65532 -g 65532 /input/principal-policy.json /output/principal-policy.json";
+    const SOURCE_INSTALL: &str =
+        "install -m 0600 -o 65532 -g 65532 /input/source-policy.json /output/source-policy.json";
+    anyhow::ensure!(
+        compose.contains("  policy-init:\n")
+            && compose.contains(PRINCIPAL_INSTALL)
+            && compose.contains(SOURCE_INSTALL),
+        "chaos compose must stage both credential policies owner-only through its pinned init service"
+    );
+    anyhow::ensure!(
+        compose
+            .matches("condition: service_completed_successfully")
+            .count()
+            == 3
+            && compose
+                .matches("policy-data:/run/exocortex-policies:ro")
+                .count()
+                == 3,
+        "every chaos node must wait for and mount the owner-only staged policy volume"
+    );
+    anyhow::ensure!(
+        !compose.contains("source-policy.empty.json:/etc/exocortex")
+            && !compose.contains("principal-policy.dev.json:/etc/exocortex"),
+        "chaos nodes must not bind-mount repository credential policies with host-controlled modes"
+    );
+    Ok(())
+}
+
+fn validate_chaos_script(script: &str) -> Result<()> {
+    anyhow::ensure!(
+        script.contains("PRINCIPAL_POLICY=crates/exocortex-cluster/tests/principal-policy.dev.json")
+            && script.contains("AUTH_TOKEN=$(jq -er")
+            && script.contains("-H \"Authorization: Bearer $AUTH_TOKEN\"")
+            && script.matches("cluster_health \"$port\"").count() == 2,
+        "chaos leader polling must authenticate both protected health loops from the dev principal policy"
+    );
     Ok(())
 }
 
@@ -1477,7 +1559,10 @@ mod metrics_hygiene_tests {
 
 #[cfg(test)]
 mod release_hardening_tests {
-    use super::{validate_fastembed_release, validate_release_hardening};
+    use super::{
+        validate_chaos_compose, validate_chaos_script, validate_fastembed_dependency_contract,
+        validate_fastembed_release, validate_release_hardening,
+    };
 
     const SHA: &str = "11d5960a326750d5838078e36cf38b85af677262";
     const PROTOC_INSTALLER: &str = r#"readonly PROTOC_VERSION=28.3
@@ -1506,7 +1591,11 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
                 "FROM scratch AS protoc-arm64\n",
                 "ADD --checksum=sha256:{digest} https://example.invalid/protoc-28.3-linux-aarch_64.zip /protoc.zip\n",
                 "FROM gcr.io/distroless/cc-debian12:nonroot@sha256:{digest}\n",
+                "RUN command -v pkg-config && pkg-config --exists openssl\n",
                 "RUN cargo build --release -p exocortex-server --bin exocortex-node --features fastembed\n",
+                "RUN HF_HOME=/opt/exocortex/models /repo/target/release/exocortex-node --verify-embedder\n",
+                "COPY --from=build --chown=65532:65532 /opt/exocortex/models /opt/exocortex/models\n",
+                "ENV HF_HOME=/opt/exocortex/models\n",
                 "USER 65532:65532\n"
             ),
             digest = "a".repeat(64)
@@ -1568,6 +1657,17 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
         assert!(validate_release_hardening(
             &workflows,
             &missing_docker_feature,
+            PROTOC_INSTALLER,
+            &[good_compose]
+        )
+        .is_err());
+        let missing_native_tls_toolchain = good_dockerfile.replace(
+            "RUN command -v pkg-config && pkg-config --exists openssl\n",
+            "",
+        );
+        assert!(validate_release_hardening(
+            &workflows,
+            &missing_native_tls_toolchain,
             PROTOC_INSTALLER,
             &[good_compose]
         )
@@ -1672,7 +1772,12 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
     fn fastembed_release_contract_rejects_each_missing_surface() {
         let release = "--features exocortex-server/fastembed";
         let workflows = [(".github/workflows/release.yml", release)];
-        let docker = "cargo build -p exocortex-server --bin exocortex-node --features fastembed";
+        let docker = concat!(
+            "cargo build -p exocortex-server --bin exocortex-node --features fastembed\n",
+            "HF_HOME=/opt/exocortex/models /repo/target/release/exocortex-node --verify-embedder\n",
+            "COPY --from=build --chown=65532:65532 /opt/exocortex/models /opt/exocortex/models\n",
+            "ENV HF_HOME=/opt/exocortex/models"
+        );
         let verify = "cargo check -p exocortex-server --all-targets --features fastembed";
         assert!(validate_fastembed_release(&workflows, docker, verify).is_ok());
         assert!(validate_fastembed_release(
@@ -1683,5 +1788,65 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
         .is_err());
         assert!(validate_fastembed_release(&workflows, "cargo build", verify).is_err());
         assert!(validate_fastembed_release(&workflows, docker, "cargo check").is_err());
+        assert!(validate_fastembed_release(
+            &workflows,
+            &docker.replace(" --verify-embedder", ""),
+            verify
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fastembed_dependency_contract_rejects_model_transport_and_msrv_drift() {
+        let workspace = include_str!("../../Cargo.toml");
+        let ingest = include_str!("../../crates/exocortex-ingest/Cargo.toml");
+        assert!(validate_fastembed_dependency_contract(workspace, ingest).is_ok());
+        assert!(validate_fastembed_dependency_contract(
+            &workspace.replace("hf-hub-rustls-tls", "online"),
+            ingest
+        )
+        .is_err());
+        assert!(validate_fastembed_dependency_contract(
+            &workspace.replace("image = \"=0.25.5\"", "image = \"0.25.5\""),
+            ingest
+        )
+        .is_err());
+        assert!(validate_fastembed_dependency_contract(
+            workspace,
+            &ingest.replace(
+                "fastembed = [\"dep:fastembed\", \"dep:image\"]",
+                "fastembed = [\"dep:fastembed\"]"
+            )
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn chaos_compose_requires_owner_only_staged_policies() {
+        let compose =
+            include_str!("../../crates/exocortex-cluster/tests/docker-compose-cluster.yml");
+        assert!(validate_chaos_compose(compose).is_ok());
+
+        let direct_mount = compose.replace(
+            "policy-data:/run/exocortex-policies:ro",
+            "./principal-policy.dev.json:/etc/exocortex/principal-policy.json:ro",
+        );
+        assert!(validate_chaos_compose(&direct_mount).is_err());
+
+        let unsafe_mode = compose.replace("install -m 0600", "install -m 0644");
+        assert!(validate_chaos_compose(&unsafe_mode).is_err());
+    }
+
+    #[test]
+    fn chaos_script_authenticates_protected_health_polling() {
+        let script = include_str!("../../scripts/chaos-leader-kill.sh");
+        assert!(validate_chaos_script(script).is_ok());
+        assert!(validate_chaos_script(
+            &script.replace("-H \"Authorization: Bearer $AUTH_TOKEN\"", "")
+        )
+        .is_err());
+        assert!(
+            validate_chaos_script(&script.replacen("cluster_health \"$port\"", "curl", 1)).is_err()
+        );
     }
 }

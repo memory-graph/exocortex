@@ -107,9 +107,18 @@ provider before constructing that listener. Transitive workspace consumers
 enable both supported providers, so Rustls cannot infer one from the unified
 feature set at runtime.
 
-The optional `exocortex-ingest/fastembed` feature directly pins `ort-sys`
-2.0.0-rc.4 because fastembed 3.14 pins the matching `ort` rc.4 API while its
-transitive system-crate range otherwise selects a newer, API-incompatible
-release whose MSRV also exceeds the workspace's Rust 1.85 contract. This direct
-constraint enforces dependency resolution; application code uses fastembed,
-not `ort-sys`.
+The optional `exocortex-ingest/fastembed` feature uses fastembed 5.2 with its
+Rustls Hugging Face downloader and pinned ONNX Runtime download feature.
+Fastembed 3.14's hf-hub 0.3 path failed clean production startup with a
+relative redirect, while its native-TLS dependency also required an undeclared
+OpenSSL build toolchain. The maintained downloader restores real first-start
+model acquisition without making native TLS a runtime dependency; application
+code continues to use only fastembed's embedding API. The optional feature also
+pins `image` 0.25.5 as a resolver constraint because fastembed 5.2 includes its
+image surface unconditionally and later 0.25 patch releases exceed the pinned
+Rust 1.85 MSRV; Exocortex does not call the image API.
+
+Fastembed's pinned ONNX Runtime download feature still selects `ort-sys`'s
+build-time native-TLS downloader. The digest-pinned Bookworm builder supplies
+and explicitly verifies `pkg-config` plus OpenSSL for that build-only path; the
+distroless runtime image does not carry those tools.

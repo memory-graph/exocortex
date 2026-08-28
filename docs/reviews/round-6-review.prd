@@ -578,8 +578,9 @@ output.
 ### R6-R176 — The clean FastEmbed Docker build lacks its native TLS toolchain
 
 A no-cache-equivalent rebuild of the documented three-node chaos image failed
-before the harness could run. FastEmbed enables `hf-hub/online`; on Linux that
-selects `native-tls` and `openssl-sys`, while the pinned `rust:1.85-slim`
+before the harness could run. FastEmbed's ONNX Runtime download feature selects
+`ort-sys`'s native-TLS build downloader and `openssl-sys`, while the pinned
+`rust:1.85-slim`
 builder contains neither `pkg-config` nor a discoverable OpenSSL development
 installation. The previous chaos success used an already-built image and was
 not authoritative evidence for the current branch. Closure requires a pinned,
@@ -615,6 +616,22 @@ responses. Closure requires the script to derive the dev-only bearer from the
 authoritative policy fixture, authenticate both polling loops, add executable
 deployment-gate coverage, and pass current-image failover without weakening
 health authorization.
+
+R6-R176 through R6-R179 are implementation-complete. The digest-pinned
+Bookworm builder proves `pkg-config` and OpenSSL for `ort-sys`'s build-only
+downloader. The production dependency contract exact-pins FastEmbed's Rustls
+model transport and the Rust-1.85 resolver boundary. The release binary's
+hidden `--verify-embedder` probe acquires, loads, and executes bge-small during
+the image build; the verified
+model cache is copied into the non-root runtime image. Fastembed 5.2 uses the
+maintained hf-hub 0.4 Rustls downloader, with the Rust-1.85-compatible image
+resolver boundary documented in `docs/PUBLISHING.md`. The chaos init service
+stages dev-only policies at 0600/65532 into a read-only node volume, and the
+harness authenticates detailed-health polling from that same policy. Focused
+negative gates pass, a no-cache current-image compose build executes the real
+384-dimensional model probe, all three nodes become healthy, and killing node2
+elects node1 in 1,393 ms. Final release closure still requires the complete gate
+matrix and a fresh strict review of this implementation.
 
 The complete mandatory gate matrix passed: formatting, workspace clippy,
 workspace tests with adapter SDK testing and `--no-fail-fast`, dependency

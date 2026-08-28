@@ -40,6 +40,9 @@ struct Args {
     /// Internal acceptance probe: execute all nine rules in this artifact.
     #[arg(long, hide = true)]
     verify_rules: bool,
+    /// Internal release probe: acquire, load, and execute the production model.
+    #[arg(long, hide = true)]
+    verify_embedder: bool,
     /// Deployment mode.
     #[arg(long, value_enum, default_value = "mcp-standalone")]
     mode: Mode,
@@ -133,6 +136,9 @@ fn main() -> anyhow::Result<()> {
     require_linked_ontology_pack();
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
     let ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
+    if args.verify_embedder {
+        return verify_production_embedder();
+    }
     // BR2 one-shot modes: org backup/restore against the selected
     // storage, then exit (no cluster, no serving).
     if args.export_org.is_some() || args.import_org.is_some() {
@@ -187,6 +193,27 @@ fn main() -> anyhow::Result<()> {
             anyhow::bail!("--mode embedded is the in-process path used by tests");
         }
     }
+}
+
+fn verify_production_embedder() -> anyhow::Result<()> {
+    #[cfg(feature = "fastembed")]
+    {
+        let embedder = exocortex_ingest::embedding::FastEmbedder::bge_small()
+            .map_err(|error| anyhow::anyhow!("initialize bge-small embedder: {error}"))?;
+        let vector = exocortex_ingest::embedding::Embedder::embed(
+            &embedder,
+            "exocortex production embedding probe",
+        )
+        .map_err(|error| anyhow::anyhow!("execute bge-small embedder: {error}"))?;
+        anyhow::ensure!(
+            vector.len() == 384 && vector.iter().all(|value| value.is_finite()),
+            "bge-small embedder returned an invalid production vector"
+        );
+        println!("embedder-ok model=bge-small version=v1 dim=384");
+        Ok(())
+    }
+    #[cfg(not(feature = "fastembed"))]
+    anyhow::bail!("--verify-embedder requires the fastembed release feature")
 }
 
 /// BR2: one-shot org backup/restore against the selected storage.

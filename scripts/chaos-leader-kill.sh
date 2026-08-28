@@ -12,6 +12,14 @@ set -euo pipefail
 
 COMPOSE=crates/exocortex-cluster/tests/docker-compose-cluster.yml
 TLS_CA=crates/exocortex-server/tests/fixtures/localhost-cert.pem
+PRINCIPAL_POLICY=crates/exocortex-cluster/tests/principal-policy.dev.json
+AUTH_TOKEN=$(jq -er '.[0].bearer_token | select(type == "string" and length >= 32)' "$PRINCIPAL_POLICY")
+
+cluster_health() {
+  curl --cacert "$TLS_CA" -sf \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    "https://127.0.0.1:$1/health/cluster" 2>/dev/null
+}
 
 leader_of() { docker compose -f "$COMPOSE" ps --format json \
     | jq -r 'select(.Service|startswith("node")) | .Service + " " + .State' \
@@ -25,7 +33,7 @@ waited=0
 while [ -z "$leader" ] && [ "$waited" -lt 15000 ]; do
   for i in 1 2 3; do
     port=$((8080 + i))
-    holder=$(curl --cacert "$TLS_CA" -sf "https://127.0.0.1:${port}/health/cluster" 2>/dev/null         | jq -r '.leader_node_id // empty' || true)
+    holder=$(cluster_health "$port" | jq -r '.leader_node_id // empty' || true)
     if [ -n "$holder" ]; then leader="$holder"; break; fi
   done
   [ -z "$leader" ] && { sleep 0.5; waited=$((waited + 500)); }
@@ -44,7 +52,7 @@ new_leader=""
 while [ "$(now_ms)" -lt "$deadline" ]; do
   for i in 1 2 3; do
     port=$((8080 + i))
-    holder=$(curl --cacert "$TLS_CA" -sf "https://127.0.0.1:${port}/health/cluster" 2>/dev/null | jq -r '.leader_node_id // empty' || true)
+    holder=$(cluster_health "$port" | jq -r '.leader_node_id // empty' || true)
     if [ -n "$holder" ] && [ "$holder" != "$leader" ]; then new_leader="$holder"; break 2; fi
   done
   sleep 0.1

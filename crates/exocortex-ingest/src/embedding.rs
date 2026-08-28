@@ -102,12 +102,9 @@ pub struct FastEmbedder {
 impl FastEmbedder {
     /// Load the default bge-small model.
     pub fn bge_small() -> Result<Self, String> {
-        let model = fastembed::TextEmbedding::try_new(fastembed::InitOptions {
-            model_name: fastembed::EmbeddingModel::BGESmallENV15,
-            show_download_progress: false,
-            ..Default::default()
-        })
-        .map_err(|e| e.to_string())?;
+        let options = fastembed::InitOptions::new(fastembed::EmbeddingModel::BGESmallENV15)
+            .with_show_download_progress(false);
+        let model = fastembed::TextEmbedding::try_new(options).map_err(|e| e.to_string())?;
         Ok(Self {
             model: std::sync::Mutex::new(model),
         })
@@ -124,7 +121,7 @@ impl Embedder for FastEmbedder {
     }
 
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-        let model = self.model.lock().map_err(|e| e.to_string())?;
+        let mut model = self.model.lock().map_err(|e| e.to_string())?;
         model
             .embed(texts.to_vec(), None)
             .map_err(|e: fastembed::Error| e.to_string())

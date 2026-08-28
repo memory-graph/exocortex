@@ -13,6 +13,10 @@ services:
       interval: 1s
       timeout: 3s
       retries: 30
+  policy-init:
+    image: busybox:1.36.1-musl@sha256:3c6ae8008e2c2eedd141725c30b20d9c36b026eb796688f88205845ef17aa213
+    command: ["sh", "-c", "install -m 0600 -o 65532 -g 65532 /input/principal-policy.json /output/principal-policy.json && install -m 0600 -o 65532 -g 65532 /input/source-policy.json /output/source-policy.json"]
+    volumes: ["./principal-policy.dev.json:/input/principal-policy.json:ro", "./source-policy.empty.json:/input/source-policy.json:ro", "policy-data:/output"]
   node1:
     image: exocortex-node:local
     build:
@@ -21,10 +25,12 @@ services:
     depends_on:
       falkordb:
         condition: service_healthy
+      policy-init:
+        condition: service_completed_successfully
     environment:
       EXOCORTEX_CLUSTER_SECRET: "4242424242424242424242424242424242424242424242424242424242424242"
-    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8081", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node1", "--gossip-addr", "0.0.0.0:8101", "--principal-policy", "/etc/exocortex/principal-policy.json", "--source-policy", "/etc/exocortex/source-policy.json", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node2:8082,node3:8083"]
-    volumes: ["./source-policy.empty.json:/etc/exocortex/source-policy.json:ro", "./principal-policy.dev.json:/etc/exocortex/principal-policy.json:ro", "../../exocortex-server/tests/fixtures/localhost-cert.pem:/etc/exocortex/tls-cert.pem:ro", "../../exocortex-server/tests/fixtures/localhost-key.pem:/etc/exocortex/tls-key.pem:ro"]
+    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8081", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node1", "--gossip-addr", "0.0.0.0:8101", "--principal-policy", "/run/exocortex-policies/principal-policy.json", "--source-policy", "/run/exocortex-policies/source-policy.json", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node2:8082,node3:8083"]
+    volumes: ["policy-data:/run/exocortex-policies:ro", "../../exocortex-server/tests/fixtures/localhost-cert.pem:/etc/exocortex/tls-cert.pem:ro", "../../exocortex-server/tests/fixtures/localhost-key.pem:/etc/exocortex/tls-key.pem:ro"]
     ports:
       - "127.0.0.1:8081:8081"
   node2:
@@ -35,10 +41,12 @@ services:
     depends_on:
       falkordb:
         condition: service_healthy
+      policy-init:
+        condition: service_completed_successfully
     environment:
       EXOCORTEX_CLUSTER_SECRET: "4242424242424242424242424242424242424242424242424242424242424242"
-    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8082", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node2", "--gossip-addr", "0.0.0.0:8102", "--principal-policy", "/etc/exocortex/principal-policy.json", "--source-policy", "/etc/exocortex/source-policy.json", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node3:8083"]
-    volumes: ["./source-policy.empty.json:/etc/exocortex/source-policy.json:ro", "./principal-policy.dev.json:/etc/exocortex/principal-policy.json:ro", "../../exocortex-server/tests/fixtures/localhost-cert.pem:/etc/exocortex/tls-cert.pem:ro", "../../exocortex-server/tests/fixtures/localhost-key.pem:/etc/exocortex/tls-key.pem:ro"]
+    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8082", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node2", "--gossip-addr", "0.0.0.0:8102", "--principal-policy", "/run/exocortex-policies/principal-policy.json", "--source-policy", "/run/exocortex-policies/source-policy.json", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node3:8083"]
+    volumes: ["policy-data:/run/exocortex-policies:ro", "../../exocortex-server/tests/fixtures/localhost-cert.pem:/etc/exocortex/tls-cert.pem:ro", "../../exocortex-server/tests/fixtures/localhost-key.pem:/etc/exocortex/tls-key.pem:ro"]
     ports:
       - "127.0.0.1:8082:8082"
   node3:
@@ -49,9 +57,14 @@ services:
     depends_on:
       falkordb:
         condition: service_healthy
+      policy-init:
+        condition: service_completed_successfully
     environment:
       EXOCORTEX_CLUSTER_SECRET: "4242424242424242424242424242424242424242424242424242424242424242"
-    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8083", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node3", "--gossip-addr", "0.0.0.0:8103", "--principal-policy", "/etc/exocortex/principal-policy.json", "--source-policy", "/etc/exocortex/source-policy.json", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node2:8082"]
-    volumes: ["./source-policy.empty.json:/etc/exocortex/source-policy.json:ro", "./principal-policy.dev.json:/etc/exocortex/principal-policy.json:ro", "../../exocortex-server/tests/fixtures/localhost-cert.pem:/etc/exocortex/tls-cert.pem:ro", "../../exocortex-server/tests/fixtures/localhost-key.pem:/etc/exocortex/tls-key.pem:ro"]
+    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8083", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node3", "--gossip-addr", "0.0.0.0:8103", "--principal-policy", "/run/exocortex-policies/principal-policy.json", "--source-policy", "/run/exocortex-policies/source-policy.json", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node2:8082"]
+    volumes: ["policy-data:/run/exocortex-policies:ro", "../../exocortex-server/tests/fixtures/localhost-cert.pem:/etc/exocortex/tls-cert.pem:ro", "../../exocortex-server/tests/fixtures/localhost-key.pem:/etc/exocortex/tls-key.pem:ro"]
     ports:
       - "127.0.0.1:8083:8083"
+
+volumes:
+  policy-data:

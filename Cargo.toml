@@ -86,10 +86,12 @@ rmcp        = "0.1"
 inventory   = "0.3"
 
 # --- embedding runtime (backend default) ---
-fastembed   = "3"
-# fastembed 3.14 pins `ort` rc.4 but its loose `ort-sys` edge otherwise
-# resolves to rc.13, whose MSRV exceeds the workspace's pinned Rust 1.85.
-ort-sys     = "=2.0.0-rc.4"
+# Rustls avoids the native OpenSSL discovery that broke clean Linux images;
+# 5.2 also carries the maintained hf-hub downloader used at first startup.
+fastembed = { version = "=5.2.0", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
+# fastembed 5.2 exposes image models unconditionally; newer image 0.25 patch
+# releases exceed Rust 1.85, so keep the compatible resolver boundary explicit.
+image = "=0.25.5"
 
 # --- time / rand ---
 chrono      = { version = "0.4", features = ["serde"] }
