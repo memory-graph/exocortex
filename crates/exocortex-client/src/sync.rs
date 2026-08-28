@@ -468,16 +468,24 @@ fn bounded_sse_stream(
     stall_timeout: Duration,
 ) -> impl futures::Stream<Item = Result<SseFrame, SseReadError>> {
     async_stream::stream! {
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
-        let client = hyper::Client::builder().build::<_, hyper::Body>(connector);
+        let uri: hyper::Uri = match url.parse() {
+            Ok(uri) => uri,
+            Err(error) => {
+                yield Err(SseReadError::Other(format!("invalid SSE URL: {error}")));
+                return;
+            }
+        };
+        let use_tls = match uri.scheme_str() {
+            Some("http") => false,
+            Some("https") => true,
+            _ => {
+                yield Err(SseReadError::Other("SSE URL must use http or https".into()));
+                return;
+            }
+        };
         let mut request = hyper::Request::builder()
             .method(hyper::Method::GET)
-            .uri(&url)
+            .uri(uri)
             .header(hyper::header::ACCEPT, "text/event-stream")
             .header(hyper::header::CACHE_CONTROL, "no-cache")
             .header("x-exocortex-sse-version", exocortex_wire::SSE_EVENT_VERSION.to_string());
@@ -491,7 +499,33 @@ fn bounded_sse_stream(
                 return;
             }
         };
-        let response = match tokio::time::timeout(stall_timeout, client.request(request)).await {
+        let response_future: futures::future::BoxFuture<
+            'static,
+            Result<hyper::Response<hyper::Body>, hyper::Error>,
+        > = if use_tls {
+            let connector = match std::panic::catch_unwind(|| {
+                hyper_rustls::HttpsConnectorBuilder::new()
+                    .with_native_roots()
+                    .https_only()
+                    .enable_http1()
+                    .enable_http2()
+                    .build()
+            }) {
+                Ok(connector) => connector,
+                Err(_) => {
+                    yield Err(SseReadError::Other(
+                        "failed to load the platform TLS trust store".into(),
+                    ));
+                    return;
+                }
+            };
+            let client = hyper::Client::builder().build::<_, hyper::Body>(connector);
+            Box::pin(async move { client.request(request).await })
+        } else {
+            let client = hyper::Client::new();
+            Box::pin(async move { client.request(request).await })
+        };
+        let response = match tokio::time::timeout(stall_timeout, response_future).await {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 yield Err(SseReadError::Other(format!("SSE request failed: {error}")));
