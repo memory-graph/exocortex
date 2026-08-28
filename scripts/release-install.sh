@@ -23,7 +23,37 @@ archive="exocortex-${tag#v}-$target.tar.gz"
 base="https://github.com/$repo/releases/download"
 url="$base/$tag/$archive"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT INT TERM
+committing=0
+committed=0
+published_bins=""
+model_published=0
+rollback_install() {
+  [ "$committing" -eq 1 ] && [ "$committed" -eq 0 ] || return 0
+  for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
+    old="$dest/.$bin.old.$$"
+    case " $published_bins " in
+      *" $bin "*)
+        rm -f "$dest/$bin"
+        [ ! -e "$old" ] || mv "$old" "$dest/$bin"
+        ;;
+      *) [ ! -e "$old" ] || mv "$old" "$dest/$bin" ;;
+    esac
+  done
+  if [ "$model_published" -eq 1 ]; then
+    rm -rf "$model_dest/$model_name"
+    [ ! -e "$previous_model" ] || mv "$previous_model" "$model_dest/$model_name"
+  elif [ -e "$previous_model" ]; then
+    mv "$previous_model" "$model_dest/$model_name"
+  fi
+}
+finish_install() {
+  status=$?
+  trap - EXIT INT TERM
+  rollback_install
+  rm -rf "$tmp"
+  exit "$status"
+}
+trap finish_install EXIT INT TERM
 echo "downloading $url"
 curl_https "$url" -o "$tmp/$archive"
 curl_https "$url.sha256" -o "$tmp/$archive.sha256"
@@ -48,25 +78,45 @@ done
 [ "$model_count" -eq 1 ] || { echo "install refused: archive must contain exactly one embedding model" >&2; exit 1; }
 dest="${CARGO_HOME:-$HOME/.cargo}/bin"
 mkdir -p "$dest"
-for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
-  install -m 0755 "$src/$bin" "$dest/$bin" 2>/dev/null || cp "$src/$bin" "$dest/$bin"
-done
 model_dest="${CARGO_HOME:-$HOME/.cargo}/share/exocortex/models"
 mkdir -p "$model_dest"
-for model in "$src"/models/*; do
-  model_name="$(basename "$model")"
-  staged="$model_dest/.$model_name.new.$$"
-  previous="$model_dest/.$model_name.old.$$"
-  cp -R "$model" "$staged"
-  if [ -e "$model_dest/$model_name" ]; then
-    mv "$model_dest/$model_name" "$previous"
-  fi
-  if mv "$staged" "$model_dest/$model_name"; then
-    [ ! -e "$previous" ] || rm -rf "$previous"
-  else
-    [ ! -e "$previous" ] || mv "$previous" "$model_dest/$model_name"
-    exit 1
-  fi
+model_name="$(basename "$model")"
+staged_model="$model_dest/.$model_name.new.$$"
+previous_model="$model_dest/.$model_name.old.$$"
+cp -R "$model" "$staged_model"
+for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
+  staged_bin="$dest/.$bin.new.$$"
+  install -m 0755 "$src/$bin" "$staged_bin" 2>/dev/null || {
+    cp "$src/$bin" "$staged_bin"
+    chmod 0755 "$staged_bin"
+  }
+done
+
+# Validate the exact staged executable/model pair before any live path changes.
+EXOCORTEX_BGE_SMALL_MODEL_DIR="$staged_model" \
+  "$dest/.exocortex-node.new.$$" --verify-embedder >/dev/null
+
+committing=1
+if [ -e "$model_dest/$model_name" ]; then
+  mv "$model_dest/$model_name" "$previous_model"
+fi
+for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
+  [ ! -e "$dest/$bin" ] || mv "$dest/$bin" "$dest/.$bin.old.$$"
+done
+mv "$staged_model" "$model_dest/$model_name"
+model_published=1
+for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
+  mv "$dest/.$bin.new.$$" "$dest/$bin"
+  published_bins="$published_bins $bin"
+done
+
+# Exercise the installed share/exocortex resolver, not an environment override.
+unset EXOCORTEX_BGE_SMALL_MODEL_DIR
+"$dest/exocortex-node" --verify-embedder >/dev/null
+committed=1
+rm -rf "$previous_model"
+for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
+  rm -f "$dest/.$bin.old.$$"
 done
 case ":$PATH:" in
   *":$dest:"*) ;;

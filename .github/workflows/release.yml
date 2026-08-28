@@ -114,6 +114,12 @@ jobs:
             cp "target/${{ matrix.target }}/release/$bin" "dist/$DIST/"
           done
           sh scripts/fetch-embedding-model.sh "dist/$DIST/models"
+          mkdir -p "dist/install-probe/bin" "dist/install-probe/share/exocortex"
+          cp "dist/$DIST/exocortex-node" "dist/install-probe/bin/"
+          cp -R "dist/$DIST/models" "dist/install-probe/share/exocortex/"
+          env -u EXOCORTEX_BGE_SMALL_MODEL_DIR \
+            "dist/install-probe/bin/exocortex-node" --verify-embedder
+          rm -rf "dist/install-probe"
           cp scripts/exocortex "dist/$DIST/exocortex"
           cp README.md LICENSE "dist/$DIST/"
           cat > "dist/$DIST/README-install.txt" <<EOF

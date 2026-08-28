@@ -30,6 +30,7 @@ else
 fi
 
 mkdir -p "$tmp/mock-bin"
+real_mv="$(command -v mv)"
 cat > "$tmp/mock-bin/curl" <<'MOCK_CURL'
 #!/bin/sh
 set -eu
@@ -63,6 +64,19 @@ done
 cp "$MOCK_RELEASE_ROOT/${url##*/}" "$output"
 MOCK_CURL
 chmod +x "$tmp/mock-bin/curl"
+cat > "$tmp/mock-bin/mv" <<MOCK_MV
+#!/bin/sh
+set -eu
+if [ "\${MOCK_FAIL_MODEL_COMMIT:-}" = 1 ] &&
+   [ "\${2:-}" = "\${MOCK_FAIL_MODEL_DEST:-}" ] &&
+   [ ! -e "\${MOCK_FAIL_STATE:-}" ]; then
+  : > "\$MOCK_FAIL_STATE"
+  echo "mock mv: injected model commit failure" >&2
+  exit 1
+fi
+exec "$real_mv" "\$@"
+MOCK_MV
+chmod +x "$tmp/mock-bin/mv"
 mock_log="$tmp/curl.log"
 
 if INSTALL_VERSION="$tag" \
@@ -99,6 +113,28 @@ sh scripts/release-install.sh >/dev/null
 test "$(cat "$tmp/cargo/share/exocortex/models/$model_dir/model.marker")" = "sidecar fixture"
 test "$(wc -l < "$mock_log" | tr -d ' ')" -eq 4
 
+for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
+  printf '#!/bin/sh\nprintf "old-%s\\n" "$0"\n' > "$tmp/cargo/bin/$bin"
+  chmod +x "$tmp/cargo/bin/$bin"
+done
+printf 'old-sidecar\n' > "$tmp/cargo/share/exocortex/models/$model_dir/model.marker"
+if INSTALL_VERSION="$tag" \
+   PATH="$tmp/mock-bin:$PATH" \
+   MOCK_RELEASE_ROOT="$release" \
+   MOCK_CURL_LOG="$mock_log" \
+   MOCK_FAIL_MODEL_COMMIT=1 \
+   MOCK_FAIL_MODEL_DEST="$tmp/cargo/share/exocortex/models/$model_dir" \
+   MOCK_FAIL_STATE="$tmp/model-failure-fired" \
+   CARGO_HOME="$tmp/cargo" \
+   sh scripts/release-install.sh >/dev/null 2>&1; then
+  echo "installer ignored injected model commit failure" >&2
+  exit 1
+fi
+test "$(cat "$tmp/cargo/share/exocortex/models/$model_dir/model.marker")" = "old-sidecar"
+for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
+  grep -q 'old-' "$tmp/cargo/bin/$bin"
+done
+
 printf 'tampered' >> "$release/$archive"
 if INSTALL_VERSION="$tag" \
    PATH="$tmp/mock-bin:$PATH" \
@@ -110,4 +146,4 @@ if INSTALL_VERSION="$tag" \
   exit 1
 fi
 test ! -e "$tmp/cargo-tampered/bin/exocortex-node"
-echo "release-installer ok: fixed HTTPS origin installs; override and tampered archive are refused"
+echo "release-installer ok: fixed HTTPS origin, failure-atomic install, and tamper refusal"
