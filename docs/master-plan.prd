@@ -1,10 +1,12 @@
 # Exocortex — Master Plan
 
 **Status (2026-08-28, Round 6):** RELEASE BLOCKED. Fresh strict review promoted
-R6-R180 through R6-R182: the live chaos harness does not yet prove the required
+R6-R180 through R6-R183: the live chaos harness does not yet prove the required
 mid-Dreams no-zombie-write contract, the release image does not pin and verify
 an immutable model revision, and the reopened review carries contradictory
-closure text. R6-R176 through R6-R179 and all earlier findings remain closed.
+closure text. The required FastEmbed 5.2 dependency deviation is also absent
+from the milestone report and R6-R79 carries stale dependency evidence.
+R6-R176 through R6-R179 and all earlier findings remain closed.
 
 **Status (2026-08-27):** Palantir-expansion PRD drafted
 (`docs/prd/exocortex-palantir-expansion-prd.md`, rev 2) — five post-v1
@@ -453,6 +455,7 @@ idea:
 | R6-R180 | Strict release convergence: prove a leader killed mid-Dreams cannot land zombie writes after takeover | Codex | In progress — current chaos proves authenticated re-election only; add a deterministic in-flight owner-fenced mutation and authoritative post-takeover Falkor history assertion |
 | R6-R181 | Strict release convergence: pin, verify, and stamp the production embedding model at an immutable revision | Codex | In progress — FastEmbed currently downloads mutable Hugging Face `main`, while the probe validates only shape/finite values and stamps generic `v1` |
 | R6-R182 | Strict release convergence advisory: make the authoritative Round 6 closure state internally consistent | Codex | In progress — label historical closure evidence and align review/master status only after R6-R180/R181, gates, and fresh strict review are clean |
+| R6-R183 | Strict release convergence: reconcile the FastEmbed 5.2 migration with the authoritative PRD and historical plan evidence | Codex | In progress — record the justified `fastembed = "3"` contract deviation in `docs/MILESTONE_REPORT.md` and update R6-R79's superseded rc.4 evidence without silently editing the PRD |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence

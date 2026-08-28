@@ -1,7 +1,7 @@
 # Exocortex v1 — Round 6 Whole-Project Review
 
 **Status:** REOPENED — strict release convergence promoted R6-R180 through
-R6-R182 after R6-R176 through R6-R179 closed; all earlier findings remain
+R6-R183 after R6-R176 through R6-R179 closed; all earlier findings remain
 closed.
 
 **Review baseline:** `f7bf463aa4a77ac719c485bfe713541d79edeab1`
@@ -663,6 +663,16 @@ closure paragraph below still says the complete matrix passed and Round 6 is
 closed without labeling that statement as historical. Closure requires a
 single internally consistent final verdict after R6-R180/R181, the complete
 gate matrix, and a fresh strict review pass.
+
+### R6-R183 — FastEmbed 5.2 migration is unreconciled with the PRD
+
+The core PRD explicitly specifies `fastembed = "3"`, while the production
+repair now exact-pins 5.2. That change is justified by the clean-image model
+acquisition defect, but the required deviation record is absent from
+`docs/MILESTONE_REPORT.md`, and R6-R79 still describes the removed direct
+`ort-sys` rc.4 constraint as current. Closure requires recording the genuine
+contract deviation without editing the PRD and correcting the plan evidence to
+distinguish the historical implementation from the current dependency state.
 
 The complete mandatory gate matrix passed: formatting, workspace clippy,
 workspace tests with adapter SDK testing and `--no-fail-fast`, dependency
