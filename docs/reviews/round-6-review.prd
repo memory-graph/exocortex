@@ -606,6 +606,16 @@ feature without constructing it. Closure requires a documented dependency
 update or equivalent deterministic repair, a real production-embedder startup
 probe, and a passing current-image cluster/chaos run.
 
+### R6-R179 — The chaos harness polls protected health without authentication
+
+After R6-R176 through R6-R178 produced three healthy current-image nodes, the
+harness still reported no lease holder. Its `/health/cluster` requests omit
+the bearer required by the already-closed R6-B62 contract and suppress the 401
+responses. Closure requires the script to derive the dev-only bearer from the
+authoritative policy fixture, authenticate both polling loops, add executable
+deployment-gate coverage, and pass current-image failover without weakening
+health authorization.
+
 The complete mandatory gate matrix passed: formatting, workspace clippy,
 workspace tests with adapter SDK testing and `--no-fail-fast`, dependency
 policy, kernel purity, fingerprint (`e1f7d17b...ddc9b2`), schema/playbook
