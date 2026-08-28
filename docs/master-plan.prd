@@ -5,10 +5,11 @@ whole-project review promoted R6-R208 through R6-R228 below; R6-R182 remains
 open until those items, the complete final gate matrix, and a subsequent clean
 strict review are evidenced.
 
-**Restart checkpoint:** Round 6 work is intentionally parked. Resume from
-[`docs/CONTINUE_ROUND_6.md`](CONTINUE_ROUND_6.md); R6-R276 has an uncommitted
-implementation but remains in progress pending its focused validation and
-same-commit closure evidence.
+**Restart checkpoint:** Round 6 finish-branch run resumed 2026-08-28;
+R6-R275 and R6-R276 are closed. The remaining sequence before R6-R182 can
+close: fresh strict whole-project review, the full gate matrix, live
+Falkor/Redis validation (chaos harness unless unavailable), the
+finish-branch audits — see [`docs/CONTINUE_ROUND_6.md`](CONTINUE_ROUND_6.md).
 
 **Status (2026-08-27):** Palantir-expansion PRD drafted
 (`docs/prd/exocortex-palantir-expansion-prd.md`, rev 2) — five post-v1
@@ -550,7 +551,7 @@ idea:
 | R6-R273 | Strict review advisory: adopt acknowledged cleanup-pending rows created before delivery generations existed | Codex | Done — the cleanup query atomically adopts missing generations from the persistent global clock before returning work; the live upgrade fixture removes the field and proves a higher generation is restored and cleanup completes (this commit) |
 | R6-R274 | Strict review: prove active outbox claims serialize across distinct effects before relying on a regional generation high-water mark | Codex | Done — two-effect in-memory and live Falkor regressions prove a second effect cannot be claimed while the first is active and receives a strictly higher generation after acknowledgement (this commit) |
 | R6-R275 | Strict review: retain finite legacy Redis identities whose pre-generation commands cannot observe the new high-water fence | Codex | Done — adopted pre-generation cleanups carry a sticky `retain_legacy_identity` flag (legacy adoption outranks a claim-time false), reclaim advances the generation fence while skipping the Redis marker `SREM` so an old Lua `SISMEMBER` still rejects delayed replays; live `adopted_legacy_cleanup_retains_marker_against_old_lua_replay` replays the old Lua before and after cleanup, live Falkor `ingest_effect_outbox_survives_reconnect_and_acknowledges_once` proves retained identity once the generation field is stripped, and the full live Redis fire suite (14) plus live Falkor integration suite (47) pass (this commit) |
-| R6-R276 | Strict review advisory: recognize uncalled expression-bodied and return-typed closures in executable-evidence analysis | Codex | In progress — cover both closure syntaxes with called/uncalled enforcement and cited-I/O fixtures |
+| R6-R276 | Strict review advisory: recognize uncalled expression-bodied and return-typed closures in executable-evidence analysis | Codex | Done — closure body resolution handles `|| expr` (delimiter/semicolon-bounded) and `|| -> T { … }` forms; called and uncalled fixtures cover both syntaxes for dead-enforcement and cited Rust I/O, and `cargo test -p xtask` (25), `dead-enforcement`, `acceptance-coverage`, clippy, and fmt pass (this commit) |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence

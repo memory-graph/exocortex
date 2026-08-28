@@ -396,25 +396,54 @@ fn enclosing_let_closures(body: &str, offset: usize) -> Vec<(String, usize)> {
             };
             value_at + 2 + relative
         };
-        let mut open = pipe_end;
-        while body
-            .as_bytes()
-            .get(open)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            open += 1;
-        }
-        if body.as_bytes().get(open) != Some(&b'{') {
-            continue;
-        }
-        let Some(close) = matching_brace(body, open) else {
+        let Some((body_start, close)) = closure_body_bounds(body, pipe_end) else {
             continue;
         };
-        if offset > open && offset < close {
+        if offset >= body_start && offset < close {
             closures.push((binding.to_owned(), close));
         }
     }
     closures
+}
+
+fn closure_body_bounds(body: &str, pipe_end: usize) -> Option<(usize, usize)> {
+    let mut body_start = pipe_end;
+    while body
+        .as_bytes()
+        .get(body_start)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        body_start += 1;
+    }
+    if body[body_start..].starts_with("->") {
+        let open = body[body_start + 2..].find('{')? + body_start + 2;
+        return matching_brace(body, open).map(|close| (open, close));
+    }
+    if body.as_bytes().get(body_start) == Some(&b'{') {
+        return matching_brace(body, body_start).map(|close| (body_start, close));
+    }
+    closure_expression_end(body, body_start).map(|close| (body_start, close))
+}
+
+fn closure_expression_end(body: &str, start: usize) -> Option<usize> {
+    let mut parentheses = 0usize;
+    let mut brackets = 0usize;
+    let mut braces = 0usize;
+    for (relative, byte) in body.as_bytes()[start..].iter().enumerate() {
+        match byte {
+            b'(' => parentheses += 1,
+            b')' => parentheses = parentheses.checked_sub(1)?,
+            b'[' => brackets += 1,
+            b']' => brackets = brackets.checked_sub(1)?,
+            b'{' => braces += 1,
+            b'}' if braces > 0 => braces -= 1,
+            b';' if parentheses == 0 && brackets == 0 && braces == 0 => {
+                return Some(start + relative);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn rust_functions(source: &str) -> Vec<RustFunction> {
@@ -1949,6 +1978,8 @@ mod tests {
             "pub fn root() { fn nested() { fence(); } } fn fence() {}\n",
             "pub fn root() { let unused = || { fence(); }; let _ = unused; } fn fence() {}\n",
             "pub fn root() { let unused = || { let value = 1; let _ = value; fence(); }; let _ = unused; } fn fence() {}\n",
+            "pub fn root() { let unused = || fence(); let _ = unused; } fn fence() {}\n",
+            "pub fn root() { let unused = || -> bool { fence(); true }; let _ = unused; } fn fence() {}\n",
             "pub fn root() { let unused = || { fence(); }; #[cfg(any())] unused(); } fn fence() {}\n",
             "pub fn root() { let unused = || { fence(); }; if false { unused(); } } fn fence() {}\n",
         ] {
@@ -1976,6 +2007,19 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+
+        for source in [
+            "pub fn root() { let used = || fence(); used(); } fn fence() {}\n",
+            "pub fn root() { let used = || -> bool { fence(); true }; used(); } fn fence() {}\n",
+        ] {
+            write(&root, "crates/example/src/lib.rs", source);
+            assert!(dead_enforcement_violations(
+                &root,
+                &[("fence", "crates/example/src/lib.rs", None)],
+            )
+            .unwrap()
+            .is_empty());
+        }
 
         write(
             &root,
@@ -2428,6 +2472,8 @@ mod tests {
             "fn inspect() { if false { let _ = std::fs::read_to_string(\"scripts/check\"); } }\n",
             "fn inspect() { fn unused() { let _ = std::fs::read_to_string(\"scripts/check\"); } }\n",
             "fn inspect() { let unused = || { let value = 1; let _ = value; let _ = std::fs::read_to_string(\"scripts/check\"); }; let _ = unused; }\n",
+            "fn inspect() { let unused = || std::fs::read_to_string(\"scripts/check\"); let _ = unused; }\n",
+            "fn inspect() { let unused = || -> bool { let _ = std::fs::read_to_string(\"scripts/check\"); true }; let _ = unused; }\n",
         ] {
             write(&root, "xtask/src/main.rs", inert_body);
             assert!(
@@ -2453,6 +2499,16 @@ mod tests {
             validate_acceptance_matrix(&root).is_ok(),
             "called multi-statement closure I/O remains executable evidence"
         );
+        for source in [
+            "fn inspect() { let used = || std::fs::read_to_string(\"scripts/check\"); used(); }\n",
+            "fn inspect() { let used = || -> bool { let _ = std::fs::read_to_string(\"scripts/check\"); true }; used(); }\n",
+        ] {
+            write(&root, "xtask/src/main.rs", source);
+            assert!(
+                validate_acceptance_matrix(&root).is_ok(),
+                "called expression or return-typed closure I/O remains executable evidence"
+            );
+        }
         write(&root, "docs/acceptance/section-23.tsv", &rows);
 
         write(
