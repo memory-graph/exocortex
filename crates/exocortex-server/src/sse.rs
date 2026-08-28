@@ -296,12 +296,7 @@ async fn memory_event_visible<S: Storage>(
     raw_id: &[u8],
     vc: &VisibilityContext,
 ) -> Result<bool, StorageError> {
-    let id = MemoryId(decode_id(raw_id)?);
-    Ok(storage
-        .get_memory(&id)
-        .await?
-        .as_ref()
-        .is_some_and(|memory| memory_visible(memory, vc)))
+    Ok(memory_event_row(storage, raw_id, Some(vc)).await?.is_some())
 }
 
 async fn memory_event_row<S: Storage>(
@@ -321,21 +316,9 @@ async fn relationship_event_visible<S: Storage>(
     raw_id: &[u8],
     vc: &VisibilityContext,
 ) -> Result<bool, StorageError> {
-    let id = RelationshipId(decode_id(raw_id)?);
-    let Some(relationship) = storage.get_relationship(&id).await? else {
-        return Ok(false);
-    };
-    let endpoints = storage
-        .get_memories(&[relationship.from, relationship.to])
-        .await?;
-    let from = endpoints
-        .iter()
-        .find(|memory| memory.id == relationship.from);
-    let to = endpoints.iter().find(|memory| memory.id == relationship.to);
-    Ok(match (from, to) {
-        (Some(from), Some(to)) => relationship_visible(&relationship, from, to, vc),
-        _ => false,
-    })
+    Ok(relationship_event_row(storage, raw_id, Some(vc))
+        .await?
+        .is_some())
 }
 
 async fn relationship_event_row<S: Storage>(
@@ -384,18 +367,32 @@ async fn graph_reseed_envelope_at<S: Storage + 'static>(
     now: chrono::DateTime<chrono::Utc>,
     frontier: u64,
 ) -> Result<InvalidationEnvelope, StorageError> {
-    let mut all_memories = std::collections::HashMap::new();
+    // Keep endpoint indices into the output vector rather than cloning full
+    // rows into a second map. Invisible/dead rows need no retained metadata:
+    // an edge with either endpoint absent cannot be visible to this caller.
+    let mut visible_memory_indices = std::collections::HashMap::new();
     let mut memories = Vec::new();
+    // Conservative JSON framing allowance; individual rows are measured
+    // before they are retained so the aggregate ceiling is an allocation
+    // boundary, not merely a post-serialization response check.
+    let mut retained_json_bytes = 64usize;
+    let mut memory_rows_seen = 0usize;
     let mut memory_rows = cluster.storage.stream_all_memories().await;
     while let Some(row) = memory_rows.next().await {
         let mut memory = row?;
-        ensure_reseed_budget(all_memories.len() + 1, 0)?;
+        memory_rows_seen += 1;
+        ensure_reseed_budget(memory_rows_seen, retained_json_bytes)?;
         let live =
             memory.valid_until.is_none_or(|until| until > now) && memory.invalidated_by.is_none();
         let visible = visibility.is_none_or(|vc| memory_visible(&memory, vc));
-        all_memories.insert(memory.id, memory.clone());
         if live && visible {
             memory.embedding = None;
+            retained_json_bytes = retained_json_bytes
+                .checked_add(encoded_json_len(&memory)?)
+                .and_then(|bytes| bytes.checked_add(1))
+                .ok_or_else(|| StorageError::Backend("SSE hydration byte count overflow".into()))?;
+            ensure_reseed_budget(memory_rows_seen, retained_json_bytes)?;
+            visible_memory_indices.insert(memory.id, memories.len());
             memories.push(memory);
         }
     }
@@ -405,7 +402,10 @@ async fn graph_reseed_envelope_at<S: Storage + 'static>(
     while let Some(row) = relationship_rows.next().await {
         let relationship = row?;
         relationship_rows_seen += 1;
-        ensure_reseed_budget(all_memories.len() + relationship_rows_seen, 0)?;
+        let total_rows = memory_rows_seen
+            .checked_add(relationship_rows_seen)
+            .ok_or_else(|| StorageError::Backend("SSE hydration row count overflow".into()))?;
+        ensure_reseed_budget(total_rows, retained_json_bytes)?;
         let live = relationship.valid_until.is_none_or(|until| until > now)
             && relationship.invalidated_by.is_none();
         if !live {
@@ -414,14 +414,21 @@ async fn graph_reseed_envelope_at<S: Storage + 'static>(
         let visible = match visibility {
             None => true,
             Some(vc) => match (
-                all_memories.get(&relationship.from),
-                all_memories.get(&relationship.to),
+                visible_memory_indices.get(&relationship.from),
+                visible_memory_indices.get(&relationship.to),
             ) {
-                (Some(from), Some(to)) => relationship_visible(&relationship, from, to, vc),
+                (Some(from), Some(to)) => {
+                    relationship_visible(&relationship, &memories[*from], &memories[*to], vc)
+                }
                 _ => false,
             },
         };
         if visible {
+            retained_json_bytes = retained_json_bytes
+                .checked_add(encoded_json_len(&relationship)?)
+                .and_then(|bytes| bytes.checked_add(1))
+                .ok_or_else(|| StorageError::Backend("SSE hydration byte count overflow".into()))?;
+            ensure_reseed_budget(total_rows, retained_json_bytes)?;
             relationships.push(relationship);
         }
     }
@@ -435,6 +442,12 @@ async fn graph_reseed_envelope_at<S: Storage + 'static>(
         snapshot_json,
         lsn: frontier,
     }))
+}
+
+fn encoded_json_len<T: serde::Serialize>(value: &T) -> Result<usize, StorageError> {
+    serde_json::to_vec(value)
+        .map(|encoded| encoded.len())
+        .map_err(|error| StorageError::Backend(error.to_string()))
 }
 
 fn ensure_reseed_budget(rows: usize, bytes: usize) -> Result<(), StorageError> {
@@ -593,5 +606,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(envelope.inv.unwrap().backend_lsn, captured, "a row observed after capture is replayed from the live subscription, never acknowledged by the snapshot frontier");
+    }
+
+    #[tokio::test]
+    async fn hydration_rejects_aggregate_bytes_while_harvesting_rows() {
+        let ontology = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = Arc::new(InMemoryStorage::new(ontology.clone()));
+        let now = chrono::Utc::now();
+        let rows = (0..520)
+            .map(|index| Memory {
+                id: MemoryId::new_v7(),
+                memory_type: 3,
+                title: format!("oversized-{index}").into(),
+                content: "x"
+                    .repeat(exocortex_wire::limits::MAX_MEMORY_CONTENT_BYTES)
+                    .into(),
+                summary: None,
+                tags: Default::default(),
+                visibility: Visibility::Org,
+                provenance: Provenance::Asserted {
+                    author: "test".into(),
+                    producer_kind: None,
+                },
+                context: MemoryContext {
+                    timestamp: now,
+                    project_id: None,
+                    project_path: None,
+                    team_id: None,
+                    tenant_id: Some("org".into()),
+                    session_id: None,
+                    user_id: None,
+                    created_by: None,
+                    files_involved: Default::default(),
+                    languages: Default::default(),
+                    frameworks: Default::default(),
+                    technologies: Default::default(),
+                    git_commit: None,
+                    git_branch: None,
+                    working_directory: None,
+                    entities: Default::default(),
+                    additional_metadata: serde_json::Value::Null,
+                },
+                importance: exocortex_kernel::memory::F01::new(0.5).unwrap(),
+                confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
+                effectiveness: None,
+                usage_count: 0,
+                valid_from: now,
+                valid_until: None,
+                recorded_at: now,
+                invalidated_by: None,
+                embedding: None,
+                lsn: LSN::new_local(0),
+            })
+            .collect::<Vec<_>>();
+        storage.upsert_batch(&rows, &[]).await.unwrap();
+        let cluster =
+            ClusterNode::new(storage, "seed-budget".into(), ontology.fingerprint, [5; 32]);
+
+        let error = graph_reseed_envelope_at(&cluster, None, now, 0)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("hydration exceeds"));
     }
 }
