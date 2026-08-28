@@ -2479,7 +2479,12 @@ itest!(
     }
 );
 
-itest!(bi_temporal_valid_at, {
+#[tokio::test(flavor = "multi_thread")]
+async fn bi_temporal_valid_at() {
+    if falkor_url().is_none() {
+        eprintln!("skipping bi_temporal_valid_at: FALKOR_URL not set");
+        return;
+    }
     let s = connect("node-1").await;
     let t0 = Utc::now() - Duration::hours(2);
     let t1 = Utc::now() - Duration::hours(1);
@@ -2556,7 +2561,7 @@ itest!(bi_temporal_valid_at, {
         correction.content,
         "ordinary reads expose only the current row"
     );
-});
+}
 
 itest!(lease_race_single_winner, {
     let a = connect("node-A").await;

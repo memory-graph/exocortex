@@ -912,19 +912,6 @@ fn validate_executable_evidence(
     let Some(function_offset) = function_offset else {
         // Some Rust evidence is deliberately a constant, method call, or
         // invariant-bearing expression rather than a test function.
-        if (relative.starts_with("tests/") || relative.contains("/tests/"))
-            && macro_generates_test(&clean_source, symbol)
-        {
-            let target = std::path::Path::new(relative)
-                .file_stem()
-                .and_then(std::ffi::OsStr::to_str)
-                .unwrap_or_default();
-            anyhow::ensure!(
-                command.contains(symbol) || command.contains(&format!("--test {target}")),
-                "criterion {criterion} command does not execute evidence `{relative}::{needle}`"
-            );
-            return Ok(());
-        }
         anyhow::ensure!(
             !(relative.starts_with("tests/") || relative.contains("/tests/")),
             "criterion {criterion} evidence `{relative}::{needle}` is not an executable test"
@@ -984,38 +971,6 @@ fn validate_executable_evidence(
         "criterion {criterion} command does not execute evidence `{relative}::{needle}`"
     );
     Ok(())
-}
-
-fn macro_generates_test(source: &str, symbol: &str) -> bool {
-    let invocation = format!("({symbol},");
-    source.match_indices(&invocation).any(|(offset, _)| {
-        let before = source[..offset].trim_end();
-        let Some(bang) = before.strip_suffix('!') else {
-            return false;
-        };
-        let macro_name = bang
-            .rsplit(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-            .next()
-            .unwrap_or_default();
-        if macro_name.is_empty() {
-            return false;
-        }
-        let declaration = format!("macro_rules! {macro_name}");
-        let Some(declaration_at) = source[..offset].find(&declaration) else {
-            return false;
-        };
-        let Some(open) = source[declaration_at..offset]
-            .find('{')
-            .map(|relative| declaration_at + relative)
-        else {
-            return false;
-        };
-        let Some(close) = matching_brace(source, open) else {
-            return false;
-        };
-        let body = &source[open..=close];
-        (body.contains("#[test") || body.contains("#[tokio::test")) && body.contains("fn $name")
-    })
 }
 
 fn command_enables_configuration(command: &str, configuration: &str) -> bool {
@@ -1680,11 +1635,11 @@ mod tests {
         write(
             &root,
             "tests/direct.rs",
-            "macro_rules! case { ($name:ident, $body:block) => { #[test] fn $name() $body }; }\ncase!(direct_case, {});\n",
+            "macro_rules! case { ($name:ident, $body:block) => {}; (@test $name:ident) => { #[test] fn $name() {} }; }\ncase!(direct_case, {});\n",
         );
         assert!(
-            validate_acceptance_matrix(&root).is_ok(),
-            "a locally defined test-generating macro remains executable evidence"
+            validate_acceptance_matrix(&root).is_err(),
+            "a test in an unselected macro arm must not make the named invocation executable"
         );
         write(&root, "tests/direct.rs", "#[test]\nfn direct_case() {}\n");
 
