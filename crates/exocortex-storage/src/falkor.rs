@@ -2539,6 +2539,28 @@ impl Storage for FalkorStorage {
         }
     }
 
+    async fn get_relationships(
+        &self,
+        ids: &[RelationshipId],
+    ) -> Result<Vec<Relationship>, StorageError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .run_template(
+                "get_relationships_by_ids",
+                &serde_json::json!({
+                    "rel_ids": ids.iter().map(|id| hex(&id.0)).collect::<Vec<_>>()
+                }),
+                true,
+            )
+            .await?;
+        rows.iter()
+            .filter_map(|row| row.first())
+            .map(relationship_from_value)
+            .collect()
+    }
+
     async fn relationships_touching(
         &self,
         frontier: &[MemoryId],

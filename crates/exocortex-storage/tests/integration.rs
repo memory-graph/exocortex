@@ -238,6 +238,31 @@ itest!(roundtrip_memory, {
     assert_eq!(got.provenance, m.provenance);
 });
 
+itest!(
+    batch_relationship_lookup_returns_existing_ids_in_one_call,
+    {
+        let s = connect("batch-relationship-lookup").await;
+        let a = mem("batch-rel-a", 3, Visibility::Org);
+        let b = mem("batch-rel-b", 3, Visibility::Org);
+        let c = mem("batch-rel-c", 3, Visibility::Org);
+        let first = rel(a.id, b.id, exocortex_kernel::kinds::SOLVES.0);
+        let second = rel(b.id, c.id, exocortex_kernel::kinds::SOLVES.0);
+        s.upsert_batch(&[a, b, c], &[first.clone(), second.clone()])
+            .await
+            .unwrap();
+        let missing = RelationshipId([0xff; 16]);
+        let rows = s
+            .get_relationships(&[second.id, missing, first.id])
+            .await
+            .expect("one production batch relationship query");
+        let ids = rows
+            .into_iter()
+            .map(|relationship| relationship.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids, [first.id, second.id].into_iter().collect());
+    }
+);
+
 itest!(governed_import_is_durable_and_does_not_duplicate_history, {
     let first = connect("governed-import-a").await;
     let graph = first.graph_name_clone();

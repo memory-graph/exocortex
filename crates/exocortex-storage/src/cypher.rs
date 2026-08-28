@@ -857,6 +857,17 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "get_relationships_by_ids",
+        read_only: true,
+        required_params: &["rel_ids"],
+        cypher: r#"
+            MATCH ()-[r]->()
+            WHERE r.id IN $rel_ids
+            RETURN r
+        "#,
+    });
+
+    reg!(Template {
         id: "memories_sharing_attributes",
         read_only: true,
         required_params: &["attribute_keys", "limit"],

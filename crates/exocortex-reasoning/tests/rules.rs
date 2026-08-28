@@ -174,6 +174,103 @@ async fn small_reasoning_update_never_scans_the_full_store() {
     );
 }
 
+#[tokio::test]
+async fn session_cohort_is_evaluated_once_with_batched_existence_and_total_cap() {
+    use futures::StreamExt as _;
+
+    let onto = ontology();
+    let storage = InMemoryStorage::new(onto.clone());
+    let session = mem(
+        exocortex_pack_dev_v1::MemoryType::Conversation.id(),
+        &[],
+        &[],
+    );
+    let members = (0..145)
+        .map(|_| mem(exocortex_pack_dev_v1::MemoryType::General.id(), &[], &[]))
+        .collect::<Vec<_>>();
+    let edges = members
+        .iter()
+        .map(|memory| Relationship {
+            id: RelationshipId::derive(
+                memory.id,
+                exocortex_kernel::kinds::IN_SESSION,
+                session.id,
+                None,
+            ),
+            kind: exocortex_kernel::kinds::IN_SESSION,
+            from: memory.id,
+            to: session.id,
+            visibility: Visibility::Org,
+            provenance: Provenance::Asserted {
+                author: "t".into(),
+                producer_kind: None,
+            },
+            properties: exocortex_kernel::RelationshipProperties {
+                strength: 1.0,
+                confidence: 1.0,
+                context: None,
+                evidence_count: 1,
+                success_rate: None,
+                validation_count: 0,
+                counter_evidence_count: 0,
+                last_validated: chrono::Utc::now(),
+            },
+            description: None,
+            bidirectional: false,
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            recorded_at: chrono::Utc::now(),
+            invalidated_by: None,
+            lsn: LSN::new_local(0),
+        })
+        .collect::<Vec<_>>();
+    let mut memories = Vec::with_capacity(members.len() + 1);
+    memories.push(session);
+    memories.extend(members.iter().cloned());
+    storage.upsert_batch(&memories, &edges).await.unwrap();
+    storage.take_read_counts();
+    storage.reasoning_query_counts();
+
+    let engine = Arc::new(ReasoningEngine::new(Arc::new(storage.clone_dyn()), 8, 3));
+    let worker = tokio::spawn(engine.clone().run());
+    engine
+        .process_durable_session_wrapup(
+            "bounded-session-cohort".into(),
+            members.iter().map(|memory| memory.id).collect(),
+        )
+        .await
+        .unwrap();
+    worker.abort();
+
+    let (point_reads, batch_reads) = storage.take_read_counts();
+    assert_eq!(point_reads, 0, "derived ids must not use point reads");
+    assert_eq!(
+        batch_reads, 2,
+        "one memory cohort read plus one relationship existence read"
+    );
+    let (_, _, frontier_reads, _) = storage.reasoning_query_counts();
+    assert!(
+        frontier_reads <= 3,
+        "the entire session must be one bounded k-hop evaluation, got {frontier_reads}"
+    );
+    let derived_d6 = storage
+        .stream_all_relationships()
+        .await
+        .filter_map(|row| async move { row.ok() })
+        .filter(|relationship| {
+            std::future::ready(matches!(
+                &relationship.provenance,
+                Provenance::Derived { rule_id, .. } if rule_id == "D6"
+            ))
+        })
+        .count()
+        .await;
+    assert_eq!(
+        derived_d6, 10_000,
+        "145 choose 2 exceeds the deterministic total derivation ceiling"
+    );
+}
+
 #[test]
 fn rules_r1_through_r3_derive_types() {
     rules::prime(&ontology());

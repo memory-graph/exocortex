@@ -1191,6 +1191,7 @@ impl Storage for InMemoryStorage {
         &self,
         id: &RelationshipId,
     ) -> Result<Option<Relationship>, StorageError> {
+        self.inner.point_reads.fetch_add(1, Ordering::SeqCst);
         Ok(self
             .inner
             .rels
@@ -1198,6 +1199,17 @@ impl Storage for InMemoryStorage {
             .unwrap()
             .get(id)
             .and_then(|history| history.last().cloned()))
+    }
+    async fn get_relationships(
+        &self,
+        ids: &[RelationshipId],
+    ) -> Result<Vec<Relationship>, StorageError> {
+        self.inner.batch_reads.fetch_add(1, Ordering::SeqCst);
+        let store = self.inner.rels.lock().unwrap();
+        Ok(ids
+            .iter()
+            .filter_map(|id| store.get(id).and_then(|history| history.last().cloned()))
+            .collect())
     }
     async fn relationships_touching(
         &self,

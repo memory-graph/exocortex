@@ -299,6 +299,17 @@ pub trait Storage: Send + Sync + 'static {
         }
         Ok(None)
     }
+    /// Batch-read current relationships by deterministic id. Missing ids are
+    /// omitted; production implementations must use one backend request.
+    async fn get_relationships(&self, ids: &[RelationshipId]) -> crate::Result<Vec<Relationship>> {
+        let mut rows = Vec::new();
+        for id in ids {
+            if let Some(relationship) = self.get_relationship(id).await? {
+                rows.push(relationship);
+            }
+        }
+        Ok(rows)
+    }
     /// Bounded relationship rows touching any node in `frontier`. Production
     /// backends implement this with endpoint indexes; the default preserves
     /// compatibility for specialized test stores.

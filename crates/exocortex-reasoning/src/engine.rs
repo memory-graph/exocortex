@@ -11,6 +11,10 @@ use tracing::{instrument, warn};
 
 use crate::rules::{self, Edge, EntityFact, TagFact};
 
+const MAX_REASONING_NODES: usize = 512;
+const MAX_REASONING_EDGES: usize = 4096;
+const MAX_DERIVED_RELATIONSHIPS: usize = 10_000;
+
 /// Queued reasoning work.
 pub enum ReasoningWork {
     /// Evaluate rules over the k-hop neighborhood of a seed.
@@ -141,14 +145,14 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
     /// bounded by `k` and the CR-6 node caps. Previously O(hops·E).
     #[instrument(skip(self))]
     pub async fn k_hop_reason(&self, seed: MemoryId, k: u8) {
-        if let Err(error) = self.try_k_hop_reason(seed, k, None).await {
+        if let Err(error) = self.try_k_hop_reason(&[seed], k, None).await {
             warn!(?error, "bounded reasoning pass failed");
         }
     }
 
     async fn try_k_hop_reason(
         &self,
-        seed: MemoryId,
+        seeds: &[MemoryId],
         k: u8,
         operation_key: Option<&str>,
     ) -> Result<(), StorageError> {
@@ -160,19 +164,28 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         // Delta-driven BFS from the changed seed. Each hop asks storage for
         // only edges touching the current frontier; it never enumerates the
         // graph-wide relationship table.
-        const MAX_NODES: usize = 512;
-        const MAX_EDGES: usize = 4096;
+        let mut seed_ids: Vec<_> = seeds.to_vec();
+        seed_ids.sort();
+        seed_ids.dedup();
+        if seed_ids.len() > MAX_REASONING_NODES {
+            return Err(StorageError::Backend(format!(
+                "reasoning seed cohort exceeds {MAX_REASONING_NODES} memories"
+            )));
+        }
         let mut neighborhood: std::collections::HashSet<MemoryId> =
-            std::collections::HashSet::from([seed]);
+            seed_ids.iter().copied().collect();
         let mut seen_edges: std::collections::HashSet<RelationshipId> =
             std::collections::HashSet::new();
         let mut relationship_rows = Vec::new();
-        let mut frontier = vec![seed];
+        let mut frontier = seed_ids;
         for _hop in 0..k {
+            if frontier.is_empty() {
+                break;
+            }
             let mut next = Vec::new();
             let rows = match self
                 .storage
-                .relationships_touching(&frontier, MAX_EDGES as u32)
+                .relationships_touching(&frontier, MAX_REASONING_EDGES as u32)
                 .await
             {
                 Ok(rows) => rows,
@@ -183,15 +196,17 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
                     continue;
                 }
                 for other in [row.from, row.to] {
-                    if neighborhood.len() < MAX_NODES && neighborhood.insert(other) {
+                    if neighborhood.len() < MAX_REASONING_NODES && neighborhood.insert(other) {
                         next.push(other);
                     }
                 }
                 relationship_rows.push(row);
             }
-            if next.is_empty() || relationship_rows.len() >= MAX_EDGES {
+            if next.is_empty() || relationship_rows.len() >= MAX_REASONING_EDGES {
                 break;
             }
+            next.sort();
+            next.dedup();
             frontier = next;
         }
 
@@ -217,8 +232,8 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         //      the cap carry no affinity signal);
         //   3. a hard cap on derived pairs per pass, with a drop counter.
         const MAX_POSTING_LIST: usize = 256;
-        const MAX_DERIVED_PAIRS: usize = 10_000;
-        let neighborhood_ids: Vec<_> = neighborhood.iter().copied().collect();
+        let mut neighborhood_ids: Vec<_> = neighborhood.iter().copied().collect();
+        neighborhood_ids.sort();
         let mut memory_rows = match self.storage.get_memories(&neighborhood_ids).await {
             Ok(rows) => rows,
             Err(error) => return Err(error),
@@ -304,8 +319,8 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
 
         let mut derived = rules::evaluate(edges, entities, tags, memories);
         let before = derived.co_occurrence_affinity.len() + derived.similar_tags_affinity.len();
-        if before > MAX_DERIVED_PAIRS {
-            let scale = MAX_DERIVED_PAIRS as f64 / before as f64;
+        if before > MAX_DERIVED_RELATIONSHIPS {
+            let scale = MAX_DERIVED_RELATIONSHIPS as f64 / before as f64;
             let keep = |v: &mut Vec<(MemoryId, MemoryId)>| {
                 let n = ((v.len() as f64) * scale).ceil() as usize;
                 v.truncate(n.min(v.len()));
@@ -313,7 +328,7 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
             keep(&mut derived.co_occurrence_affinity);
             keep(&mut derived.similar_tags_affinity);
             metrics::counter!("exocortex_reasoning_derived_pairs_capped_total")
-                .increment((before - MAX_DERIVED_PAIRS) as u64);
+                .increment((before - MAX_DERIVED_RELATIONSHIPS) as u64);
         }
         self.write_back(derived, &memory_rows, &relationship_rows, operation_key)
             .await
@@ -324,11 +339,8 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         ms: &[MemoryId],
         operation_key: Option<&str>,
     ) -> Result<(), StorageError> {
-        for m in ms {
-            let seed_key = operation_key.map(|key| durable_seed_key(key, *m));
-            self.try_k_hop_reason(*m, 3, seed_key.as_deref()).await?;
-        }
-        Ok(())
+        let cohort_key = operation_key.map(|key| durable_cohort_key(key, ms));
+        self.try_k_hop_reason(ms, 3, cohort_key.as_deref()).await
     }
 
     /// Write derived relationships not already present (idempotent by
@@ -510,10 +522,14 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
             for (m, sess) in &derived.session_cohort {
                 by_session.entry(*sess).or_default().push(*m);
             }
-            let mut members: Vec<&MemoryId> = by_session.keys().collect();
+            let mut members: Vec<MemoryId> = by_session.keys().copied().collect();
             members.sort();
             for sess in members {
-                let group = &by_session[sess];
+                let group = by_session
+                    .get_mut(&sess)
+                    .expect("session key collected above");
+                group.sort();
+                group.dedup();
                 for (i, m1) in group.iter().enumerate() {
                     for m2 in group.iter().skip(i + 1) {
                         if m1 != m2 {
@@ -524,18 +540,35 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
             }
         }
 
+        new_rels.sort_by_key(|relationship| relationship.id);
+        new_rels.dedup_by_key(|relationship| relationship.id);
+        if new_rels.len() > MAX_DERIVED_RELATIONSHIPS {
+            let dropped = new_rels.len() - MAX_DERIVED_RELATIONSHIPS;
+            new_rels.truncate(MAX_DERIVED_RELATIONSHIPS);
+            metrics::counter!("exocortex_reasoning_derived_pairs_capped_total")
+                .increment(dropped as u64);
+        }
+
         if new_rels.is_empty() && operation_key.is_none() {
             return Ok(());
         }
-        // Idempotency uses indexed point reads over only the bounded derived
-        // candidates, never a graph-wide relationship enumeration.
-        let mut fresh = Vec::new();
-        for relationship in new_rels {
-            match self.storage.get_relationship(&relationship.id).await? {
-                Some(_) => {}
-                None => fresh.push(relationship),
-            }
-        }
+        // Idempotency resolves every bounded candidate in one storage batch,
+        // never one backend round trip per derived relationship.
+        let candidate_ids = new_rels
+            .iter()
+            .map(|relationship| relationship.id)
+            .collect::<Vec<_>>();
+        let existing = self
+            .storage
+            .get_relationships(&candidate_ids)
+            .await?
+            .into_iter()
+            .map(|relationship| relationship.id)
+            .collect::<std::collections::HashSet<_>>();
+        let fresh = new_rels
+            .into_iter()
+            .filter(|relationship| !existing.contains(&relationship.id))
+            .collect::<Vec<_>>();
         if let Some(operation_key) = operation_key {
             let committed = self
                 .storage
@@ -583,11 +616,20 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
     }
 }
 
-fn durable_seed_key(effect_key: &str, memory_id: MemoryId) -> String {
+fn durable_cohort_key(effect_key: &str, seeds: &[MemoryId]) -> String {
     use std::fmt::Write as _;
-    let mut key = format!("reasoning:v1:{}:{effect_key}:", effect_key.len());
-    for byte in memory_id.0 {
-        let _ = write!(key, "{byte:02x}");
+    let mut seeds = seeds.to_vec();
+    seeds.sort();
+    seeds.dedup();
+    let mut key = format!(
+        "reasoning:v2:{}:{effect_key}:{}:",
+        effect_key.len(),
+        seeds.len()
+    );
+    for seed in seeds {
+        for byte in seed.0 {
+            let _ = write!(key, "{byte:02x}");
+        }
     }
     key
 }
@@ -644,13 +686,14 @@ mod durable_key_tests {
     use super::*;
 
     #[test]
-    fn durable_seed_identity_is_versioned_length_framed_raw_hex() {
-        let id = MemoryId([
+    fn durable_cohort_identity_is_versioned_length_framed_sorted_raw_hex() {
+        let first = MemoryId([
             0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0, 0, 0, 0, 0, 0, 0, 0,
         ]);
+        let second = MemoryId([0xff; 16]);
         assert_eq!(
-            durable_seed_key("effect", id),
-            "reasoning:v1:6:effect:0123456789abcdef0000000000000000"
+            durable_cohort_key("effect", &[second, first, first]),
+            "reasoning:v2:6:effect:2:0123456789abcdef0000000000000000ffffffffffffffffffffffffffffffff"
         );
     }
 }
