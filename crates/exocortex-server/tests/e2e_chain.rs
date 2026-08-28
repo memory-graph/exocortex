@@ -74,6 +74,7 @@ use exocortex_client::sync::{run_sse_sync, SseSyncConfig};
 
 const CLUSTER_KEY: [u8; 32] = [7u8; 32];
 const PRODUCER_KEY: [u8; 32] = [8u8; 32];
+const HARNESS_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn authed<T>(message: T) -> tonic::Request<T> {
     let mut request = tonic::Request::new(message);
@@ -229,12 +230,9 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
     let connection_ready = Arc::new(tokio::sync::Notify::new());
     cfg.connection_ready = Some(connection_ready.clone());
     let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 0, None));
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        connection_ready.notified(),
-    )
-    .await
-    .expect("SSE subscriber establishes its live stream");
+    tokio::time::timeout(HARNESS_STARTUP_TIMEOUT, connection_ready.notified())
+        .await
+        .expect("SSE subscriber establishes its live stream");
 
     // Producer: register + submit over real gRPC.
     let mut client = IngestServiceClient::connect(format!("http://{addr}"))
@@ -379,7 +377,7 @@ async fn mcp_wal_sync_backend_sse_sibling_is_one_chain_under_500ms() {
     let live = Arc::new(tokio::sync::Notify::new());
     sync_cfg.connection_ready = Some(live.clone());
     let sync = tokio::spawn(run_sse_sync(sync_cfg, sibling.clone(), 0, None));
-    tokio::time::timeout(std::time::Duration::from_secs(2), live.notified())
+    tokio::time::timeout(HARNESS_STARTUP_TIMEOUT, live.notified())
         .await
         .expect("sibling SSE is live before the harness write");
 

@@ -72,7 +72,7 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
     let source_policy = policy_dir.path().join("sources.json");
     std::fs::write(
         &source_policy,
-        r#"[{"org_id":"org","source_uri":"fixture://fixture-e2e","producer_id":"fixture-e2e","ceiling":3}]"#,
+        r#"[{"org_id":"org","source_uri":"fixture://fixture-e2e","producer_id":"fixture-e2e","ceiling":3,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
     )
     .unwrap();
     let principal_policy = policy_dir.path().join("principals.json");
@@ -105,12 +105,18 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn exocortex-node");
+    let mut ready = false;
     for _ in 0..100 {
         if std::net::TcpStream::connect(("127.0.0.1", node_port)).is_ok() {
+            ready = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    assert!(
+        ready,
+        "backend-node accepts connections before worker starts"
+    );
 
     // 2. Fixture file: two memories + one edge.
     let dir = tempfile::TempDir::new().unwrap();

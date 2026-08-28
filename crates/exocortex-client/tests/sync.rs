@@ -17,6 +17,9 @@ use exocortex_wire::WIRE_VERSION;
 use prost::Message;
 
 const HMAC_KEY: [u8; 32] = [9u8; 32];
+// Process/test scheduling is not part of the 500 ms change-propagation SLO.
+// Arm that exact deadline only after the authenticated initial image arrives.
+const HARNESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn hex16(b: &[u8; 16]) -> String {
     use std::fmt::Write as _;
@@ -538,7 +541,7 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
         c
     };
     let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 0, None));
-    tokio::time::timeout(Duration::from_secs(2), hydrated.notified())
+    tokio::time::timeout(HARNESS_STARTUP_TIMEOUT, hydrated.notified())
         .await
         .expect("authenticated graph reseed reaches the client");
 
@@ -614,7 +617,7 @@ async fn periodic_reseed_repairs_a_commit_with_no_change_feed_publication() {
     cfg.reconcile_interval = Duration::from_millis(40);
     cfg.hydration_ready = Some(hydrated.clone());
     let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 0, None));
-    tokio::time::timeout(Duration::from_secs(2), hydrated.notified())
+    tokio::time::timeout(HARNESS_STARTUP_TIMEOUT, hydrated.notified())
         .await
         .expect("initial authoritative image");
 
@@ -685,7 +688,7 @@ async fn per_client_sse_hmac_verifies_with_derived_key() {
     cfg.client_key = Some(derived);
     cfg.hydration_ready = Some(hydrated.clone());
     let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 0, None));
-    tokio::time::timeout(Duration::from_secs(2), hydrated.notified())
+    tokio::time::timeout(HARNESS_STARTUP_TIMEOUT, hydrated.notified())
         .await
         .expect("derived-key verified initial image");
 
@@ -831,7 +834,7 @@ async fn production_backend_sync_hydrates_before_ready_and_stays_live() {
     ));
     cfg.backoff = Duration::from_millis(20);
     let sync = tokio::time::timeout(
-        Duration::from_secs(2),
+        HARNESS_STARTUP_TIMEOUT,
         exocortex_client::sync::hydrate_and_start_backend_sync(cfg, cache.clone(), writer_rx),
     )
     .await

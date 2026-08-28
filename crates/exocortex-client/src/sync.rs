@@ -401,15 +401,19 @@ pub async fn run_sse_sync(
                 let Some(item) = item else {
                     break;
                 };
-                match item {
-                    // R-C5: heartbeats/connect anchors arrive as comments;
-                    // transport-level silence trips `read_timeout` below.
-                    Ok(es::SSE::Connected(_)) => {
-                        if let Some(ready) = &cfg.connection_ready {
-                            ready.notify_one();
-                        }
+                // `eventsource-client` does not promise a separate
+                // `Connected` item for every HTTP/SSE response shape. Any
+                // successfully parsed SSE item proves that authentication,
+                // status handling, and stream framing completed.
+                if item.is_ok() {
+                    if let Some(ready) = &cfg.connection_ready {
+                        ready.notify_one();
                     }
-                    Ok(es::SSE::Comment(_)) => {}
+                }
+                match item {
+                    // R-C5: heartbeats/connect anchors prove transport-level
+                    // activity; silence still trips `read_timeout` below.
+                    Ok(es::SSE::Connected(_)) | Ok(es::SSE::Comment(_)) => {}
                     Ok(es::SSE::Event(ev)) => {
                         if ev.event_type == "inv" {
                             let verify_key = cfg.client_key.unwrap_or(cfg.hmac_key);
