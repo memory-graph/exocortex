@@ -143,6 +143,7 @@ struct RustFunction {
     body_start: usize,
     body_end: usize,
     root: bool,
+    method: bool,
     configured_out: bool,
 }
 
@@ -163,7 +164,11 @@ fn contains_reachable_production_call(source: &str, name: &str) -> bool {
             for callee in 0..functions.len() {
                 if !reachable[callee]
                     && !functions[callee].configured_out
-                    && body.contains(&format!("{}(", functions[callee].name))
+                    && contains_call(
+                        body,
+                        &functions[callee].name,
+                        Some(functions[callee].method),
+                    )
                 {
                     reachable[callee] = true;
                     changed = true;
@@ -176,15 +181,39 @@ fn contains_reachable_production_call(source: &str, name: &str) -> bool {
     }
 
     let needle = format!("{name}(");
+    let target_is_method = functions
+        .iter()
+        .find(|function| function.name == name)
+        .map(|function| function.method);
     functions.iter().enumerate().any(|(index, function)| {
         if !reachable[index] {
             return false;
         }
         let body = &source[function.body_start..function.body_end];
         body.match_indices(&needle).any(|(relative, _)| {
-            !configured_out_at(body, relative) && !after_unconditional_exit(body, relative)
+            is_call_to(body, relative, target_is_method)
+                && !configured_out_at(body, relative)
+                && !after_unconditional_exit(body, relative)
         })
     })
+}
+
+fn contains_call(body: &str, name: &str, method: Option<bool>) -> bool {
+    let needle = format!("{name}(");
+    body.match_indices(&needle)
+        .any(|(offset, _)| is_call_to(body, offset, method))
+}
+
+fn is_call_to(body: &str, offset: usize, method: Option<bool>) -> bool {
+    let preceding = body[..offset]
+        .bytes()
+        .rev()
+        .find(|byte| !byte.is_ascii_whitespace());
+    match preceding {
+        Some(byte) if byte == b'_' || byte.is_ascii_alphanumeric() => false,
+        Some(b'.' | b':') => method != Some(false),
+        _ => true,
+    }
 }
 
 fn rust_functions(source: &str) -> Vec<RustFunction> {
@@ -236,11 +265,37 @@ fn rust_functions(source: &str) -> Vec<RustFunction> {
             body_start: body_start + 1,
             body_end,
             root,
+            method: inside_impl(source, at),
             configured_out: header.contains("#[cfg("),
         });
         cursor = body_start + 1;
     }
     functions
+}
+
+fn inside_impl(source: &str, function_at: usize) -> bool {
+    let mut search_end = function_at;
+    while let Some(impl_at) = source[..search_end].rfind("impl") {
+        let before_is_ident = impl_at > 0
+            && (source.as_bytes()[impl_at - 1].is_ascii_alphanumeric()
+                || source.as_bytes()[impl_at - 1] == b'_');
+        let after = source.as_bytes().get(impl_at + 4).copied();
+        if before_is_ident || !after.is_some_and(|byte| byte.is_ascii_whitespace() || byte == b'<')
+        {
+            search_end = impl_at;
+            continue;
+        }
+        let Some(open_offset) = source[impl_at..function_at].find('{') else {
+            search_end = impl_at;
+            continue;
+        };
+        let open = impl_at + open_offset;
+        if matching_brace(source, open).is_some_and(|close| close > function_at) {
+            return true;
+        }
+        search_end = impl_at;
+    }
+    false
 }
 
 fn function_body_start(source: &str, signature_start: usize) -> Option<usize> {
@@ -967,10 +1022,43 @@ fn validate_executable_evidence(
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default();
     anyhow::ensure!(
-        command.contains(symbol) || command.contains(&format!("--test {target}")),
+        command_executes_test(command, relative, target, symbol),
         "criterion {criterion} command does not execute evidence `{relative}::{needle}`"
     );
     Ok(())
+}
+
+fn command_executes_test(command: &str, relative: &str, target: &str, symbol: &str) -> bool {
+    let expected_package = relative
+        .strip_prefix("crates/")
+        .and_then(|path| path.split('/').next());
+    command.split("&&").any(|segment| {
+        let tokens = segment.split_whitespace().collect::<Vec<_>>();
+        if !tokens.windows(2).any(|pair| pair == ["cargo", "test"]) {
+            return false;
+        }
+        if let Some(package) = expected_package {
+            let package_selected = tokens
+                .windows(2)
+                .any(|pair| (pair[0] == "-p" || pair[0] == "--package") && pair[1] == package)
+                || tokens.iter().any(|token| {
+                    token
+                        .strip_prefix("--package=")
+                        .is_some_and(|value| value == package)
+                });
+            if !package_selected && !tokens.contains(&"--workspace") {
+                return false;
+            }
+        }
+        let exact_filter = tokens.iter().any(|token| *token == symbol);
+        let exact_target = tokens
+            .windows(2)
+            .any(|pair| pair[0] == "--test" && pair[1] == target)
+            || tokens
+                .iter()
+                .any(|token| token.strip_prefix("--test=") == Some(target));
+        exact_filter || exact_target
+    })
 }
 
 fn command_enables_configuration(command: &str, configuration: &str) -> bool {
@@ -1146,6 +1234,7 @@ fn strip_comments_and_strings(source: &str) -> String {
         BlockComment(usize),
         String,
         Char,
+        RawString(usize),
     }
     let bytes = source.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -1164,6 +1253,22 @@ fn strip_comments_and_strings(source: &str) -> String {
                 state = State::BlockComment(1);
                 out.extend_from_slice(b"  ");
                 i += 2;
+            }
+            State::Code if current == b'r' || (current == b'b' && next == Some(b'r')) => {
+                let prefix = if current == b'b' { 2 } else { 1 };
+                let mut cursor = i + prefix;
+                while bytes.get(cursor) == Some(&b'#') {
+                    cursor += 1;
+                }
+                if bytes.get(cursor) == Some(&b'"') {
+                    let hashes = cursor - (i + prefix);
+                    state = State::RawString(hashes);
+                    out.resize(out.len() + cursor - i + 1, b' ');
+                    i = cursor + 1;
+                } else {
+                    out.push(current);
+                    i += 1;
+                }
             }
             State::Code if current == b'"' => {
                 state = State::String;
@@ -1219,6 +1324,22 @@ fn strip_comments_and_strings(source: &str) -> String {
             State::Char if current == b'\'' => {
                 state = State::Code;
                 out.push(b' ');
+                i += 1;
+            }
+            State::RawString(hashes) if current == b'"' => {
+                let closes = (0..hashes).all(|hash| bytes.get(i + 1 + hash) == Some(&b'#'));
+                if closes {
+                    state = State::Code;
+                    out.resize(out.len() + hashes + 1, b' ');
+                    i += hashes + 1;
+                } else {
+                    out.push(b' ');
+                    i += 1;
+                }
+            }
+            State::RawString(hashes) => {
+                state = State::RawString(hashes);
+                out.push(if current == b'\n' { b'\n' } else { b' ' });
                 i += 1;
             }
             State::String | State::Char => {
@@ -1294,6 +1415,19 @@ mod tests {
         let violations =
             dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")]).unwrap();
         assert_eq!(violations.len(), 1);
+
+        write(
+            &root,
+            "crates/example/src/lib.rs",
+            "pub fn root(x: &Guard) { x.fence(); } fn fence() {}\n",
+        );
+        let violations =
+            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")]).unwrap();
+        assert_eq!(
+            violations.len(),
+            1,
+            "an unrelated method call must not make a same-named free control reachable"
+        );
     }
 
     #[test]
@@ -1680,6 +1814,45 @@ mod tests {
         let mismatched = rows.replace("cargo test direct_case", "cargo test unrelated");
         write(&root, "docs/acceptance/section-23.tsv", &mismatched);
         assert!(validate_acceptance_matrix(&root).is_err());
+
+        let prefix_collision =
+            rows.replace("cargo test direct_case", "cargo test direct_case_removed");
+        write(&root, "docs/acceptance/section-23.tsv", &prefix_collision);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "a prefix/suffix filter collision must not select the cited test"
+        );
+
+        write(
+            &root,
+            "crates/example/tests/direct.rs",
+            "#[test]\nfn direct_case() {}\n",
+        );
+        let wrong_package = rows
+            .replace(
+                "tests/direct.rs::direct_case",
+                "crates/example/tests/direct.rs::direct_case",
+            )
+            .replace(
+                "cargo test direct_case",
+                "cargo test -p other --test direct",
+            );
+        write(&root, "docs/acceptance/section-23.tsv", &wrong_package);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "a same-stem target in another package must not select the cited test"
+        );
+
+        write(
+            &root,
+            "tests/direct.rs",
+            "const TEXT: &str = r#\"x\" #[test]\nfn direct_case() {} \"#;\n",
+        );
+        write(&root, "docs/acceptance/section-23.tsv", &rows);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "test syntax inside a raw Rust string must not count as executable evidence"
+        );
 
         write(
             &root,
