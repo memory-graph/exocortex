@@ -345,3 +345,20 @@ Failed or unavailable:
 6. Full validation, then repeated strict whole-project review/remediation until
    no verified actionable finding remains.
 
+## Fresh strict-review follow-up (2026-08-27)
+
+A nine-lens strict review of current `main` after R6-R54–R6-R64 found additional
+actionable work. The deduplicated findings are accepted as R6-R65–R6-R87 in the
+master plan: invalidation-stream continuity; two missing live corruption/guard
+regressions; installer origin trust and bearer strength; four semantic gate
+bypasses; bounded legacy hydration; mixed-version invalidation delivery and
+rollback history; production cache batching/recovery load; blocking embedding;
+Dreams locality; client URL redaction; ingest admission ordering; and five
+cleanup/structural corrections. Product-lens duplicates of mixed-version feed
+and rollback defects remain owned by R6-R75/R6-R76.
+
+The previously open new-client/old-server question is promoted as R6-R74. The
+repository documents additive evolution and rollout work but no deployment
+order that permits an indefinite pre-readiness wait; the runtime must therefore
+either hydrate compatibly or fail promptly and explicitly. This is not closed
+by assumption or by the D10 rollout-test deferral.
