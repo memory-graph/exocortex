@@ -220,17 +220,47 @@ fn contains_reachable_production_call(
         }
         let body = &source[function.body_start..function.body_end];
         if let Some(qualified_call) = qualified_call {
-            let compact = body
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .collect::<String>();
-            return compact.contains(&format!("{qualified_call}("));
+            return qualified_call_offsets(body, qualified_call).any(|offset| {
+                !configured_out_at(body, offset) && !after_unconditional_exit(body, offset)
+            });
         }
         body.match_indices(&needle).any(|(relative, _)| {
             is_call_to(body, relative, target_is_method)
                 && !configured_out_at(body, relative)
                 && !after_unconditional_exit(body, relative)
         })
+    })
+}
+
+fn qualified_call_offsets<'a>(body: &'a str, pattern: &'a str) -> impl Iterator<Item = usize> + 'a {
+    body.char_indices().filter_map(move |(start, first)| {
+        if !pattern.starts_with(first)
+            || body[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return None;
+        }
+        let mut source = body[start..].char_indices().peekable();
+        for expected in pattern.chars() {
+            while source
+                .peek()
+                .is_some_and(|(_, found)| found.is_whitespace())
+            {
+                source.next();
+            }
+            if source.next().map(|(_, found)| found) != Some(expected) {
+                return None;
+            }
+        }
+        while source
+            .peek()
+            .is_some_and(|(_, found)| found.is_whitespace())
+        {
+            source.next();
+        }
+        (source.next().map(|(_, found)| found) == Some('(')).then_some(start)
     })
 }
 
@@ -1088,10 +1118,17 @@ fn shell_evidence_is_executed(
     all_evidence: &str,
     command: &str,
 ) -> Result<bool> {
-    if command.contains(relative) {
+    let tokens = command
+        .split_whitespace()
+        .map(|token| token.trim_matches(['\'', '"']))
+        .collect::<Vec<_>>();
+    if tokens.first().is_some_and(|token| *token == relative)
+        || tokens
+            .windows(2)
+            .any(|pair| matches!(pair[0], "sh" | "bash") && pair[1] == relative)
+    {
         return Ok(true);
     }
-    let tokens = command.split_whitespace().collect::<Vec<_>>();
     let Some(position) = tokens.iter().position(|token| *token == "xtask") else {
         return Ok(false);
     };
@@ -1114,7 +1151,18 @@ fn shell_evidence_is_executed(
     let Some(close) = matching_brace(&source, open) else {
         return Ok(false);
     };
-    Ok(source[open..=close].contains(relative))
+    let body = &source[open..=close];
+    let clean = strip_comments_and_strings(body);
+    Ok(["read_to_string", "Command::new", "include_str!"]
+        .into_iter()
+        .any(|call| {
+            let needle = format!("{call}(\"{relative}\")");
+            body.match_indices(&needle).any(|(offset, _)| {
+                clean[offset..]
+                    .get(..call.len())
+                    .is_some_and(|candidate| candidate == call)
+            })
+        }))
 }
 
 fn is_shell_source(relative: &str, source: &str) -> bool {
@@ -1154,47 +1202,73 @@ pub(crate) fn active_shell_commands(script: &str) -> Vec<String> {
         line
     }
 
-    fn heredoc(command: &str) -> Option<(String, bool)> {
-        let mut cursor = 0;
-        let marker = loop {
-            let relative = command[cursor..].find("<<")?;
-            let marker = cursor + relative;
-            if command.as_bytes().get(marker + 2) == Some(&b'<') {
-                cursor = marker + 3;
+    fn heredocs(command: &str) -> std::collections::VecDeque<(String, bool)> {
+        let bytes = command.as_bytes();
+        let mut found = std::collections::VecDeque::new();
+        let (mut cursor, mut single, mut double, mut escaped) = (0, false, false, false);
+        while cursor + 1 < bytes.len() {
+            let byte = bytes[cursor];
+            if escaped {
+                escaped = false;
+                cursor += 1;
                 continue;
             }
-            break marker;
-        };
-        let mut rest = &command[marker + 2..];
-        let strip_tabs = rest.starts_with('-');
-        if strip_tabs {
-            rest = &rest[1..];
+            match byte {
+                b'\\' if !single => escaped = true,
+                b'\'' if !double => single = !single,
+                b'"' if !single => double = !double,
+                b'<' if !single && !double && bytes.get(cursor + 1) == Some(&b'<') => {
+                    if bytes.get(cursor + 2) == Some(&b'<') {
+                        cursor += 3;
+                        continue;
+                    }
+                    let mut token_start = cursor + 2;
+                    let strip_tabs = bytes.get(token_start) == Some(&b'-');
+                    if strip_tabs {
+                        token_start += 1;
+                    }
+                    while bytes.get(token_start).is_some_and(u8::is_ascii_whitespace) {
+                        token_start += 1;
+                    }
+                    let quote = bytes
+                        .get(token_start)
+                        .copied()
+                        .filter(|byte| matches!(byte, b'\'' | b'"'));
+                    if quote.is_some() {
+                        token_start += 1;
+                    }
+                    let mut token_end = token_start;
+                    while let Some(current) = bytes.get(token_end) {
+                        if quote.map_or_else(|| current.is_ascii_whitespace(), |q| *current == q) {
+                            break;
+                        }
+                        token_end += 1;
+                    }
+                    if token_end > token_start {
+                        found.push_back((command[token_start..token_end].to_owned(), strip_tabs));
+                    }
+                    cursor = token_end + usize::from(quote.is_some());
+                    continue;
+                }
+                _ => {}
+            }
+            cursor += 1;
         }
-        rest = rest.trim_start();
-        let token = rest.split_whitespace().next()?;
-        let delimiter = if token.len() >= 2
-            && ((token.starts_with('\'') && token.ends_with('\''))
-                || (token.starts_with('"') && token.ends_with('"')))
-        {
-            &token[1..token.len() - 1]
-        } else {
-            token
-        };
-        (!delimiter.is_empty()).then(|| (delimiter.to_owned(), strip_tabs))
+        found
     }
 
     let mut commands = Vec::new();
     let mut current = String::new();
-    let mut heredoc_body: Option<(String, bool)> = None;
+    let mut heredoc_bodies = std::collections::VecDeque::new();
     for line in script.lines() {
-        if let Some((delimiter, strip_tabs)) = &heredoc_body {
+        if let Some((delimiter, strip_tabs)) = heredoc_bodies.front() {
             let candidate = if *strip_tabs {
                 line.trim_start_matches('\t')
             } else {
                 line
             };
             if candidate == delimiter {
-                heredoc_body = None;
+                heredoc_bodies.pop_front();
             }
             continue;
         }
@@ -1210,7 +1284,7 @@ pub(crate) fn active_shell_commands(script: &str) -> Vec<String> {
         current.push_str(fragment);
         if !continued {
             let command = std::mem::take(&mut current);
-            heredoc_body = heredoc(&command);
+            heredoc_bodies = heredocs(&command);
             commands.push(command);
         }
     }
@@ -1649,6 +1723,27 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+
+        for source in [
+            "struct Guard; impl Guard { fn fence(&self) {} } pub fn root(guard: &Guard) { return; guard.fence(); }\n",
+            "struct Guard; impl Guard { fn fence(&self) {} } pub fn root(guard: &Guard) { #[cfg(any())] guard.fence(); }\n",
+        ] {
+            write(&root, "crates/example/src/lib.rs", source);
+            assert_eq!(
+                dead_enforcement_violations(
+                    &root,
+                    &[(
+                        "fence",
+                        "crates/example/src/lib.rs",
+                        Some("guard.fence"),
+                    )],
+                )
+                .unwrap()
+                .len(),
+                1,
+                "qualified witnesses must still be executable and reachable"
+            );
+        }
     }
 
     #[test]
@@ -2022,6 +2117,12 @@ mod tests {
             validate_acceptance_matrix(&root).is_err(),
             "the recorded command must execute or inspect the cited shell artifact"
         );
+        let mentioned_shell = shell_rows.replace("sh scripts/check", "printf scripts/check");
+        write(&root, "docs/acceptance/section-23.tsv", &mentioned_shell);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "a textual path argument is not execution"
+        );
         write(
             &root,
             "scripts/check",
@@ -2032,6 +2133,39 @@ mod tests {
             validate_acceptance_matrix(&root).is_err(),
             "heredoc body data must not satisfy executable shell evidence"
         );
+        write(
+            &root,
+            "scripts/check",
+            "#!/bin/sh\ncat <<'A' <<\"B\"\nfirst body\nA\nshell_evidence\nB\n",
+        );
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "every heredoc body in one command must remain inert"
+        );
+        let inspected_rows = shell_rows
+            .replacen(
+                "scripts/check::shell_evidence",
+                "scripts/check::shell_evidence;xtask/src/main.rs::fn inspect()",
+                1,
+            )
+            .replacen("sh scripts/check", "cargo xtask inspect", 1);
+        write(&root, "scripts/check", "#!/bin/sh\nshell_evidence=1\n");
+        write(
+            &root,
+            "xtask/src/main.rs",
+            "fn inspect() { let _ = \"scripts/check\"; }\n",
+        );
+        write(&root, "docs/acceptance/section-23.tsv", &inspected_rows);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "an inspecting gate must use the shell path in executable I/O syntax"
+        );
+        write(
+            &root,
+            "xtask/src/main.rs",
+            "fn inspect() { let _ = std::fs::read_to_string(\"scripts/check\"); }\n",
+        );
+        assert!(validate_acceptance_matrix(&root).is_ok());
         write(&root, "docs/acceptance/section-23.tsv", &rows);
 
         write(
