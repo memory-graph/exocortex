@@ -736,7 +736,7 @@ fn validate_chaos_compose(compose: &str) -> Result<()> {
 }
 
 fn validate_chaos_script(script: &str) -> Result<()> {
-    let active = active_shell_commands(script).join("\n");
+    let active = gates::active_shell_commands(script).join("\n");
     anyhow::ensure!(
         active.contains("PRINCIPAL_POLICY=crates/exocortex-cluster/tests/principal-policy.dev.json")
             && active.contains("AUTH_TOKEN=$(jq -er")
@@ -776,58 +776,6 @@ fn validate_chaos_script(script: &str) -> Result<()> {
         "chaos success must follow a killed production-node mutation barrier, takeover, and authoritative no-residue proof"
     );
     Ok(())
-}
-
-fn active_shell_commands(script: &str) -> Vec<String> {
-    fn without_comment(line: &str) -> &str {
-        let mut single = false;
-        let mut double = false;
-        let mut escaped = false;
-        for (index, character) in line.char_indices() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match character {
-                '\\' if !single => escaped = true,
-                '\'' if !double => single = !single,
-                '"' if !single => double = !double,
-                '#' if !single
-                    && !double
-                    && line[..index]
-                        .chars()
-                        .next_back()
-                        .is_none_or(char::is_whitespace) =>
-                {
-                    return &line[..index];
-                }
-                _ => {}
-            }
-        }
-        line
-    }
-
-    let mut commands = Vec::new();
-    let mut current = String::new();
-    for line in script.lines() {
-        let line = without_comment(line).trim();
-        if line.is_empty() {
-            continue;
-        }
-        let continued = line.ends_with('\\');
-        let fragment = line.strip_suffix('\\').unwrap_or(line).trim_end();
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(fragment);
-        if !continued {
-            commands.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        commands.push(current);
-    }
-    commands
 }
 
 fn ontology_surfaces() -> Result<()> {

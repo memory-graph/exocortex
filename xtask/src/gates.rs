@@ -916,6 +916,8 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
                 })?;
                 let searchable = if relative.ends_with(".rs") {
                     strip_comments_and_strings(&source)
+                } else if is_shell_source(relative, &source) {
+                    active_shell_commands(&source).join("\n")
                 } else {
                     source.clone()
                 };
@@ -942,6 +944,14 @@ fn validate_executable_evidence(
     source: &str,
     command: &str,
 ) -> Result<()> {
+    if is_shell_source(relative, source) {
+        let active = active_shell_commands(source).join("\n");
+        anyhow::ensure!(
+            active.contains(needle),
+            "criterion {criterion} evidence `{relative}::{needle}` exists only in shell comments or inert text"
+        );
+        return Ok(());
+    }
     if !relative.ends_with(".rs") {
         return Ok(());
     }
@@ -1026,6 +1036,66 @@ fn validate_executable_evidence(
         "criterion {criterion} command does not execute evidence `{relative}::{needle}`"
     );
     Ok(())
+}
+
+fn is_shell_source(relative: &str, source: &str) -> bool {
+    relative.ends_with(".sh")
+        || source
+            .lines()
+            .next()
+            .is_some_and(|line| line.starts_with("#!") && line.contains("sh"))
+}
+
+pub(crate) fn active_shell_commands(script: &str) -> Vec<String> {
+    fn without_comment(line: &str) -> &str {
+        let mut single = false;
+        let mut double = false;
+        let mut escaped = false;
+        for (index, character) in line.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' if !single => escaped = true,
+                '\'' if !double => single = !single,
+                '"' if !single => double = !double,
+                '#' if !single
+                    && !double
+                    && line[..index]
+                        .chars()
+                        .next_back()
+                        .is_none_or(char::is_whitespace) =>
+                {
+                    return &line[..index];
+                }
+                _ => {}
+            }
+        }
+        line
+    }
+
+    let mut commands = Vec::new();
+    let mut current = String::new();
+    for line in script.lines() {
+        let line = without_comment(line).trim();
+        if line.is_empty() || line.starts_with("#!") {
+            continue;
+        }
+        let continued = line.ends_with('\\');
+        let fragment = line.strip_suffix('\\').unwrap_or(line).trim_end();
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(fragment);
+        if !continued {
+            commands.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        commands.push(current);
+    }
+    commands
 }
 
 fn command_executes_test(command: &str, relative: &str, target: &str, symbol: &str) -> bool {
@@ -1765,6 +1835,29 @@ mod tests {
         }
         write(&root, "docs/acceptance/section-23.tsv", &rows);
         assert!(validate_acceptance_matrix(&root).is_ok());
+
+        write(
+            &root,
+            "scripts/check",
+            "#!/bin/sh\n# shell_evidence exists only in a comment\ntrue\n",
+        );
+        let shell_rows = rows.replacen(
+            "tests/direct.rs::direct_case\tcargo test direct_case",
+            "scripts/check::shell_evidence\tsh scripts/check",
+            1,
+        );
+        write(&root, "docs/acceptance/section-23.tsv", &shell_rows);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "comment-only shell text must not satisfy executable evidence"
+        );
+        write(
+            &root,
+            "scripts/check",
+            "#!/bin/sh\nshell_evidence=1\ntest \"$shell_evidence\" = 1\n",
+        );
+        assert!(validate_acceptance_matrix(&root).is_ok());
+        write(&root, "docs/acceptance/section-23.tsv", &rows);
 
         write(
             &root,
