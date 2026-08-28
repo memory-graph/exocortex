@@ -409,3 +409,27 @@ The mandatory dead-enforcement gate then correctly rejected its stale
 singular Dreams witness after ingestion moved to exact batched deltas.
 R6-R117 binds the gate to the production `on_writes` entrypoint instead of a
 now-unused compatibility wrapper.
+
+## Final convergence strict review (2026-08-28)
+
+A fresh strict review of committed `1267fb9` against `origin/main` ran all nine
+required lenses over the complete 161-file hand-authored/parity surface. The
+preflight SQL-schema and container-test scanners emitted no leads; all three
+hazard classes fired. After root verification and deduplication, the actionable
+results are accepted as R6-R118–R6-R143 in the master plan.
+
+The confirmed defects cover startup and reconnect loss windows; durable
+post-ingest effects; mixed-version storage compare-and-set and assertion-shape
+correctness; bounded regional Dreams reads; explicit audit authority; SSE
+embedding and connection admission; executable acceptance evidence; standalone
+runtime and release topology; immutable live-test inputs; backup fidelity and
+idempotency; and two test-only production surfaces. Duplicate lens reports are
+owned by the single corresponding plan row.
+
+Three hazard questions received evidenced disposition. Backend URLs are
+validated before credential attachment and reject userinfo, so the proposed URL
+credential-to-log path is retired. Deployment or proxy connection limits are
+not a substitute for first-party SSE admission and are owned by R6-R142.
+Principal policy files contain plaintext bearer credentials and the loader did
+not validate their mode, so that question is promoted as R6-R143 rather than
+closed by deployment assumption.
