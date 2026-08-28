@@ -39,6 +39,16 @@ fn graph_suffix() -> String {
         + &N.fetch_add(1, Ordering::SeqCst).to_string()
 }
 
+fn id_hex(bytes: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(32), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        })
+}
+
 async fn connect(node: &str) -> FalkorStorage {
     connect_graph(node, format!("exocortex_test_{}", graph_suffix())).await
 }
@@ -228,6 +238,42 @@ itest!(find_by_entity_reads_persisted_memory_entity_ids, {
         .expect("entity lookup");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, matching.id);
+});
+
+itest!(find_by_entity_filters_tenant_before_limit, {
+    let s = connect("entity-tenant-limit").await;
+    let entity = EntityId([10; 16]);
+    let mut matching = mem("matching-tenant", 3, Visibility::Org);
+    matching.context.entities.push(entity);
+    let mut tenantless = mem("tenantless", 3, Visibility::Org);
+    tenantless.context.entities.push(entity);
+    tenantless.context.tenant_id = None;
+    tenantless.recorded_at = matching.recorded_at + Duration::seconds(1);
+    s.upsert_batch(&[matching.clone(), tenantless], &[])
+        .await
+        .unwrap();
+
+    let rows = s
+        .find_by_entity(
+            &entity,
+            &MemoryFilter {
+                limit: 1,
+                visibility_ctx: VisibilityContext {
+                    user_id: "user-1".into(),
+                    org_id: "test-org".into(),
+                    project_ids: ["proj".into()].into_iter().collect(),
+                    max_visibility: Visibility::Org,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|memory| memory.id).collect::<Vec<_>>(),
+        [matching.id]
+    );
 });
 
 itest!(
@@ -541,6 +587,62 @@ itest!(malformed_fingerprint_fails_closed_without_rewrite, {
 });
 
 itest!(
+    future_schema_is_rejected_before_absent_fingerprint_is_pinned,
+    {
+        let first = connect("future-schema-a").await;
+        let graph = first.graph_name_clone();
+        first
+            .make_future_schema_without_fingerprint_for_testing()
+            .await
+            .unwrap();
+        let url = falkor_url().unwrap();
+        let result = FalkorStorage::connect(
+            FalkorConfig {
+                falkor_url: url.clone(),
+                redis_url: std::env::var("REDIS_URL")
+                    .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+                graph_name: graph.clone(),
+                org_id: "test-org".into(),
+                node_id: "future-schema-b".into(),
+            },
+            ontology(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(StorageError::CorruptMetadata {
+                key: "schema_version",
+                ..
+            })
+        ));
+
+        let fingerprint = first
+            .query_cypher(&CypherQuery {
+                template_id: "read_fingerprint",
+                params: serde_json::json!({}),
+                read_only: true,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        assert!(
+            fingerprint.rows.is_empty(),
+            "rejected startup did not pin a fingerprint"
+        );
+        let schema = first
+            .query_cypher(&CypherQuery {
+                template_id: "read_schema_version",
+                params: serde_json::json!({}),
+                read_only: true,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(schema.rows, vec![serde_json::json!([2])]);
+    }
+);
+
+itest!(
     discovery_acceptance_is_scoped_consumed_and_audited_atomically,
     {
         let s = connect("discovery-atomic").await;
@@ -586,6 +688,23 @@ itest!(
         .unwrap();
         s.create_discovery_proposal(&proposal).await.unwrap();
         s.create_discovery_proposal(&proposal).await.unwrap();
+        let proposed_reissue = s
+            .store_discovery(&DiscoveryRecord {
+                discovery_id: proposal.discovery_id.clone(),
+                region: proposal.region.clone(),
+                from: proposal.from,
+                to: proposal.to,
+                discovery_type: "transitive".into(),
+                quality: 0.6,
+                via_types: [1, 2],
+                discovery_cycle_id: "live-cycle".into(),
+                discovered_at: proposal.issued_at,
+            })
+            .await;
+        assert!(
+            matches!(proposed_reissue, Err(StorageError::ProposalMismatch)),
+            "proposed discovery reissue result: {proposed_reissue:?}"
+        );
         assert!(s.get_discovery("live-proposal").await.unwrap().is_none());
         assert!(s.list_discoveries("test-org", 10).await.unwrap().is_empty());
         let mut conflicting = proposal.clone();
@@ -628,9 +747,119 @@ itest!(
             s.create_discovery_proposal(&proposal).await,
             Err(StorageError::ProposalNotFound)
         ));
+        assert!(matches!(
+            s.store_discovery(&DiscoveryRecord {
+                discovery_id: proposal.discovery_id.clone(),
+                region: proposal.region.clone(),
+                from: proposal.from,
+                to: proposal.to,
+                discovery_type: "transitive".into(),
+                quality: 0.6,
+                via_types: [1, 2],
+                discovery_cycle_id: "live-cycle".into(),
+                discovered_at: proposal.issued_at,
+            })
+            .await,
+            Err(StorageError::ProposalMismatch)
+        ));
         let audits = s.audit_range("test-org", 0, 10).await.unwrap();
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0]["action"], "accept_discovery");
+    }
+);
+
+itest!(
+    malformed_discovery_proposal_fails_closed_without_consumption,
+    {
+        let s = connect("malformed-proposal").await;
+        let from = mem("malformed-from", 3, Visibility::Org);
+        let to = mem("malformed-to", 3, Visibility::Org);
+        s.upsert_batch(&[from.clone(), to.clone()], &[])
+            .await
+            .unwrap();
+        let region = RegionKey {
+            org: "test-org".into(),
+            project: "*".into(),
+            memory_type: from.memory_type,
+        };
+        let record = DiscoveryRecord {
+            discovery_id: "malformed-proposal".into(),
+            region: region.clone(),
+            from: from.id,
+            to: to.id,
+            discovery_type: "transitive".into(),
+            quality: 0.6,
+            via_types: [1, 2],
+            discovery_cycle_id: "malformed-cycle".into(),
+            discovered_at: Utc::now(),
+        };
+        s.store_discovery(&record).await.unwrap();
+        let scope = VisibilityContext {
+            user_id: "user-1".into(),
+            org_id: "test-org".into(),
+            max_visibility: Visibility::Org,
+            ..Default::default()
+        };
+        let kind = exocortex_kernel::kinds::FIXES;
+        let proposal = DiscoveryProposal {
+            discovery_id: record.discovery_id.clone(),
+            region: region.clone(),
+            from: from.id,
+            to: to.id,
+            kind,
+            proposed_visibility: Visibility::Org,
+            caller_scope: scope.clone(),
+            issued_at: Utc::now(),
+        };
+        s.create_discovery_proposal(&proposal).await.unwrap();
+        s.query_cypher(&CypherQuery {
+            template_id: "integration_corrupt_discovery_proposal",
+            params: serde_json::json!({
+                "discovery_id": proposal.discovery_id,
+                "props_json": "not-json",
+            }),
+            read_only: false,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            s.get_discovery_proposal(&proposal.discovery_id).await,
+            Err(StorageError::CorruptMetadata {
+                key: "discovery_proposal",
+                ..
+            })
+        ));
+        let relationship = rel(from.id, to.id, kind.0);
+        assert!(matches!(
+            s.accept_discovery(&DiscoveryAcceptance {
+                discovery_id: proposal.discovery_id.clone(),
+                region,
+                caller_scope: scope,
+                relationship: relationship.clone(),
+                audit: AuditEvent {
+                    action: "accept_discovery".into(),
+                    actor: "user-1".into(),
+                    org_id: "test-org".into(),
+                    input_digest: [5; 32],
+                    output_ids: Default::default(),
+                    fingerprint: s.ontology_fingerprint(),
+                    lease_epoch: None,
+                    recorded_at: Utc::now(),
+                },
+            })
+            .await,
+            Err(StorageError::CorruptMetadata {
+                key: "discovery_proposal",
+                ..
+            })
+        ));
+        assert!(s
+            .get_relationship(&relationship.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(s.audit_range("test-org", 0, 10).await.unwrap().is_empty());
     }
 );
 
@@ -711,6 +940,79 @@ itest!(traverse_applies_exact_caller_visibility, {
             .collect()
     );
 });
+
+itest!(
+    traverse_never_crosses_hidden_intermediates_and_honors_direction,
+    {
+        let s = connect("traverse-hidden-intermediates").await;
+        let seed = mem("seed", 4, Visibility::Org);
+        let visible_out = mem("visible-out", 4, Visibility::Org);
+        let visible_in = mem("visible-in", 4, Visibility::Org);
+        let scoped_edge_target = mem("scoped-edge-target", 4, Visibility::Org);
+        let mut hidden = vec![
+            mem("private-hidden", 4, Visibility::Private),
+            mem("project-hidden", 4, Visibility::Project),
+            mem("team-hidden", 4, Visibility::Team),
+            mem("tenant-hidden", 4, Visibility::Org),
+        ];
+        hidden[0].context.user_id = Some("other-user".into());
+        hidden[1].context.project_id = Some("other-project".into());
+        hidden[2].context.team_id = Some("other-team".into());
+        hidden[3].context.tenant_id = Some("other-org".into());
+        let terminals: Vec<_> = (0..hidden.len())
+            .map(|index| mem(&format!("terminal-{index}"), 4, Visibility::Org))
+            .collect();
+        let mut memories = vec![
+            seed.clone(),
+            visible_out.clone(),
+            visible_in.clone(),
+            scoped_edge_target.clone(),
+        ];
+        memories.extend(hidden.iter().cloned());
+        memories.extend(terminals.iter().cloned());
+        s.upsert_batch(&memories, &[]).await.unwrap();
+        let kind = exocortex_kernel::kinds::SOLVES;
+        let mut edges = vec![
+            rel(seed.id, visible_out.id, kind.0),
+            rel(visible_in.id, seed.id, kind.0),
+        ];
+        let mut subjectless_project_edge = rel(seed.id, scoped_edge_target.id, kind.0);
+        subjectless_project_edge.visibility = Visibility::Project;
+        edges.push(subjectless_project_edge);
+        for (intermediate, terminal) in hidden.iter().zip(&terminals) {
+            edges.push(rel(seed.id, intermediate.id, kind.0));
+            edges.push(rel(intermediate.id, terminal.id, kind.0));
+        }
+        s.upsert_batch(&[], &edges).await.unwrap();
+        let mut traversal = spec(2, 100);
+        traversal.kinds.push(kind);
+        traversal.visibility_ctx.project_ids = ["proj".into()].into_iter().collect();
+
+        traversal.direction = exocortex_storage::Direction::Out;
+        let out = s.traverse(&seed.id, &traversal).await.unwrap();
+        assert_eq!(
+            out.iter().map(|memory| memory.id).collect::<Vec<_>>(),
+            [visible_out.id]
+        );
+
+        traversal.direction = exocortex_storage::Direction::In;
+        let incoming = s.traverse(&seed.id, &traversal).await.unwrap();
+        assert_eq!(
+            incoming.iter().map(|memory| memory.id).collect::<Vec<_>>(),
+            [visible_in.id]
+        );
+
+        traversal.direction = exocortex_storage::Direction::Both;
+        let both: std::collections::HashSet<_> = s
+            .traverse(&seed.id, &traversal)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|memory| memory.id)
+            .collect();
+        assert_eq!(both, [visible_out.id, visible_in.id].into_iter().collect());
+    }
+);
 
 itest!(
     discovery_records_survive_reconnect_and_fail_closed_on_corruption,
@@ -1134,3 +1436,59 @@ itest!(bulk_streams_fetch_pages_only_when_consumed, {
         "dropping an early relationship consumer must not fetch the terminal page"
     );
 });
+
+itest!(
+    bulk_streams_validate_entire_cursor_page_before_yielding_rows,
+    {
+        let s = connect("corrupt-stream-cursor").await;
+        let from = mem("cursor-from", 3, Visibility::Org);
+        let to = mem("cursor-to", 3, Visibility::Org);
+        let relationship = rel(from.id, to.id, exocortex_kernel::kinds::FIXES.0);
+        s.upsert_batch(
+            &[from.clone(), to.clone()],
+            std::slice::from_ref(&relationship),
+        )
+        .await
+        .unwrap();
+        for (template_id, params) in [
+            (
+                "integration_corrupt_memory_stream_lsn",
+                serde_json::json!({ "id": id_hex(&from.id.0), "lsn": 1 }),
+            ),
+            (
+                "integration_corrupt_memory_stream_lsn",
+                serde_json::json!({ "id": id_hex(&to.id.0), "lsn": 1 }),
+            ),
+            (
+                "integration_corrupt_relationship_stream_lsn",
+                serde_json::json!({ "rel_id": id_hex(&relationship.id.0), "lsn": -1 }),
+            ),
+        ] {
+            s.query_cypher(&CypherQuery {
+                template_id,
+                params,
+                read_only: false,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        }
+        let mut memories = s.stream_all_memories().await;
+        assert!(matches!(
+            memories.next().await,
+            Some(Err(StorageError::CorruptMetadata {
+                key: "stream_cursor",
+                ..
+            }))
+        ));
+        drop(memories);
+        let mut relationships = s.stream_all_relationships().await;
+        assert!(matches!(
+            relationships.next().await,
+            Some(Err(StorageError::CorruptMetadata {
+                key: "stream_cursor",
+                ..
+            }))
+        ));
+    }
+);

@@ -252,6 +252,39 @@ fn decode_settled_ingest(row: &[FalkorValue]) -> Result<SettledIngestBatch, Stor
     })
 }
 
+fn decode_stream_lsn(
+    row: &[FalkorValue],
+    previous: u64,
+    row_kind: &'static str,
+) -> Result<u64, StorageError> {
+    let value = match row.get(1) {
+        Some(FalkorValue::I64(value)) => *value,
+        Some(other) => {
+            return Err(StorageError::CorruptMetadata {
+                key: "stream_cursor",
+                detail: format!("{row_kind} LSN must be an integer, found {other:?}"),
+            });
+        }
+        None => {
+            return Err(StorageError::CorruptMetadata {
+                key: "stream_cursor",
+                detail: format!("{row_kind} row is missing its LSN"),
+            });
+        }
+    };
+    let lsn = u64::try_from(value).map_err(|_| StorageError::CorruptMetadata {
+        key: "stream_cursor",
+        detail: format!("{row_kind} LSN must be non-negative, found {value}"),
+    })?;
+    if lsn <= previous {
+        return Err(StorageError::CorruptMetadata {
+            key: "stream_cursor",
+            detail: format!("{row_kind} LSN {lsn} did not advance beyond {previous}"),
+        });
+    }
+    Ok(lsn)
+}
+
 const STORAGE_SCHEMA_VERSION: i64 = 1;
 
 fn schema_needs_migration(rows: &[Vec<FalkorValue>]) -> Result<bool, StorageError> {
@@ -332,22 +365,28 @@ impl FalkorStorage {
             stream_memory_pages: AtomicU64::new(0),
             stream_relationship_pages: AtomicU64::new(0),
         };
-        this.pin_fingerprint().await?;
+        let graphs = this
+            .client
+            .list_graphs()
+            .await
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let graph_exists = graphs.iter().any(|graph| graph == &this.graph);
+        if graph_exists {
+            let schema = this
+                .run_template("read_schema_version", &serde_json::json!({}), true)
+                .await?;
+            schema_needs_migration(&schema)?;
+        }
+        this.pin_fingerprint(graph_exists).await?;
         this.migrate_schema().await?;
         Ok(this)
     }
 
     /// Read the persisted fingerprint. If empty, write ours. If present and
     /// different, refuse to start (R-D5).
-    async fn pin_fingerprint(&self) -> Result<(), StorageError> {
+    async fn pin_fingerprint(&self, graph_exists: bool) -> Result<(), StorageError> {
         // FalkorDB refuses read queries on a graph key that does not exist
         // yet; only read the pinned fingerprint once the graph has data.
-        let graphs = self
-            .client
-            .list_graphs()
-            .await
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
-        let graph_exists = graphs.iter().any(|g| g == &self.graph);
         let rows = if graph_exists {
             self.run_template("read_fingerprint", &serde_json::json!({}), true)
                 .await?
@@ -366,12 +405,25 @@ impl FalkorStorage {
                     }
                     out
                 };
-                self.run_template(
-                    "write_fingerprint",
-                    &serde_json::json!({ "fp": hexfp }),
-                    false,
-                )
-                .await?;
+                let rows = self
+                    .run_template(
+                        "write_fingerprint_if_schema_compatible",
+                        &serde_json::json!({
+                            "fp": hexfp,
+                            "max_schema": STORAGE_SCHEMA_VERSION,
+                        }),
+                        false,
+                    )
+                    .await?;
+                if rows.is_empty() {
+                    let schema = self
+                        .run_template("read_schema_version", &serde_json::json!({}), true)
+                        .await?;
+                    schema_needs_migration(&schema)?;
+                    return Err(StorageError::Backend(
+                        "fingerprint pin was rejected by schema guard".into(),
+                    ));
+                }
                 tracing::info!(fingerprint = %hexfp, "pinned ontology fingerprint");
                 Ok(())
             }
@@ -440,6 +492,22 @@ impl FalkorStorage {
         self.run_template(
             "integration_make_legacy_schema",
             &serde_json::json!({}),
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Integration-only fixture for proving future schema validation happens
+    /// before an absent fingerprint can be pinned.
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    pub async fn make_future_schema_without_fingerprint_for_testing(
+        &self,
+    ) -> Result<(), StorageError> {
+        self.run_template(
+            "integration_make_future_schema_without_fingerprint",
+            &serde_json::json!({ "version": STORAGE_SCHEMA_VERSION + 1 }),
             false,
         )
         .await?;
@@ -1417,15 +1485,21 @@ impl Storage for FalkorStorage {
                 true,
             )
             .await?;
-        let Some(FalkorValue::String(json)) = rows.first().and_then(|row| row.first()) else {
-            return Ok(None);
-        };
-        serde_json::from_str(json)
-            .map(Some)
-            .map_err(|e| StorageError::CorruptMetadata {
+        match rows.first().and_then(|row| row.first()) {
+            None | Some(FalkorValue::None) => Ok(None),
+            Some(FalkorValue::String(json)) => {
+                serde_json::from_str(json)
+                    .map(Some)
+                    .map_err(|e| StorageError::CorruptMetadata {
+                        key: "discovery_proposal",
+                        detail: e.to_string(),
+                    })
+            }
+            Some(other) => Err(StorageError::CorruptMetadata {
                 key: "discovery_proposal",
-                detail: e.to_string(),
-            })
+                detail: format!("expected JSON string, found {other:?}"),
+            }),
+        }
     }
 
     async fn accept_discovery(
@@ -1433,7 +1507,19 @@ impl Storage for FalkorStorage {
         acceptance: &DiscoveryAcceptance,
     ) -> Result<CommitRecord, StorageError> {
         let relationship = &acceptance.relationship;
-        if acceptance.region.org != acceptance.caller_scope.org_id
+        let Some(proposal) = self
+            .get_discovery_proposal(&acceptance.discovery_id)
+            .await?
+        else {
+            return Err(StorageError::ProposalMismatch);
+        };
+        if proposal.region != acceptance.region
+            || proposal.caller_scope != acceptance.caller_scope
+            || proposal.from != relationship.from
+            || proposal.to != relationship.to
+            || proposal.kind != relationship.kind
+            || proposal.proposed_visibility != relationship.visibility
+            || acceptance.region.org != acceptance.caller_scope.org_id
             || acceptance.audit.org_id != acceptance.caller_scope.org_id
             || acceptance.audit.actor != acceptance.caller_scope.user_id
             || relationship.visibility > acceptance.caller_scope.max_visibility
@@ -1459,6 +1545,8 @@ impl Storage for FalkorStorage {
                 "kind": relationship.kind.0,
                 "visibility": relationship.visibility as u8,
                 "caller_scope_json": serde_json::to_string(&acceptance.caller_scope)
+                    .map_err(|e| StorageError::Backend(e.to_string()))?,
+                "proposal_json": serde_json::to_string(&proposal)
                     .map_err(|e| StorageError::Backend(e.to_string()))?,
             }),
         ));
@@ -1730,9 +1818,27 @@ impl Storage for FalkorStorage {
             .iter()
             .map(|k| self.kind_label(*k))
             .collect::<Result<_, _>>()?;
-        let params = serde_json::json!({
-            "from": hex(&from.0), "kind_labels": kinds,
-            "max_depth": spec.max_depth, "max_nodes": spec.max_nodes,
+        if spec.max_depth == 0 || spec.max_nodes == 0 {
+            return Ok(Vec::new());
+        }
+        if self
+            .get_visible_memories(&[*from], &spec.visibility_ctx)
+            .await?
+            .is_empty()
+        {
+            return Ok(Vec::new());
+        }
+        let mut frontier = vec![*from];
+        let mut seen = std::collections::HashSet::from([*from]);
+        let mut out = Vec::new();
+        for _ in 0..spec.max_depth {
+            let remaining = spec.max_nodes as usize - out.len();
+            if remaining == 0 || frontier.is_empty() {
+                break;
+            }
+            let params = serde_json::json!({
+            "frontier": frontier.iter().map(|id| hex(&id.0)).collect::<Vec<_>>(),
+            "kind_labels": kinds, "max_nodes": remaining,
             // R-T11: Public reads as Org, so an Org-scoped traversal fetches
             // at the widest internal ceiling (ST3 parity with the double).
             "max_visibility": fetch_ceiling(spec.visibility_ctx.max_visibility),
@@ -1740,20 +1846,35 @@ impl Storage for FalkorStorage {
             "user_id": spec.visibility_ctx.user_id,
             "project_ids": spec.visibility_ctx.project_ids,
             "team_ids": spec.visibility_ctx.team_ids,
-        });
-        let rows = self.run_template("traverse_bounded", &params, true).await?;
-        let mut out: Vec<Memory> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for row in &rows {
-            if let Some(v) = row.first() {
-                let m = memory_from_value(v)?;
-                if crate::memory_visible(&m, &spec.visibility_ctx)
-                    && seen.insert(m.id)
-                    && out.len() < spec.max_nodes as usize
-                {
-                    out.push(m);
+            });
+            let mut rows = Vec::new();
+            if matches!(spec.direction, Direction::Out | Direction::Both) {
+                rows.extend(
+                    self.run_template("traverse_one_hop_out", &params, true)
+                        .await?,
+                );
+            }
+            if matches!(spec.direction, Direction::In | Direction::Both) {
+                rows.extend(
+                    self.run_template("traverse_one_hop_in", &params, true)
+                        .await?,
+                );
+            }
+            let mut next = Vec::new();
+            for row in &rows {
+                if let Some(value) = row.first() {
+                    let memory = memory_from_value(value)?;
+                    if crate::memory_visible(&memory, &spec.visibility_ctx)
+                        && seen.insert(memory.id)
+                    {
+                        next.push(memory);
+                    }
                 }
             }
+            next.sort_by_key(|memory| memory.id);
+            next.truncate(remaining);
+            frontier = next.iter().map(|memory| memory.id).collect();
+            out.extend(next);
         }
         Ok(out)
     }
@@ -1863,16 +1984,18 @@ impl Storage for FalkorStorage {
 
     async fn stream_all_memories(&self) -> BoxStream<'_, Result<Memory, StorageError>> {
         let stream = futures::stream::unfold(
-            (self, 0_u64, std::collections::VecDeque::new(), false),
-            |(storage, mut cursor, mut buffered, mut done)| async move {
+            (self, 0_u64, true, std::collections::VecDeque::new(), false),
+            |(storage, mut cursor, mut first_page, mut buffered, mut done)| async move {
                 loop {
                     if let Some(item) = buffered.pop_front() {
-                        return Some((item, (storage, cursor, buffered, done)));
+                        return Some((item, (storage, cursor, first_page, buffered, done)));
                     }
                     if done {
                         return None;
                     }
-                    let params = serde_json::json!({ "after_lsn": cursor, "limit": 500_u32 });
+                    let params = serde_json::json!({
+                        "after_lsn": cursor, "first_page": first_page, "limit": 500_u32
+                    });
                     storage.stream_memory_pages.fetch_add(1, Ordering::Relaxed);
                     let rows = match storage.run_template("stream_memories", &params, true).await {
                         Ok(rows) => rows,
@@ -1886,25 +2009,32 @@ impl Storage for FalkorStorage {
                         done = true;
                         continue;
                     }
-                    let mut advanced = false;
+                    let mut decoded = std::collections::VecDeque::new();
+                    let mut page_cursor = cursor;
                     for row in &rows {
-                        if let Some(FalkorValue::I64(lsn)) = row.get(1) {
-                            if (*lsn as u64) > cursor {
-                                cursor = *lsn as u64;
-                                advanced = true;
+                        let result = (|| {
+                            page_cursor = decode_stream_lsn(row, page_cursor, "memory")?;
+                            let value =
+                                row.first().ok_or_else(|| StorageError::CorruptMetadata {
+                                    key: "stream_cursor",
+                                    detail: "memory stream row is empty".into(),
+                                })?;
+                            memory_from_value(value)
+                        })();
+                        match result {
+                            Ok(memory) => decoded.push_back(Ok(memory)),
+                            Err(error) => {
+                                done = true;
+                                buffered.clear();
+                                buffered.push_back(Err(error));
+                                break;
                             }
                         }
-                        if let Some(value) = row.first() {
-                            buffered.push_back(memory_from_value(value));
-                        }
                     }
-                    if !advanced {
-                        done = true;
-                        if buffered.is_empty() {
-                            buffered.push_back(Err(StorageError::Backend(
-                                "memory stream page did not advance".into(),
-                            )));
-                        }
+                    if !done {
+                        cursor = page_cursor;
+                        first_page = false;
+                        buffered = decoded;
                     }
                 }
             },
@@ -1914,16 +2044,18 @@ impl Storage for FalkorStorage {
 
     async fn stream_all_relationships(&self) -> BoxStream<'_, Result<Relationship, StorageError>> {
         let stream = futures::stream::unfold(
-            (self, 0_u64, std::collections::VecDeque::new(), false),
-            |(storage, mut cursor, mut buffered, mut done)| async move {
+            (self, 0_u64, true, std::collections::VecDeque::new(), false),
+            |(storage, mut cursor, mut first_page, mut buffered, mut done)| async move {
                 loop {
                     if let Some(item) = buffered.pop_front() {
-                        return Some((item, (storage, cursor, buffered, done)));
+                        return Some((item, (storage, cursor, first_page, buffered, done)));
                     }
                     if done {
                         return None;
                     }
-                    let params = serde_json::json!({ "after_lsn": cursor, "limit": 500_u32 });
+                    let params = serde_json::json!({
+                        "after_lsn": cursor, "first_page": first_page, "limit": 500_u32
+                    });
                     storage
                         .stream_relationship_pages
                         .fetch_add(1, Ordering::Relaxed);
@@ -1942,25 +2074,32 @@ impl Storage for FalkorStorage {
                         done = true;
                         continue;
                     }
-                    let mut advanced = false;
+                    let mut decoded = std::collections::VecDeque::new();
+                    let mut page_cursor = cursor;
                     for row in &rows {
-                        if let Some(FalkorValue::I64(lsn)) = row.get(1) {
-                            if (*lsn as u64) > cursor {
-                                cursor = *lsn as u64;
-                                advanced = true;
+                        let result = (|| {
+                            page_cursor = decode_stream_lsn(row, page_cursor, "relationship")?;
+                            let value =
+                                row.first().ok_or_else(|| StorageError::CorruptMetadata {
+                                    key: "stream_cursor",
+                                    detail: "relationship stream row is empty".into(),
+                                })?;
+                            relationship_from_value(value)
+                        })();
+                        match result {
+                            Ok(relationship) => decoded.push_back(Ok(relationship)),
+                            Err(error) => {
+                                done = true;
+                                buffered.clear();
+                                buffered.push_back(Err(error));
+                                break;
                             }
                         }
-                        if let Some(value) = row.first() {
-                            buffered.push_back(relationship_from_value(value));
-                        }
                     }
-                    if !advanced {
-                        done = true;
-                        if buffered.is_empty() {
-                            buffered.push_back(Err(StorageError::Backend(
-                                "relationship stream page did not advance".into(),
-                            )));
-                        }
+                    if !done {
+                        cursor = page_cursor;
+                        first_page = false;
+                        buffered = decoded;
                     }
                 }
             },
@@ -2476,5 +2615,27 @@ mod row_decode_tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn stream_cursor_rejects_missing_wrong_negative_and_non_monotonic_lsns() {
+        for row in [
+            vec![FalkorValue::None],
+            vec![FalkorValue::None, FalkorValue::String("1".into())],
+            vec![FalkorValue::None, FalkorValue::I64(-1)],
+            vec![FalkorValue::None, FalkorValue::I64(7)],
+        ] {
+            assert!(matches!(
+                decode_stream_lsn(&row, 7, "memory"),
+                Err(StorageError::CorruptMetadata {
+                    key: "stream_cursor",
+                    ..
+                })
+            ));
+        }
+        assert_eq!(
+            decode_stream_lsn(&[FalkorValue::None, FalkorValue::I64(8)], 7, "memory").unwrap(),
+            8
+        );
     }
 }

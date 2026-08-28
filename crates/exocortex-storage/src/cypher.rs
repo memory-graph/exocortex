@@ -480,12 +480,11 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
-        id: "traverse_bounded",
+        id: "traverse_one_hop_out",
         read_only: true,
         required_params: &[
-            "from",
+            "frontier",
             "kind_labels",
-            "max_depth",
             "max_nodes",
             "max_visibility",
             "org_id",
@@ -493,30 +492,75 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "project_ids",
             "team_ids"
         ],
-        // M2 amendment (recorded): the pinned FalkorDB server cannot evaluate
-        // `ALL(r IN rels ...)` predicates over var-length edge lists, so kind
-        // filtering rides relationship TYPES via the `__KIND_TYPES__`
-        // placeholder (substituted from the validated ontology allowlist;
-        // empty kind list = any type). Edge-level visibility is enforced by
-        // the cache-layer traversal (§8.4), the interactive read path.
         cypher: r#"
-            MATCH (a:Memory {id: $from})
-            CALL {
-              WITH a
-              MATCH (a)-[rels__KIND_TYPES__*1..$max_depth]->(b:Memory)
-              // The seed anchors the neighborhood; with inverse
-              // materialization (R-T4) a round-trip path would otherwise
-              // return the seed itself.
-              WHERE b.visibility <= $max_visibility
-                AND b.tenant_id = $org_id
-                AND (b.visibility >= 3
-                     OR (b.visibility = 0 AND b.user_id = $user_id)
-                     OR (b.visibility = 1 AND b.project_id IN $project_ids)
-                     OR (b.visibility = 2 AND b.team_id IN $team_ids))
-                AND b.id <> $from
-              RETURN DISTINCT b LIMIT $max_nodes
-            }
+            MATCH (a:Memory)-[r__KIND_TYPES__]->(b:Memory)
+            WHERE a.id IN $frontier
+              AND a.tenant_id = $org_id AND b.tenant_id = $org_id
+              AND a.visibility <= $max_visibility
+              AND b.visibility <= $max_visibility
+              AND r.visibility <= $max_visibility
+              AND (a.visibility >= 3
+                   OR (a.visibility = 0 AND a.user_id = $user_id)
+                   OR (a.visibility = 1 AND a.project_id IN $project_ids)
+                   OR (a.visibility = 2 AND a.team_id IN $team_ids))
+              AND (b.visibility >= 3
+                   OR (b.visibility = 0 AND b.user_id = $user_id)
+                   OR (b.visibility = 1 AND b.project_id IN $project_ids)
+                   OR (b.visibility = 2 AND b.team_id IN $team_ids))
+              AND (r.visibility >= 3
+                   OR (r.visibility = 0 AND
+                       ((a.visibility = 0 AND a.user_id = $user_id) OR
+                        (b.visibility = 0 AND b.user_id = $user_id)))
+                   OR (r.visibility = 1 AND
+                       ((a.visibility = 1 AND a.project_id IN $project_ids) OR
+                        (b.visibility = 1 AND b.project_id IN $project_ids)))
+                   OR (r.visibility = 2 AND
+                       ((a.visibility = 2 AND a.team_id IN $team_ids) OR
+                        (b.visibility = 2 AND b.team_id IN $team_ids))))
+            RETURN DISTINCT b ORDER BY b.id ASC LIMIT $max_nodes
+        "#,
+    });
+
+    reg!(Template {
+        id: "traverse_one_hop_in",
+        read_only: true,
+        required_params: &[
+            "frontier",
+            "kind_labels",
+            "max_nodes",
+            "max_visibility",
+            "org_id",
+            "user_id",
+            "project_ids",
+            "team_ids"
+        ],
+        cypher: r#"
+            MATCH (b:Memory)-[r__KIND_TYPES__]->(a:Memory)
+            WHERE a.id IN $frontier
+              AND a.tenant_id = $org_id AND b.tenant_id = $org_id
+              AND a.visibility <= $max_visibility
+              AND b.visibility <= $max_visibility
+              AND r.visibility <= $max_visibility
+              AND (a.visibility >= 3
+                   OR (a.visibility = 0 AND a.user_id = $user_id)
+                   OR (a.visibility = 1 AND a.project_id IN $project_ids)
+                   OR (a.visibility = 2 AND a.team_id IN $team_ids))
+              AND (b.visibility >= 3
+                   OR (b.visibility = 0 AND b.user_id = $user_id)
+                   OR (b.visibility = 1 AND b.project_id IN $project_ids)
+                   OR (b.visibility = 2 AND b.team_id IN $team_ids))
+              AND (r.visibility >= 3
+                   OR (r.visibility = 0 AND
+                       ((a.visibility = 0 AND a.user_id = $user_id) OR
+                        (b.visibility = 0 AND b.user_id = $user_id)))
+                   OR (r.visibility = 1 AND
+                       ((a.visibility = 1 AND a.project_id IN $project_ids) OR
+                        (b.visibility = 1 AND b.project_id IN $project_ids)))
+                   OR (r.visibility = 2 AND
+                       ((a.visibility = 2 AND a.team_id IN $team_ids) OR
+                        (b.visibility = 2 AND b.team_id IN $team_ids))))
             RETURN b
+            ORDER BY b.id ASC LIMIT $max_nodes
         "#,
     });
 
@@ -555,7 +599,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (m:Memory)
             WHERE $entity_id IN m.entity_ids
               AND m.visibility <= $max_visibility
-              AND (m.tenant_id IS NULL OR m.tenant_id = $org_id)
+              AND m.tenant_id = $org_id
               AND (m.visibility >= 3
                    OR (m.visibility = 0 AND m.user_id = $user_id)
                    OR (m.visibility = 1 AND m.project_id IN $project_ids)
@@ -572,12 +616,14 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "stream_memories",
         read_only: true,
-        required_params: &["after_lsn", "limit"],
+        required_params: &["after_lsn", "first_page", "limit"],
         // ST2 (audit): the row LSN the WHERE filters on is RETURNED so the
         // pager advances the cursor from the same value it selected on —
         // never from the (possibly stale) copy inside props_json.
         cypher: r#"
-            MATCH (m:Memory) WHERE m.lsn > $after_lsn
+            MATCH (m:Memory)
+            WHERE m.props_json IS NOT NULL
+              AND ($first_page = true OR m.lsn > $after_lsn)
             RETURN m, m.lsn AS node_lsn ORDER BY m.lsn ASC LIMIT $limit
         "#,
     });
@@ -585,11 +631,13 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "stream_relationships",
         read_only: true,
-        required_params: &["after_lsn", "limit"],
+        required_params: &["after_lsn", "first_page", "limit"],
         // Untyped match: edges carry per-kind types (R-T2); the lsn
         // predicate excludes entity/MENTIONS edges, which have no LSN.
         cypher: r#"
-            MATCH ()-[r]->() WHERE r.lsn > $after_lsn
+            MATCH ()-[r]->()
+            WHERE r.props_json IS NOT NULL
+              AND ($first_page = true OR r.lsn > $after_lsn)
             RETURN r, r.lsn AS row_lsn ORDER BY r.lsn ASC LIMIT $limit
         "#,
     });
@@ -611,6 +659,19 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MERGE (m:_ExocortexMeta {key: 'ontology_fingerprint'})
             SET m.value = $fp
+        "#,
+    });
+
+    reg!(Template {
+        id: "write_fingerprint_if_schema_compatible",
+        read_only: false,
+        required_params: &["fp", "max_schema"],
+        cypher: r#"
+            OPTIONAL MATCH (v:_ExocortexMeta {key: 'schema_version'})
+            WITH v WHERE v IS NULL OR v.value <= $max_schema
+            MERGE (m:_ExocortexMeta {key: 'ontology_fingerprint'})
+            SET m.value = $fp
+            RETURN m.value
         "#,
     });
 
@@ -682,6 +743,21 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             WITH memory_count, memory_history_count, count(rh) AS relationship_history_count
             MATCH (v:_ExocortexMeta {key: 'schema_version'}) DELETE v
             RETURN memory_count, memory_history_count, relationship_history_count
+        "#,
+    });
+
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_make_future_schema_without_fingerprint",
+        read_only: false,
+        required_params: &["version"],
+        cypher: r#"
+            OPTIONAL MATCH (f:_ExocortexMeta {key: 'ontology_fingerprint'})
+            DELETE f
+            WITH count(f) AS removed
+            MERGE (v:_ExocortexMeta {key: 'schema_version'})
+            SET v.value = $version
+            RETURN removed, v.value
         "#,
     });
 
@@ -865,7 +941,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                           p.issued_at = $issued_at,
                           p.props_json = $props_json
             WITH d, p
-            WHERE p.org_id = $org_id
+            WHERE p.consumed_at IS NULL
+              AND p.org_id = $org_id
               AND p.region_project = $region_project
               AND p.region_memory_type = $region_memory_type
               AND p.from = $from AND p.to = $to AND p.kind = $kind
@@ -892,17 +969,22 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "lsn"
         ],
         cypher: r#"
-            MERGE (d:_Discovery {discovery_id: $discovery_id})
-            ON CREATE SET d.org_id = $org_id,
-                          d.region_project = $region_project,
-                          d.region_memory_type = $region_memory_type,
-                          d.from = $from,
-                          d.to = $to,
-                          d.discovered_at = $discovered_at,
-                          d.props_json = $props_json,
-                          d.lsn = $lsn
-            WITH d
-            WHERE d.org_id = $org_id
+            OPTIONAL MATCH (p:_DiscoveryProposal {discovery_id: $discovery_id})
+            WITH collect(p) AS proposals
+            FOREACH (_ IN CASE WHEN size(proposals) = 0 THEN [1] ELSE [] END |
+                MERGE (d:_Discovery {discovery_id: $discovery_id})
+                ON CREATE SET d.org_id = $org_id,
+                              d.region_project = $region_project,
+                              d.region_memory_type = $region_memory_type,
+                              d.from = $from,
+                              d.to = $to,
+                              d.discovered_at = $discovered_at,
+                              d.props_json = $props_json,
+                              d.lsn = $lsn)
+            WITH proposals
+            MATCH (d:_Discovery {discovery_id: $discovery_id})
+            WHERE size(proposals) = 0
+              AND d.org_id = $org_id
               AND d.region_project = $region_project
               AND d.region_memory_type = $region_memory_type
               AND d.from = $from AND d.to = $to
@@ -941,6 +1023,39 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (d:_Discovery {discovery_id: $discovery_id})
             SET d.props_json = $props_json
             RETURN d.discovery_id AS discovery_id
+        "#,
+    });
+
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_corrupt_discovery_proposal",
+        read_only: false,
+        required_params: &["discovery_id", "props_json"],
+        cypher: r#"
+            MATCH (p:_DiscoveryProposal {discovery_id: $discovery_id})
+            SET p.props_json = $props_json
+            RETURN p.discovery_id
+        "#,
+    });
+
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_corrupt_memory_stream_lsn",
+        read_only: false,
+        required_params: &["id", "lsn"],
+        cypher: r#"
+            MATCH (m:Memory {id: $id}) SET m.lsn = $lsn RETURN m.id
+        "#,
+    });
+
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_corrupt_relationship_stream_lsn",
+        read_only: false,
+        required_params: &["rel_id", "lsn"],
+        cypher: r#"
+            MATCH ()-[r]->() WHERE r.id = $rel_id
+            SET r.lsn = $lsn RETURN r.id
         "#,
     });
 
@@ -997,7 +1112,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "to",
             "kind",
             "visibility",
-            "caller_scope_json"
+            "caller_scope_json",
+            "proposal_json"
         ],
         cypher: r#"
             MATCH (p:_DiscoveryProposal {discovery_id: $discovery_id}),
@@ -1010,6 +1126,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
               AND p.from = $from AND p.to = $to AND p.kind = $kind
               AND p.visibility = $visibility
               AND p.caller_scope_json = $caller_scope_json
+              AND p.props_json = $proposal_json
         "#,
     });
 

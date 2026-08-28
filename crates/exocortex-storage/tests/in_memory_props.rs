@@ -346,6 +346,10 @@ async fn discovery_issue_retires_record_and_consumed_reissue_is_rejected() {
     };
     storage.create_discovery_proposal(&proposal).await.unwrap();
     storage.create_discovery_proposal(&proposal).await.unwrap();
+    assert!(matches!(
+        storage.store_discovery(&record).await,
+        Err(StorageError::ProposalMismatch)
+    ));
     assert!(storage.get_discovery(id).await.unwrap().is_none());
     assert!(storage
         .list_discoveries("org", 10)
@@ -365,6 +369,10 @@ async fn discovery_issue_retires_record_and_consumed_reissue_is_rejected() {
     assert!(matches!(
         storage.create_discovery_proposal(&proposal).await,
         Err(StorageError::ProposalNotFound)
+    ));
+    assert!(matches!(
+        storage.store_discovery(&record).await,
+        Err(StorageError::ProposalMismatch)
     ));
 }
 
@@ -761,4 +769,40 @@ async fn find_by_entity_uses_canonical_memory_context() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, matching.id);
+}
+
+#[tokio::test]
+async fn find_by_entity_filters_tenant_before_limit() {
+    let store = InMemoryStorage::new(ontology());
+    let entity = EntityId([8; 16]);
+    let mut matching = base_memory("matching-tenant".into(), "matching".into(), 2, 3);
+    matching.context.entities.push(entity);
+    let mut tenantless = base_memory("tenantless".into(), "foreign".into(), 2, 3);
+    tenantless.context.entities.push(entity);
+    tenantless.context.tenant_id = None;
+    tenantless.recorded_at = matching.recorded_at + Duration::seconds(1);
+    store
+        .upsert_batch(&[matching.clone(), tenantless], &[])
+        .await
+        .unwrap();
+
+    let rows = store
+        .find_by_entity(
+            &entity,
+            &MemoryFilter {
+                limit: 1,
+                visibility_ctx: VisibilityContext {
+                    org_id: "org".into(),
+                    max_visibility: Visibility::Org,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|memory| memory.id).collect::<Vec<_>>(),
+        [matching.id]
+    );
 }
