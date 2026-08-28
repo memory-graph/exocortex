@@ -1,7 +1,8 @@
 # Exocortex v1 — Round 6 Whole-Project Review
 
-**Status:** REOPENED — post-closure current-image Docker verification promoted
-R6-R176; all earlier findings remain closed.
+**Status:** REOPENED — strict release convergence promoted R6-R180 through
+R6-R182 after R6-R176 through R6-R179 closed; all earlier findings remain
+closed.
 
 **Review baseline:** `f7bf463aa4a77ac719c485bfe713541d79edeab1`
 (2026-08-27). Scope was the entire tracked repository: 199 files, of which
@@ -632,6 +633,36 @@ negative gates pass, a no-cache current-image compose build executes the real
 384-dimensional model probe, all three nodes become healthy, and killing node2
 elects node1 in 1,393 ms. Final release closure still requires the complete gate
 matrix and a fresh strict review of this implementation.
+
+### R6-R180 — Live chaos does not prove no zombie Dreams write lands
+
+The authenticated current-image harness proves leader re-election within the
+two-second budget, but it never starts and suspends an owner-fenced Dreams
+mutation or inspects authoritative Falkor history after takeover. A stale
+owner mutation could therefore land while the harness still prints PASS,
+leaving the core PRD's mid-Dreams no-zombie-write requirement unverified.
+Closure requires a deterministic live in-flight barrier, holder termination,
+successor acquisition, release of the stale attempt, and an authoritative
+assertion that no stale-epoch version committed; the deployment gate must
+reject loss of that proof.
+
+### R6-R181 — Release embedding model content is mutable and unstamped
+
+FastEmbed 5.2 resolves `Xenova/bge-small-en-v1.5` from the repository's mutable
+default revision. The image-build probe checks only a finite 384-dimensional
+output while printing the generic `bge-small/v1` stamp, so identical source can
+produce semantically different release images and persisted vectors if upstream
+content moves. Closure requires an exact upstream commit, verified artifact
+digests, offline construction from those verified artifacts, an immutable model
+stamp, and negative release-gate plus known-output evidence.
+
+### R6-R182 — The reopened review carries contradictory closure state
+
+The current header and master plan correctly keep Round 6 open, but the prior
+closure paragraph below still says the complete matrix passed and Round 6 is
+closed without labeling that statement as historical. Closure requires a
+single internally consistent final verdict after R6-R180/R181, the complete
+gate matrix, and a fresh strict review pass.
 
 The complete mandatory gate matrix passed: formatting, workspace clippy,
 workspace tests with adapter SDK testing and `--no-fail-fast`, dependency

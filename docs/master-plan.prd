@@ -1,10 +1,10 @@
 # Exocortex — Master Plan
 
-**Status (2026-08-28, Round 6):** RELEASE BLOCKED pending final gates and
-strict review. Post-closure current-image verification promoted and closed
-R6-R176 through R6-R179: clean image construction, owner-only chaos policies,
-real production-model startup, and authenticated failover polling now have
-executable evidence. All earlier Round 6 findings remain closed.
+**Status (2026-08-28, Round 6):** RELEASE BLOCKED. Fresh strict review promoted
+R6-R180 through R6-R182: the live chaos harness does not yet prove the required
+mid-Dreams no-zombie-write contract, the release image does not pin and verify
+an immutable model revision, and the reopened review carries contradictory
+closure text. R6-R176 through R6-R179 and all earlier findings remain closed.
 
 **Status (2026-08-27):** Palantir-expansion PRD drafted
 (`docs/prd/exocortex-palantir-expansion-prd.md`, rev 2) — five post-v1
@@ -450,6 +450,9 @@ idea:
 | R6-R177 | Post-closure chaos verification: stage owner-only dev policies without embedding test credentials in the release image | Codex | Done — pinned init service installs both policies as 0600/65532 into a named volume; all nodes wait and mount it read-only; negative gate rejects unsafe mode and direct bind mounts |
 | R6-R178 | Post-closure release verification: make the production FastEmbed model path boot in a clean image | Codex | Done — fastembed 5.2/hf-hub 0.4 Rustls path boots on Rust 1.85; `--verify-embedder` acquires, loads, and executes bge-small during image construction, whose verified cache ships in the image |
 | R6-R179 | Post-closure chaos verification: authenticate detailed health polling | Codex | Done — both polling loops derive the dev bearer from the policy fixture and send it in the Authorization header; negative gate rejects either omission; no-cache current-image failover passes node2 -> node1 in 1,393 ms |
+| R6-R180 | Strict release convergence: prove a leader killed mid-Dreams cannot land zombie writes after takeover | Codex | In progress — current chaos proves authenticated re-election only; add a deterministic in-flight owner-fenced mutation and authoritative post-takeover Falkor history assertion |
+| R6-R181 | Strict release convergence: pin, verify, and stamp the production embedding model at an immutable revision | Codex | In progress — FastEmbed currently downloads mutable Hugging Face `main`, while the probe validates only shape/finite values and stamps generic `v1` |
+| R6-R182 | Strict release convergence advisory: make the authoritative Round 6 closure state internally consistent | Codex | In progress — label historical closure evidence and align review/master status only after R6-R180/R181, gates, and fresh strict review are clean |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence
