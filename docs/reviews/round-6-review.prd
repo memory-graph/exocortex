@@ -2,7 +2,8 @@
 
 **Status:** RELEASE BLOCKED. The first fresh strict review promoted R6-R185
 through R6-R202 into the master plan. R6-R202 live planner verification then
-confirmed and promoted R6-R203. R6-R182 remains open until their
+confirmed and promoted R6-R203; its full live validation then promoted
+R6-R204. R6-R182 remains open until their
 remediation, the complete final gate matrix, and a subsequent clean strict
 review.
 
