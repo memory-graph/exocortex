@@ -171,6 +171,12 @@ each step (88 tests at completion).
 | PX5 | Read-only object explorer at `/explorer` on the node binary: six views, bearer auth, `VisibilityContext`-filtered at every render, no JS build step | palantir-expansion PRD §3.5 | Accepted — post-v1; depends on PX6 for the provenance view |
 | PX6 | Kernel catalogue <-> operation registry bijection: `GetChain`, `ExplainEdge`, and `RetractEdge` are declared in `exocortex-kernel/src/actions.rs` / `functions.rs` with names and budgets and have no registered operation. `operations.rs:3` already documents `retract_edge` as living in that module; it does not. Implement all three | palantir-expansion PRD §3.3 S6 | Accepted — post-v1. Smallest item; `soft_delete_relationship` already exists under `RetractEdge` |
 
+**Wave assignment for the PX rows above:** PX2 and PX6 are Wave 1 and
+unblock the rest (PX6 is the smallest item in the plan and PX5 depends on
+it); PX1 and PX3 are Wave 1; PX4 is Wave 2, alongside D1 and D13 — the
+docs run is one producer among several rather than the headline; PX5 is
+Wave 3.
+
 ## In progress
 
 | ID | Item | Owner | Notes |
@@ -398,19 +404,46 @@ are recorded in the "Rounds 4-5" section below.
 | H7 | Audit ledger routed onto storage templates (R-A1) | `ops/src/audit.rs` (in-process double kept) |
 | H8 | Milestone report residual-work disclosure | `docs/MILESTONE_REPORT.md` round-1 addendum |
 
-## Deferred to v2 (with PRD citation)
+## Sequenced (post-v1)
 
-| ID | Item | PRD |
-|----|------|-----|
-| D1 | Iceberg / Delta / parquet-dir adapter workers (unblocked: B8+B9+A1 closed) | §18.4, §24 |
-| D2 | Second-pack demo — **superseded by PX1**: promoted from deferral to accepted scope as `exocortex-pack-mortgage-v1`, with the non-primary-author rule as its acceptance test | §23.26, §24 |
-| D3 | Federation | §24 |
-| D4 | Embedding fine-tuning | §24 |
-| D5 | Ingest-time SimilarTo seeding (`SimilarityCosine`) | §24 q12 (lean: no) |
-| D6 | OTel export (R-O3) — opentelemetry dep decision | §19, round-2 W14 |
-| D7 | Contradiction-resolution op (§23 #13) | §23 #13, round-2 H14 |
-| D8 | ABSTRACT row-writing variant (ontology shape TBD) | §12.1 step 4, round-2 H9 |
-| D9 | 100-user visibility fuzz + concurrent-region/CrossRegion suites | §23 #21/#22, round-2 H10 |
-| D10 | Wire-protocol throughput fan-out + additive-change rollout tests | §23 #23, round-2 H10 |
-| D11 | Partition-and-heal live run (leader-kill convergence OBSERVED: 4/4 in 1290-1448ms; the partition leg remains manual) | §3 M5 AC, round-2 H10 |
-| D12 | Round-3 accepted residue (R1/R2 above): bridge reconcile loop, cursor fsync, checksum preimage hardening, persistent batch-dedup, WAL replay rebuild — **superseded in part**: persistent batch-dedup closed by W7, WAL replay rebuild+sign closed by W1 (the drain signs fresh, never replays stored signatures) | round-3 review M3/M6-M15 |
+Nothing here is deferred to a v2 that never arrives. Every item is accepted
+work with a wave; a wave is a **dependency and value ordering, not a
+schedule** — no dates, no durations, no estimates. Work starts on a wave
+when the prior wave's blocking items are closed and Round 6 is shut.
+IDs are stable: review rounds and PRDs cite them, so they are never
+renumbered, only re-waved.
+
+- **Wave 1 — ontology verbs and modularity.** The pack seam becomes a
+  product: typed domain verbs, a second pack, and the seam set that keeps
+  both honest. Everything else reads better once this lands.
+- **Wave 2 — data breadth.** The claim that matters most and the one the
+  repo is weakest on: point Exocortex at data that is not a coding
+  session. Structured-source adapters plus the deterministic half of
+  entity resolution, which is what makes a graph of documents into a model
+  of a world.
+- **Wave 3 — surface and operability.** Make the graph visible and the
+  node observable.
+- **Wave 4 — scale.** Prove the numbers past 100k before anyone bets an
+  org on them.
+- **Wave 5 — multi-tenant and federated.** The capabilities that only
+  matter once more than one org depends on a deployment.
+
+| ID | Wave | Item | PRD |
+|----|------|------|-----|
+| D1 | **2** | Iceberg / Delta / parquet-dir adapter workers — **undeferred**. Already unblocked (B8+B9+A1 closed) and the single largest gap between what the README claims and what the repo ingests: today every producer is a coding session, a docs page, or the analytics worker. Structured-source ingest is what makes "point it at your data" true | §18.4, §24 |
+| D2 | **1** | Second-pack demo — **superseded by PX1**: promoted from deferral to accepted scope as `exocortex-pack-mortgage-v1`, with the non-primary-author rule as its acceptance test | §23.26, §24 |
+| D3 | **5** | Federation | §24 |
+| D4 | **4** | Embedding fine-tuning | §24 |
+| D5 | **4** | Ingest-time SimilarTo seeding (`SimilarityCosine`) | §24 q12 (lean: no) |
+| D6 | **3** | OTel export (R-O3) — opentelemetry dep decision | §19, round-2 W14 |
+| D7 | **3** | Contradiction-resolution op (§23 #13) | §23 #13, round-2 H14 |
+| D8 | **4** | ABSTRACT row-writing variant (ontology shape TBD) | §12.1 step 4, round-2 H9 |
+| D9 | **4** | 100-user visibility fuzz + concurrent-region/CrossRegion suites | §23 #21/#22, round-2 H10 |
+| D10 | **4** | Wire-protocol throughput fan-out + additive-change rollout tests | §23 #23, round-2 H10 |
+| D11 | **4** | Partition-and-heal live run (leader-kill convergence OBSERVED: 4/4 in 1290-1448ms; the partition leg remains manual) | §3 M5 AC, round-2 H10 |
+| D12 | **1** | Round-3 accepted residue (R1/R2 above): bridge reconcile loop, cursor fsync, checksum preimage hardening, persistent batch-dedup, WAL replay rebuild — **superseded in part**: persistent batch-dedup closed by W7, WAL replay rebuild+sign closed by W1 (the drain signs fresh, never replays stored signatures) | round-3 review M3/M6-M15 |
+| D13 | **2** | **Deterministic entity resolution** — resolve the same real-world entity across producers by shared external identity (`ExternalKey`, typed entities as convergent join points), not by fuzzy matching. Explicitly NOT the ML half: no corpus, no labelled set, no model. Without this the graph is a collection of documents rather than a model of a world, which is the core ontology claim. Fuzzy/probabilistic ER is a separate later item, and `NearDuplicateApplicant` stays a Dreams-computed proposal in the meantime | palantir-expansion PRD §5; core PRD §24 |
+| D14 | **4** | Org-scale benchmarks past the existing 100k suite (10M memories) — forces the embedding-store decision, so it waits for a deployment that demands it rather than leading one | palantir-expansion PRD §5, §24 |
+| D15 | **5** | Row-level ACLs beyond the five visibility labels (inheritance chains, an authorization DSL) | palantir-expansion PRD §5, §24 |
+| D16 | **5** | Ontology branching / PRs against the ontology — only meaningful once a third pack is proposed by someone outside the org | palantir-expansion PRD §5, §24 |
+| D17 | **2** | Probabilistic / fuzzy entity resolution (the half D13 excludes): corpus, labelled set, evaluation harness. Sequenced after D13 proves the deterministic join carries most of the value | palantir-expansion PRD §5, §24 |
