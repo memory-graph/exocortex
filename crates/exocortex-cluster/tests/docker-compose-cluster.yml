@@ -29,7 +29,7 @@ services:
         condition: service_completed_successfully
     environment:
       EXOCORTEX_CLUSTER_SECRET: "4242424242424242424242424242424242424242424242424242424242424242"
-    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8081", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node1", "--gossip-addr", "0.0.0.0:8101", "--principal-policy", "/run/exocortex-policies/principal-policy.json", "--source-policy", "/run/exocortex-policies/source-policy.json", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node2:8082,node3:8083"]
+    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8081", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node1", "--gossip-addr", "0.0.0.0:8101", "--principal-policy", "/run/exocortex-policies/principal-policy.json", "--source-policy", "/run/exocortex-policies/source-policy.json", "--storage", "falkor://falkordb:6379", "--allow-private-network-plaintext-data-plane", "--cluster-endpoints", "node2:8082,node3:8083"]
     volumes: ["policy-data:/run/exocortex-policies:ro", "../../exocortex-server/tests/fixtures/localhost-cert.pem:/etc/exocortex/tls-cert.pem:ro", "../../exocortex-server/tests/fixtures/localhost-key.pem:/etc/exocortex/tls-key.pem:ro"]
     ports:
       - "127.0.0.1:8081:8081"
@@ -45,7 +45,7 @@ services:
         condition: service_completed_successfully
     environment:
       EXOCORTEX_CLUSTER_SECRET: "4242424242424242424242424242424242424242424242424242424242424242"
-    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8082", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node2", "--gossip-addr", "0.0.0.0:8102", "--principal-policy", "/run/exocortex-policies/principal-policy.json", "--source-policy", "/run/exocortex-policies/source-policy.json", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node3:8083"]
+    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8082", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node2", "--gossip-addr", "0.0.0.0:8102", "--principal-policy", "/run/exocortex-policies/principal-policy.json", "--source-policy", "/run/exocortex-policies/source-policy.json", "--storage", "falkor://falkordb:6379", "--allow-private-network-plaintext-data-plane", "--cluster-endpoints", "node1:8081,node3:8083"]
     volumes: ["policy-data:/run/exocortex-policies:ro", "../../exocortex-server/tests/fixtures/localhost-cert.pem:/etc/exocortex/tls-cert.pem:ro", "../../exocortex-server/tests/fixtures/localhost-key.pem:/etc/exocortex/tls-key.pem:ro"]
     ports:
       - "127.0.0.1:8082:8082"
@@ -61,7 +61,7 @@ services:
         condition: service_completed_successfully
     environment:
       EXOCORTEX_CLUSTER_SECRET: "4242424242424242424242424242424242424242424242424242424242424242"
-    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8083", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node3", "--gossip-addr", "0.0.0.0:8103", "--principal-policy", "/run/exocortex-policies/principal-policy.json", "--source-policy", "/run/exocortex-policies/source-policy.json", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node2:8082"]
+    command: ["--mode", "backend-node", "--bind", "0.0.0.0:8083", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node3", "--gossip-addr", "0.0.0.0:8103", "--principal-policy", "/run/exocortex-policies/principal-policy.json", "--source-policy", "/run/exocortex-policies/source-policy.json", "--storage", "falkor://falkordb:6379", "--allow-private-network-plaintext-data-plane", "--cluster-endpoints", "node1:8081,node2:8082"]
     volumes: ["policy-data:/run/exocortex-policies:ro", "../../exocortex-server/tests/fixtures/localhost-cert.pem:/etc/exocortex/tls-cert.pem:ro", "../../exocortex-server/tests/fixtures/localhost-key.pem:/etc/exocortex/tls-key.pem:ro"]
     ports:
       - "127.0.0.1:8083:8083"

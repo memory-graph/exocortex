@@ -52,4 +52,4 @@ COPY --from=build --chown=65532:65532 /opt/exocortex/models /opt/exocortex/model
 # image (deployment-specific).
 USER 65532:65532
 ENTRYPOINT ["exocortex-node"]
-CMD ["--mode", "backend-node", "--storage", "falkor://falkordb:6379", "--bind", "0.0.0.0:8080", "--tls-cert", "/run/secrets/exocortex/tls.crt", "--tls-key", "/run/secrets/exocortex/tls.key"]
+CMD ["--mode", "backend-node", "--storage", "falkor://falkordb:6379", "--allow-private-network-plaintext-data-plane", "--bind", "0.0.0.0:8080", "--tls-cert", "/run/secrets/exocortex/tls.crt", "--tls-key", "/run/secrets/exocortex/tls.key"]

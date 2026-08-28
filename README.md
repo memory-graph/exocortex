@@ -358,7 +358,7 @@ cargo install --git https://github.com/memory-graph/exocortex --bin exocortex-no
 Run the node:
 
 ```sh
-exocortex-node --mode backend-node --storage falkor://falkordb:6379 \
+exocortex-node --mode backend-node --storage falkor://falkordb:6379 --allow-private-network-plaintext-data-plane \
   --bind 0.0.0.0:8080 --tls-cert /run/secrets/exocortex/tls.crt \
   --tls-key /run/secrets/exocortex/tls.key \
   --principal-policy /run/secrets/exocortex/principals.json \
@@ -366,6 +366,10 @@ exocortex-node --mode backend-node --storage falkor://falkordb:6379 \
 ```
 
 Shared/LAN binds require an operator-provided TLS certificate and key.
+Remote Falkor and Dreams Redis endpoints likewise require `falkors://` and
+`rediss://`. The `--allow-private-network-plaintext-data-plane` flag shown
+above is only for an isolated container/private network whose transport is
+secured outside Exocortex; it is not a public-network exception.
 For local development only, plaintext must be explicitly enabled with
 `--bind 127.0.0.1:8080 --allow-plaintext-loopback`; the node rejects that
 mode for every non-loopback address.
@@ -390,8 +394,8 @@ Back up and restore the org's durable graph (disaster recovery —
 byte-faithful rows modulo storage-assigned LSNs, fingerprint-gated):
 
 ```sh
-exocortex-node --mode backend-node --storage falkor://falkordb:6379   --graph-name my-org --export-org org-backup.json
-exocortex-node --mode backend-node --storage falkor://falkordb:6379   --graph-name my-org --import-org org-backup.json
+exocortex-node --mode backend-node --storage falkor://falkordb:6379 --allow-private-network-plaintext-data-plane --graph-name my-org --export-org org-backup.json
+exocortex-node --mode backend-node --storage falkor://falkordb:6379 --allow-private-network-plaintext-data-plane --graph-name my-org --import-org org-backup.json
 ```
 
 Set `EXOCORTEX_AUTH_TOKEN`, the exact source's `EXOCORTEX_HMAC_KEY`, and its

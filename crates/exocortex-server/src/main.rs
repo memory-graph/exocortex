@@ -87,6 +87,10 @@ struct Args {
     /// it the node runs Dreams on the in-process fire channel only.
     #[arg(long)]
     redis_url: Option<String>,
+    /// Explicit private-network exception for plaintext Falkor/Redis data
+    /// planes. Public or untrusted networks must use falkors:// / rediss://.
+    #[arg(long)]
+    allow_private_network_plaintext_data_plane: bool,
     /// Preferred Dreams consolidation window in the org's canonical timezone
     /// (backend-node; R-Dr14, two-digit START-END).
     #[arg(long, default_value = "02-06")]
@@ -260,11 +264,14 @@ async fn org_backup_main(args: Args) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| format!("exocortex-{org}"));
     if let Some(path) = &args.export_org {
-        if let Some(url) = args.storage.strip_prefix("falkor://") {
+        if let Some((falkor_url, redis_url)) = resolve_falkor_urls(
+            &args.storage,
+            args.allow_private_network_plaintext_data_plane,
+        )? {
             let storage = exocortex_storage::FalkorStorage::connect(
                 exocortex_storage::FalkorConfig {
-                    falkor_url: format!("falkor://{url}"),
-                    redis_url: format!("redis://{url}"),
+                    falkor_url,
+                    redis_url,
                     graph_name: graph_name.clone(),
                     org_id: org.into(),
                     node_id: format!("node-{}", std::process::id()).into(),
@@ -282,11 +289,14 @@ async fn org_backup_main(args: Args) -> anyhow::Result<()> {
         return Ok(());
     }
     if let Some(path) = &args.import_org {
-        if let Some(url) = args.storage.strip_prefix("falkor://") {
+        if let Some((falkor_url, redis_url)) = resolve_falkor_urls(
+            &args.storage,
+            args.allow_private_network_plaintext_data_plane,
+        )? {
             let storage = exocortex_storage::FalkorStorage::connect(
                 exocortex_storage::FalkorConfig {
-                    falkor_url: format!("falkor://{url}"),
-                    redis_url: format!("redis://{url}"),
+                    falkor_url,
+                    redis_url,
                     graph_name,
                     org_id: org.into(),
                     node_id: format!("node-{}", std::process::id()).into(),
@@ -347,6 +357,12 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
             .graph_name
             .clone()
             .unwrap_or_else(|| format!("exocortex-{}", args.org));
+        if let Some(redis_url) = args.redis_url.as_deref() {
+            validate_redis_url(
+                redis_url,
+                args.allow_private_network_plaintext_data_plane,
+            )?;
+        }
         let node_args = backend::BackendNodeArgs {
             org: args.org.clone(),
             bind: args.bind.clone(),
@@ -366,12 +382,15 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
                 .with_utc_offset_minutes(args.quiet_hours_utc_offset_minutes)?,
             admin_source_policies,
         };
-        if let Some(url) = args.storage.strip_prefix("falkor://") {
+        if let Some((falkor_url, redis_url)) = resolve_falkor_urls(
+            &args.storage,
+            args.allow_private_network_plaintext_data_plane,
+        )? {
             let storage = std::sync::Arc::new(
                 exocortex_storage::FalkorStorage::connect(
                     exocortex_storage::FalkorConfig {
-                        falkor_url: format!("falkor://{url}"),
-                        redis_url: format!("redis://{url}"),
+                        falkor_url,
+                        redis_url,
                         graph_name,
                         org_id: args.org.clone().into(),
                         node_id: format!("node-{}", std::process::id()).into(),
@@ -389,7 +408,7 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
             serve_forever(storage, ontology, node_args, args.verify_rules).await
         } else {
             anyhow::bail!(
-                "backend-node needs --storage=falkor://host:port or memory (embedded storage is mcp-standalone)"
+                "backend-node needs --storage=falkors://host:port, an explicitly admitted private falkor:// endpoint, or memory"
             );
         }
     })
@@ -432,6 +451,60 @@ fn resolve_cluster_secret(secret: Option<&str>) -> anyhow::Result<[u8; 32]> {
     })?;
     exocortex_wire::signing::decode_hex32(secret)
         .map_err(|e| anyhow::anyhow!("EXOCORTEX_CLUSTER_SECRET: {e}"))
+}
+
+fn data_plane_host_is_loopback(endpoint: &str) -> bool {
+    use std::net::IpAddr;
+
+    let authority = endpoint.split(['/', '?', '#']).next().unwrap_or(endpoint);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split_once(']').map(|(host, _)| host).unwrap_or("")
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn resolve_falkor_urls(
+    storage: &str,
+    allow_private_plaintext: bool,
+) -> anyhow::Result<Option<(String, String)>> {
+    if let Some(endpoint) = storage.strip_prefix("falkors://") {
+        anyhow::ensure!(!endpoint.is_empty(), "falkors URL has no authority");
+        return Ok(Some((storage.to_owned(), format!("rediss://{endpoint}"))));
+    }
+    let Some(endpoint) = storage.strip_prefix("falkor://") else {
+        return Ok(None);
+    };
+    anyhow::ensure!(!endpoint.is_empty(), "falkor URL has no authority");
+    anyhow::ensure!(
+        data_plane_host_is_loopback(endpoint) || allow_private_plaintext,
+        "remote plaintext Falkor requires --allow-private-network-plaintext-data-plane; prefer falkors://"
+    );
+    Ok(Some((storage.to_owned(), format!("redis://{endpoint}"))))
+}
+
+fn validate_redis_url(url: &str, allow_private_plaintext: bool) -> anyhow::Result<()> {
+    if let Some(endpoint) = url.strip_prefix("rediss://") {
+        anyhow::ensure!(!endpoint.is_empty(), "rediss URL has no authority");
+        return Ok(());
+    }
+    let endpoint = url
+        .strip_prefix("redis://")
+        .ok_or_else(|| anyhow::anyhow!("Dreams Redis URL must use rediss:// or redis://"))?;
+    anyhow::ensure!(
+        data_plane_host_is_loopback(endpoint) || allow_private_plaintext,
+        "remote plaintext Redis requires --allow-private-network-plaintext-data-plane; prefer rediss://"
+    );
+    Ok(())
 }
 
 fn resolve_transport(
@@ -589,8 +662,8 @@ fn data_home() -> anyhow::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_source_policy_org, load_source_policy, resolve_cluster_secret, resolve_transport,
-        Args,
+        ensure_source_policy_org, load_source_policy, resolve_cluster_secret, resolve_falkor_urls,
+        resolve_transport, validate_redis_url, Args,
     };
     use clap::Parser;
 
@@ -703,5 +776,23 @@ mod tests {
         assert!(
             resolve_transport("0.0.0.0:8080", Some(Path::new("cert.pem")), None, false,).is_err()
         );
+    }
+
+    #[test]
+    fn data_plane_urls_preserve_tls_and_require_an_explicit_plaintext_exception() {
+        assert_eq!(
+            resolve_falkor_urls("falkors://db.example:6379", false).unwrap(),
+            Some((
+                "falkors://db.example:6379".into(),
+                "rediss://db.example:6379".into()
+            ))
+        );
+        assert!(resolve_falkor_urls("falkor://db.example:6379", false).is_err());
+        assert!(resolve_falkor_urls("falkor://db.example:6379", true).is_ok());
+        assert!(resolve_falkor_urls("falkor://127.0.0.1:6379", false).is_ok());
+        assert!(resolve_falkor_urls("falkor://user:secret@127.0.0.1:6379", false).is_ok());
+        assert!(validate_redis_url("rediss://queue.example:6379", false).is_ok());
+        assert!(validate_redis_url("redis://queue.example:6379", false).is_err());
+        assert!(validate_redis_url("redis://queue.example:6379", true).is_ok());
     }
 }
