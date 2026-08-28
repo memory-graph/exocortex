@@ -71,7 +71,9 @@ fn reviewed_outbound_dependency(manifest: &str, package: &str) -> bool {
     matches!(
         (manifest, package),
         ("Cargo.toml", "eventsource-client")
+            | ("Cargo.toml", "hyper")
             | ("crates/exocortex-client/Cargo.toml", "eventsource-client")
+            | ("crates/exocortex-client/Cargo.toml", "hyper")
             | ("crates/exocortex-cluster/Cargo.toml", "eventsource-client")
     )
 }
@@ -1353,14 +1355,24 @@ mod tests {
         write(
             &root,
             "Cargo.toml",
-            "[workspace.dependencies]\neventsource-client = \"1\"\n",
+            "[workspace.dependencies]\neventsource-client = \"1\"\nhyper = \"1\"\n",
         );
         write(
             &root,
             "crates/exocortex-client/Cargo.toml",
-            "[dependencies]\neventsource-client = { workspace = true }\n",
+            "[dependencies]\neventsource-client = { workspace = true }\nhyper = { workspace = true }\n",
         );
         assert!(no_llm_violations(&root).unwrap().is_empty());
+
+        write(
+            &root,
+            "crates/example/Cargo.toml",
+            "[dependencies]\nhyper = { workspace = true }\n",
+        );
+        assert_eq!(
+            no_llm_violations(&root).unwrap(),
+            ["crates/example/Cargo.toml: unreviewed outbound client dependency `hyper` (declared as `hyper`)"],
+        );
     }
 
     #[test]
