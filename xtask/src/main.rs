@@ -387,7 +387,9 @@ fn validate_fastembed_release(
                 "hf:Xenova/bge-small-en-v1.5@{REVISION}"
             ))
             && embedding_source.contains("exocortex_wire::signing::content_digest_hex")
-            && embedding_source.contains("actual_sha256 != expected_sha256"),
+            && embedding_source.contains("actual_sha256 != expected_sha256")
+            && embedding_source.contains("BGE_SMALL_MAX_LENGTH: usize = 512")
+            && embedding_source.contains("with_max_length(BGE_SMALL_MAX_LENGTH)"),
         "production embedder must verify local bytes, construct offline, and stamp the immutable revision"
     );
     anyhow::ensure!(
@@ -398,8 +400,10 @@ fn validate_fastembed_release(
     anyhow::ensure!(
         server_main.contains("const EXPECTED_PREFIX: [f32; 8]")
             && server_main.contains("max_error <= 1.0e-4")
-            && server_main.contains("bge-small known-output mismatch"),
-        "release probe must enforce the pinned model's known output, not only its shape"
+            && server_main.contains("bge-small known-output mismatch")
+            && server_main.contains("bge-small long-input truncation probe")
+            && server_main.contains("repeat(400)"),
+        "release probe must enforce the pinned model's known output and established input window"
     );
     Ok(())
 }
@@ -1942,6 +1946,19 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
             installer,
             embedding,
             &server_main.replace("max_error <= 1.0e-4", "true"),
+        )
+        .is_err());
+        assert!(validate_fastembed_release(
+            &workflows,
+            docker,
+            verify,
+            fetcher,
+            installer,
+            &embedding.replace(
+                "BGE_SMALL_MAX_LENGTH: usize = 512",
+                "BGE_SMALL_MAX_LENGTH: usize = 384"
+            ),
+            server_main,
         )
         .is_err());
     }

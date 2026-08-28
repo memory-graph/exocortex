@@ -235,9 +235,30 @@ fn verify_production_embedder() -> anyhow::Result<()> {
             max_error <= 1.0e-4,
             "bge-small known-output mismatch (max prefix error {max_error})"
         );
+        // The named-model constructor used before the offline artifact pin had
+        // a 512-token window. Exercise content beyond token 384 so a mistaken
+        // output-dimension/input-window substitution fails the release probe.
+        let long_prefix = "the ".repeat(400);
+        let long_vectors = exocortex_ingest::embedding::Embedder::embed_batch(
+            &embedder,
+            &[
+                format!("{long_prefix}left-boundary"),
+                format!("{long_prefix}right-boundary"),
+            ],
+        )
+        .map_err(|error| anyhow::anyhow!("execute bge-small long-input probe: {error}"))?;
+        anyhow::ensure!(
+            long_vectors.len() == 2
+                && long_vectors[0]
+                    .iter()
+                    .zip(&long_vectors[1])
+                    .any(|(left, right)| left.to_bits() != right.to_bits()),
+            "bge-small long-input truncation probe did not observe tokens beyond position 384"
+        );
         println!(
-            "embedder-ok model=bge-small version={} dim=384",
-            exocortex_ingest::embedding::BGE_SMALL_VERSION
+            "embedder-ok model=bge-small version={} dim=384 max_tokens={}",
+            exocortex_ingest::embedding::BGE_SMALL_VERSION,
+            exocortex_ingest::embedding::BGE_SMALL_MAX_LENGTH
         );
         Ok(())
     }

@@ -97,6 +97,10 @@ pub const BGE_SMALL_REVISION: &str = "ea104dacec62c0de699686887e3f920caeb4f3e3";
 #[cfg(feature = "fastembed")]
 pub const BGE_SMALL_VERSION: &str =
     "hf:Xenova/bge-small-en-v1.5@ea104dacec62c0de699686887e3f920caeb4f3e3";
+/// The established bge-small input window. Keep this separate from the
+/// 384-dimensional output shape: changing either alters production behavior.
+#[cfg(feature = "fastembed")]
+pub const BGE_SMALL_MAX_LENGTH: usize = 512;
 /// Release-sidecar directory containing the verified model files.
 #[cfg(feature = "fastembed")]
 pub const BGE_SMALL_DIRECTORY: &str =
@@ -172,7 +176,8 @@ impl FastEmbedder {
         };
         let supplied = fastembed::UserDefinedEmbeddingModel::new(onnx_file, tokenizer_files)
             .with_pooling(fastembed::Pooling::Cls);
-        let options = fastembed::InitOptionsUserDefined::new().with_max_length(384);
+        let options =
+            fastembed::InitOptionsUserDefined::new().with_max_length(BGE_SMALL_MAX_LENGTH);
         let model = fastembed::TextEmbedding::try_new_from_user_defined(supplied, options)
             .map_err(|error| error.to_string())?;
         Ok(Self {
