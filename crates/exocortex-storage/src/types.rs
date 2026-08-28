@@ -223,10 +223,9 @@ impl FencedRestore {
 pub enum CycleJournalState {
     /// The cycle may require successor recovery.
     Active,
-    /// Recovery or the normal cycle completed; retained as an idempotent tombstone.
+    /// Recovery or the normal cycle completed. Successful fire identities are
+    /// retained separately because multiple cycles per region must coexist.
     Completed,
-    /// The whole cycle, including durable discoveries, settled successfully.
-    Succeeded,
 }
 
 /// Durable rollback material for one fenced owner cycle.

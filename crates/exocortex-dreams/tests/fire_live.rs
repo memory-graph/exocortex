@@ -260,6 +260,7 @@ async fn shared_counters_coalesce_and_acknowledge_exact_fired_snapshot() {
         DrainResult::Ready(notification) => notification,
         other => panic!("expected ready notification, got {other:?}"),
     };
+    let failed_fire_id = failed.fire_id.clone();
     assert!(matches!(
         queue
             .acknowledge(&failed, false, trigger, "owner")
@@ -271,6 +272,10 @@ async fn shared_counters_coalesce_and_acknowledge_exact_fired_snapshot() {
         DrainResult::Ready(notification) => notification,
         other => panic!("expected retry notification, got {other:?}"),
     };
+    assert_eq!(
+        retry.fire_id, failed_fire_id,
+        "ambiguous graph success must retry under the same tombstone identity"
+    );
     assert_eq!(retry.fired_at.unwrap().memories_since_last_cycle, 2);
     assert!(matches!(
         queue

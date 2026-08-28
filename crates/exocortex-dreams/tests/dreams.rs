@@ -1208,6 +1208,20 @@ async fn successful_fire_replay_is_settled_without_repeating_graph_mutations() {
     assert!(!discoveries_after_success.is_empty());
 
     assert!(engine
+        .try_consolidate_once_for_testing(&region, "newer-success")
+        .await
+        .unwrap()
+        .is_some());
+    let evidence_after_newer_success = storage
+        .get_relationship(&first_edge.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .properties
+        .evidence_count;
+    let discoveries_after_newer_success = storage.list_discoveries("o", 100).await.unwrap();
+
+    assert!(engine
         .try_consolidate_once_for_testing(&region, "success-before-ack")
         .await
         .unwrap()
@@ -1220,14 +1234,16 @@ async fn successful_fire_replay_is_settled_without_repeating_graph_mutations() {
             .unwrap()
             .properties
             .evidence_count,
-        evidence_after_success,
-        "a recovered successful fire must not strengthen twice"
+        evidence_after_newer_success,
+        "an older successful fire must remain settled after a newer cycle"
     );
     assert_eq!(
         storage.list_discoveries("o", 100).await.unwrap(),
-        discoveries_after_success,
-        "a recovered successful fire must preserve one discovery identity"
+        discoveries_after_newer_success,
+        "an older successful fire must preserve discovery identity after a newer cycle"
     );
+    assert!(evidence_after_newer_success >= evidence_after_success);
+    assert!(discoveries_after_newer_success.len() >= discoveries_after_success.len());
 }
 
 #[tokio::test]

@@ -511,7 +511,6 @@ impl RedisFireQueue {
             return Ok(AcknowledgeOutcome::Stale);
         };
         let now = chrono::Utc::now().timestamp().max(0) as u64;
-        let next_fire_id = uuid::Uuid::new_v4().to_string();
         let values: (u32, u32, u8) = redis::Script::new(ACKNOWLEDGE_LUA)
             .key(self.queue_key.as_str())
             .key(counter_key(&notification.region))
@@ -531,7 +530,10 @@ impl RedisFireQueue {
             .arg(notification.region.project.as_str())
             .arg(notification.region.memory_type)
             .arg(fired_by)
-            .arg(next_fire_id)
+            // A failure may be an ambiguous success after graph settlement.
+            // Preserve the identity so the durable success tombstone makes
+            // the retry a no-op; a genuinely failed cycle has no tombstone.
+            .arg(fire_id.as_str())
             .arg(payload)
             .invoke_async(&mut self.conn)
             .await?;

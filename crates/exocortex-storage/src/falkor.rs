@@ -452,6 +452,7 @@ impl FalkorStorage {
         this.migrate_schema().await?;
         this.repair_legacy_memories().await?;
         this.ensure_memory_attribute_index().await?;
+        this.ensure_dreams_cycle_success_index().await?;
         Ok(this)
     }
 
@@ -755,6 +756,25 @@ impl FalkorStorage {
         )
         .await?;
         Ok(())
+    }
+
+    async fn ensure_dreams_cycle_success_index(&self) -> Result<(), StorageError> {
+        match self
+            .run_template(
+                "create_dreams_cycle_success_index",
+                &serde_json::json!({}),
+                false,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(StorageError::Backend(detail))
+                if detail.contains("already indexed") || detail.contains("already exists") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Adopt only the unambiguous pre-v1 shape: a current row whose exact LSN
@@ -1307,6 +1327,11 @@ impl FalkorStorage {
             "recorded_at": audit.recorded_at.to_rfc3339(),
             "lsn": lsn,
         })
+    }
+
+    fn dreams_cycle_success_id(key: &LeaseKey, cycle_id: &str) -> Result<String, StorageError> {
+        serde_json::to_string(&(key, cycle_id))
+            .map_err(|error| StorageError::Backend(error.to_string()))
     }
 
     fn proposal_params(proposal: &DiscoveryProposal) -> Result<serde_json::Value, StorageError> {
@@ -3581,19 +3606,17 @@ impl Storage for FalkorStorage {
             .run_template(
                 "cycle_journal_succeeded",
                 &serde_json::json!({
-                    "lease_key": serde_json::to_string(key)
-                        .map_err(|error| StorageError::Backend(error.to_string()))?,
-                    "cycle_id": cycle_id,
+                    "success_id": Self::dreams_cycle_success_id(key, cycle_id)?,
                 }),
                 true,
             )
             .await?;
         match rows.first().and_then(|row| row.first()) {
             Some(FalkorValue::I64(0)) => Ok(false),
-            Some(FalkorValue::I64(1)) => Ok(true),
+            Some(FalkorValue::I64(value)) if *value > 0 => Ok(true),
             other => Err(StorageError::CorruptMetadata {
                 key: "cycle journal success count",
-                detail: format!("expected 0 or 1, got {other:?}"),
+                detail: format!("expected a non-negative count, got {other:?}"),
             }),
         }
     }
@@ -3604,6 +3627,12 @@ impl Storage for FalkorStorage {
         discoveries: &[DiscoveryRecord],
         lease: &OwnerLease,
     ) -> Result<(), StorageError> {
+        // Avoid allocating Redis LSNs for a durable no-op. The graph query
+        // below independently handles a concurrent same-cycle settlement,
+        // but the ordinary replay path must leave the public frontier exact.
+        if self.cycle_succeeded(&lease.key, cycle_id).await? {
+            return Ok(());
+        }
         let mut discovery_ids = Vec::with_capacity(discoveries.len());
         let mut org_ids = Vec::with_capacity(discoveries.len());
         let mut region_projects = Vec::with_capacity(discoveries.len());
@@ -3638,6 +3667,7 @@ impl Storage for FalkorStorage {
                     "lease_key": serde_json::to_string(&lease.key)
                         .map_err(|error| StorageError::Backend(error.to_string()))?,
                     "cycle_id": cycle_id,
+                    "success_id": Self::dreams_cycle_success_id(&lease.key, cycle_id)?,
                     "token": lease.fencing_token.as_str(),
                     "epoch": lease.epoch,
                     "now_ms": Utc::now().timestamp_millis(),
@@ -3657,6 +3687,19 @@ impl Storage for FalkorStorage {
             )
             .await?;
         if settled.is_empty() {
+            for discovery in discoveries {
+                if self
+                    .get_discovery_proposal(discovery.discovery_id.as_str())
+                    .await?
+                    .is_some()
+                    || self
+                        .get_discovery(discovery.discovery_id.as_str())
+                        .await?
+                        .is_some_and(|stored| stored != *discovery)
+                {
+                    return Err(StorageError::ProposalMismatch);
+                }
+            }
             return Err(StorageError::FencedWriteRejected {
                 lease_epoch: lease.epoch,
             });
@@ -4085,6 +4128,22 @@ impl FalkorStorage {
     #[doc(hidden)]
     pub fn release_paused_lsn_for_testing(&self) {
         self.lsn_release.notify_one();
+    }
+    /// Current graph-committed LSN, isolated from other integration graphs
+    /// that intentionally share the Redis allocator.
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    pub async fn graph_committed_lsn_for_testing(&self) -> Result<u64, StorageError> {
+        let rows = self
+            .run_template("read_committed_lsn", &serde_json::json!({}), true)
+            .await?;
+        match rows.first().and_then(|row| row.first()) {
+            Some(FalkorValue::I64(value)) if *value >= 0 => Ok(*value as u64),
+            other => Err(StorageError::CorruptMetadata {
+                key: "committed_lsn",
+                detail: format!("expected one non-negative graph LSN, got {other:?}"),
+            }),
+        }
     }
     /// Inject a Redis frontier failure before the next snapshot read.
     #[cfg(feature = "integration")]

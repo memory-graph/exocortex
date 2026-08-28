@@ -52,6 +52,10 @@ struct InMemoryInner {
     pending_ingest_effect_reads: AtomicU64,
     governed_imports: Mutex<std::collections::HashSet<String>>,
     cycle_journals: Mutex<HashMap<LeaseKey, CycleJournalRecord>>,
+    // Redis fire messages have no expiry, so pruning a success identity could
+    // make a delayed replay mutate the graph twice. Retain exact identities
+    // indefinitely; the live backend follows the same correctness contract.
+    succeeded_cycles: Mutex<std::collections::HashSet<(LeaseKey, smol_str::SmolStr)>>,
     point_reads: AtomicU64,
     batch_reads: AtomicU64,
     fail_next_batch_read: AtomicBool,
@@ -151,6 +155,7 @@ impl InMemoryStorage {
                 pending_ingest_effect_reads: AtomicU64::new(0),
                 governed_imports: Default::default(),
                 cycle_journals: Default::default(),
+                succeeded_cycles: Default::default(),
                 point_reads: Default::default(),
                 batch_reads: Default::default(),
                 fail_next_batch_read: AtomicBool::new(false),
@@ -1874,13 +1879,10 @@ impl Storage for InMemoryStorage {
     async fn cycle_succeeded(&self, key: &LeaseKey, cycle_id: &str) -> Result<bool, StorageError> {
         Ok(self
             .inner
-            .cycle_journals
+            .succeeded_cycles
             .lock()
             .unwrap()
-            .get(key)
-            .is_some_and(|journal| {
-                journal.cycle_id == cycle_id && journal.state == CycleJournalState::Succeeded
-            }))
+            .contains(&(key.clone(), cycle_id.into())))
     }
     async fn settle_dreams_cycle_fenced(
         &self,
@@ -1930,9 +1932,14 @@ impl Storage for InMemoryStorage {
                     lease_key: lease.key.clone(),
                     lease_epoch: lease.epoch,
                     restore: FencedRestore::default(),
-                    state: CycleJournalState::Succeeded,
+                    state: CycleJournalState::Completed,
                 },
             );
+            self.inner
+                .succeeded_cycles
+                .lock()
+                .unwrap()
+                .insert((lease.key.clone(), cycle_id.into()));
             invalidations
         };
         for invalidation in invalidations {
@@ -2208,6 +2215,79 @@ mod atomic_fence_tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn dreams_settlement_retains_exact_success_and_rejects_identity_collisions() {
+        let ontology = std::sync::Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = InMemoryStorage::new(ontology);
+        let key = LeaseKey::Dreams {
+            org: "org".into(),
+            region: "project:0".into(),
+        };
+        let lease = storage
+            .acquire_lease(&key, std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        let record = discovery("stable-discovery");
+        storage
+            .settle_dreams_cycle_fenced("cycle-a", std::slice::from_ref(&record), &lease)
+            .await
+            .unwrap();
+        storage
+            .settle_dreams_cycle_fenced("cycle-b", &[], &lease)
+            .await
+            .unwrap();
+        assert!(storage.cycle_succeeded(&key, "cycle-a").await.unwrap());
+        assert!(storage.cycle_succeeded(&key, "cycle-b").await.unwrap());
+
+        let mut conflicting = record.clone();
+        conflicting.quality = 0.9;
+        assert!(matches!(
+            storage
+                .settle_dreams_cycle_fenced("cycle-conflict", &[conflicting], &lease)
+                .await,
+            Err(StorageError::ProposalMismatch)
+        ));
+        assert!(!storage
+            .cycle_succeeded(&key, "cycle-conflict")
+            .await
+            .unwrap());
+
+        let proposal_record = discovery("proposed-discovery");
+        storage.store_discovery(&proposal_record).await.unwrap();
+        storage
+            .create_discovery_proposal(&DiscoveryProposal {
+                discovery_id: proposal_record.discovery_id.clone(),
+                region: proposal_record.region.clone(),
+                from: proposal_record.from,
+                to: proposal_record.to,
+                kind: exocortex_kernel::kinds::CAUSES,
+                proposed_visibility: Visibility::Project,
+                caller_scope: VisibilityContext {
+                    user_id: "user".into(),
+                    org_id: "org".into(),
+                    project_ids: ["project".into()].into_iter().collect(),
+                    team_ids: Default::default(),
+                    max_visibility: Visibility::Org,
+                },
+                issued_at: proposal_record.discovered_at,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage
+                .settle_dreams_cycle_fenced("cycle-proposal", &[proposal_record], &lease)
+                .await,
+            Err(StorageError::ProposalMismatch)
+        ));
+        assert!(!storage
+            .cycle_succeeded(&key, "cycle-proposal")
+            .await
+            .unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

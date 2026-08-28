@@ -601,7 +601,9 @@ pub trait Storage: Send + Sync + 'static {
             "durable fenced cycle journals unsupported".into(),
         ))
     }
-    /// Whether this exact cycle identity durably settled successfully.
+    /// Whether this exact cycle identity durably settled successfully. Success
+    /// identities are retained indefinitely because queued fire messages have
+    /// no expiry and may replay after arbitrarily many newer cycles.
     async fn cycle_succeeded(&self, key: &LeaseKey, cycle_id: &str) -> crate::Result<bool> {
         let _ = (key, cycle_id);
         Err(StorageError::Backend(

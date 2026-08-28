@@ -2638,9 +2638,24 @@ itest!(dreams_cycle_settlement_is_atomic_and_idempotent, {
         s.get_discovery(record.discovery_id.as_str()).await.unwrap(),
         Some(record.clone())
     );
+    let frontier_after_first = s.graph_committed_lsn_for_testing().await.unwrap();
+    let newer_cycle_id = format!("dream-fire:{}", graph_suffix());
+    s.settle_dreams_cycle_fenced(&newer_cycle_id, &[], &lease)
+        .await
+        .unwrap();
+    assert!(s.cycle_succeeded(&lease_key, &cycle_id).await.unwrap());
+    assert!(s
+        .cycle_succeeded(&lease_key, &newer_cycle_id)
+        .await
+        .unwrap());
     s.settle_dreams_cycle_fenced(&cycle_id, std::slice::from_ref(&record), &lease)
         .await
         .unwrap();
+    assert_eq!(
+        s.graph_committed_lsn_for_testing().await.unwrap(),
+        frontier_after_first,
+        "an exact successful replay must not allocate an unpublishable LSN"
+    );
     assert_eq!(
         s.list_discoveries("test-org", 100)
             .await
@@ -2650,6 +2665,54 @@ itest!(dreams_cycle_settlement_is_atomic_and_idempotent, {
             .count(),
         1
     );
+
+    let mut conflicting = record.clone();
+    conflicting.quality = 0.9;
+    let conflict_cycle = format!("dream-fire:{}", graph_suffix());
+    assert!(matches!(
+        s.settle_dreams_cycle_fenced(&conflict_cycle, &[conflicting], &lease)
+            .await,
+        Err(StorageError::ProposalMismatch)
+    ));
+    assert!(!s
+        .cycle_succeeded(&lease_key, &conflict_cycle)
+        .await
+        .unwrap());
+
+    let proposal_record = DiscoveryRecord {
+        discovery_id: format!("discovery:{}", graph_suffix()).into(),
+        discovery_cycle_id: "proposal-source".into(),
+        ..record.clone()
+    };
+    s.store_discovery(&proposal_record).await.unwrap();
+    s.create_discovery_proposal(&DiscoveryProposal {
+        discovery_id: proposal_record.discovery_id.clone(),
+        region: proposal_record.region.clone(),
+        from: proposal_record.from,
+        to: proposal_record.to,
+        kind: exocortex_kernel::kinds::CAUSES,
+        proposed_visibility: Visibility::Project,
+        caller_scope: VisibilityContext {
+            user_id: "settlement-user".into(),
+            org_id: "test-org".into(),
+            project_ids: ["settlement".into()].into_iter().collect(),
+            team_ids: Default::default(),
+            max_visibility: Visibility::Org,
+        },
+        issued_at: proposal_record.discovered_at,
+    })
+    .await
+    .unwrap();
+    let proposal_cycle = format!("dream-fire:{}", graph_suffix());
+    assert!(matches!(
+        s.settle_dreams_cycle_fenced(&proposal_cycle, &[proposal_record], &lease)
+            .await,
+        Err(StorageError::ProposalMismatch)
+    ));
+    assert!(!s
+        .cycle_succeeded(&lease_key, &proposal_cycle)
+        .await
+        .unwrap());
     s.release_lease(lease).await.unwrap();
 });
 

@@ -259,13 +259,18 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "cycle_journal_succeeded",
         read_only: true,
-        required_params: &["lease_key", "cycle_id"],
+        required_params: &["success_id"],
         cypher: r#"
-            MATCH (journal:_CycleJournal {
-                lease_key: $lease_key, cycle_id: $cycle_id, state: 'Succeeded'
-            })
-            RETURN count(journal)
+            MATCH (success:_DreamsCycleSuccess {success_id: $success_id})
+            RETURN count(success)
         "#,
+    });
+
+    reg!(Template {
+        id: "create_dreams_cycle_success_index",
+        read_only: false,
+        required_params: &[],
+        cypher: "CREATE INDEX FOR (success:_DreamsCycleSuccess) ON (success.success_id)",
     });
 
     reg!(Template {
@@ -274,6 +279,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         required_params: &[
             "lease_key",
             "cycle_id",
+            "success_id",
             "token",
             "epoch",
             "now_ms",
@@ -293,19 +299,36 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (lease:_ExocortexLease {lease_key: $lease_key, token: $token})
             WHERE lease.epoch = $epoch AND lease.expires_at_ms > $now_ms
             OPTIONAL MATCH (existing:_CycleJournal {lease_key: $lease_key})
-            WITH lease, existing
-            WHERE existing IS NULL OR existing.state <> 'Active'
-                  OR existing.cycle_id = $cycle_id
-            MERGE (journal:_CycleJournal {lease_key: $lease_key})
-            SET journal.cycle_id = $cycle_id,
-                journal.lease_epoch = $epoch,
-                journal.state = 'Succeeded',
-                journal.completed_by_epoch = $epoch
-            MERGE (order:_ExocortexMeta {key: 'committed_lsn'})
-            ON CREATE SET order.value = 0
-            SET order.value = CASE
-                WHEN order.value < $max_lsn THEN $max_lsn ELSE order.value END
-            FOREACH (i IN $discovery_indexes |
+            OPTIONAL MATCH (success:_DreamsCycleSuccess {
+                success_id: $success_id
+            })
+            WITH lease, existing, success
+            WHERE success IS NOT NULL OR existing IS NULL
+                  OR existing.state <> 'Active' OR existing.cycle_id = $cycle_id
+            OPTIONAL MATCH (proposal:_DiscoveryProposal)
+            WHERE proposal.discovery_id IN $discovery_ids
+            WITH lease, existing, success, collect(proposal) AS proposals
+            WHERE success IS NOT NULL OR size(proposals) = 0
+            OPTIONAL MATCH (stored:_Discovery)
+            WHERE stored.discovery_id IN $discovery_ids
+            WITH lease, existing, success, collect(stored) AS stored
+            WHERE success IS NOT NULL OR all(d IN stored WHERE
+                any(i IN $discovery_indexes WHERE
+                    d.discovery_id = $discovery_ids[i]
+                    AND d.props_json = $discovery_props[i]))
+            FOREACH (_ IN CASE WHEN success IS NULL THEN [1] ELSE [] END |
+                MERGE (journal:_CycleJournal {lease_key: $lease_key})
+                SET journal.cycle_id = $cycle_id,
+                    journal.lease_epoch = $epoch,
+                    journal.state = 'Completed',
+                    journal.completed_by_epoch = $epoch)
+            FOREACH (_ IN CASE WHEN success IS NULL THEN [1] ELSE [] END |
+                MERGE (order:_ExocortexMeta {key: 'committed_lsn'})
+                ON CREATE SET order.value = 0
+                SET order.value = CASE
+                    WHEN order.value < $max_lsn THEN $max_lsn ELSE order.value END)
+            FOREACH (i IN CASE WHEN success IS NULL
+                               THEN $discovery_indexes ELSE [] END |
                 MERGE (d:_Discovery {discovery_id: $discovery_ids[i]})
                 ON CREATE SET d.org_id = $org_ids[i],
                               d.region_project = $region_projects[i],
@@ -316,7 +339,14 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                               d.props_json = $discovery_props[i],
                               d.lsn = $discovery_lsns[i],
                               d.published = false)
-            RETURN journal.cycle_id
+            FOREACH (_ IN CASE WHEN success IS NULL THEN [1] ELSE [] END |
+                MERGE (settled:_DreamsCycleSuccess {
+                    success_id: $success_id
+                })
+                ON CREATE SET settled.lease_key = $lease_key,
+                              settled.cycle_id = $cycle_id,
+                              settled.lease_epoch = $epoch)
+            RETURN $cycle_id
         "#,
     });
 
