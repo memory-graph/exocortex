@@ -117,6 +117,7 @@ async fn every_operation_answers_over_http_with_auth() {
     cache.publish("org", Arc::new(snap));
     storage.upsert_memory(&a).await.unwrap();
     storage.upsert_memory(&b).await.unwrap();
+    let discovery_at = chrono::Utc::now();
     storage
         .store_discovery(&DiscoveryRecord {
             discovery_id: "http-parity-discovery".into(),
@@ -131,7 +132,7 @@ async fn every_operation_answers_over_http_with_auth() {
             quality: 0.6,
             via_types: [1, 2],
             discovery_cycle_id: "http-parity-cycle".into(),
-            discovered_at: chrono::Utc::now(),
+            discovered_at: discovery_at,
         })
         .await
         .unwrap();
@@ -215,6 +216,20 @@ async fn every_operation_answers_over_http_with_auth() {
             issued_at: chrono::Utc::now(),
         });
         if let Some(proposal) = &proposal {
+            storage
+                .store_discovery(&DiscoveryRecord {
+                    discovery_id: proposal.discovery_id.clone(),
+                    region: proposal.region.clone(),
+                    from: proposal.from,
+                    to: proposal.to,
+                    discovery_type: "transitive".into(),
+                    quality: 0.6,
+                    via_types: [1, 2],
+                    discovery_cycle_id: "typed-acceptance".into(),
+                    discovered_at: proposal.issued_at,
+                })
+                .await
+                .unwrap();
             storage.create_discovery_proposal(proposal).await.unwrap();
         }
         let expected = (entry.handler)(&ctx, input.clone())
@@ -226,11 +241,50 @@ async fn every_operation_answers_over_http_with_auth() {
         // permanently consumes the first id. Relationship identity depends on
         // endpoints and kind, so the stable outputs remain directly comparable.
         let mut http_input = input.clone();
+        if entry.name == "issue_discovery" {
+            // Issuance atomically retires presentation state and leaves an
+            // immutable proposal behind. Give HTTP an independent discovery
+            // id with otherwise identical content.
+            let http_discovery_id = "http-parity-discovery-http";
+            http_input["discovery_id"] = serde_json::Value::String(http_discovery_id.to_owned());
+            storage
+                .store_discovery(&DiscoveryRecord {
+                    discovery_id: http_discovery_id.into(),
+                    region: RegionKey {
+                        org: "org".into(),
+                        project: "*".into(),
+                        memory_type: a.memory_type,
+                    },
+                    from: a.id,
+                    to: b.id,
+                    discovery_type: "transitive".into(),
+                    quality: 0.6,
+                    via_types: [1, 2],
+                    discovery_cycle_id: "http-parity-cycle".into(),
+                    discovered_at: discovery_at,
+                })
+                .await
+                .unwrap();
+        }
         if let Some(proposal) = &proposal {
             let mut http_proposal = proposal.clone();
             http_proposal.discovery_id = "33333333-3333-3333-3333-333333333333".into();
             http_input["discovery_id"] =
                 serde_json::Value::String(http_proposal.discovery_id.to_string());
+            storage
+                .store_discovery(&DiscoveryRecord {
+                    discovery_id: http_proposal.discovery_id.clone(),
+                    region: http_proposal.region.clone(),
+                    from: http_proposal.from,
+                    to: http_proposal.to,
+                    discovery_type: "transitive".into(),
+                    quality: 0.6,
+                    via_types: [1, 2],
+                    discovery_cycle_id: "http-acceptance".into(),
+                    discovered_at: http_proposal.issued_at,
+                })
+                .await
+                .unwrap();
             storage
                 .create_discovery_proposal(&http_proposal)
                 .await
@@ -301,6 +355,14 @@ async fn every_operation_answers_over_http_with_auth() {
 /// covers every stable field and requires a live audit LSN on both sides.
 fn parity_check(name: &str, http_out: &serde_json::Value, direct: &serde_json::Value) {
     match name {
+        "issue_discovery" => {
+            // Discovery ids are immutable and single-use, so the direct and
+            // HTTP halves receive independent ids over identical endpoints.
+            assert_ne!(http_out["discovery_id"], direct["discovery_id"]);
+            for field in ["from", "to", "kind", "visibility"] {
+                assert_eq!(http_out[field], direct[field], "{name}: {field}");
+            }
+        }
         "accept_discovery" => {
             // Discovery ids are single-use and deliberately participate in
             // relationship identity, so the two independently authorized

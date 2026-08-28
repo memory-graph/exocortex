@@ -75,11 +75,17 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
     let registration_error = ingest
         .register_source(tonic::Request::new(RegisterSourceRequest {
             org_id: "org".into(),
-            source_uri: format!("session://{SENTINEL}"),
-            producer_id: SENTINEL.into(),
+            source_uri: "session://safe-source".into(),
+            producer_id: "safe-producer".into(),
             ceiling: 3,
             source_flavor: "custom".into(),
-            producer: None,
+            producer: Some(ProducerIdentity {
+                node_id: "safe-node".into(),
+                agent_id: String::new(),
+                adapter_id: String::new(),
+                hmac_signature: SENTINEL.as_bytes().to_vec(),
+                client_metadata: None,
+            }),
             producer_kind: 5,
         }))
         .await
@@ -88,9 +94,9 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
 
     let submission = IngestBatch {
         org_id: "org".into(),
-        source_uri: format!("session://{SENTINEL}"),
-        producer_id: SENTINEL.into(),
-        batch_id: SENTINEL.into(),
+        source_uri: "session://safe-source".into(),
+        producer_id: "safe-producer".into(),
+        batch_id: "safe-batch".into(),
         mapping_version: "test:1".into(),
         ontology_fingerprint: ontology.fingerprint.0.to_vec(),
         ceiling: 3,
@@ -108,10 +114,10 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
         }],
         relationships: Vec::new(),
         producer: Some(ProducerIdentity {
-            node_id: SENTINEL.into(),
+            node_id: "safe-node".into(),
             agent_id: String::new(),
             adapter_id: String::new(),
-            hmac_signature: Vec::new(),
+            hmac_signature: SENTINEL.as_bytes().to_vec(),
             client_metadata: None,
         }),
     };
