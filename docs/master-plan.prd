@@ -543,6 +543,7 @@ idea:
 | R6-R271 | Strict review advisory: close remaining nested closure and cited-I/O reachability false positives | Codex | Done — shared reachability rejects cfg/constant-false closure invocations; shell evidence follows a bounded nested-function call graph, with negative and positive fixtures plus xtask, acceptance, dead-enforcement, fmt, and clippy passing (this commit) |
 | R6-R272 | Strict review advisory: reject uncalled multi-statement closures as enforcement or cited-I/O evidence | Codex | In progress — identify enclosing closure bodies structurally and add called/uncalled multi-statement fixtures |
 | R6-R273 | Strict review advisory: adopt acknowledged cleanup-pending rows created before delivery generations existed | Codex | In progress — atomically assign a fresh durable generation before returning legacy cleanup work and prove upgraded rows do not stall the drainer |
+| R6-R274 | Strict review: prove active outbox claims serialize across distinct effects before relying on a regional generation high-water mark | Codex | In progress — add two-effect in-memory and live Falkor regressions proving the second claim waits and receives a higher generation |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence
