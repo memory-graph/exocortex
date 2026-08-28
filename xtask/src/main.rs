@@ -221,11 +221,21 @@ fn validate_release_hardening(
             workflow.contains("permissions:\n  contents: read\n"),
             "{path} must default to read-only repository permission"
         );
+        let mutable_package_commands = [
+            "apt-get ",
+            "apt install ",
+            "apk add ",
+            "brew install ",
+            "dnf install ",
+            "microdnf install ",
+            "yum install ",
+            "zypper install ",
+        ];
         anyhow::ensure!(
-            !workflow.contains("protobuf-compiler")
-                && !workflow.contains("brew install protobuf")
-                && !workflow.contains("apt install protobuf"),
-            "{path} must not install protoc from a mutable package repository"
+            !mutable_package_commands
+                .iter()
+                .any(|command| workflow.contains(command)),
+            "{path} must not install build inputs from a mutable package repository"
         );
         let required_installs = if path.ends_with("release.yml") || path.ends_with("release.yaml") {
             2
@@ -284,6 +294,9 @@ fn validate_release_hardening(
             .split_whitespace()
             .nth(1)
             .ok_or_else(|| anyhow::anyhow!("malformed Dockerfile base: {base}"))?;
+        if image == "scratch" || image == "protoc-${TARGETARCH}" {
+            continue;
+        }
         let digest = image
             .rsplit_once("@sha256:")
             .map(|(_, digest)| digest)
@@ -293,6 +306,29 @@ fn validate_release_hardening(
             "Dockerfile base image must be pinned to a full sha256 digest: {base}"
         );
     }
+    let mutable_package_commands = [
+        "apt-get ",
+        "apt install ",
+        "apk add ",
+        "brew install ",
+        "dnf install ",
+        "microdnf install ",
+        "yum install ",
+        "zypper install ",
+    ];
+    anyhow::ensure!(
+        !mutable_package_commands
+            .iter()
+            .any(|command| dockerfile.contains(command)),
+        "Dockerfile must not resolve build or runtime inputs through a mutable package repository"
+    );
+    anyhow::ensure!(
+        dockerfile.matches("ADD --checksum=sha256:").count() == 2
+            && dockerfile.contains("protoc-28.3-linux-x86_64.zip")
+            && dockerfile.contains("protoc-28.3-linux-aarch_64.zip")
+            && dockerfile.contains("gcr.io/distroless/cc-debian12:nonroot@sha256:"),
+        "Dockerfile must checksum both protoc platform archives and use the pinned CA-root runtime"
+    );
     anyhow::ensure!(
         dockerfile
             .lines()
@@ -1315,7 +1351,17 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
         let good_ci = format!(
             "permissions:\n  contents: read\njobs:\n  gates:\n    steps:\n      - uses: actions/checkout@{SHA}\n      - run: bash scripts/install-protoc.sh /tmp/protoc\n"
         );
-        let good_dockerfile = format!("FROM debian@sha256:{}\nUSER 65532:65532\n", "a".repeat(64));
+        let good_dockerfile = format!(
+            concat!(
+                "FROM scratch AS protoc-amd64\n",
+                "ADD --checksum=sha256:{digest} https://example.invalid/protoc-28.3-linux-x86_64.zip /protoc.zip\n",
+                "FROM scratch AS protoc-arm64\n",
+                "ADD --checksum=sha256:{digest} https://example.invalid/protoc-28.3-linux-aarch_64.zip /protoc.zip\n",
+                "FROM gcr.io/distroless/cc-debian12:nonroot@sha256:{digest}\n",
+                "USER 65532:65532\n"
+            ),
+            digest = "a".repeat(64)
+        );
         let good_compose = "ports:\n  - \"127.0.0.1:8080:8080\"\n";
         let workflows = [
             (".github/workflows/release.yml", good_release.as_str()),
@@ -1360,6 +1406,20 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
             &[good_compose]
         )
         .is_err());
+        for package_command in [
+            "apt-get install -y ca-certificates",
+            "brew install protobuf",
+            "apk add ca-certificates",
+        ] {
+            let package_managed_dockerfile = format!("{good_dockerfile}RUN {package_command}\n");
+            assert!(validate_release_hardening(
+                &workflows,
+                &package_managed_dockerfile,
+                PROTOC_INSTALLER,
+                &[good_compose]
+            )
+            .is_err());
+        }
         assert!(validate_release_hardening(
             &workflows,
             &good_dockerfile,
@@ -1388,21 +1448,27 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
             .is_err());
         }
 
-        let mutable_protoc_workflow = good_ci.replace(
-            "bash scripts/install-protoc.sh /tmp/protoc",
+        for package_command in [
             "sudo apt-get install -y protobuf-compiler",
-        );
-        let mutable_workflows = [
-            (".github/workflows/release.yml", good_release.as_str()),
-            (".github/workflows/ci.yml", mutable_protoc_workflow.as_str()),
-        ];
-        assert!(validate_release_hardening(
-            &mutable_workflows,
-            &good_dockerfile,
-            PROTOC_INSTALLER,
-            &[good_compose]
-        )
-        .is_err());
+            "brew install protobuf",
+            "apk add protobuf",
+        ] {
+            let mutable_protoc_workflow = good_ci.replace(
+                "bash scripts/install-protoc.sh /tmp/protoc",
+                package_command,
+            );
+            let mutable_workflows = [
+                (".github/workflows/release.yml", good_release.as_str()),
+                (".github/workflows/ci.yml", mutable_protoc_workflow.as_str()),
+            ];
+            assert!(validate_release_hardening(
+                &mutable_workflows,
+                &good_dockerfile,
+                PROTOC_INSTALLER,
+                &[good_compose]
+            )
+            .is_err());
+        }
 
         let unchecked_installer = PROTOC_INSTALLER.replace(
             "if [[ \"$actual_sha256\" != \"$expected_sha256\" ]]; then exit 1; fi",

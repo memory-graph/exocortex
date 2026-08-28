@@ -2,10 +2,26 @@
 # Build:  docker build -t exocortex-node:local .
 # The cluster compose harness (crates/exocortex-cluster/tests/
 # docker-compose-cluster.yml) references this tag.
+ARG TARGETARCH
+
+# BuildKit verifies the selected upstream archive before it enters any image.
+# Separate stages keep the URL and checksum literal for each supported platform.
+FROM scratch AS protoc-amd64
+ADD --checksum=sha256:0ad949f04a6a174da83cdcbdb36dee0a4925272a5b6d83f79a6bf9852076d53f https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip /protoc.zip
+
+FROM scratch AS protoc-arm64
+ADD --checksum=sha256:1de522032a8b194002fe35cab86d747848238b5e4de4f99648372079f5b46f9a https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-aarch_64.zip /protoc.zip
+
+FROM protoc-${TARGETARCH} AS protoc-archive
+
+FROM busybox:1.36.1-musl@sha256:3c6ae8008e2c2eedd141725c30b20d9c36b026eb796688f88205845ef17aa213 AS protoc
+COPY --from=protoc-archive /protoc.zip /tmp/protoc.zip
+RUN mkdir -p /opt/protoc && unzip -q /tmp/protoc.zip -d /opt/protoc
+
 FROM rust:1.85-slim@sha256:9f841bbe9e7d8e37ceb96ed907265a3a0df7f44e3737d0b100e7907a679acb36 AS build
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=protoc /opt/protoc/bin/protoc /usr/local/bin/protoc
+COPY --from=protoc /opt/protoc/include /usr/local/include
+RUN test "$(protoc --version)" = "libprotoc 28.3"
 WORKDIR /repo
 COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml ./
 COPY .cargo .cargo
@@ -14,12 +30,7 @@ COPY proto proto
 COPY crates crates
 RUN cargo build --release -p exocortex-server --bin exocortex-node
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system --gid 65532 exocortex \
-    && useradd --system --uid 65532 --gid exocortex --no-create-home exocortex
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=build --chown=65532:65532 /repo/target/release/exocortex-node /usr/local/bin/exocortex-node
 # backend-node by default; the deployer must mount its TLS certificate and
 # private key at the paths below, plus the required auth/cluster policy flags.

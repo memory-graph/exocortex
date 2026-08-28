@@ -73,9 +73,13 @@ workspace license/repository metadata applies).
   CI and release builds install protobuf 28.3 from the upstream release ZIP
   through `scripts/install-protoc.sh`: the version and all supported-host
   SHA-256 values are committed, so neither a moving package repository nor an
-  unchecked archive can change generated build inputs. Container base tags
-  retain readable names but are resolved by committed multi-platform manifest
-  digests for the same reason.
+  unchecked archive can change generated build inputs. The Docker build uses
+  the same fixed Linux archives through BuildKit's `ADD --checksum`, performs
+  no package-manager operation, and runs on digest-pinned Rust, BusyBox, and
+  distroless non-root/CA-root images. This keeps compiler tools, extraction
+  tools, runtime libraries, and trust roots independent of mutable package
+  repositories while retaining readable image names beside their OCI index
+  digests.
 - **git install**: `cargo install --git
   https://github.com/memory-graph/exocortex --bin exocortex-node` (needs
   `protoc`)
