@@ -60,8 +60,8 @@ pub struct HttpBind {
 
 impl HttpBind {
     /// Build an embedded single-principal binding. The bearer protects every
-    /// operation, SSE, and metrics route; identity-free health probes remain
-    /// unauthenticated.
+    /// operation, SSE, metrics, and detailed health route. Only the minimal
+    /// identity-free readiness probe remains unauthenticated.
     pub fn new(ctx: Arc<OpContext>, bearer: String) -> Self {
         let principals = PrincipalRegistry::single(bearer, ctx.visibility_ctx.clone())
             .expect("HttpBind bearer must be non-empty");
@@ -108,8 +108,8 @@ impl HttpBind {
                 ops.route(entry.http_path, post(handler))
             };
         }
-        // The bearer layer covers operations, SSE, and metrics. Health is
-        // deliberately identity-free and remains probeable without secrets.
+        // The bearer layer covers operations, SSE, metrics, and detailed
+        // health. Only a minimal ready/not-ready probe is public.
         let mut protected = ops;
         if let Some(extra) = extra {
             protected = protected.merge(extra);
@@ -130,48 +130,11 @@ impl HttpBind {
                 }
             }),
         );
-        let principals = self.principals.clone();
-        let protected = protected.layer(middleware::from_fn(move |req, next| {
-            auth(req, next, principals.clone())
-        }));
-
-        let _health = self.health.clone();
-        let health_ready = self.health.clone();
         let health_cluster = self.health.clone();
         let health_sync = self.health.clone();
         let health_hydration = self.health.clone();
         let ctx = self.ctx.clone();
-        let obs = Router::new()
-            .route(
-                "/health/ready",
-                get(move || {
-                    let h = health_ready.load_full();
-                    async move {
-                        // R-O4: 200 only when hydration completed, storage
-                        // answers, the reasoning worker is consuming, and
-                        // (backend) the lease loop ticked recently.
-                        let lease_fresh = h
-                            .last_lease_tick
-                            .is_some_and(|t| (chrono::Utc::now() - t).num_seconds() < 15);
-                        let ready = h.hydrated && h.storage_ok && h.reasoning_alive && lease_fresh;
-                        let status = if ready {
-                            StatusCode::OK
-                        } else {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        };
-                        (
-                            status,
-                            axum::Json(serde_json::json!({
-                                "status": if ready { "ready" } else { "not-ready" },
-                                "hydrated": h.hydrated,
-                                "storage_ok": h.storage_ok,
-                                "reasoning_alive": h.reasoning_alive,
-                                "lease_fresh": lease_fresh,
-                            })),
-                        )
-                    }
-                }),
-            )
+        protected = protected
             .route(
                 "/health/cluster",
                 get(move || {
@@ -216,8 +179,39 @@ impl HttpBind {
                     }
                 }),
             );
+        let principals = self.principals.clone();
+        let protected = protected.layer(middleware::from_fn(move |req, next| {
+            auth(req, next, principals.clone())
+        }));
 
-        protected.merge(obs)
+        let health_ready = self.health.clone();
+        let readiness = Router::new().route(
+            "/health/ready",
+            get(move || {
+                let h = health_ready.load_full();
+                async move {
+                    // R-O4: public probes learn only ready/not-ready. Detailed
+                    // subsystem state remains behind bearer authentication.
+                    let lease_fresh = h
+                        .last_lease_tick
+                        .is_some_and(|t| (chrono::Utc::now() - t).num_seconds() < 15);
+                    let ready = h.hydrated && h.storage_ok && h.reasoning_alive && lease_fresh;
+                    let status = if ready {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    (
+                        status,
+                        axum::Json(serde_json::json!({
+                            "status": if ready { "ready" } else { "not-ready" },
+                        })),
+                    )
+                }
+            }),
+        );
+
+        protected.merge(readiness)
     }
 }
 

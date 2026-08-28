@@ -1,7 +1,6 @@
-//! GATE1 / audit §2.3: auth coverage. Every network-reachable endpoint
-//! on a backend-node router rejects an unauthenticated call — the op
-//! routes AND the SSE change feed (which previously sat outside the
-//! bearer layer).
+//! GATE1 / audit §2.3: auth coverage. Every detailed network endpoint rejects
+//! unauthenticated calls; only the minimal identity-free readiness probe is
+//! public for deployment health checks.
 
 use std::sync::Arc;
 
@@ -73,9 +72,8 @@ async fn unauth(addr: std::net::SocketAddr, method: &str, path: &str, body: Opti
         .unwrap_or(0)
 }
 
-/// §2.3: EVERY registered operation route + the SSE feed answers 401
-/// without a bearer header. A newly registered operation joins the table
-/// automatically via `entries()`.
+/// §2.3: every registered operation and explicit non-operation route has an
+/// asserted unauthenticated posture.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_endpoint_rejects_unauthenticated_calls() {
     let (router, _storage) = boot_router();
@@ -106,6 +104,18 @@ async fn every_endpoint_rejects_unauthenticated_calls() {
         unauth(addr, "GET", "/metrics", None).await,
         401,
         "metrics must not expose deployment data without authentication"
+    );
+    for path in ["/health/cluster", "/health/sync", "/health/hydration"] {
+        assert_eq!(
+            unauth(addr, "GET", path, None).await,
+            401,
+            "detailed health route {path} must require authentication"
+        );
+    }
+    assert_eq!(
+        unauth(addr, "GET", "/health/ready", None).await,
+        200,
+        "minimal readiness remains public for deployment probes"
     );
 }
 

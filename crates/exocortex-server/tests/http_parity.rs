@@ -344,7 +344,9 @@ async fn every_operation_answers_over_http_with_auth() {
     assert_eq!(status, 200);
     assert_eq!(body["status"], "ready");
     for path in ["/health/cluster", "/health/sync", "/health/hydration"] {
-        let (status, body, _) = http(addr, "GET", path, None, None).await;
+        let (status, _, _) = http(addr, "GET", path, None, None).await;
+        assert_eq!(status, 401, "{path} rejects unauthenticated callers");
+        let (status, body, _) = http(addr, "GET", path, Some("secret-token"), None).await;
         assert_eq!(status, 200, "{path} answers");
         assert!(body.is_object(), "{path} returns JSON");
     }

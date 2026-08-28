@@ -405,13 +405,13 @@ fn dead_enforcement() -> Result<()> {
     Ok(())
 }
 
-/// §2.3: the auth-coverage suite (every endpoint rejects unauthenticated).
+/// §2.3: detailed endpoints require auth; readiness is minimal and public.
 fn auth_coverage() -> Result<()> {
     run(
         &["test", "-p", "exocortex-server", "--test", "auth_coverage"],
         &[],
     )?;
-    println!("auth-coverage ok: every network endpoint rejects unauthenticated calls");
+    println!("auth-coverage ok: detailed endpoints require auth; readiness is minimal/public");
     Ok(())
 }
 

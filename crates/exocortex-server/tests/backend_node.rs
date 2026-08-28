@@ -669,8 +669,8 @@ async fn plaintext_transport_rejects_non_loopback_library_bind() {
 }
 
 /// R-O4: readiness is observational — when the storage probe fails and the
-/// lease loop goes stale, `/health/ready` answers 503 with the failed
-/// checks named; healthy maintainers restore 200.
+/// lease loop goes stale, `/health/ready` answers a minimal 503; healthy
+/// maintainers restore 200.
 #[tokio::test(flavor = "multi_thread")]
 async fn health_ready_reflects_maintainer_truth() {
     let onto = std::sync::Arc::new(
@@ -703,7 +703,7 @@ async fn health_ready_reflects_maintainer_truth() {
     let (status, body) = http_get(node.local_addr, "/health/ready", None).await;
     assert_eq!(status, 503, "unhealthy node must not answer ready");
     assert!(
-        body.contains("\"storage_ok\":false"),
-        "names the failed check: {body}"
+        body.contains("\"not-ready\"") && !body.contains("storage_ok"),
+        "public probe is minimal: {body}"
     );
 }
