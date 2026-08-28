@@ -72,6 +72,17 @@ pub trait Storage: Send + Sync + 'static {
         ms: &[Memory],
         rs: &[Relationship],
     ) -> crate::Result<Vec<CommitRecord>>;
+    /// Atomically apply a batch at most once for a stable operation key.
+    /// Replays append no temporal assertions and publish no invalidations.
+    async fn upsert_batch_once(
+        &self,
+        operation_key: &str,
+        ms: &[Memory],
+        rs: &[Relationship],
+    ) -> crate::Result<bool> {
+        let _ = (operation_key, ms, rs);
+        Err(StorageError::Backend("idempotent batch unsupported".into()))
+    }
     /// Atomically import a governed backup exactly once. `import_key` is a
     /// stable digest of the validated backup document. A repeated key is a
     /// durable no-op: it appends no assertion history and publishes nothing.

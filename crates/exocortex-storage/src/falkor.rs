@@ -1513,8 +1513,17 @@ impl Storage for FalkorStorage {
         ms: &[Memory],
         rs: &[Relationship],
     ) -> Result<bool, StorageError> {
+        self.upsert_batch_once(import_key, ms, rs).await
+    }
+
+    async fn upsert_batch_once(
+        &self,
+        operation_key: &str,
+        ms: &[Memory],
+        rs: &[Relationship],
+    ) -> Result<bool, StorageError> {
         Ok(self
-            .upsert_batch_inner(ms, rs, None, None, Some(import_key))
+            .upsert_batch_inner(ms, rs, None, None, Some(operation_key))
             .await?
             .is_some())
     }

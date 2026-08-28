@@ -30,9 +30,15 @@ pub enum ReasoningWork {
     DurableSessionWrapup {
         /// The committed memories.
         memories: Vec<MemoryId>,
+        /// Stable durable-effect identity for atomic write idempotency.
+        operation_key: smol_str::SmolStr,
         /// Signals only after all reasoning reads and writes succeed.
         completion: tokio::sync::oneshot::Sender<Result<(), StorageError>>,
     },
+    /// Test/supervision probe: terminate this consumer without closing the
+    /// engine-owned queue so its supervisor can restart it.
+    #[doc(hidden)]
+    StopWorker,
 }
 
 /// The reasoning engine: storage-backed, queue-fed, single consumer.
@@ -76,16 +82,21 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
             match w {
                 ReasoningWork::KHopOver { seed, k } => self.k_hop_reason(seed, k).await,
                 ReasoningWork::SessionWrapup { memories } => {
-                    if let Err(error) = self.process_session_wrapup(&memories).await {
+                    if let Err(error) = self.process_session_wrapup(&memories, None).await {
                         warn!(?error, "session reasoning failed");
                     }
                 }
                 ReasoningWork::DurableSessionWrapup {
                     memories,
+                    operation_key,
                     completion,
                 } => {
-                    let _ = completion.send(self.process_session_wrapup(&memories).await);
+                    let _ = completion.send(
+                        self.process_session_wrapup(&memories, Some(operation_key.as_str()))
+                            .await,
+                    );
                 }
+                ReasoningWork::StopWorker => return,
             }
         }
     }
@@ -95,12 +106,14 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
     /// error, so callers retain their durable outbox record for retry.
     pub async fn process_durable_session_wrapup(
         &self,
+        operation_key: smol_str::SmolStr,
         memories: Vec<MemoryId>,
     ) -> Result<(), StorageError> {
         let (completion, completed) = tokio::sync::oneshot::channel();
         self.tx_work
             .send(ReasoningWork::DurableSessionWrapup {
                 memories,
+                operation_key,
                 completion,
             })
             .await
@@ -108,6 +121,12 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         completed.await.map_err(|_| {
             StorageError::Backend("reasoning worker stopped before completion".into())
         })?
+    }
+
+    /// Request a clean consumer exit while retaining the queue for restart.
+    #[doc(hidden)]
+    pub async fn stop_worker_for_testing(&self) {
+        let _ = self.tx_work.send(ReasoningWork::StopWorker).await;
     }
 
     /// Bounded k-hop reasoning (§10.7 step 4): gather the neighborhood,
@@ -119,12 +138,17 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
     /// bounded by `k` and the CR-6 node caps. Previously O(hops·E).
     #[instrument(skip(self))]
     pub async fn k_hop_reason(&self, seed: MemoryId, k: u8) {
-        if let Err(error) = self.try_k_hop_reason(seed, k).await {
+        if let Err(error) = self.try_k_hop_reason(seed, k, None).await {
             warn!(?error, "bounded reasoning pass failed");
         }
     }
 
-    async fn try_k_hop_reason(&self, seed: MemoryId, k: u8) -> Result<(), StorageError> {
+    async fn try_k_hop_reason(
+        &self,
+        seed: MemoryId,
+        k: u8,
+        operation_key: Option<&str>,
+    ) -> Result<(), StorageError> {
         let k = k.clamp(1, self.k_hop.max(1));
         let mut edges: Vec<Edge> = Vec::new();
         let entities: Vec<EntityFact>;
@@ -288,13 +312,18 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
             metrics::counter!("exocortex_reasoning_derived_pairs_capped_total")
                 .increment((before - MAX_DERIVED_PAIRS) as u64);
         }
-        self.write_back(derived, &memory_rows, &relationship_rows)
+        self.write_back(derived, &memory_rows, &relationship_rows, operation_key)
             .await
     }
 
-    async fn process_session_wrapup(&self, ms: &[MemoryId]) -> Result<(), StorageError> {
+    async fn process_session_wrapup(
+        &self,
+        ms: &[MemoryId],
+        operation_key: Option<&str>,
+    ) -> Result<(), StorageError> {
         for m in ms {
-            self.try_k_hop_reason(*m, 3).await?;
+            let seed_key = operation_key.map(|key| format!("{key}:{m:?}"));
+            self.try_k_hop_reason(*m, 3, seed_key.as_deref()).await?;
         }
         Ok(())
     }
@@ -309,6 +338,7 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         mut derived: rules::Derived,
         memory_rows: &[Memory],
         relationship_rows: &[Relationship],
+        operation_key: Option<&str>,
     ) -> Result<(), StorageError> {
         let ontology = self.storage_ontology();
         let mut new_rels: Vec<Relationship> = Vec::new();
@@ -504,7 +534,13 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
             }
         }
         if !fresh.is_empty() {
-            self.storage.upsert_batch(&[], &fresh).await?;
+            if let Some(operation_key) = operation_key {
+                self.storage
+                    .upsert_batch_once(operation_key, &[], &fresh)
+                    .await?;
+            } else {
+                self.storage.upsert_batch(&[], &fresh).await?;
+            }
             metrics::counter!("exocortex_rules_executed_total", "engine" => "crepe")
                 .increment(fresh.len() as u64);
         }

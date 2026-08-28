@@ -629,14 +629,22 @@ impl Storage for InMemoryStorage {
         ms: &[Memory],
         rs: &[Relationship],
     ) -> Result<bool, StorageError> {
+        self.upsert_batch_once(import_key, ms, rs).await
+    }
+    async fn upsert_batch_once(
+        &self,
+        operation_key: &str,
+        ms: &[Memory],
+        rs: &[Relationship],
+    ) -> Result<bool, StorageError> {
         let (records, invalidations) = {
             let _gate = self.inner.mutation_gate.lock().unwrap();
             let mut imports = self.inner.governed_imports.lock().unwrap();
-            if imports.contains(import_key) {
+            if imports.contains(operation_key) {
                 return Ok(false);
             }
             let result = self.upsert_batch_locked(ms, rs)?;
-            imports.insert(import_key.to_owned());
+            imports.insert(operation_key.to_owned());
             result
         };
         let _ = records;
@@ -833,7 +841,8 @@ impl Storage for InMemoryStorage {
         let Some(row) = effects.get_mut(effect_id) else {
             return Ok(false);
         };
-        if !matches!(&row.claim, Some((token, _)) if token.as_str() == claim_token) {
+        if !matches!(&row.claim, Some((token, until)) if token.as_str() == claim_token && *until > std::time::Instant::now())
+        {
             return Ok(false);
         }
         row.acknowledged = true;

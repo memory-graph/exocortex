@@ -699,6 +699,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (d:_IngestBatch {effect_id: $effect_id})
             WHERE d.state = 'settled' AND d.effect_json IS NOT NULL
               AND d.effect_claim_token = $claim_token
+              AND d.effect_claim_until_ms > timestamp()
             SET d.effect_acknowledged = true
             REMOVE d.effect_claim_token, d.effect_claim_until_ms
             RETURN d.effect_id
@@ -1644,6 +1645,17 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         required_params: &["id"],
         cypher: r#"
             MATCH (h:_MemoryAssertion {id: $id})
+            RETURN count(h)
+        "#,
+    });
+
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_relationship_assertion_count",
+        read_only: true,
+        required_params: &["id"],
+        cypher: r#"
+            MATCH (h:_RelationshipAssertion {id: $id})
             RETURN count(h)
         "#,
     });

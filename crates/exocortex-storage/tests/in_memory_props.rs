@@ -106,6 +106,27 @@ fn base_relationship(from: MemoryId, to: MemoryId) -> Relationship {
     }
 }
 
+#[tokio::test]
+async fn stable_operation_key_appends_derived_batch_once() {
+    let storage = InMemoryStorage::new(ontology());
+    let left = base_memory("left".into(), "left".into(), 1, 3);
+    let right = base_memory("right".into(), "right".into(), 1, 3);
+    storage
+        .upsert_batch(&[left.clone(), right.clone()], &[])
+        .await
+        .unwrap();
+    let relationship = base_relationship(left.id, right.id);
+    assert!(storage
+        .upsert_batch_once("reasoning:effect-1", &[], &[relationship.clone()])
+        .await
+        .unwrap());
+    assert!(!storage
+        .upsert_batch_once("reasoning:effect-1", &[], &[relationship.clone()])
+        .await
+        .unwrap());
+    assert_eq!(storage.relationship_history(&relationship.id).len(), 1);
+}
+
 #[test]
 fn tenantless_and_foreign_rows_fail_closed() {
     let mut row = base_memory("row".into(), "content".into(), 1, 3);
@@ -826,8 +847,8 @@ async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
         [effect.clone()]
     );
     let (claim_a, claim_b) = tokio::join!(
-        store.claim_ingest_effect("worker-a", 20),
-        store.claim_ingest_effect("worker-b", 20),
+        store.claim_ingest_effect("worker-a", 1_000),
+        store.claim_ingest_effect("worker-b", 1_000),
     );
     let (winner, loser) = match (claim_a.unwrap(), claim_b.unwrap()) {
         (Some(claimed), None) => {
@@ -840,16 +861,16 @@ async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
         }
         claims => panic!("exactly one simultaneous claimant must win: {claims:?}"),
     };
-    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(store
-        .renew_ingest_effect_claim(effect.effect_id.as_str(), winner, 50)
+        .renew_ingest_effect_claim(effect.effect_id.as_str(), winner, 2_000)
         .await
         .unwrap());
     assert!(!store
-        .renew_ingest_effect_claim(effect.effect_id.as_str(), loser, 50)
+        .renew_ingest_effect_claim(effect.effect_id.as_str(), loser, 2_000)
         .await
         .unwrap());
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
     assert!(
         store
             .claim_ingest_effect(loser, 30_000)
@@ -858,7 +879,14 @@ async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
             .is_none(),
         "renewal must exclude contenders beyond the original lease"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(45)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    assert!(
+        !store
+            .acknowledge_ingest_effect(effect.effect_id.as_str(), winner)
+            .await
+            .unwrap(),
+        "an expired owner cannot acknowledge before reclaim"
+    );
     assert_eq!(
         store.claim_ingest_effect(loser, 30_000).await.unwrap(),
         Some(effect.clone()),

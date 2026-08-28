@@ -1048,6 +1048,27 @@ async fn health_ready_reflects_maintainer_truth() {
     }
     assert!(ok, "ready turns 200 once maintainers report green");
 
+    node.reasoning.stop_worker_for_testing().await;
+    let mut saw_reasoning_outage = false;
+    for _ in 0..100 {
+        if !node.health.load().reasoning_alive {
+            saw_reasoning_outage = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    assert!(saw_reasoning_outage, "supervisor publishes worker outage");
+    for _ in 0..100 {
+        if node.health.load().reasoning_alive {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    assert!(
+        node.health.load().reasoning_alive,
+        "reasoning worker restarts"
+    );
+
     // Simulate maintainer failure: storage probe fails + lease tick stale.
     node.health.rcu(|h| {
         let mut next = h.as_ref().clone();

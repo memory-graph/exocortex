@@ -1445,7 +1445,10 @@ impl<S: Storage + 'static> IngestServer<S> {
         if !effect.session_memory_ids.is_empty() {
             if let Some(engine) = &self.reasoning {
                 engine
-                    .process_durable_session_wrapup(effect.session_memory_ids.clone())
+                    .process_durable_session_wrapup(
+                        format!("reasoning:{}", effect.effect_id).into(),
+                        effect.session_memory_ids.clone(),
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
             }

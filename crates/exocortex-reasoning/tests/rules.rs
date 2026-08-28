@@ -33,7 +33,7 @@ async fn durable_submission_survives_worker_restart() {
     let replacement = tokio::spawn(engine.clone().run());
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        engine.process_durable_session_wrapup(vec![MemoryId::new_v7()]),
+        engine.process_durable_session_wrapup("restart-test".into(), vec![MemoryId::new_v7()]),
     )
     .await
     .expect("replacement worker must drain retained durable work");

@@ -27,6 +27,58 @@ fn one_row_batch() -> IngestBatch {
     }
 }
 
+#[tokio::test]
+async fn administrator_kind_survives_runtime_lru_overflow() {
+    use exocortex_wire::ingest::v1::ingest_service_server::IngestService as _;
+
+    let ontology = Arc::new(Ontology::from_packs(vec![pack_def()]).unwrap());
+    let policies = (0..=REGISTRY_LRU_CAP)
+        .map(|index| {
+            (
+                (
+                    "org".into(),
+                    format!("fixture://{index}"),
+                    "producer".into(),
+                ),
+                AdminSourcePolicy {
+                    ceiling: Visibility::Org,
+                    kind: exocortex_kernel::ProducerKind::CodingAgent,
+                    signing_key: [5; 32],
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let server = IngestServer::new_with_admin_policies(
+        Arc::new(InMemoryStorage::new(ontology.clone())),
+        ontology,
+        policies,
+    );
+    let key = server
+        .admin_policies
+        .keys()
+        .find(|key| !server.sources.lock().unwrap().contains(key))
+        .expect("more policies than the LRU capacity must leave one absent")
+        .clone();
+    server
+        .register_source(tonic::Request::new(exocortex_wire::signing::registration(
+            &[5; 32],
+            &key.0,
+            &key.1,
+            &key.2,
+            Visibility::Org as i32,
+            "session",
+            "node",
+            exocortex_wire::ingest::v1::ProducerKind::DocsAdapter,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        server.sources.lock().unwrap().get(&key).unwrap().kind,
+        exocortex_kernel::ProducerKind::CodingAgent,
+        "bounded runtime state cannot replace immutable policy authority"
+    );
+}
+
 fn assert_reject_code(ack: &IngestAck, code: RejectCode) {
     assert!(!ack.rejections.is_empty());
     assert!(ack.rejections.iter().all(|row| row.code == code as i32));

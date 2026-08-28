@@ -114,6 +114,9 @@ pub struct BackendNode<S: Storage> {
     pub leader_gate: Arc<std::sync::atomic::AtomicBool>,
     /// Production Dreams engine, exposed for lifecycle readiness and health.
     pub dreams: Arc<exocortex_dreams::DreamsEngine<S>>,
+    /// Supervised reasoning engine, exposed for deterministic lifecycle tests.
+    #[doc(hidden)]
+    pub reasoning: Arc<exocortex_reasoning::ReasoningEngine<S>>,
     /// Live gossip handle retained for the backend process lifetime.
     pub gossip: chitchat::ChitchatHandle,
     cache_bridge: Option<tokio::task::JoinHandle<()>>,
@@ -849,6 +852,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
         cache,
         leader_gate,
         dreams,
+        reasoning,
         gossip,
         cache_bridge: Some(cache_bridge),
         cluster_feed: Some(cluster_feed),

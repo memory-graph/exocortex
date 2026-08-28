@@ -547,6 +547,7 @@ administrator producer-kind authority could be evicted from the 1,000-entry
 runtime LRU, reasoning-worker failure was not restarted, simultaneous claimant
 coverage was sequential, and the new policy field was absent from operator
 documentation. R6-R163 through R6-R167 close those findings with
-storage-clock lease renewal plus cancellation on ownership loss, direct
+storage-clock lease renewal plus atomic effect-keyed derived write settlement,
+expired-owner acknowledgement rejection, direct
 immutable-policy selection, a cancellation-safe supervised reasoning receiver,
 simultaneous cross-client claim regressions, and a fail-closed migration note.

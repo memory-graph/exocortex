@@ -587,13 +587,26 @@ itest!(
         )
         .await
         .unwrap();
+        let contender = FalkorStorage::connect(
+            FalkorConfig {
+                falkor_url: url.clone(),
+                redis_url: std::env::var("REDIS_URL")
+                    .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+                graph_name: restarted.graph_name_clone(),
+                org_id: "test-org".into(),
+                node_id: "ingest-outbox-c".into(),
+            },
+            ontology(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             restarted.pending_ingest_effects(10).await.unwrap(),
             [effect.clone()]
         );
         assert!(matches!(
             restarted
-                .commit_ingest_batch_with_effect(&key, &[memory], &[], 1, &effect)
+                .commit_ingest_batch_with_effect(&key, &[memory.clone()], &[], 1, &effect)
                 .await
                 .unwrap(),
             IngestCommitOutcome::Duplicate(_)
@@ -602,9 +615,29 @@ itest!(
             restarted.pending_ingest_effects(10).await.unwrap(),
             [effect.clone()]
         );
+        let peer = mem("outbox-peer", 3, Visibility::Org);
+        let derived = rel(memory.id, peer.id, 1);
+        assert!(restarted
+            .upsert_batch_once("reasoning:live-effect", &[peer.clone()], &[derived.clone()])
+            .await
+            .unwrap());
+        assert!(!contender
+            .upsert_batch_once("reasoning:live-effect", &[peer], &[derived.clone()])
+            .await
+            .unwrap());
+        let assertion_count = restarted
+            .query_cypher(&CypherQuery {
+                template_id: "integration_relationship_assertion_count",
+                params: serde_json::json!({ "id": id_hex(&derived.id.0) }),
+                read_only: true,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(assertion_count.rows, vec![serde_json::json!([1])]);
         let (claim_a, claim_b) = tokio::join!(
-            restarted.claim_ingest_effect("worker-a", 100),
-            restarted.claim_ingest_effect("worker-b", 100),
+            restarted.claim_ingest_effect("worker-a", 2_000),
+            contender.claim_ingest_effect("worker-b", 2_000),
         );
         let (winner, loser) = match (claim_a.unwrap(), claim_b.unwrap()) {
             (Some(claimed), None) => {
@@ -617,27 +650,34 @@ itest!(
             }
             claims => panic!("exactly one simultaneous live claimant must win: {claims:?}"),
         };
-        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         assert!(restarted
-            .renew_ingest_effect_claim(effect.effect_id.as_str(), winner, 200)
+            .renew_ingest_effect_claim(effect.effect_id.as_str(), winner, 3_000)
             .await
             .unwrap());
         assert!(!restarted
-            .renew_ingest_effect_claim(effect.effect_id.as_str(), loser, 200)
+            .renew_ingest_effect_claim(effect.effect_id.as_str(), loser, 3_000)
             .await
             .unwrap());
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
         assert!(
-            restarted
+            contender
                 .claim_ingest_effect(loser, 30_000)
                 .await
                 .unwrap()
                 .is_none(),
             "renewal must exclude live contenders beyond the original lease"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(175)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        assert!(
+            !restarted
+                .acknowledge_ingest_effect(effect.effect_id.as_str(), winner)
+                .await
+                .unwrap(),
+            "an expired live owner cannot acknowledge before reclaim"
+        );
         assert_eq!(
-            restarted.claim_ingest_effect(loser, 30_000).await.unwrap(),
+            contender.claim_ingest_effect(loser, 30_000).await.unwrap(),
             Some(effect.clone()),
             "an abandoned claim becomes retryable after its deadline"
         );
