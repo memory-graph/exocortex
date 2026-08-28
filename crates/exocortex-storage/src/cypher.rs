@@ -1616,6 +1616,18 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         "#,
     });
 
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_current_memory_assertion_temporal_fields",
+        read_only: true,
+        required_params: &["id"],
+        cypher: r#"
+            MATCH (m:Memory {id: $id})
+            MATCH (h:_MemoryAssertion {id: $id}) WHERE h.lsn = m.lsn
+            RETURN h.invalidated_by, h.valid_until, h.recorded_at
+        "#,
+    });
+
     reg!(Template {
         id: "integration_corrupt_ingest_settlement",
         read_only: false,

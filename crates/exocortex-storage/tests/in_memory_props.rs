@@ -466,10 +466,13 @@ async fn relationships_in_region_is_exact_ordered_and_fail_closed_at_limit() {
         .upsert_batch(&[a.clone(), b.clone(), foreign.clone()], &[])
         .await
         .unwrap();
-    let in_region = base_relationship(a.id, b.id);
+    let mut lower_id = base_relationship(a.id, b.id);
+    lower_id.id = RelationshipId([0x10; 16]);
+    let mut higher_id = lower_id.clone();
+    higher_id.id = RelationshipId([0x20; 16]);
     let unrelated = base_relationship(a.id, foreign.id);
     storage
-        .upsert_batch(&[], &[unrelated, in_region.clone()])
+        .upsert_batch(&[], &[unrelated, higher_id.clone(), lower_id.clone()])
         .await
         .unwrap();
     let region = RegionKey {
@@ -477,7 +480,7 @@ async fn relationships_in_region_is_exact_ordered_and_fail_closed_at_limit() {
         project: "project".into(),
         memory_type: 3,
     };
-    let rows = storage.relationships_in_region(&region, 2).await.unwrap();
+    let rows = storage.relationships_in_region(&region, 3).await.unwrap();
     assert!(rows.iter().all(|row| {
         (row.from == a.id && row.to == b.id) || (row.from == b.id && row.to == a.id)
     }));
@@ -485,6 +488,16 @@ async fn relationships_in_region_is_exact_ordered_and_fail_closed_at_limit() {
         (pair[0].from, pair[0].to, pair[0].kind, pair[0].id)
             <= (pair[1].from, pair[1].to, pair[1].kind, pair[1].id)
     }));
+    assert_eq!(
+        rows.iter()
+            .filter(|row| {
+                row.from == lower_id.from && row.to == lower_id.to && row.kind == lower_id.kind
+            })
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        vec![lower_id.id, higher_id.id],
+        "the final relationship-id key orders otherwise identical rows"
+    );
     assert!(storage.relationships_in_region(&region, 1).await.is_err());
 }
 

@@ -504,3 +504,12 @@ outbox reads now back off exponentially to one second, while a successful
 commit sends an in-process notification that wakes the drainer without waiting
 for its timer. A paused-time regression bounds the idle read count and proves
 the prompt wakeup; focused ingest tests and reasoning/ingest clippy pass.
+
+R6-R153–R6-R155 are closed with executable and authoritative evidence. Both
+relationship-order fixtures now insert explicit descending ids for otherwise
+identical endpoint/kind tuples and assert ascending persisted-id order; the
+in-memory and live Falkor regressions pass. The live fenced-restore fixture now
+uses a non-null invalidator and verifies both the decoded current memory and
+the current `_MemoryAssertion` scalar fields after rollback. R6-B20's plan
+evidence now points to the canonical bounded-I/O atomic-replace regression.
+Integration-feature storage clippy passes.

@@ -273,6 +273,7 @@ async fn fenced_restore_is_one_live_atomic_preimage_swap() {
     let s = falkor("restore").await;
     let mut preclosed = mem(20);
     preclosed.valid_until = Some(Utc::now());
+    preclosed.invalidated_by = Some(MemoryId([0x55; 16]));
     let existing = mem(21);
     let target = mem(22);
     let mut preclosed_edge = rel(preclosed.id, target.id);
@@ -331,13 +332,26 @@ async fn fenced_restore_is_one_live_atomic_preimage_swap() {
     )
     .await
     .unwrap();
+    let restored_preclosed = s.get_memory(&preclosed.id).await.unwrap().unwrap();
+    assert_eq!(restored_preclosed.valid_until, preclosed.valid_until);
+    assert_eq!(restored_preclosed.invalidated_by, preclosed.invalidated_by);
+    let assertion = s
+        .query_cypher(&CypherQuery {
+            template_id: "integration_current_memory_assertion_temporal_fields",
+            params: serde_json::json!({ "id": hex(&preclosed.id.0) }),
+            read_only: true,
+            deadline: Utc::now() + chrono::Duration::seconds(5),
+        })
+        .await
+        .unwrap();
     assert_eq!(
-        s.get_memory(&preclosed.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .valid_until,
-        preclosed.valid_until
+        assertion.rows,
+        vec![serde_json::json!([
+            hex(&preclosed.invalidated_by.unwrap().0),
+            preclosed.valid_until.unwrap().to_rfc3339(),
+            preclosed.recorded_at.to_rfc3339(),
+        ])],
+        "rollback must restore the assertion's indexed temporal scalars, not only props_json"
     );
     assert_eq!(
         s.get_memory(&existing.id).await.unwrap().unwrap().title,

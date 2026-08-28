@@ -295,9 +295,9 @@ itest!(
             .unwrap();
         let kind = exocortex_kernel::kinds::FIXES;
         let mut left = rel(from.id, to.id, kind.0);
-        left.id = RelationshipId::derive(from.id, kind, to.id, Some("left"));
+        left.id = RelationshipId([0x10; 16]);
         let mut right = left.clone();
-        right.id = RelationshipId::derive(from.id, kind, to.id, Some("right"));
+        right.id = RelationshipId([0x20; 16]);
         storage
             .upsert_batch(&[], &[right.clone(), left.clone()])
             .await
@@ -324,9 +324,7 @@ itest!(
             .filter(|row| row.from == from.id && row.to == to.id && row.kind == kind)
             .map(|row| row.id)
             .collect();
-        let mut expected = vec![left.id, right.id];
-        expected.sort();
-        assert_eq!(forward, expected);
+        assert_eq!(forward, vec![left.id, right.id]);
     }
 );
 
