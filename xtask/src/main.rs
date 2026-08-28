@@ -669,38 +669,39 @@ fn validate_chaos_compose(compose: &str) -> Result<()> {
 }
 
 fn validate_chaos_script(script: &str) -> Result<()> {
+    let active = active_shell_commands(script).join("\n");
     anyhow::ensure!(
-        script.contains("PRINCIPAL_POLICY=crates/exocortex-cluster/tests/principal-policy.dev.json")
-            && script.contains("AUTH_TOKEN=$(jq -er")
-            && script.contains("-H \"Authorization: Bearer $AUTH_TOKEN\"")
-            && script.matches("cluster_health \"$port\"").count() == 2,
+        active.contains("PRINCIPAL_POLICY=crates/exocortex-cluster/tests/principal-policy.dev.json")
+            && active.contains("AUTH_TOKEN=$(jq -er")
+            && active.contains("-H \"Authorization: Bearer $AUTH_TOKEN\"")
+            && active.matches("cluster_health \"$port\"").count() == 2,
         "chaos leader polling must authenticate both protected health loops from the dev principal policy"
     );
-    let seed_position = script
+    let seed_position = active
         .find("seed_actual_production_dreams_barrier_fixture")
         .ok_or_else(|| anyhow::anyhow!("chaos harness must seed an actual production cycle"))?;
-    let barrier_position = script
+    let barrier_position = active
         .find("GET \"$BARRIER_KEY:reached\"")
         .ok_or_else(|| anyhow::anyhow!("chaos harness must observe the production-node barrier"))?;
-    let kill_position = script
+    let kill_position = active
         .find("kill \"$leader\"")
         .ok_or_else(|| anyhow::anyhow!("chaos harness must kill the barrier owner"))?;
-    let assertion_position = script
+    let assertion_position = active
         .find("assert_actual_production_dreams_barrier_fixture")
         .ok_or_else(|| {
             anyhow::anyhow!("chaos harness must inspect authoritative successor state")
         })?;
-    let pass_position = script
+    let pass_position = active
         .find("PASS: killed production Dreams owner left no old-LSN residue")
         .ok_or_else(|| {
             anyhow::anyhow!("chaos harness must report combined takeover/fencing success")
         })?;
     anyhow::ensure!(
-        script.contains("CHAOS_OLD_LSN_START=\"$old_lsn_start\"")
-            && script.contains("CHAOS_OLD_LSN_END=\"$old_lsn_end\"")
-            && script.contains("CHAOS_OLD_EPOCH=\"$old_epoch\"")
-            && script.contains("FALKOR_URL=falkor://127.0.0.1:16379")
-            && script.contains("--features integration")
+        active.contains("CHAOS_OLD_LSN_START=\"$old_lsn_start\"")
+            && active.contains("CHAOS_OLD_LSN_END=\"$old_lsn_end\"")
+            && active.contains("CHAOS_OLD_EPOCH=\"$old_epoch\"")
+            && active.contains("FALKOR_URL=falkor://127.0.0.1:16379")
+            && active.contains("--features integration")
             && seed_position < barrier_position
             && barrier_position < kill_position
             && kill_position < assertion_position
@@ -708,6 +709,58 @@ fn validate_chaos_script(script: &str) -> Result<()> {
         "chaos success must follow a killed production-node mutation barrier, takeover, and authoritative no-residue proof"
     );
     Ok(())
+}
+
+fn active_shell_commands(script: &str) -> Vec<String> {
+    fn without_comment(line: &str) -> &str {
+        let mut single = false;
+        let mut double = false;
+        let mut escaped = false;
+        for (index, character) in line.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' if !single => escaped = true,
+                '\'' if !double => single = !single,
+                '"' if !single => double = !double,
+                '#' if !single
+                    && !double
+                    && line[..index]
+                        .chars()
+                        .next_back()
+                        .is_none_or(char::is_whitespace) =>
+                {
+                    return &line[..index];
+                }
+                _ => {}
+            }
+        }
+        line
+    }
+
+    let mut commands = Vec::new();
+    let mut current = String::new();
+    for line in script.lines() {
+        let line = without_comment(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let continued = line.ends_with('\\');
+        let fragment = line.strip_suffix('\\').unwrap_or(line).trim_end();
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(fragment);
+        if !continued {
+            commands.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        commands.push(current);
+    }
+    commands
 }
 
 fn ontology_surfaces() -> Result<()> {
@@ -2063,5 +2116,23 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
             "true",
         );
         assert!(validate_chaos_script(&reordered).is_err());
+
+        let commented = script
+            .lines()
+            .map(|line| {
+                if line.contains("seed_actual_production_dreams_barrier_fixture")
+                    || line.contains("assert_actual_production_dreams_barrier_fixture")
+                {
+                    format!("# {line}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            validate_chaos_script(&commented).is_err(),
+            "commented-out commands are not executable deployment evidence"
+        );
     }
 }

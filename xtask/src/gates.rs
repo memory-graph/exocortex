@@ -482,6 +482,23 @@ pub(crate) fn kernel_boundary_violations(root: &Path) -> Result<Vec<String>> {
     walk_files(&kernel.join("src"), &mut files, &["rs"])?;
     for path in files {
         let source = strip_comments_and_strings(&std::fs::read_to_string(&path)?);
+        let statements = source.split(';').map(str::trim).collect::<Vec<_>>();
+        let mut std_aliases = vec!["std".to_string()];
+        for statement in &statements {
+            for prefix in ["use std as ", "use ::std as ", "extern crate std as "] {
+                if let Some(alias) = statement.strip_prefix(prefix).and_then(first_identifier) {
+                    std_aliases.push(alias.to_owned());
+                }
+            }
+            if statement.starts_with("use std::{") || statement.starts_with("use ::std::{") {
+                if let Some(alias) = statement
+                    .split_once("self as ")
+                    .and_then(|(_, tail)| first_identifier(tail))
+                {
+                    std_aliases.push(alias.to_owned());
+                }
+            }
+        }
         for marker in [
             "std::fs::",
             "std::io::",
@@ -497,7 +514,18 @@ pub(crate) fn kernel_boundary_violations(root: &Path) -> Result<Vec<String>> {
                 ));
             }
         }
-        for statement in source.split(';').map(str::trim) {
+        for alias in std_aliases.iter().filter(|alias| alias.as_str() != "std") {
+            for module in ["fs", "io", "net", "process"] {
+                let marker = format!("{alias}::{module}::");
+                if source.contains(&marker) {
+                    violations.push(format!(
+                        "{} uses standard I/O through root alias `{marker}`",
+                        path.strip_prefix(root).unwrap_or(&path).display()
+                    ));
+                }
+            }
+        }
+        for statement in statements {
             if (statement.starts_with("use std")
                 || statement.starts_with("use ::std")
                 || statement.starts_with("extern crate std"))
@@ -513,6 +541,16 @@ pub(crate) fn kernel_boundary_violations(root: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(violations)
+}
+
+fn first_identifier(value: &str) -> Option<&str> {
+    let end = value
+        .char_indices()
+        .find_map(|(index, character)| {
+            (!character.is_ascii_alphanumeric() && character != '_').then_some(index)
+        })
+        .unwrap_or(value.len());
+    (end > 0).then_some(&value[..end])
 }
 
 pub(crate) fn cypher_outside_storage_violations(root: &Path) -> Result<Vec<String>> {
@@ -559,7 +597,49 @@ fn composed_rust_string_literals(source: &str) -> Vec<String> {
             cursor = close + 1;
         }
     }
+    for suffix in ["].concat()", "].join(\"\")"] {
+        let mut cursor = 0usize;
+        while let Some(relative) = source[cursor..].find(suffix) {
+            let close = cursor + relative;
+            let Some(open) = matching_delimiter_backwards(source, close, b'[', b']') else {
+                break;
+            };
+            composed.push(rust_string_literals(&source[open + 1..close]).join(""));
+            cursor = close + suffix.len();
+        }
+    }
+    for statement in source
+        .split(';')
+        .filter(|statement| statement.contains('+'))
+    {
+        let literals = rust_string_literals(statement);
+        if literals.len() > 1 {
+            composed.push(literals.join(""));
+        }
+    }
     composed
+}
+
+fn matching_delimiter_backwards(
+    source: &str,
+    close: usize,
+    opening: u8,
+    closing: u8,
+) -> Option<usize> {
+    let mut depth = 1usize;
+    for index in (0..close).rev() {
+        match source.as_bytes()[index] {
+            byte if byte == closing => depth += 1,
+            byte if byte == opening => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn matching_delimiter(source: &str, open: usize, opening: u8, closing: u8) -> Option<usize> {
@@ -1333,6 +1413,14 @@ mod tests {
         write(
             &root,
             "crates/exocortex-kernel/src/lib.rs",
+            "use std as system; fn leak() { let _ = system::fs::read(\"x\"); }\n",
+        );
+        let violations = kernel_boundary_violations(&root).unwrap();
+        assert_eq!(violations.len(), 2, "{violations:?}");
+
+        write(
+            &root,
+            "crates/exocortex-kernel/src/lib.rs",
             "use ::std::fs as disk; fn leak() { let _ = disk::read(\"x\"); }\n",
         );
         let violations = kernel_boundary_violations(&root).unwrap();
@@ -1351,6 +1439,12 @@ mod tests {
             &root,
             "crates/exocortex-client/src/lib.rs",
             "// MATCH ( is documentation; unrelated strings must not combine.\nconst A: &str = \"MATCH (\"; const B: &str = \" RETURN \";\n",
+        );
+        assert_eq!(cypher_outside_storage_violations(&root).unwrap().len(), 1);
+        write(
+            &root,
+            "crates/exocortex-server/src/lib.rs",
+            "fn query() -> String { [\"MATCH (n)\", \" RETURN n\"].concat() }\n",
         );
         assert_eq!(cypher_outside_storage_violations(&root).unwrap().len(), 1);
         write(

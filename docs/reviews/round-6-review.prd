@@ -786,6 +786,17 @@ collision shape now derives distinct ids. Milestone deviation 18 records that
 v1-derived external ids require explicit re-import/migration and are not
 silently rewritten.
 
+### Executable guard and operator-contract repairs (R6-R214/R219/R220/R221/R224)
+
+Deployment acceptance now reasons over active shell commands with continuation
+joining and comment removal, so leaving seed/assertion names in comments cannot
+stand in for execution. Kernel purity resolves aliases of the `std` root before
+checking qualified I/O, and Cypher confinement evaluates array concat/join and
+additive literal composition as well as macros. Exact negative fixtures cover
+all three bypasses. Publishing docs now name the workflow's `macos-14` Apple
+runner, and the chaos comment states the same exactly-one successor close that
+the live assertion enforces.
+
 ### Historical pre-R176 closure evidence (superseded)
 
 At the earlier closure point, the complete mandatory gate matrix passed:

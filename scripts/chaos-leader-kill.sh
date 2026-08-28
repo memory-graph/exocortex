@@ -103,8 +103,8 @@ echo "takeover PASS: $leader -> $new_leader in $((t1 - t0))ms"
 # to observe the successor cross the same journaled
 # mutation boundary and durably acknowledge the recovered fire. The old
 # reserved LSN interval must contain no memory/relationship assertion and no
-# active old-epoch journal. The duplicate fixture may leave no closed row
-# because the production MCR² guard is allowed to roll the merge back.
+# active old-epoch journal. The successor must complete the recovered merge
+# and leave exactly one closed duplicate owned outside the killed interval.
 assert_log="/tmp/exocortex-chaos-dreams-assert.$$.log"
 asserted=0
 for _ in $(seq 1 320); do

@@ -56,8 +56,8 @@ workspace license/repository metadata applies).
 
 - **Installer (primary)**: tag push (`git tag v0.2.2 && git push
   memory-graph v0.2.2`) triggers `.github/workflows/release.yml` —
-  cross-platform release builds (macOS arm64 via macos-14, Intel via
-  macos-13, Linux x64) for all three binaries, sha256 checksums, and an
+  cross-platform release builds (macOS arm64 and Intel via macos-14, Linux
+  x64) for all three binaries, sha256 checksums, and an
   auto-generated `install.sh` attached to the GitHub Release:
 
   ```sh
