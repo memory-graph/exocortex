@@ -455,6 +455,10 @@ when the prior wave's blocking items are closed and Round 6 is shut.
 IDs are stable: review rounds and PRDs cite them, so they are never
 renumbered, only re-waved.
 
+- **Wave 0 — ontology compatibility.** How two components decide they may
+  exchange data at all. It comes first because Wave 1 moves the fingerprint
+  whether or not anyone planned for it, and Wave 0 is the difference between a
+  managed change and a fleet-wide surprise. `OC-PRD`.
 - **Wave 1 — ontology verbs and modularity.** The pack seam becomes a
   product: typed domain verbs, a second pack, and the seam set that keeps
   both honest. Everything else reads better once this lands.

@@ -249,7 +249,9 @@ The three additive changes to the kernel that D1–D5 force.
 
 ### 4.1 `pack!` block gains `actions!` and `functions!`
 
-Both sections are optional; existing packs compile unchanged. The macro today accepts `name`, `version`, `kernel_min`, `memory_types!`, `entity_types!`, optional `computed_only_kinds!`, `kinds!`, `type_triples!`, and `crepe_rules!`; the two new sections slot in after `crepe_rules!`. Each is code-generated into a per-pack `ActionRegistry` and `FunctionRegistry`, and `Ontology::from_packs` merges them into a single per-node registry keyed by `(pack_name, verb_name)`. Fingerprint hashes over the action and function *signatures* (name, input types, visibility ceiling, budgets), not their bodies — bodies can be patched at the pack version level without a fingerprint bump; signatures cannot.
+Both sections are optional; existing packs compile unchanged. The macro today accepts `name`, `version`, `kernel_min`, `memory_types!`, `entity_types!`, optional `computed_only_kinds!`, `kinds!`, `type_triples!`, and `crepe_rules!`; the two new sections slot in after `crepe_rules!`. Each is code-generated into a per-pack `ActionRegistry` and `FunctionRegistry`, and `Ontology::from_packs` merges them into a single per-node registry keyed by `(pack_name, verb_name)`. Fingerprint handling is **not** free here, and an earlier draft of this PRD got it wrong. It claimed signatures would be hashed and bodies would not, so bodies could be patched without a fingerprint bump. That is not achievable as the kernel stands: `OntologyFingerprint::compute` hashes `bincode::serialize(PackDef)` wholesale, so anything that lands in `PackDef` is hashed, and **adding the fields at all changes the serialization for every pack — including dev-v1 with zero declared actions**.
+
+That is why this deliverable depends on Wave 0 (`docs/prd/ontology-compatibility-prd.md`). Once the compatibility hash covers only meaning-bearing structure, the signature-versus-body distinction becomes expressible: signatures join the compatibility hash, bodies stay out of it. Landing D2 before Wave 0 means moving the fleet's fingerprint as an unmanaged side effect of a macro change.
 
 ### 4.2 Packs declare structured agent guidance
 
@@ -316,6 +318,7 @@ Each of these is accepted work with a wave, not a deferral.
 - **Probabilistic entity resolution.** Master plan **D17, Wave 2**, after D13. This is the half that genuinely needs a corpus, a labelled set, and an evaluation harness — and splitting it from D13 is the point: the earlier draft deferred both together and lost the cheap half with the expensive one.
 - **Org-scale (10M+) benchmarks.** Master plan **D14, Wave 4**. The 100k suite passes; 10M forces an embedding-store decision that should follow a deployment demanding it, not lead one.
 - **Row-level ACLs beyond the five visibility labels.** Master plan **D15, Wave 5**. Needs an authorization DSL; five labels hold for one org.
+- **Replacing positional `u8` ontology ids** with explicit or name-derived ids. Named and deliberately deferred by `docs/prd/ontology-compatibility-prd.md` §5.1 — it is the root cause of the fingerprint's strictness, and it would be the largest single change ever made to the kernel.
 - **Ontology branching / PRs against the ontology.** Master plan **D16, Wave 5**. Meaningful once a third pack is proposed from outside the org; pack-version + fingerprint already gives "provably the same ontology across a cluster."
 
 ### 5.2 Not doing — design choices, not sequencing
@@ -360,11 +363,13 @@ and a number in this table would be a guess dressed as a commitment. Waves
 match `docs/master-plan.prd`'s sequenced backlog, where these items live
 as PX1-PX6 alongside the rest of the plan.
 
+**Wave 0 — ontology compatibility.** Owned by `docs/prd/ontology-compatibility-prd.md`, not by this PRD, and listed here because step 1a cannot start until it lands: adding `actions!` / `functions!` / `guidance!` to `PackDef` moves the fingerprint for every pack, and Wave 0 is what makes that a managed change rather than a fleet-wide surprise.
+
 **Wave 1 — ontology verbs and modularity.** Nothing downstream reads well until this lands.
 
 | Step | Deliverable | Owner | Depends on |
 |---|---|---|---|
-| **1a** | `actions!` / `functions!` / `guidance!` on the `pack!` macro; dispatch via macro-generated `inventory::submit!`; audit, MCP+HTTP mount, preflight, visibility-ceiling enforcement (D2 kernel side) | Platform | — |
+| **1a** | `actions!` / `functions!` / `guidance!` on the `pack!` macro; dispatch via macro-generated `inventory::submit!`; audit, MCP+HTTP mount, preflight, visibility-ceiling enforcement (D2 kernel side) | Platform | **Wave 0** |
 | **1b** | D2 supporting machinery: generated Function-SLO bench harness, `--dump-tools`, `--dump-fingerprint` | Platform | 1a |
 | **1c** | D3-S6 catalogue bijection — `GetChain`, `ExplainEdge`, `RetractEdge` implemented (smallest item in the PRD; `ExplainEdge` gates the explorer's provenance view) | Platform | — |
 | **1d** | D3-S1 three-way `Storage` corpus + `xtask seam-inventory` | Platform | — |
@@ -389,7 +394,7 @@ as PX1-PX6 alongside the rest of the plan.
 | **3b** | Demo recording; publish with the composed pack set; README rewrite | Platform | 3a |
 | **3c** | Dogfood on real usage; iterate on the pack and the explorer | Platform | 3b |
 
-The chain that actually constrains everything is 1a → 1f → 1i → 2b → 3a. Every other step parallelizes against it.
+The chain that actually constrains everything is Wave 0 → 1a → 1f → 1i → 2b → 3a. Every other step parallelizes against it.
 
 ## 8. Relationship to the codebase audit
 
@@ -419,6 +424,7 @@ Recorded, not blocking.
 - Does **not** amend `docs/prd/exocortex-core-prd.md` — additive product scope, not a kernel rewrite.
 - Does **not** replace `agent-instructions-prd.md` — the CLAUDE.md/AGENTS.md block from that PRD is kept, and pack guidance composes into it through that PRD's own `gen-playbook` mechanism (§4.2).
 - Does **not** replace `docs/prd/mintlify-docs-integration-prd.md` — D4 is the *first end-to-end run* of what that PRD specified; the mechanics stay unchanged.
+- Does **not** own the fingerprint. `docs/prd/ontology-compatibility-prd.md` does, and this PRD depends on it (§4.1, §7 Wave 0).
 - Does **not** contradict `docs/master-plan.prd` — it feeds it. These deliverables live there as PX1-PX6, and the master plan's sequenced backlog is authoritative for ordering. Note that the structured-source adapters (iceberg/delta/parquet, master plan D1) are **no longer deferred**: they are Wave 2 work alongside this PRD's docs producer, not behind it.
 - Does **not** own, restate, or schedule anything in `docs/bug-prd-codebase-audit.md` (§8).
 

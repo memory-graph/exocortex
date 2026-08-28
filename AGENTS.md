@@ -142,12 +142,17 @@ is pinned 1.85.0. Live-backend suites (`--features integration` with
 |---|---|
 | What should this feature do? | `docs/prd/exocortex-core-prd.md` (the §-refs) |
 | How do I write an ontology pack? | `docs/ONTOLOGY_GUIDE.md` |
-| What's accepted work? | `docs/master-plan.prd` |
+| What's accepted work, and in what order? | `docs/master-plan.prd` — including its PRD index |
 | What was delivered/deviated? | `docs/MILESTONE_REPORT.md` |
-| What did reviews find? | `docs/reviews/round-{1,2,3}-review.prd` |
+| What did reviews find? | `docs/reviews/round-<n>-review.prd` (1, 2, 3, 6) |
 | How do we publish? | `docs/PUBLISHING.md` (`scripts/publish.sh`) |
-| Known bugs, fixed? | `docs/bug-prd-external-key-identity.md` |
-| Future adapter work? | `docs/prd/mintlify-docs-integration-prd.md` |
+| Known bugs? | `docs/bug-prd-*.md` — these keep their `docs/` paths because code comments cite them |
+| What is planned but not built? | `docs/prd/` — every feature PRD lives here; the master plan's index says which wave each is in |
+
+**Doc conventions.** Feature PRDs live in `docs/prd/`. Bug PRDs stay at
+`docs/bug-prd-*.md` because source comments reference those paths. Review
+rounds are `docs/reviews/round-<n>-review.prd`. The master plan is the only
+`.prd` outside `docs/reviews/`, and it indexes everything else.
 
 The closing rule of every task: the master plan reflects reality at
 every commit (see "How work is organized" above).
