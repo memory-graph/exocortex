@@ -167,7 +167,7 @@ Callers hit these over MCP by name — `exocortex.pack.mortgage.is_categorically
 
 ### 3.3 D3 — Seam conformance suite and inventory
 
-**What ships:** A complete, enumerated set of seam conformance suites under `crates/exocortex-conformance/*`, plus `xtask seam-inventory` and the CI gate that makes the *set* enforceable. Three of the six seams have substantial coverage today and are extended rather than written from scratch; three are new.
+**What ships:** A complete, enumerated set of seam conformance suites under `crates/exocortex-conformance/*`, plus `xtask seam-inventory` and the CI gate that makes the *set* enforceable. Three of the seven seams have substantial coverage today and are extended rather than written from scratch; four are new.
 
 **S1 — `Storage` conformance. NEW.** A shared corpus (~50 scenarios covering upsert, fenced-upsert, soft-delete, k-hop, cypher templates, stream, LSN assignment) run against **all three** implementations of the trait: `FalkorStorage`, `InMemoryStorage`, and `NoBackendStorage` (`crates/exocortex-client/src/no_backend.rs`). The third is not optional — it is the offline path, it is a full `impl Storage`, and a two-way Falkor↔InMemory corpus would not exercise it at all. Falkor scenarios stay gated on `FALKOR_URL`; the other two run everywhere.
 
