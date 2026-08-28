@@ -976,6 +976,53 @@ async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
 }
 
 #[tokio::test]
+async fn ingest_claims_serialize_distinct_effects_with_increasing_generations() {
+    let store = InMemoryStorage::new(ontology());
+    for suffix in ["a", "b"] {
+        let key = IngestBatchKey {
+            org_id: "org".into(),
+            producer_id: "producer".into(),
+            batch_id: suffix.into(),
+        };
+        let effect = PostIngestEffect {
+            effect_id: format!("effect-{suffix}").into(),
+            session_memory_ids: vec![],
+            region_deltas: vec![],
+        };
+        assert!(matches!(
+            store
+                .commit_ingest_batch_with_effect(&key, &[], &[], 0, &effect)
+                .await
+                .unwrap(),
+            IngestCommitOutcome::Committed { .. }
+        ));
+    }
+
+    let first = store
+        .claim_ingest_effect("first-worker", 30_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.effect.effect_id.as_str(), "effect-a");
+    assert!(store
+        .claim_ingest_effect("blocked-worker", 30_000)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .acknowledge_ingest_effect(first.effect.effect_id.as_str(), "first-worker")
+        .await
+        .unwrap());
+    let second = store
+        .claim_ingest_effect("second-worker", 30_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.effect.effect_id.as_str(), "effect-b");
+    assert!(second.delivery_generation > first.delivery_generation);
+}
+
+#[tokio::test]
 async fn find_by_entity_uses_canonical_memory_context() {
     let store = InMemoryStorage::new(ontology());
     let entity = EntityId([7; 16]);

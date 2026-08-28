@@ -943,15 +943,26 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
 
     reg!(Template {
         id: "ingest_effect_cleanups_pending",
-        read_only: true,
+        read_only: false,
         required_params: &["limit"],
         cypher: r#"
             MATCH (d:_IngestBatch)
             WHERE d.state = 'settled' AND d.effect_json IS NOT NULL
               AND d.effect_acknowledged = true
               AND coalesce(d.effect_cleanup_complete, false) = false
+            WITH d ORDER BY d.effect_id ASC LIMIT $limit
+            MERGE (clock:_IngestEffectClaimClock {id: 'global'})
+            SET clock.generation = CASE
+                WHEN d.effect_delivery_generation IS NULL
+                    THEN coalesce(clock.generation, 0) + 1
+                WHEN coalesce(clock.generation, 0) < d.effect_delivery_generation
+                    THEN d.effect_delivery_generation
+                ELSE clock.generation
+            END
+            WITH d, clock.generation AS adoption_generation
+            SET d.effect_delivery_generation =
+                coalesce(d.effect_delivery_generation, adoption_generation)
             RETURN d.effect_json, d.effect_delivery_generation
-            ORDER BY d.effect_id ASC LIMIT $limit
         "#,
     });
 
@@ -2110,6 +2121,18 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (m:Memory {id: $id})
             MATCH (h:_MemoryAssertion {id: $id}) WHERE h.lsn = m.lsn
             RETURN h.invalidated_by, h.valid_until, h.recorded_at
+        "#,
+    });
+
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_clear_ingest_effect_generation",
+        read_only: false,
+        required_params: &["effect_id"],
+        cypher: r#"
+            MATCH (d:_IngestBatch {effect_id: $effect_id})
+            REMOVE d.effect_delivery_generation
+            RETURN d.effect_id
         "#,
     });
 

@@ -1287,6 +1287,15 @@ itest!(
             .acknowledge_ingest_effect(effect.effect_id.as_str(), loser)
             .await
             .unwrap());
+        restarted
+            .query_cypher(&CypherQuery {
+                template_id: "integration_clear_ingest_effect_generation",
+                params: serde_json::json!({ "effect_id": effect.effect_id }),
+                read_only: false,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
         assert!(restarted
             .pending_ingest_effects(10)
             .await
@@ -1295,10 +1304,7 @@ itest!(
         let cleanups = restarted.pending_ingest_effect_cleanups(10).await.unwrap();
         assert_eq!(cleanups.len(), 1);
         assert_eq!(cleanups[0].effect, effect);
-        assert_eq!(
-            cleanups[0].delivery_generation,
-            reclaimed.delivery_generation
-        );
+        assert!(cleanups[0].delivery_generation > reclaimed.delivery_generation);
         assert!(restarted
             .claim_ingest_effect("worker-after-ack", 30_000)
             .await
@@ -1315,6 +1321,52 @@ itest!(
             .is_empty());
     }
 );
+
+itest!(distinct_ingest_effect_claims_are_globally_serialized, {
+    let store = connect("distinct-effect-claims").await;
+    for suffix in ["a", "b"] {
+        let key = IngestBatchKey {
+            org_id: "test-org".into(),
+            producer_id: "producer".into(),
+            batch_id: suffix.into(),
+        };
+        let effect = PostIngestEffect {
+            effect_id: format!("effect-{suffix}").into(),
+            session_memory_ids: vec![],
+            region_deltas: vec![],
+        };
+        assert!(matches!(
+            store
+                .commit_ingest_batch_with_effect(&key, &[], &[], 0, &effect)
+                .await
+                .unwrap(),
+            IngestCommitOutcome::Committed { .. }
+        ));
+    }
+
+    let first = store
+        .claim_ingest_effect("first-worker", 30_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.effect.effect_id.as_str(), "effect-a");
+    assert!(store
+        .claim_ingest_effect("blocked-worker", 30_000)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .acknowledge_ingest_effect(first.effect.effect_id.as_str(), "first-worker")
+        .await
+        .unwrap());
+    let second = store
+        .claim_ingest_effect("second-worker", 30_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.effect.effect_id.as_str(), "effect-b");
+    assert!(second.delivery_generation > first.delivery_generation);
+});
 
 itest!(corrupt_ingest_settlement_fails_closed_on_retry, {
     for (case, accepted, rejected, assigned_lsn) in [

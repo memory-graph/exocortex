@@ -2370,7 +2370,7 @@ impl Storage for FalkorStorage {
             .run_template(
                 "ingest_effect_cleanups_pending",
                 &serde_json::json!({ "limit": limit }),
-                true,
+                false,
             )
             .await?;
         rows.iter()
