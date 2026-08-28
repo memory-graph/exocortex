@@ -490,3 +490,7 @@ R6-R152 is closed by fail-closed recovery and publish-after-persist ordering.
 Malformed existing state and failed atomic replacement regressions prove that
 neither path installs widened live authority; the serialized concurrent
 replacement test remains green.
+
+R6-R148 is closed: ingress is a retained node-owned task, node drop aborts it
+and clears leadership, and the CLI awaits unexpected ingress termination. A
+fixed-port regression proves drop releases the listener; server clippy passes.

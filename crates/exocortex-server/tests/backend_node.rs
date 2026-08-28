@@ -56,6 +56,33 @@ async fn http_get(addr: std::net::SocketAddr, path: &str, bearer: Option<&str>) 
     )
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_backend_node_stops_ingress_and_releases_its_port() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let node = run_backend_node(storage, onto, args("127.0.0.1:0", 41991, vec![]))
+        .await
+        .unwrap();
+    let addr = node.local_addr;
+    assert!(std::net::TcpStream::connect(addr).is_ok());
+    drop(node);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(listener) = std::net::TcpListener::bind(addr) {
+            drop(listener);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "dropping BackendNode must release {addr}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn cache_bridge_reseeds_past_an_upsert_whose_row_was_already_deleted() {
     use exocortex_kernel::{Provenance, Relationship, RelationshipId, RelationshipProperties};

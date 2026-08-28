@@ -350,13 +350,13 @@ async fn serve_forever<S: exocortex_storage::Storage + 'static>(
     node_args: backend::BackendNodeArgs,
     verify_rules: bool,
 ) -> anyhow::Result<()> {
-    let node = backend::run_backend_node(storage, ontology.clone(), node_args).await?;
+    let mut node = backend::run_backend_node(storage, ontology.clone(), node_args).await?;
     tracing::info!(addr = %node.local_addr, "backend-node up; serving until interrupted");
     if verify_rules {
         verify_deployed_rules(&ontology, "backend-node")?;
         return Ok(());
     }
-    std::future::pending::<anyhow::Result<()>>().await
+    node.wait_for_ingress().await
 }
 
 fn verify_deployed_rules(

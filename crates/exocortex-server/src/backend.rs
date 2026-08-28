@@ -103,6 +103,7 @@ pub struct BackendNode<S: Storage> {
     cluster_feed: Option<tokio::task::JoinHandle<()>>,
     post_ingest_effects: Option<tokio::task::JoinHandle<()>>,
     leader_election: Option<tokio::task::JoinHandle<()>>,
+    ingress: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
 impl<S: Storage> BackendNode<S> {
@@ -114,10 +115,29 @@ impl<S: Storage> BackendNode<S> {
             task.abort();
         }
     }
+
+    /// Wait for the ingress task to terminate. A running backend is expected
+    /// to serve indefinitely, so every termination is a supervision failure.
+    pub async fn wait_for_ingress(&mut self) -> anyhow::Result<()> {
+        let task = self
+            .ingress
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("backend ingress task is not running"))?;
+        match task.await {
+            Ok(Ok(())) => anyhow::bail!("backend ingress stopped unexpectedly"),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(anyhow::anyhow!("backend ingress task failed: {error}")),
+        }
+    }
 }
 
 impl<S: Storage> Drop for BackendNode<S> {
     fn drop(&mut self) {
+        self.leader_gate
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(task) = self.ingress.take() {
+            task.abort();
+        }
         if let Some(task) = self.cache_bridge.take() {
             task.abort();
         }
@@ -693,13 +713,8 @@ pub async fn run_backend_node<S: Storage + 'static>(
         tls = matches!(args.transport, TransportSecurity::Tls { .. }),
         "backend-node serving http+grpc"
     );
-    {
-        tokio::spawn(async move {
-            if let Err(e) = ingress.serve(app).await {
-                tracing::error!(%e, "ingress server failed");
-            }
-        });
-    }
+    let ingress =
+        tokio::spawn(async move { ingress.serve(app).await.map_err(anyhow::Error::from) });
 
     // Lease re-election (§9.2): acquire, renew, re-acquire on loss. The
     // epoch check rides storage-side fencing (R-C3).
@@ -794,6 +809,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
         cluster_feed: Some(cluster_feed),
         post_ingest_effects: Some(post_ingest_effects),
         leader_election: Some(leader_election),
+        ingress: Some(ingress),
     })
 }
 
