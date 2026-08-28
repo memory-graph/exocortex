@@ -209,6 +209,7 @@ fn rust_functions(source: &str) -> Vec<RustFunction> {
         let header = &source[attribute_start..body_start];
         let root = name == "main"
             || name == "handle"
+            || inside_trait_impl(source, at)
             || header
                 .split_whitespace()
                 .any(|token| token.starts_with("pub"));
@@ -222,6 +223,31 @@ fn rust_functions(source: &str) -> Vec<RustFunction> {
         cursor = body_start + 1;
     }
     functions
+}
+
+fn inside_trait_impl(source: &str, function_at: usize) -> bool {
+    let mut search_end = function_at;
+    while let Some(impl_at) = source[..search_end].rfind("impl") {
+        let before_is_ident = impl_at > 0
+            && (source.as_bytes()[impl_at - 1].is_ascii_alphanumeric()
+                || source.as_bytes()[impl_at - 1] == b'_');
+        let after = source.as_bytes().get(impl_at + 4).copied();
+        if before_is_ident || !after.is_some_and(|byte| byte.is_ascii_whitespace() || byte == b'<')
+        {
+            search_end = impl_at;
+            continue;
+        }
+        let Some(open_offset) = source[impl_at..function_at].find('{') else {
+            search_end = impl_at;
+            continue;
+        };
+        let open = impl_at + open_offset;
+        if matching_brace(source, open).is_some_and(|close| close > function_at) {
+            return source[impl_at..open].contains(" for ");
+        }
+        search_end = impl_at;
+    }
+    false
 }
 
 fn matching_brace(source: &str, open: usize) -> Option<usize> {
@@ -955,6 +981,19 @@ mod tests {
             dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")])
                 .unwrap()
                 .is_empty()
+        );
+
+        let root = fixture("trait-entrypoint");
+        write(
+            &root,
+            "crates/example/src/lib.rs",
+            "trait Api { fn submit(&self); } struct Server; impl Api for Server { fn submit(&self) { fence(); } } fn fence() {}\n",
+        );
+        assert!(
+            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")])
+                .unwrap()
+                .is_empty(),
+            "public trait implementations are production entrypoints"
         );
     }
 
