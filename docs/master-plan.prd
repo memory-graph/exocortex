@@ -128,6 +128,7 @@ A PRD that is not listed here is not accepted work.
 | `docs/bug-prd-codebase-audit.md` | The 70-defect audit and its fix order | Closed in sweep rounds 4-5 |
 | `docs/bug-prd-standalone-readback.md` | Zero-setup mode's write→read loop | Closed (SR-PRD) |
 | `docs/bug-prd-external-key-identity.md` | `ExternalKey` identity stability | Closed |
+| `docs/prd/adapter-contract-prd.md` | Projection bounds, adapter-side validation, source-schema evolution — the contract every table/CDC/API adapter needs | **Not written** — D21, Wave 2, blocks D1/D19/D20 |
 | `docs/reviews/round-<n>-review.prd` | Findings against completed work; 1, 2, 3 closed, **6 is the live release gate** | Round 6 open — RELEASE BLOCKED |
 
 Bug PRDs keep their `docs/` paths because source comments cite them; feature
@@ -200,6 +201,62 @@ unblock the rest (PX6 is the smallest item in the plan and PX5 depends on
 it); PX1 and PX3 are Wave 1; PX4 is Wave 2, alongside D1 and D13 — the
 docs run is one producer among several rather than the headline; PX5 is
 Wave 3.
+
+### Vertical pack candidates
+
+Not committed work — candidates, listed so the pack strategy is visible and
+argued rather than improvised. All of them are gated on PX1 proving an outside
+author can ship a pack, and on D13, because every one of these domains is
+multi-source and unjoined data is not an ontology.
+
+The selection principle: **regulated domains arrive with their ontology already
+written.** ECOA/Reg B reason codes, SNOMED/ICD/LOINC, CDISC SDTM, DO-178C
+traceability, MITRE ATT&CK — someone already did the taxonomy work and made it
+mandatory. A pack encodes a taxonomy the customer is already required to follow,
+versions it, diffs it, and proves which version was in force on a given date.
+That is the pack seam's actual market, and it is why the fingerprint and
+bi-temporal work is load-bearing rather than decorative.
+
+| ID | Wave | Vertical | Why it fits | Gate |
+|----|------|----------|-------------|------|
+| VP1 | **1** | Mortgage / lending underwriting | Adverse-action notices legally require a stated reason; rulebooks vary by lender and change over time, so "which rules governed this file" is a bi-temporal question with a compliance consequence | Already in flight as PX1 |
+| VP2 | **2** | Software engineering | Git + Linear + docs + incidents is a graph every org over ~100 engineers has and nobody solves deterministically. Uniquely, it demos on the prospect's own repo with no data leaving the machine | D18, D19 |
+| VP3 | **4** | Clinical trials / pharma | 21 CFR Part 11 and ALCOA require attributable, contemporaneous, never-destructively-edited records — a prose description of provenance over an append-only bi-temporal store. Protocol amendments are ontology versions; deviations are typed findings against the version in force | PX1, D13 |
+| VP4 | **4** | Security detection engineering and IR | Detection rules as versioned ontology; post-incident review is a bi-temporal query. Buyers are structurally hostile to both data egress and LLMs in a defensible decision path | PX1, D13 |
+| VP5 | **5** | Aerospace / safety-critical engineering | Requirements traceability is a typed graph with provenance and nothing else; auditors ask what the trace looked like at certification time. Air-gapped deployment is mandatory, which is a feature here | PX1, D13, air-gap story |
+| VP6 | **5** | Utilities / industrial | Asset ontologies, maintenance history, failure causality, "what was the configuration when it failed" | PX1, D13, D14 |
+
+Explicitly poor fits, recorded so they are not revisited: consumer and marketing
+analytics (volume-first, semantics-thin, nobody defends a decision three years
+later); anything whose value is prediction rather than record (no LLM, no ML —
+that is not our fight); petabyte telemetry (wrong tier, see D14); and raw-prose
+domains such as PDF contract piles, where the no-LLM rule means we can only
+ingest what is already structured.
+
+### Training-corpus direction (open, not yet accepted)
+
+A candidate reframing worth recording: Exocortex as the layer that **ingests
+broadly, validates deterministically, and emits training-ready corpora** — the
+typed ontology as the corpus schema, the validators as the quality gate, and
+bi-temporality plus provenance as the two things training-data pipelines
+generally cannot produce (leak-free temporal splits, and per-record lineage).
+Under that framing the `no LLM inside` invariant stops being a constraint and
+becomes the product claim: the thing preparing the data is the thing that cannot
+hallucinate. D22, D23, and D24 are its concrete pieces.
+
+Three tensions to resolve before this is accepted as direction rather than an
+idea:
+
+1. **Scale stops being deferrable.** Corpora are millions to billions of rows
+   against a 100k benchmark. D14 moves from "wait for a deployment that demands
+   it" to the primary axis, and that reopens storage-architecture decisions this
+   plan has deliberately postponed.
+2. **"All the information" implies unstructured sources**, and deterministic
+   extraction only works on already-structured ones. That forces D23 — and
+   option (a) is the version that keeps the invariant intact.
+3. **It is a second product with a different buyer**, different competitors, and
+   a different scale envelope from the ontology framing. The substrate is shared;
+   the go-to-market is not. Pick deliberately rather than drift.
 
 ## In progress
 
@@ -496,3 +553,10 @@ renumbered, only re-waved.
 | D15 | **5** | Row-level ACLs beyond the five visibility labels (inheritance chains, an authorization DSL) | palantir-expansion PRD §5, §24 |
 | D16 | **5** | Ontology branching / PRs against the ontology — only meaningful once a third pack is proposed by someone outside the org | palantir-expansion PRD §5, §24 |
 | D17 | **2** | Probabilistic / fuzzy entity resolution (the half D13 excludes): corpus, labelled set, evaluation harness. Sequenced after D13 proves the deterministic join carries most of the value | palantir-expansion PRD §5, §24 |
+| D18 | **2** | **Git-history adapter** — commits, authors, files, PRs into `Fix` / `Problem` / `CodePattern` / `Technology`, which `exocortex-pack-dev-v1` already declares. No auth, no network, fully deterministic, offline-testable, and self-evidencing: it runs against this repository. Cheapest real adapter available and the strongest zero-friction demo, so it lands ahead of D1 | adapter roadmap; §18.4 |
+| D19 | **2** | **SaaS-API adapter family** — Linear/Jira first, then GitHub, then Salesforce/ServiceNow. Highest semantic density of any source: these systems already carry relationships (issue→assignee→team, PR→commit→file), so edges are transcribed rather than inferred. Linear and GitHub join directly to D18's git graph on the same entities | adapter roadmap; §18.4 |
+| D20 | **3** | **CDC adapters** — Postgres logical replication first, then MySQL binlog / Debezium. Structurally different from table sources: continuous rather than batch-with-cursor, deletes arrive as first-class events (a clean match for soft-delete and `valid_until`), primary keys map onto `ExternalKey`, and source ordering must reconcile with LSN assignment. This is the category that makes integration of *operational* systems real | adapter roadmap; §18.4 |
+| D21 | **2** | **Adapter-contract PRD** (to be written) — three gaps that D1/D18-D20 all hit and none of them owns: (a) **projection discipline** — a table can hold a billion rows against a 100k benchmark, so an adapter ingests a bounded projection, never a table, and the contract must say so; (b) **local validation vs R-I1/R-I4** — the SDK links wire only and never the kernel, so rejections are discovered at the server, which is fine for 70 docs pages and untenable at table volume; needs either a server-side dry-run generalizing `preflight_wrapup` or the rulebook shipped to adapters as data; (c) **source-schema evolution policy** — `schema_hash` and `mapping_version` model it, nothing defines behaviour when a column is added or retyped. Blocks D1, D19, D20 | adapter roadmap |
+| D22 | **3** | **Training-corpus export** — materialize the graph as JSONL for training and evaluation. Two properties fall out of the existing design rather than needing to be built: bi-temporal validity yields **temporally-clean splits** (everything the graph believed as of time T, with no future leakage), and provenance plus `ExternalKey` plus the audit ledger yield a **per-record lineage manifest** answering where each row came from. Dreams' MCR² and `SimilarTo` machinery already covers corpus dedup. Adjacent to the shipped `--export` work | training direction (below) |
+| D23 | **3** | **LLM boundary decision** — the `no LLM inside` invariant (R-D6/CR-19, `cargo xtask no-llm`, AGENTS.md rule 1) is enforced by CI and cited as a differentiator throughout the PRDs. Two very different things are called "LLM integration" and this row exists to force the choice explicitly rather than let a gate get quietly disabled: **(a) LLM as an external producer** — extraction runs out-of-process in an adapter, emits typed drafts through the same signed ingest path, is stamped `Provenance::Extracted` with a distinguishing `ProducerKind`, and is filterable and revocable at query time. Costs nothing architecturally; the gate greps this workspace, not adapter repos; the store stays deterministic. **(b) LLM inside the node** — semantic search, natural-language query, generative reads. Breaks R-D6/CR-19, deletes the differentiator, and changes what the product is. Option (a) is available today; option (b) requires an explicit invariant reversal recorded here and in `docs/MILESTONE_REPORT.md` | direction decision |
+| D24 | **3** | **Rights and consent provenance** — if corpora leave the system for training, "may this be trained on" becomes a first-class field: licence, consent basis, retention limit, redaction state, per source and per record. Not modelled today. Gates D22 for any corpus that leaves the org | training direction (below) |
