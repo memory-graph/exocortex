@@ -68,9 +68,13 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                 m.project_id        = $project_id,
                 m.team_id           = $team_id,
                 m.lsn               = $lsn
-            CREATE (h:_MemoryAssertion {id: $id, visibility: $visibility,
+            CREATE (h:_MemoryAssertion {id: $id, memory_type_label: $memory_type_label,
+                memory_type_id: $memory_type_id, visibility: $visibility,
                 valid_from: $valid_from, valid_until: $valid_until,
-                recorded_at: $recorded_at, props_json: $props_json, lsn: $lsn})
+                recorded_at: $recorded_at, invalidated_by: $invalidated_by,
+                props_json: $props_json, tags: $tags, entity_ids: $entity_ids,
+                tenant_id: $tenant_id, user_id: $user_id, project_id: $project_id,
+                team_id: $team_id, lsn: $lsn})
             RETURN id(m) AS node_id, m.lsn AS lsn
         "#,
     });
@@ -116,9 +120,13 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                 m.project_id        = $project_id,
                 m.team_id           = $team_id,
                 m.lsn               = $lsn
-            CREATE (h:_MemoryAssertion {id: $id, visibility: $visibility,
+            CREATE (h:_MemoryAssertion {id: $id, memory_type_label: $memory_type_label,
+                memory_type_id: $memory_type_id, visibility: $visibility,
                 valid_from: $valid_from, valid_until: $valid_until,
-                recorded_at: $recorded_at, props_json: $props_json, lsn: $lsn})
+                recorded_at: $recorded_at, invalidated_by: $invalidated_by,
+                props_json: $props_json, tags: $tags, entity_ids: $entity_ids,
+                tenant_id: $tenant_id, user_id: $user_id, project_id: $project_id,
+                team_id: $team_id, lsn: $lsn})
         "#,
     });
 
@@ -173,6 +181,150 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "batch_purge_memory_if_current",
+        read_only: false,
+        required_params: &["id", "owned_lsns"],
+        cypher: r#"
+            OPTIONAL MATCH (m:Memory {id: $id})
+            OPTIONAL MATCH (h:_MemoryAssertion {id: $id})
+            WITH m, h ORDER BY h.lsn DESC
+            WITH m, m.lsn IN $owned_lsns AS current_owned, collect(h) AS history
+            WITH m, current_owned,
+                head([row IN history WHERE NOT row.lsn IN $owned_lsns]) AS survivor,
+                [row IN history WHERE row.lsn IN $owned_lsns] AS doomed
+            FOREACH (row IN doomed | DELETE row)
+            FOREACH (_ IN CASE WHEN current_owned AND survivor IS NOT NULL THEN [1] ELSE [] END |
+                SET m.memory_type_label = survivor.memory_type_label,
+                    m.memory_type_id = survivor.memory_type_id,
+                    m.visibility = survivor.visibility, m.valid_from = survivor.valid_from,
+                    m.valid_until = survivor.valid_until, m.recorded_at = survivor.recorded_at,
+                    m.invalidated_by = survivor.invalidated_by, m.props_json = survivor.props_json,
+                    m.tags = survivor.tags, m.entity_ids = survivor.entity_ids,
+                    m.tenant_id = survivor.tenant_id, m.user_id = survivor.user_id,
+                    m.project_id = survivor.project_id, m.team_id = survivor.team_id,
+                    m.lsn = survivor.lsn)
+            FOREACH (_ IN CASE WHEN current_owned AND survivor IS NULL THEN [1] ELSE [] END | DELETE m)
+        "#,
+    });
+
+    reg!(Template {
+        id: "batch_purge_relationship_if_current",
+        read_only: false,
+        required_params: &["rel_id", "kind_label", "owned_lsns"],
+        cypher: r#"
+            OPTIONAL MATCH ()-[r]->() WHERE r.id = $rel_id
+            OPTIONAL MATCH (h:_RelationshipAssertion {id: $rel_id})
+            WITH r, h ORDER BY h.lsn DESC
+            WITH r, startNode(r) AS a, endNode(r) AS b,
+                r.lsn IN $owned_lsns AS current_owned, collect(h) AS history
+            WITH r, a, b, current_owned,
+                head([row IN history WHERE NOT row.lsn IN $owned_lsns]) AS survivor,
+                [row IN history WHERE row.lsn IN $owned_lsns] AS doomed
+            FOREACH (row IN doomed | DELETE row)
+            FOREACH (_ IN CASE WHEN current_owned THEN [1] ELSE [] END | DELETE r)
+            FOREACH (_ IN CASE WHEN current_owned AND survivor IS NOT NULL THEN [1] ELSE [] END |
+                CREATE (a)-[:__KIND_TYPE__ {id: $rel_id, kind_label: survivor.kind_label,
+                    visibility: survivor.visibility, valid_from: survivor.valid_from,
+                    valid_until: survivor.valid_until, recorded_at: survivor.recorded_at,
+                    invalidated_by: survivor.invalidated_by, props_json: survivor.props_json,
+                    lsn: survivor.lsn}]->(b))
+        "#,
+    });
+
+    reg!(Template {
+        id: "batch_restore_memory_if_current",
+        read_only: false,
+        required_params: &[
+            "id",
+            "owned_lsns",
+            "preimage_lsn",
+            "memory_type_label",
+            "memory_type_id",
+            "props_json",
+            "tags",
+            "entity_ids",
+            "tenant_id",
+            "user_id",
+            "project_id",
+            "team_id",
+            "visibility",
+            "valid_from",
+            "valid_until",
+            "invalidated_by",
+            "recorded_at",
+            "lsn"
+        ],
+        cypher: r#"
+            OPTIONAL MATCH (m:Memory {id: $id})
+            OPTIONAL MATCH (h:_MemoryAssertion {id: $id})
+            WITH m, h ORDER BY h.lsn DESC
+            WITH m, m.lsn IN $owned_lsns AS current_owned, collect(h) AS history
+            WITH m, current_owned,
+                head([row IN history WHERE NOT row.lsn IN $owned_lsns]) AS survivor,
+                [row IN history WHERE row.lsn IN $owned_lsns] AS doomed
+            FOREACH (row IN doomed | DELETE row)
+            FOREACH (_ IN CASE WHEN current_owned THEN [1] ELSE [] END |
+                SET m.memory_type_label = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.memory_type_label ELSE $memory_type_label END,
+                    m.memory_type_id = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.memory_type_id ELSE $memory_type_id END,
+                    m.visibility = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.visibility ELSE $visibility END,
+                    m.valid_from = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.valid_from ELSE $valid_from END,
+                    m.valid_until = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.valid_until ELSE $valid_until END,
+                    m.recorded_at = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.recorded_at ELSE $recorded_at END,
+                    m.invalidated_by = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.invalidated_by ELSE $invalidated_by END,
+                    m.props_json = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.props_json ELSE $props_json END,
+                    m.tags = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.tags ELSE $tags END,
+                    m.entity_ids = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.entity_ids ELSE $entity_ids END,
+                    m.tenant_id = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.tenant_id ELSE $tenant_id END,
+                    m.user_id = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.user_id ELSE $user_id END,
+                    m.project_id = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.project_id ELSE $project_id END,
+                    m.team_id = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.team_id ELSE $team_id END,
+                    m.lsn = CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.lsn ELSE $preimage_lsn END)
+        "#,
+    });
+
+    reg!(Template {
+        id: "batch_restore_relationship_if_current",
+        read_only: false,
+        required_params: &[
+            "rel_id",
+            "owned_lsns",
+            "preimage_lsn",
+            "from",
+            "to",
+            "kind_label",
+            "props_json",
+            "visibility",
+            "valid_from",
+            "valid_until",
+            "invalidated_by",
+            "recorded_at",
+            "lsn"
+        ],
+        cypher: r#"
+            MATCH (a:Memory {id: $from}), (b:Memory {id: $to})
+            OPTIONAL MATCH ()-[old]->() WHERE old.id = $rel_id
+            OPTIONAL MATCH (h:_RelationshipAssertion {id: $rel_id})
+            WITH a, b, old, h ORDER BY h.lsn DESC
+            WITH a, b, old, old.lsn IN $owned_lsns AS current_owned, collect(h) AS history
+            WITH a, b, old, current_owned,
+                head([row IN history WHERE NOT row.lsn IN $owned_lsns]) AS survivor,
+                [row IN history WHERE row.lsn IN $owned_lsns] AS doomed
+            FOREACH (row IN doomed | DELETE row)
+            FOREACH (_ IN CASE WHEN current_owned THEN [1] ELSE [] END |
+                DELETE old
+                CREATE (a)-[:__KIND_TYPE__ {id: $rel_id,
+                    kind_label: CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.kind_label ELSE $kind_label END,
+                    visibility: CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.visibility ELSE $visibility END,
+                    valid_from: CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.valid_from ELSE $valid_from END,
+                    valid_until: CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.valid_until ELSE $valid_until END,
+                    recorded_at: CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.recorded_at ELSE $recorded_at END,
+                    invalidated_by: CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.invalidated_by ELSE $invalidated_by END,
+                    props_json: CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.props_json ELSE $props_json END,
+                    lsn: CASE WHEN survivor.lsn > $preimage_lsn THEN survivor.lsn ELSE $preimage_lsn END}]->(b))
+        "#,
+    });
+
+    reg!(Template {
         id: "upsert_relationship",
         read_only: false,
         // Note: no MERGE on the relationship (R-S2). We DELETE-then-CREATE so
@@ -213,7 +365,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                                    invalidated_by: $invalidated_by,
                                    props_json: $props_json,
                                    lsn: $lsn}]->(b)
-            CREATE (h:_RelationshipAssertion {id: $rel_id,
+            CREATE (h:_RelationshipAssertion {id: $rel_id, from: $from, to: $to,
+                kind_label: $kind_label,
                 visibility: $visibility, valid_from: $valid_from,
                 valid_until: $valid_until, recorded_at: $recorded_at,
                 props_json: $props_json, lsn: $lsn})
@@ -251,7 +404,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                                    invalidated_by: $invalidated_by,
                                    props_json: $props_json,
                                    lsn: $lsn}]->(b)
-            CREATE (h:_RelationshipAssertion {id: $rel_id,
+            CREATE (h:_RelationshipAssertion {id: $rel_id, from: $from, to: $to,
+                kind_label: $kind_label,
                 visibility: $visibility, valid_from: $valid_from,
                 valid_until: $valid_until, recorded_at: $recorded_at,
                 props_json: $props_json, lsn: $lsn})

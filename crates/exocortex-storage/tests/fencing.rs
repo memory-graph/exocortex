@@ -16,6 +16,145 @@ fn store() -> InMemoryStorage {
     ))
 }
 
+#[tokio::test]
+async fn fenced_restore_preserves_concurrent_non_cycle_versions() {
+    use futures::StreamExt;
+    let s = store();
+    let original = mem(30);
+    let target = mem(31);
+    let original_edge = rel(original.id, target.id);
+    s.upsert_batch(
+        &[original.clone(), target.clone()],
+        &[original_edge.clone()],
+    )
+    .await
+    .unwrap();
+    let lease = s
+        .acquire_lease(
+            &LeaseKey::Dreams {
+                org: "org".into(),
+                region: "*:*".into(),
+            },
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+    let mut cycle_memory = original.clone();
+    cycle_memory.title = "cycle".into();
+    let mut cycle_edge = original_edge.clone();
+    cycle_edge.properties.evidence_count = 2;
+    let created = mem(32);
+    let created_edge = rel(created.id, target.id);
+    let mut cycle_commit = s
+        .upsert_batch_fenced(
+            &[cycle_memory, created.clone()],
+            &[cycle_edge, created_edge.clone()],
+            &lease,
+        )
+        .await
+        .unwrap();
+    let mut concurrent_memory = original.clone();
+    concurrent_memory.title = "concurrent".into();
+    let mut concurrent_created = created.clone();
+    concurrent_created.title = "concurrent-created".into();
+    let mut concurrent_edge = original_edge.clone();
+    concurrent_edge.properties.evidence_count = 99;
+    let mut concurrent_created_edge = created_edge.clone();
+    concurrent_created_edge.properties.evidence_count = 77;
+    s.upsert_batch(
+        &[concurrent_memory, concurrent_created],
+        &[concurrent_edge, concurrent_created_edge],
+    )
+    .await
+    .unwrap();
+
+    let mut later_cycle_memory = original.clone();
+    later_cycle_memory.title = "later-cycle".into();
+    let mut later_cycle_created = created.clone();
+    later_cycle_created.title = "later-cycle-created".into();
+    let mut later_cycle_edge = original_edge.clone();
+    later_cycle_edge.properties.evidence_count = 3;
+    let mut later_cycle_created_edge = created_edge.clone();
+    later_cycle_created_edge.properties.evidence_count = 4;
+    let later_commit = s
+        .upsert_batch_fenced(
+            &[later_cycle_memory, later_cycle_created],
+            &[later_cycle_edge, later_cycle_created_edge],
+            &lease,
+        )
+        .await
+        .unwrap();
+    for (id, lsns) in later_commit.memory_lsns {
+        cycle_commit.memory_lsns.entry(id).or_default().extend(lsns);
+    }
+    for (id, lsns) in later_commit.relationship_lsns {
+        cycle_commit
+            .relationship_lsns
+            .entry(id)
+            .or_default()
+            .extend(lsns);
+    }
+    let owned_memory_lsns = cycle_commit.memory_lsns.clone();
+    let owned_relationship_lsns = cycle_commit.relationship_lsns.clone();
+
+    s.restore_fenced(
+        &FencedRestore {
+            memories: vec![original.clone()],
+            relationships: vec![original_edge.clone()],
+            created_memories: vec![created.clone()],
+            created_relationships: vec![created_edge.clone()],
+            owned_memory_lsns: cycle_commit.memory_lsns,
+            owned_relationship_lsns: cycle_commit.relationship_lsns,
+        },
+        &lease,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        s.get_memory(&original.id).await.unwrap().unwrap().title,
+        "concurrent"
+    );
+    assert_eq!(
+        s.get_memory(&created.id).await.unwrap().unwrap().title,
+        "concurrent-created"
+    );
+    let relationships: std::collections::HashMap<_, _> = s
+        .stream_all_relationships()
+        .await
+        .map(|row| {
+            let relationship = row.unwrap();
+            (relationship.id, relationship)
+        })
+        .collect()
+        .await;
+    assert_eq!(
+        relationships[&original_edge.id].properties.evidence_count,
+        99
+    );
+    assert_eq!(
+        relationships[&created_edge.id].properties.evidence_count,
+        77
+    );
+    for (id, lsns) in owned_memory_lsns {
+        assert!(
+            s.memory_history(&id)
+                .iter()
+                .all(|version| !lsns.contains(&version.lsn.value)),
+            "every Dreams-owned memory assertion must be removed"
+        );
+    }
+    for (id, lsns) in owned_relationship_lsns {
+        assert!(
+            s.relationship_history(&id)
+                .iter()
+                .all(|version| !lsns.contains(&version.lsn.value)),
+            "every Dreams-owned relationship assertion must be removed"
+        );
+    }
+}
+
 fn mem(seed: u8) -> Memory {
     Memory {
         id: MemoryId::new_v7(),
@@ -212,20 +351,23 @@ async fn fenced_restore_preserves_preimages_and_removes_only_created_rows() {
     created_edge.kind = exocortex_kernel::RelKindId(0x8000_0024);
     created_edge.id =
         RelationshipId::derive(created_edge.from, created_edge.kind, created_edge.to, None);
-    s.upsert_batch_fenced(
-        &[reopened, changed, created.clone()],
-        &[changed_edge, created_edge.clone()],
-        &lease,
-    )
-    .await
-    .unwrap();
+    let cycle_commit = s
+        .upsert_batch_fenced(
+            &[reopened, changed, created.clone()],
+            &[changed_edge, created_edge.clone()],
+            &lease,
+        )
+        .await
+        .unwrap();
 
     s.restore_fenced(
         &FencedRestore {
             memories: vec![preclosed.clone(), existing.clone()],
             relationships: vec![preclosed_edge.clone(), existing_edge.clone()],
-            created_memories: vec![created.id],
-            created_relationships: vec![created_edge.id],
+            created_memories: vec![created.clone()],
+            created_relationships: vec![created_edge.clone()],
+            owned_memory_lsns: cycle_commit.memory_lsns,
+            owned_relationship_lsns: cycle_commit.relationship_lsns,
         },
         &lease,
     )

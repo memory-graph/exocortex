@@ -1137,3 +1137,55 @@ async fn discovery_budget_selects_the_same_bounded_pairs() {
         "the capped proposal set must be reproducible"
     );
 }
+
+#[tokio::test]
+async fn rollback_preserves_a_concurrent_non_cycle_memory_version() {
+    let storage = InMemoryStorage::new(ontology());
+    let target = mem_with_embedding(95_000, None, unit(20));
+    let mut duplicate_a = mem_with_embedding(95_001, Some(1), unit(1));
+    let mut duplicate_b = mem_with_embedding(95_002, Some(1), unit(1));
+    duplicate_a.embedding.as_mut().unwrap().vector[2] = 0.01;
+    duplicate_b.embedding.as_mut().unwrap().vector[3] = 0.01;
+    storage
+        .upsert_batch(&[target, duplicate_a.clone(), duplicate_b.clone()], &[])
+        .await
+        .unwrap();
+
+    duplicate_a.title = "concurrent-a".into();
+    duplicate_b.title = "concurrent-b".into();
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        true,
+        "conditional-rollback".into(),
+    )
+    .with_cycle_fault_after(1)
+    .with_rollback_concurrent_memories(vec![duplicate_a.clone(), duplicate_b.clone()]);
+    let region = RegionKey {
+        org: "o".into(),
+        project: "p".into(),
+        memory_type: 3,
+    };
+
+    assert!(engine.try_consolidate(&region).await.is_err());
+    assert_eq!(
+        storage
+            .get_memory(&duplicate_a.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .title,
+        "concurrent-a"
+    );
+    assert_eq!(
+        storage
+            .get_memory(&duplicate_b.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .title,
+        "concurrent-b"
+    );
+}

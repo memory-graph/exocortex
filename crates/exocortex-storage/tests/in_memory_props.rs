@@ -141,7 +141,7 @@ async fn fenced_restore_preserves_precycle_history_and_removes_failed_versions()
         .unwrap();
     let mut failed_cycle = preimage.clone();
     failed_cycle.title = "failed-cycle".into();
-    storage
+    let cycle_commit = storage
         .upsert_batch_fenced(&[failed_cycle], &[], &lease)
         .await
         .unwrap();
@@ -149,6 +149,7 @@ async fn fenced_restore_preserves_precycle_history_and_removes_failed_versions()
         .restore_fenced(
             &FencedRestore {
                 memories: vec![preimage.clone()],
+                owned_memory_lsns: cycle_commit.memory_lsns,
                 ..Default::default()
             },
             &lease,
@@ -159,11 +160,10 @@ async fn fenced_restore_preserves_precycle_history_and_removes_failed_versions()
     let history = storage.memory_history(&preimage.id);
     assert_eq!(
         history.len(),
-        2,
-        "original assertion plus restore assertion"
+        1,
+        "only the exact pre-cycle assertion remains"
     );
-    assert!(history.iter().all(|row| row.title.as_str() == "original"));
-    assert!(history[0].lsn.value < history[1].lsn.value);
+    assert_eq!(history[0].title.as_str(), "original");
 }
 
 #[tokio::test]

@@ -1225,7 +1225,7 @@ impl Storage for InMemoryStorage {
         ms: &[Memory],
         rs: &[Relationship],
         lease: &OwnerLease,
-    ) -> Result<Vec<CommitRecord>, StorageError> {
+    ) -> Result<FencedBatchCommit, StorageError> {
         let (records, invalidations) = {
             let _gate = self.inner.mutation_gate.lock().unwrap();
             self.check_lease_current(lease)?;
@@ -1233,11 +1233,28 @@ impl Storage for InMemoryStorage {
             self.pause_at_fence_checkpoint();
             self.upsert_batch_locked(ms, rs)?
         };
+        let mut committed = FencedBatchCommit {
+            records,
+            ..FencedBatchCommit::default()
+        };
         for inv in invalidations {
+            match &inv {
+                Invalidation::MemoryUpserted { id, lsn } => {
+                    committed.memory_lsns.entry(*id).or_default().insert(*lsn);
+                }
+                Invalidation::RelationshipUpserted { id, lsn, .. } => {
+                    committed
+                        .relationship_lsns
+                        .entry(*id)
+                        .or_default()
+                        .insert(*lsn);
+                }
+                _ => {}
+            }
             self.index_invalidation(&inv);
             let _ = self.feed.send(inv);
         }
-        Ok(records)
+        Ok(committed)
     }
     async fn delete_memory_fenced(
         &self,
@@ -1280,39 +1297,45 @@ impl Storage for InMemoryStorage {
                 next
             };
 
-            for id in &restore.created_relationships {
-                relationships.remove(id);
+            for (id, owned_lsns) in &restore.owned_memory_lsns {
+                let Some(history) = memories.get_mut(id) else {
+                    continue;
+                };
+                let before = history.len();
+                history.retain(|version| !owned_lsns.contains(&version.lsn.value));
+                if history.len() == before {
+                    continue;
+                }
                 let lsn = record();
-                invalidations.push(Invalidation::RelationshipDeleted { id: *id, lsn });
+                if history.is_empty() {
+                    memories.remove(id);
+                    invalidations.push(Invalidation::MemoryDeleted { id: *id, lsn });
+                } else {
+                    invalidations.push(Invalidation::MemoryUpserted { id: *id, lsn });
+                }
             }
-            for id in &restore.created_memories {
-                memories.remove(id);
+            for (id, owned_lsns) in &restore.owned_relationship_lsns {
+                let Some(history) = relationships.get_mut(id) else {
+                    continue;
+                };
+                let before = history.len();
+                history.retain(|version| !owned_lsns.contains(&version.lsn.value));
+                if history.len() == before {
+                    continue;
+                }
                 let lsn = record();
-                invalidations.push(Invalidation::MemoryDeleted { id: *id, lsn });
-            }
-            for preimage in &restore.memories {
-                let lsn = record();
-                let mut memory = preimage.clone();
-                memory.lsn = exocortex_kernel::LSN::new_backend(lsn);
-                let history = memories.entry(memory.id).or_default();
-                history.retain(|version| version.lsn.value <= preimage.lsn.value);
-                history.push(memory.clone());
-                invalidations.push(Invalidation::MemoryUpserted { id: memory.id, lsn });
-            }
-            for preimage in &restore.relationships {
-                let lsn = record();
-                let mut relationship = preimage.clone();
-                relationship.lsn = exocortex_kernel::LSN::new_backend(lsn);
-                let history = relationships.entry(relationship.id).or_default();
-                history.retain(|version| version.lsn.value <= preimage.lsn.value);
-                history.push(relationship.clone());
-                invalidations.push(Invalidation::RelationshipUpserted {
-                    id: relationship.id,
-                    from: relationship.from,
-                    to: relationship.to,
-                    kind: relationship.kind,
-                    lsn,
-                });
+                if let Some(current) = history.last() {
+                    invalidations.push(Invalidation::RelationshipUpserted {
+                        id: *id,
+                        from: current.from,
+                        to: current.to,
+                        kind: current.kind,
+                        lsn,
+                    });
+                } else {
+                    relationships.remove(id);
+                    invalidations.push(Invalidation::RelationshipDeleted { id: *id, lsn });
+                }
             }
             self.lsn.store(next, Ordering::SeqCst);
             *self.inner.memories.lock().unwrap() = memories;

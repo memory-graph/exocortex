@@ -98,7 +98,7 @@ impl Storage for NoBackendStorage {
         _ms: &[Memory],
         _rs: &[Relationship],
         _lease: &OwnerLease,
-    ) -> R<Vec<CommitRecord>> {
+    ) -> R<exocortex_storage::FencedBatchCommit> {
         no_backend()
     }
     async fn delete_memory_fenced(&self, _id: &MemoryId, _lease: &OwnerLease) -> R<CommitRecord> {

@@ -334,6 +334,23 @@ fn fetch_ceiling(max: Visibility) -> u8 {
 }
 
 impl FalkorStorage {
+    fn expand_relationships(&self, rs: &[Relationship]) -> Vec<Relationship> {
+        let mut all_rels = Vec::with_capacity(rs.len() * 2);
+        let mut seen: std::collections::HashSet<RelationshipId> =
+            rs.iter().map(|relationship| relationship.id).collect();
+        for relationship in rs {
+            all_rels.push(relationship.clone());
+            if let Some(inverse) =
+                exocortex_kernel::materialize_inverse(&self.ontology, relationship)
+            {
+                if seen.insert(inverse.id) {
+                    all_rels.push(inverse);
+                }
+            }
+        }
+        all_rels
+    }
+
     /// Connect, then pin the ontology fingerprint (fail fast on mismatch,
     /// R-D5).
     pub async fn connect(cfg: FalkorConfig, ontology: Arc<Ontology>) -> Result<Self, StorageError> {
@@ -858,16 +875,7 @@ impl FalkorStorage {
         lease: Option<&OwnerLease>,
     ) -> Result<Vec<CommitRecord>, StorageError> {
         // R-T4 inverse companions join the same transaction.
-        let mut all_rels: Vec<Relationship> = Vec::with_capacity(rs.len() * 2);
-        let mut seen: std::collections::HashSet<RelationshipId> = rs.iter().map(|r| r.id).collect();
-        for r in rs {
-            all_rels.push(r.clone());
-            if let Some(inv) = exocortex_kernel::materialize_inverse(&self.ontology, r) {
-                if seen.insert(inv.id) {
-                    all_rels.push(inv);
-                }
-            }
-        }
+        let all_rels = self.expand_relationships(rs);
 
         let total = ms.len() + all_rels.len();
         let block = self.next_lsn_block(total).await?;
@@ -2219,8 +2227,28 @@ impl Storage for FalkorStorage {
         ms: &[Memory],
         rs: &[Relationship],
         lease: &OwnerLease,
-    ) -> Result<Vec<CommitRecord>, StorageError> {
-        self.upsert_batch_inner(ms, rs, Some(lease)).await
+    ) -> Result<FencedBatchCommit, StorageError> {
+        let relationships = self.expand_relationships(rs);
+        let records = self.upsert_batch_inner(ms, rs, Some(lease)).await?;
+        let mut memory_lsns = std::collections::BTreeMap::new();
+        for (memory, record) in ms.iter().zip(&records) {
+            memory_lsns
+                .entry(memory.id)
+                .or_insert_with(std::collections::BTreeSet::new)
+                .insert(record.lsn);
+        }
+        let mut relationship_lsns = std::collections::BTreeMap::new();
+        for (relationship, record) in relationships.iter().zip(records.iter().skip(ms.len())) {
+            relationship_lsns
+                .entry(relationship.id)
+                .or_insert_with(std::collections::BTreeSet::new)
+                .insert(record.lsn);
+        }
+        Ok(FencedBatchCommit {
+            records,
+            memory_lsns,
+            relationship_lsns,
+        })
     }
 
     async fn delete_memory_fenced(
@@ -2302,10 +2330,34 @@ impl Storage for FalkorStorage {
         restore: &FencedRestore,
         lease: &OwnerLease,
     ) -> Result<Vec<CommitRecord>, StorageError> {
-        let total = restore.created_relationships.len()
-            + restore.created_memories.len()
-            + restore.memories.len()
-            + restore.relationships.len();
+        let total = restore
+            .created_relationships
+            .iter()
+            .filter(|relationship| {
+                restore
+                    .owned_relationship_lsns
+                    .contains_key(&relationship.id)
+            })
+            .count()
+            + restore
+                .created_memories
+                .iter()
+                .filter(|memory| restore.owned_memory_lsns.contains_key(&memory.id))
+                .count()
+            + restore
+                .memories
+                .iter()
+                .filter(|memory| restore.owned_memory_lsns.contains_key(&memory.id))
+                .count()
+            + restore
+                .relationships
+                .iter()
+                .filter(|relationship| {
+                    restore
+                        .owned_relationship_lsns
+                        .contains_key(&relationship.id)
+                })
+                .count();
         let block = self.next_lsn_block(total).await?;
         let now = Utc::now();
         let mut next = block.start;
@@ -2330,25 +2382,44 @@ impl Storage for FalkorStorage {
             });
         };
 
-        for id in &restore.created_relationships {
+        for relationship in &restore.created_relationships {
+            let Some(owned_lsns) = restore.owned_relationship_lsns.get(&relationship.id) else {
+                continue;
+            };
             parts.push((
-                "batch_purge_relationship",
-                serde_json::json!({ "rel_id": hex(&id.0) }),
+                "batch_purge_relationship_if_current",
+                serde_json::json!({
+                    "rel_id": hex(&relationship.id.0),
+                    "kind_label": self.kind_label(relationship.kind)?,
+                    "owned_lsns": owned_lsns,
+                }),
             ));
             push_record(next);
-            invalidations.push(Invalidation::RelationshipDeleted { id: *id, lsn: next });
+            invalidations.push(Invalidation::RelationshipDeleted {
+                id: relationship.id,
+                lsn: next,
+            });
             next += 1;
         }
-        for id in &restore.created_memories {
+        for memory in &restore.created_memories {
+            let Some(owned_lsns) = restore.owned_memory_lsns.get(&memory.id) else {
+                continue;
+            };
             parts.push((
-                "batch_purge_memory",
-                serde_json::json!({ "id": hex(&id.0) }),
+                "batch_purge_memory_if_current",
+                serde_json::json!({ "id": hex(&memory.id.0), "owned_lsns": owned_lsns }),
             ));
             push_record(next);
-            invalidations.push(Invalidation::MemoryDeleted { id: *id, lsn: next });
+            invalidations.push(Invalidation::MemoryDeleted {
+                id: memory.id,
+                lsn: next,
+            });
             next += 1;
         }
         for memory in &restore.memories {
+            let Some(owned_lsns) = restore.owned_memory_lsns.get(&memory.id) else {
+                continue;
+            };
             let label = self
                 .ontology
                 .memory_type_names
@@ -2356,17 +2427,10 @@ impl Storage for FalkorStorage {
                 .ok_or_else(|| {
                     StorageError::Backend(format!("bad memory_type {}", memory.memory_type))
                 })?;
-            parts.push((
-                "batch_purge_memory_assertions_after",
-                serde_json::json!({
-                    "id": hex(&memory.id.0),
-                    "preimage_lsn": memory.lsn.value,
-                }),
-            ));
-            parts.push((
-                "batch_upsert_memory",
-                self.memory_params(memory, next, label),
-            ));
+            let mut params = self.memory_params(memory, next, label);
+            params["owned_lsns"] = serde_json::json!(owned_lsns);
+            params["preimage_lsn"] = serde_json::json!(memory.lsn.value);
+            parts.push(("batch_restore_memory_if_current", params));
             push_record(next);
             invalidations.push(Invalidation::MemoryUpserted {
                 id: memory.id,
@@ -2375,17 +2439,15 @@ impl Storage for FalkorStorage {
             next += 1;
         }
         for relationship in &restore.relationships {
+            let Some(owned_lsns) = restore.owned_relationship_lsns.get(&relationship.id) else {
+                continue;
+            };
             parts.push((
-                "batch_purge_relationship_assertions_after",
+                "batch_restore_relationship_if_current",
                 serde_json::json!({
                     "rel_id": hex(&relationship.id.0),
+                    "owned_lsns": owned_lsns,
                     "preimage_lsn": relationship.lsn.value,
-                }),
-            ));
-            parts.push((
-                "batch_upsert_relationship",
-                serde_json::json!({
-                    "rel_id": hex(&relationship.id.0),
                     "from": hex(&relationship.from.0),
                     "to": hex(&relationship.to.0),
                     "kind_label": self.kind_label(relationship.kind)?,

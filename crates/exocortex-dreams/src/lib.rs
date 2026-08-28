@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tracing::{info, instrument, warn};
 
 use exocortex_kernel::{Memory, MemoryId, Provenance, Relationship, RelationshipId};
-use exocortex_storage::{FencedRestore, LeaseKey, RegionKey, Storage};
+use exocortex_storage::{FencedBatchCommit, FencedRestore, LeaseKey, RegionKey, Storage};
 
 use mcr2::{
     compute_sparsity, effective_strength, GraphSparsity, MCR2Engine, MCR2Value, MemoryWithEmbedding,
@@ -99,13 +99,16 @@ pub enum PruneReason {
 struct CycleJournal {
     memories: std::collections::BTreeMap<MemoryId, Memory>,
     relationships: std::collections::BTreeMap<RelationshipId, Relationship>,
-    created_memories: std::collections::BTreeSet<MemoryId>,
-    created_relationships: std::collections::BTreeSet<RelationshipId>,
+    created_memories: std::collections::BTreeMap<MemoryId, Memory>,
+    created_relationships: std::collections::BTreeMap<RelationshipId, Relationship>,
+    owned_memory_lsns: std::collections::BTreeMap<MemoryId, std::collections::BTreeSet<u64>>,
+    owned_relationship_lsns:
+        std::collections::BTreeMap<RelationshipId, std::collections::BTreeSet<u64>>,
 }
 
 impl CycleJournal {
     fn record_memory(&mut self, memory: &Memory) {
-        if !self.created_memories.contains(&memory.id) {
+        if !self.created_memories.contains_key(&memory.id) {
             self.memories
                 .entry(memory.id)
                 .or_insert_with(|| memory.clone());
@@ -113,16 +116,59 @@ impl CycleJournal {
     }
 
     fn record_relationship(&mut self, relationship: &Relationship) {
-        if !self.created_relationships.contains(&relationship.id) {
+        if !self.created_relationships.contains_key(&relationship.id) {
             self.relationships
                 .entry(relationship.id)
                 .or_insert_with(|| relationship.clone());
         }
     }
 
-    fn create_relationship(&mut self, id: RelationshipId) {
-        if !self.relationships.contains_key(&id) {
-            self.created_relationships.insert(id);
+    fn create_relationship(&mut self, relationship: &Relationship) {
+        if !self.relationships.contains_key(&relationship.id) {
+            self.created_relationships
+                .entry(relationship.id)
+                .or_insert_with(|| relationship.clone());
+        }
+    }
+
+    fn prepare_relationship_writes(
+        &mut self,
+        writes: &[Relationship],
+        current: &std::collections::HashMap<RelationshipId, Relationship>,
+    ) {
+        let ontology = dreams_ontology();
+        let mut seen: std::collections::HashSet<RelationshipId> =
+            writes.iter().map(|relationship| relationship.id).collect();
+        for relationship in writes {
+            self.prepare_relationship(relationship, current);
+            if let Some(inverse) = exocortex_kernel::materialize_inverse(ontology, relationship) {
+                if seen.insert(inverse.id) {
+                    self.prepare_relationship(&inverse, current);
+                }
+            }
+        }
+    }
+
+    fn prepare_relationship(
+        &mut self,
+        relationship: &Relationship,
+        current: &std::collections::HashMap<RelationshipId, Relationship>,
+    ) {
+        match current.get(&relationship.id) {
+            Some(preimage) => self.record_relationship(preimage),
+            None => self.create_relationship(relationship),
+        }
+    }
+
+    fn record_commit(&mut self, commit: &FencedBatchCommit) {
+        for (id, lsns) in &commit.memory_lsns {
+            self.owned_memory_lsns.entry(*id).or_default().extend(lsns);
+        }
+        for (id, lsns) in &commit.relationship_lsns {
+            self.owned_relationship_lsns
+                .entry(*id)
+                .or_default()
+                .extend(lsns);
         }
     }
 
@@ -130,17 +176,24 @@ impl CycleJournal {
         FencedRestore {
             memories: self.memories.values().cloned().collect(),
             relationships: self.relationships.values().cloned().collect(),
-            created_memories: self.created_memories.iter().copied().collect(),
-            created_relationships: self.created_relationships.iter().copied().collect(),
+            created_memories: self.created_memories.values().cloned().collect(),
+            created_relationships: self.created_relationships.values().cloned().collect(),
+            owned_memory_lsns: self.owned_memory_lsns.clone(),
+            owned_relationship_lsns: self.owned_relationship_lsns.clone(),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.memories.is_empty()
-            && self.relationships.is_empty()
-            && self.created_memories.is_empty()
-            && self.created_relationships.is_empty()
+        self.owned_memory_lsns.is_empty() && self.owned_relationship_lsns.is_empty()
     }
+}
+
+fn dreams_ontology() -> &'static exocortex_kernel::Ontology {
+    static ONTOLOGY: std::sync::OnceLock<exocortex_kernel::Ontology> = std::sync::OnceLock::new();
+    ONTOLOGY.get_or_init(|| {
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+            .expect("the compiled development ontology must be valid")
+    })
 }
 
 /// The Dreams engine: queue-fed, lease-gated, per-region.
@@ -189,6 +242,8 @@ pub struct DreamsEngine<S: Storage> {
     #[cfg(feature = "testing")]
     rollback_pause: Option<Duration>,
     #[cfg(feature = "testing")]
+    rollback_concurrent_memories: Vec<Memory>,
+    #[cfg(feature = "testing")]
     renewal_failure_after: Option<usize>,
 }
 
@@ -232,6 +287,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             #[cfg(feature = "testing")]
             rollback_pause: None,
             #[cfg(feature = "testing")]
+            rollback_concurrent_memories: Vec::new(),
+            #[cfg(feature = "testing")]
             renewal_failure_after: None,
         }
     }
@@ -268,6 +325,14 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     #[cfg(feature = "testing")]
     pub fn with_rollback_pause(mut self, pause: Duration) -> Self {
         self.rollback_pause = Some(pause);
+        self
+    }
+
+    /// Commit deterministic non-cycle writes immediately before compensation.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn with_rollback_concurrent_memories(mut self, memories: Vec<Memory>) -> Self {
+        self.rollback_concurrent_memories = memories;
         self
     }
 
@@ -816,7 +881,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                         }
                         journal.record_relationship(existing);
                     } else {
-                        journal.create_relationship(rewired.id);
+                        journal.create_relationship(&rewired);
                     }
                     res.rewired.push(rewired.id);
                     relationship_updates.insert(rewired.id, rewired);
@@ -825,10 +890,13 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 m.valid_until = Some(now);
                 m.invalidated_by = Some(c.a);
                 let relationship_updates: Vec<_> = relationship_updates.into_values().collect();
-                self.storage
+                journal.prepare_relationship_writes(&relationship_updates, &current_relationships);
+                let commit = self
+                    .storage
                     .upsert_batch_fenced(&[m], &relationship_updates, lease)
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
+                journal.record_commit(&commit);
                 res.merged.push(c.b);
             }
         }
@@ -849,6 +917,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         use futures::StreamExt;
         let now = chrono::Utc::now();
         let mut updates = Vec::new();
+        let mut current_relationships = std::collections::HashMap::new();
         // IN1: only edges with BOTH endpoints inside the leased region.
         let mut member_ids: std::collections::HashSet<exocortex_kernel::MemoryId> =
             std::collections::HashSet::new();
@@ -864,6 +933,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let mut rs = self.storage.stream_all_relationships().await;
         while let Some(row) = rs.next().await {
             let mut r = row?;
+            current_relationships.insert(r.id, r.clone());
             if !member_ids.contains(&r.from) || !member_ids.contains(&r.to) {
                 continue;
             }
@@ -892,14 +962,17 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             updates.push(r);
         }
         drop(rs);
+        journal.prepare_relationship_writes(&updates, &current_relationships);
         for r in &updates {
             res.strengthened.push(r.id);
         }
         if !updates.is_empty() {
-            self.storage
+            let commit = self
+                .storage
                 .upsert_batch_fenced(&[], &updates, lease)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            journal.record_commit(&commit);
         }
         Ok(())
     }
@@ -978,15 +1051,18 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             match existing.get(&edge.id) {
                 Some(row) if row.valid_until.is_none() => continue,
                 Some(row) => journal.record_relationship(row),
-                None => journal.create_relationship(edge.id),
+                None => journal.create_relationship(&edge),
             }
             fresh.push(edge);
         }
         if !fresh.is_empty() {
-            self.storage
+            journal.prepare_relationship_writes(&fresh, &existing);
+            let commit = self
+                .storage
                 .upsert_batch_fenced(&[], &fresh, lease)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            journal.record_commit(&commit);
             res.similar_edges.extend(fresh.iter().map(|e| e.id));
             metrics::counter!("exocortex_dreams_similar_edges_total").increment(fresh.len() as u64);
         }
@@ -1022,6 +1098,13 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         #[cfg(feature = "testing")]
         if let Some(pause) = self.rollback_pause {
             tokio::time::sleep(pause).await;
+        }
+        #[cfg(feature = "testing")]
+        if !self.rollback_concurrent_memories.is_empty() {
+            self.storage
+                .upsert_batch(&self.rollback_concurrent_memories, &[])
+                .await
+                .map_err(|error| anyhow::anyhow!("inject concurrent rollback write: {error}"))?;
         }
         self.storage
             .restore_fenced(&journal.restore(), lease)

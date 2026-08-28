@@ -57,6 +57,21 @@ pub enum IngestCommitOutcome {
     Duplicate(SettledIngestBatch),
 }
 
+/// Exact semantic identities committed by one fenced owner batch.
+///
+/// The identity maps let an owner journal the backend LSN of every row it
+/// actually wrote, including storage-materialized inverse relationships.
+#[derive(Clone, Debug, Default)]
+pub struct FencedBatchCommit {
+    /// Ordinary per-row commit metadata.
+    pub records: Vec<CommitRecord>,
+    /// Backend LSN assigned to each memory written by the batch.
+    pub memory_lsns: std::collections::BTreeMap<MemoryId, std::collections::BTreeSet<u64>>,
+    /// Backend LSN assigned to each relationship written by the batch.
+    pub relationship_lsns:
+        std::collections::BTreeMap<RelationshipId, std::collections::BTreeSet<u64>>,
+}
+
 /// Exact semantic preimage and cycle-created rows for one fenced rollback.
 /// Restored rows receive fresh backend LSNs; every other field is restored
 /// verbatim. Created ids are physically removed rather than soft-closed.
@@ -67,9 +82,14 @@ pub struct FencedRestore {
     /// Pre-existing relationships changed by the failed owner cycle.
     pub relationships: Vec<Relationship>,
     /// Memory rows absent before, but created by, this cycle.
-    pub created_memories: Vec<MemoryId>,
+    pub created_memories: Vec<Memory>,
     /// Relationship rows absent before, but created by, this cycle.
-    pub created_relationships: Vec<RelationshipId>,
+    pub created_relationships: Vec<Relationship>,
+    /// Exact cycle-written memory version that may be compensated.
+    pub owned_memory_lsns: std::collections::BTreeMap<MemoryId, std::collections::BTreeSet<u64>>,
+    /// Exact cycle-written relationship version that may be compensated.
+    pub owned_relationship_lsns:
+        std::collections::BTreeMap<RelationshipId, std::collections::BTreeSet<u64>>,
 }
 
 /// Bounded traversal descriptor. Every field carries a hard cap enforced

@@ -259,23 +259,26 @@ async fn fenced_restore_is_one_live_atomic_preimage_swap() {
     created_edge.id =
         RelationshipId::derive(created_edge.from, created_edge.kind, created_edge.to, None);
     let ontology = exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap();
-    let mut created_relationships = vec![created_edge.id];
+    let mut created_relationships = vec![created_edge.clone()];
     if let Some(inverse) = exocortex_kernel::materialize_inverse(&ontology, &created_edge) {
-        created_relationships.push(inverse.id);
+        created_relationships.push(inverse);
     }
-    s.upsert_batch_fenced(
-        &[reopened, changed, created.clone()],
-        &[changed_edge, created_edge.clone()],
-        &lease,
-    )
-    .await
-    .unwrap();
+    let cycle_commit = s
+        .upsert_batch_fenced(
+            &[reopened, changed, created.clone()],
+            &[changed_edge, created_edge.clone()],
+            &lease,
+        )
+        .await
+        .unwrap();
     s.restore_fenced(
         &FencedRestore {
             memories: vec![preclosed.clone(), existing.clone()],
             relationships: vec![preclosed_edge.clone(), existing_edge.clone()],
-            created_memories: vec![created.id],
+            created_memories: vec![created.clone()],
             created_relationships,
+            owned_memory_lsns: cycle_commit.memory_lsns,
+            owned_relationship_lsns: cycle_commit.relationship_lsns,
         },
         &lease,
     )
@@ -318,4 +321,93 @@ async fn fenced_restore_is_one_live_atomic_preimage_swap() {
         state.relationship_count, 2,
         "only existing edge and its required inverse are live"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fenced_restore_preserves_live_concurrent_versions() {
+    if falkor_url().is_none() {
+        eprintln!("skipping fenced_restore_preserves_live_concurrent_versions: FALKOR_URL not set");
+        return;
+    }
+    use futures::StreamExt;
+    let s = falkor("conditional_restore").await;
+    let original = mem(30);
+    let target = mem(31);
+    let original_edge = rel(original.id, target.id);
+    s.upsert_batch(
+        &[original.clone(), target.clone()],
+        &[original_edge.clone()],
+    )
+    .await
+    .unwrap();
+    let lease = s
+        .acquire_lease(
+            &LeaseKey::Dreams {
+                org: "org".into(),
+                region: "*:*".into(),
+            },
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let mut cycle_memory = original.clone();
+    cycle_memory.title = "cycle".into();
+    let mut cycle_edge = original_edge.clone();
+    cycle_edge.properties.evidence_count = 2;
+    let mut cycle_commit = s
+        .upsert_batch_fenced(&[cycle_memory], &[cycle_edge], &lease)
+        .await
+        .unwrap();
+
+    let mut concurrent_memory = original.clone();
+    concurrent_memory.title = "concurrent".into();
+    let mut concurrent_edge = original_edge.clone();
+    concurrent_edge.properties.evidence_count = 99;
+    s.upsert_batch(&[concurrent_memory], &[concurrent_edge])
+        .await
+        .unwrap();
+    let mut later_cycle_memory = original.clone();
+    later_cycle_memory.title = "later-cycle".into();
+    let mut later_cycle_edge = original_edge.clone();
+    later_cycle_edge.properties.evidence_count = 3;
+    let later_commit = s
+        .upsert_batch_fenced(&[later_cycle_memory], &[later_cycle_edge], &lease)
+        .await
+        .unwrap();
+    for (id, lsns) in later_commit.memory_lsns {
+        cycle_commit.memory_lsns.entry(id).or_default().extend(lsns);
+    }
+    for (id, lsns) in later_commit.relationship_lsns {
+        cycle_commit
+            .relationship_lsns
+            .entry(id)
+            .or_default()
+            .extend(lsns);
+    }
+    s.restore_fenced(
+        &FencedRestore {
+            memories: vec![original.clone()],
+            relationships: vec![original_edge.clone()],
+            owned_memory_lsns: cycle_commit.memory_lsns,
+            owned_relationship_lsns: cycle_commit.relationship_lsns,
+            ..Default::default()
+        },
+        &lease,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        s.get_memory(&original.id).await.unwrap().unwrap().title,
+        "concurrent"
+    );
+    let mut relationships = s.stream_all_relationships().await;
+    let mut found = None;
+    while let Some(row) = relationships.next().await {
+        let relationship = row.unwrap();
+        if relationship.id == original_edge.id {
+            found = Some(relationship);
+        }
+    }
+    assert_eq!(found.unwrap().properties.evidence_count, 99);
 }

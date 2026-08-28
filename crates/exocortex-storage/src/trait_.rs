@@ -7,9 +7,9 @@ use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId}
 
 use crate::types::{
     AuditEvent, CommitRecord, CypherQuery, DiscoveryAcceptance, DiscoveryProposal, DiscoveryRecord,
-    Embedding, FencedRestore, GraphSnapshot, IngestBatchKey, IngestCommitOutcome, Invalidation,
-    LeaseKey, MemoryFilter, OwnerLease, RegionKey, ResultSet, StorageBackendId,
-    StorageCapabilities, TraversalSpec,
+    Embedding, FencedBatchCommit, FencedRestore, GraphSnapshot, IngestBatchKey,
+    IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter, OwnerLease, RegionKey, ResultSet,
+    StorageBackendId, StorageCapabilities, TraversalSpec,
 };
 
 /// Errors surfaced by every `Storage` implementation.
@@ -380,7 +380,7 @@ pub trait Storage: Send + Sync + 'static {
         ms: &[Memory],
         rs: &[Relationship],
         lease: &OwnerLease,
-    ) -> crate::Result<Vec<CommitRecord>>;
+    ) -> crate::Result<FencedBatchCommit>;
     /// [`Storage::delete_memory`](Self::delete_memory) under the same
     /// fencing check (a rollback must not delete a newer owner's rows).
     async fn delete_memory_fenced(
