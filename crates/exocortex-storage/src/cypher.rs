@@ -553,6 +553,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MATCH (i:_GovernedImport {key: $operation_key})
             WHERE i.applied = true AND i.publication_claim_token = $claim_token
+              AND i.publication_claim_until_ms > timestamp()
             SET i.publication_pending = false
             REMOVE i.publication_claim_token, i.publication_claim_until_ms,
                    i.publication_json

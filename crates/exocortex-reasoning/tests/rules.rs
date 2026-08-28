@@ -41,6 +41,54 @@ async fn durable_submission_survives_worker_restart() {
     replacement.abort();
 }
 
+#[tokio::test]
+async fn durable_zero_output_settlement_blocks_later_state_from_changing_replay() {
+    use futures::StreamExt as _;
+
+    let storage = Arc::new(InMemoryStorage::new(ontology()));
+    let engine = Arc::new(ReasoningEngine::new(storage.clone(), 8, 3));
+    let first = mem(3, &["stable-zero"], &[]);
+    storage.upsert_memory(&first).await.unwrap();
+    let worker = tokio::spawn(engine.clone().run());
+    engine
+        .process_durable_session_wrapup("zero-output-effect".into(), vec![first.id])
+        .await
+        .unwrap();
+
+    let later = mem(3, &["stable-zero"], &[]);
+    storage.upsert_memory(&later).await.unwrap();
+    engine
+        .process_durable_session_wrapup("zero-output-effect".into(), vec![first.id])
+        .await
+        .unwrap();
+    assert_eq!(
+        storage
+            .stream_all_relationships()
+            .await
+            .filter_map(|row| async move { row.ok() })
+            .count()
+            .await,
+        0,
+        "a settled no-output effect cannot derive from later graph state"
+    );
+
+    engine
+        .process_durable_session_wrapup("different-effect".into(), vec![first.id])
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .stream_all_relationships()
+            .await
+            .filter_map(|row| async move { row.ok() })
+            .count()
+            .await
+            > 0,
+        "the later state is derivable under a distinct operation identity"
+    );
+    worker.abort();
+}
+
 fn kind(name: &str) -> u32 {
     ontology().kind_id(name).unwrap().0
 }

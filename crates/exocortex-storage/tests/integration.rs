@@ -723,15 +723,15 @@ itest!(
             })
             .await
             .unwrap();
+        restarted.release_paused_publish_for_testing();
+        assert!(
+            owner.await.unwrap().is_err(),
+            "expired owner cannot report publication success before takeover"
+        );
         assert!(!contender
             .upsert_batch_once("reasoning:lease-loss", &[], &[])
             .await
             .unwrap());
-        restarted.release_paused_publish_for_testing();
-        assert!(
-            owner.await.unwrap().is_err(),
-            "expired owner cannot report publication success"
-        );
         let (claim_a, claim_b) = tokio::join!(
             restarted.claim_ingest_effect("worker-a", 2_000),
             contender.claim_ingest_effect("worker-b", 2_000),
