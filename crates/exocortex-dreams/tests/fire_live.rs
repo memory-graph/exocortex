@@ -432,3 +432,106 @@ async fn stable_write_event_is_counted_once_after_an_ambiguous_retry() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn counters_and_failed_cycle_survive_standalone_queue_restarts() {
+    let Some((client, mut first_process, key)) = isolated_queue("restart-org").await else {
+        return;
+    };
+    let region = RegionKey {
+        org: "restart-org".into(),
+        project: "standalone".into(),
+        memory_type: 3,
+    };
+    let trigger = DreamsTrigger {
+        memory_threshold: 2,
+        edge_threshold: u32::MAX,
+        age_floor_days: u32::MAX,
+        min_interval_hours: 0,
+    };
+    assert!(matches!(
+        first_process
+            .record_write_once(&region, 1, 0, trigger, "standalone", "effect:one")
+            .await
+            .unwrap(),
+        RecordWriteOutcome::Accumulated(c) if c.memories_since_last_cycle == 1
+    ));
+    drop(first_process);
+
+    let second_connection = client.get_multiplexed_async_connection().await.unwrap();
+    let mut second_process = RedisFireQueue::new_with_queue_key(
+        second_connection,
+        QuietHours::none(),
+        "restart-org",
+        key.clone(),
+    );
+    assert!(matches!(
+        second_process
+            .record_write_once(&region, 1, 0, trigger, "standalone", "effect:two")
+            .await
+            .unwrap(),
+        RecordWriteOutcome::Queued(c) if c.memories_since_last_cycle == 2
+    ));
+    let in_flight = match second_process.drain(Duration::from_secs(1)).await.unwrap() {
+        DrainResult::Ready(notification) => notification,
+        other => panic!("expected durable fire after restart, got {other:?}"),
+    };
+    let fire_id = in_flight.fire_id.clone();
+    drop(second_process);
+
+    let third_connection = client.get_multiplexed_async_connection().await.unwrap();
+    let mut third_process = RedisFireQueue::new_with_queue_key(
+        third_connection,
+        QuietHours::none(),
+        "restart-org",
+        key.clone(),
+    );
+    assert_eq!(third_process.recover_inflight().await.unwrap(), 1);
+    let recovered = match third_process.drain(Duration::from_secs(1)).await.unwrap() {
+        DrainResult::Ready(notification) => notification,
+        other => panic!("expected recovered in-flight fire, got {other:?}"),
+    };
+    assert_eq!(recovered.fire_id, fire_id);
+    assert!(matches!(
+        third_process
+            .acknowledge(&recovered, false, trigger, "standalone")
+            .await
+            .unwrap(),
+        AcknowledgeOutcome::Requeued(c) if c.memories_since_last_cycle == 2
+    ));
+    drop(third_process);
+
+    let fourth_connection = client.get_multiplexed_async_connection().await.unwrap();
+    let mut fourth_process = RedisFireQueue::new_with_queue_key(
+        fourth_connection,
+        QuietHours::none(),
+        "restart-org",
+        key.clone(),
+    );
+    let retry = match fourth_process.drain(Duration::from_secs(1)).await.unwrap() {
+        DrainResult::Ready(notification) => notification,
+        other => panic!("expected failed cycle retry after restart, got {other:?}"),
+    };
+    assert_eq!(retry.fired_at.unwrap().memories_since_last_cycle, 2);
+    assert!(matches!(
+        fourth_process
+            .acknowledge(&retry, true, trigger, "standalone")
+            .await
+            .unwrap(),
+        AcknowledgeOutcome::Acknowledged(c) if c.memories_since_last_cycle == 0
+    ));
+
+    let mut inspect = client.get_multiplexed_async_connection().await.unwrap();
+    let counter_key = format!(
+        "exocortex:dreams:counters:{}",
+        serde_json::to_string(&region).unwrap()
+    );
+    let _: u64 = redis::cmd("DEL")
+        .arg(&key)
+        .arg(format!("{key}:deferred"))
+        .arg(format!("{key}:processing"))
+        .arg(counter_key)
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+}

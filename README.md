@@ -270,7 +270,9 @@ authenticated HTTP.
 `exocortex --mode mcp-standalone` is the personal persistent topology: the
 wrapper supervises one loopback FalkorDB process and one node, then connects
 the foreground MCP client to that node for both writes and reads. It uses an
-in-process coordinator—no gossip, distributed fire queue, or cluster election.
+in-process coordinator—no gossip or cluster election. Dreams counters and fire
+retries use the same supervised local Redis so acknowledged writes survive a
+process restart; this is durable local transport, not an inter-node service.
 The client WAL is a bounded offline buffer, not the standalone database.
 
 ## The ontology

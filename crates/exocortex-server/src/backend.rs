@@ -694,34 +694,41 @@ async fn run_backend_node_inner<S: Storage + 'static>(
         }));
     }
 
-    // Shared Dreams transport uses separate Redis connections for blocking
-    // drain and producer/ack traffic. A configured transport is mandatory:
-    // startup fails rather than silently falling back to node-local fires.
-    let (distributed_fire, fire_drainer) = if !standalone {
-        if let Some(redis_url) = &args.redis_url {
-            let client = redis::Client::open(redis_url.as_str())?;
-            let producer = client.get_multiplexed_async_connection().await?;
-            let drainer = client.get_multiplexed_async_connection().await?;
-            (
-                Some(Arc::new(tokio::sync::Mutex::new(
-                    exocortex_dreams::fire::RedisFireQueue::new(
-                        producer,
-                        args.quiet_hours,
-                        args.org.clone(),
-                    ),
-                ))),
-                Some(exocortex_dreams::fire::RedisFireQueue::new(
-                    drainer,
+    // Durable Dreams transport uses separate Redis connections for blocking
+    // drain and producer/ack traffic. Standalone's supervised Redis is local,
+    // but it still owns the counters whose ingest effects have been settled.
+    // A configured transport is mandatory: startup fails rather than silently
+    // falling back to process-local counters.
+    let (distributed_fire, mut fire_drainer) = if let Some(redis_url) = &args.redis_url {
+        let client = redis::Client::open(redis_url.as_str())?;
+        let producer = client.get_multiplexed_async_connection().await?;
+        let drainer = client.get_multiplexed_async_connection().await?;
+        (
+            Some(Arc::new(tokio::sync::Mutex::new(
+                exocortex_dreams::fire::RedisFireQueue::new(
+                    producer,
                     args.quiet_hours,
                     args.org.clone(),
-                )),
-            )
-        } else {
-            (None, None)
-        }
+                ),
+            ))),
+            Some(exocortex_dreams::fire::RedisFireQueue::new(
+                drainer,
+                args.quiet_hours,
+                args.org.clone(),
+            )),
+        )
     } else {
         (None, None)
     };
+
+    if standalone {
+        if let Some(queue) = fire_drainer.as_mut() {
+            queue
+                .recover_inflight()
+                .await
+                .map_err(|error| anyhow::anyhow!("recover standalone Dreams work: {error}"))?;
+        }
+    }
 
     // Dreams: the consolidation loop over the fire channel. CS4 (audit):
     // the elected leader gate makes the re-election lease fence something
@@ -745,9 +752,9 @@ async fn run_backend_node_inner<S: Storage + 'static>(
         background_tasks.push(tokio::spawn(async move { engine.run().await }));
     }
 
-    // Only the elected owner drains shared fires. Notifications move through
-    // a durable processing list; a successor requeues a dead owner's items
-    // before advertising leadership below.
+    // Only the active owner drains durable fires. Notifications move through
+    // a processing list; standalone recovered it above, while a clustered
+    // successor recovers it before advertising leadership below.
     if let Some(mut queue) = fire_drainer {
         let dreams = dreams.clone();
         let elected = leader_gate.clone();

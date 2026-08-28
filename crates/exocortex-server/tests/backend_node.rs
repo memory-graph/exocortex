@@ -63,11 +63,11 @@ async fn standalone_uses_only_the_in_process_coordinator() {
     );
     let storage = Arc::new(InMemoryStorage::new(onto.clone()));
     let mut config = args("127.0.0.1:0", 0, vec!["invalid-cluster-seed".into()]);
-    config.redis_url = Some("redis://standalone-must-not-connect.invalid:1".into());
+    config.redis_url = None;
 
     let node = run_standalone_backend_node(storage, onto, config, [9; 32])
         .await
-        .expect("standalone ignores distributed coordination transports");
+        .expect("standalone starts without inter-node coordination");
     assert!(!node.cluster_coordination_active());
     assert!(node.gossip.is_none(), "standalone must not spawn gossip");
     assert!(node.leader_gate.load(std::sync::atomic::Ordering::SeqCst));
@@ -76,6 +76,22 @@ async fn standalone_uses_only_the_in_process_coordinator() {
     assert_eq!(
         health.lease_epoch, 0,
         "the in-process coordinator has no cluster epoch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn standalone_requires_its_configured_durable_fire_transport() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let mut config = args("127.0.0.1:0", 0, Vec::new());
+    config.redis_url = Some("redis://127.0.0.1:1".into());
+
+    let result = run_standalone_backend_node(storage, onto, config, [9; 32]).await;
+    assert!(
+        result.is_err(),
+        "standalone must not acknowledge writes against process-local Dreams counters when its durable transport is configured"
     );
 }
 
