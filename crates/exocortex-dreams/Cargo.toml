@@ -15,11 +15,7 @@ path = "src/lib.rs"
 
 exocortex-kernel = { workspace = true }
 exocortex-storage = { workspace = true }
-exocortex-cache = { workspace = true }
-exocortex-reasoning = { workspace = true }
-exocortex-cluster = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
-once_cell = { workspace = true }
 redis = { workspace = true }
 metrics = { workspace = true }
 anyhow = { workspace = true }

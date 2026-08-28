@@ -2,6 +2,83 @@
 
 use std::net::IpAddr;
 
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Encode bytes with the RFC 4648 standard base64 alphabet and padding.
+pub fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(BASE64_ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(BASE64_ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            BASE64_ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            BASE64_ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decode RFC 4648 standard base64, rejecting invalid padding or alphabet.
+pub fn base64_decode(value: &str) -> Option<Vec<u8>> {
+    fn sextet(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes: Vec<u8> = value
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let unpadded: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != b'=')
+        .collect();
+    let padding = bytes.len().saturating_sub(unpadded.len());
+    if bytes.len() % 4 != 0
+        || padding > 2
+        || bytes[unpadded.len()..].iter().any(|byte| *byte != b'=')
+        || (padding == 1 && unpadded.len() % 4 != 3)
+        || (padding == 2 && unpadded.len() % 4 != 2)
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity(unpadded.len() * 3 / 4);
+    for chunk in unpadded.chunks(4) {
+        let mut n = 0_u32;
+        for (index, byte) in chunk.iter().enumerate() {
+            n |= u32::from(sextet(*byte)?) << (18 - 6 * index);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Admit encrypted remote backends and the explicit local-development
 /// plaintext exception. This must run before credentials are attached or
 /// connection retries begin.
@@ -50,7 +127,24 @@ pub fn validate_backend_url(url: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_backend_url;
+    use super::{base64_decode, base64_encode, validate_backend_url};
+
+    #[test]
+    fn base64_standard_vectors_and_padding_are_canonical() {
+        for (plain, encoded) in [
+            (b"".as_slice(), ""),
+            (b"f".as_slice(), "Zg=="),
+            (b"fo".as_slice(), "Zm8="),
+            (b"foo".as_slice(), "Zm9v"),
+            (b"foobar".as_slice(), "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(plain), encoded);
+            assert_eq!(base64_decode(encoded).as_deref(), Some(plain));
+        }
+        for invalid in ["!!!", "Zg=", "Z===", "Zg=a"] {
+            assert!(base64_decode(invalid).is_none(), "{invalid}");
+        }
+    }
 
     #[test]
     fn encrypted_remote_and_plaintext_loopback_are_admitted() {

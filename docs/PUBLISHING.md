@@ -122,8 +122,9 @@ network acquisition or mutable-revision fallback.
 Fastembed 3.14's hf-hub 0.3 path failed clean production startup with a
 relative redirect. Moving to 5.2 provides the maintained offline
 user-defined-model API used by the immutable sidecar; this PRD dependency
-deviation is recorded in `docs/MILESTONE_REPORT.md`. The optional feature also
-adds a direct `sha2` edge for runtime artifact verification and pins `image`
+deviation is recorded in `docs/MILESTONE_REPORT.md`. Runtime artifact
+verification uses the canonical `exocortex_wire::signing` SHA-256 helper; the
+optional feature pins `image`
 0.25.5 as a resolver constraint because fastembed 5.2 includes its image
 surface unconditionally and later 0.25 patch releases exceed the pinned Rust
 1.85 MSRV; Exocortex does not call the image API.

@@ -177,31 +177,6 @@ impl<S: Storage> Drop for BackendNode<S> {
     }
 }
 
-/// Apply one observed backend invalidation to the node-local cache. The
-/// backend frontier advances immediately, while the sync frontier advances
-/// only after the cache writer acknowledges an atomic publication. Hydration
-/// failures retry the same item, preserving feed order and making lag honest.
-#[doc(hidden)]
-pub async fn apply_cache_invalidation_with_retry<S: Storage>(
-    cache: &LocalCache,
-    storage: &S,
-    org: &str,
-    health: &arc_swap::ArcSwap<HealthSnapshot>,
-    invalidation: exocortex_storage::Invalidation,
-    retry_delay: Duration,
-) {
-    apply_cache_invalidations_with_retry(
-        cache,
-        storage,
-        org,
-        health,
-        vec![invalidation],
-        retry_delay,
-        retry_delay,
-    )
-    .await;
-}
-
 async fn retry_with_capped_backoff<F, Fut, T, E>(
     mut operation: F,
     initial_delay: Duration,

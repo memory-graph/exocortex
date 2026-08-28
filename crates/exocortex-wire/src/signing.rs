@@ -29,6 +29,17 @@ pub fn content_digest(bytes: &[u8]) -> [u8; 32] {
     sha2::Sha256::digest(bytes).into()
 }
 
+/// Lowercase hexadecimal form of [`content_digest`].
+pub fn content_digest_hex(bytes: &[u8]) -> String {
+    let digest = content_digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    use std::fmt::Write as _;
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
 /// Derive the per-subscriber SSE verification key from the cluster key and
 /// opaque client token (R-Sec5).
 pub fn derive_sse_client_key(cluster_key: &[u8; 32], token: &str) -> [u8; 32] {

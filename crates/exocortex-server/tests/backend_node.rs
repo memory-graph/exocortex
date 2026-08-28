@@ -166,27 +166,29 @@ async fn cache_bridge_reseeds_past_an_upsert_whose_row_was_already_deleted() {
     };
     tokio::time::timeout(
         Duration::from_millis(250),
-        exocortex_server::backend::apply_cache_invalidation_with_retry(
+        exocortex_server::backend::apply_cache_invalidations_with_retry(
             &cache,
             &*storage,
             "org",
             &health,
-            invalidation,
+            vec![invalidation],
+            Duration::from_millis(1),
             Duration::from_millis(1),
         ),
     )
     .await
     .expect("authoritative reseed lets the bridge pass a stale upsert");
     assert_eq!(health.load().sync_lsn, 54);
-    exocortex_server::backend::apply_cache_invalidation_with_retry(
+    exocortex_server::backend::apply_cache_invalidations_with_retry(
         &cache,
         &*storage,
         "org",
         &health,
-        Invalidation::RelationshipDeleted {
+        vec![Invalidation::RelationshipDeleted {
             id: relationship.id,
             lsn: 55,
-        },
+        }],
+        Duration::from_millis(1),
         Duration::from_millis(1),
     )
     .await;

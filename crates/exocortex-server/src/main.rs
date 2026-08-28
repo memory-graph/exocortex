@@ -514,6 +514,7 @@ fn load_source_policy(path: Option<&std::path::Path>) -> anyhow::Result<Vec<Sour
     let rows: Vec<SourcePolicyRow> = serde_json::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("parse --source-policy {}: {e}", path.display()))?;
     let mut seen = std::collections::HashSet::new();
+    let mut seen_signing_keys = std::collections::HashSet::new();
     rows.into_iter()
         .map(|row| {
             anyhow::ensure!(
@@ -535,6 +536,10 @@ fn load_source_policy(path: Option<&std::path::Path>) -> anyhow::Result<Vec<Sour
             );
             let signing_key = exocortex_wire::signing::decode_hex32(&row.hmac_key)
                 .map_err(|error| anyhow::anyhow!("source policy hmac_key: {error}"))?;
+            anyhow::ensure!(
+                seen_signing_keys.insert(signing_key),
+                "source policy signing keys must be unique across producer identities"
+            );
             let kind = match row.producer_kind {
                 1 => exocortex_kernel::ProducerKind::CodingAgent,
                 2 => exocortex_kernel::ProducerKind::ResearchAgent,
@@ -655,6 +660,16 @@ mod tests {
         )
         .unwrap();
         assert!(load_source_policy(Some(&path)).is_err());
+        std::fs::write(
+            &path,
+            r#"[
+                {"org_id":"org","source_uri":"s1","producer_id":"p1","ceiling":3,"producer_kind":4,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"},
+                {"org_id":"org","source_uri":"s2","producer_id":"p2","ceiling":3,"producer_kind":4,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}
+            ]"#,
+        )
+        .unwrap();
+        let error = load_source_policy(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("signing keys must be unique"), "{error}");
         std::fs::write(
             &path,
             r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":9,"producer_kind":4,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,

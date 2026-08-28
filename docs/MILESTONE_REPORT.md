@@ -135,9 +135,9 @@ cross-cutting gates (§3). Commits: one per milestone, `M<n>: <what and why>`.
     entirely. Exocortex now packages `Xenova/bge-small-en-v1.5` at commit
     `ea104dacec62c0de699686887e3f920caeb4f3e3`, verifies all five artifacts at
     build, release-fetch, and runtime boundaries, constructs offline, and
-    stamps the full immutable revision. The feature's direct optional `sha2`
-    dependency exists solely for runtime artifact verification; `image`
-    remains exact-pinned at the Rust 1.85-compatible 0.25.5 resolver boundary.
+    stamps the full immutable revision. Runtime verification reuses the
+    canonical `exocortex_wire::signing` SHA-256 helper; `image` remains
+    exact-pinned at the Rust 1.85-compatible 0.25.5 resolver boundary.
 
 ## Post-review round 1 (2026-08-24)
 

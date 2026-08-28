@@ -1109,31 +1109,7 @@ async fn production_backend_sync_hydrates_before_ready_and_stays_live() {
 }
 
 /// Standard-alphabet base64 encode (mirror of the server's encoder).
-fn b64_encode(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            T[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            T[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
+use exocortex_wire::transport::base64_encode as b64_encode;
 
 /// Deterministic replay probe: publish 3 envelopes first, then subscribe
 /// from LSN 1 — the client must replay-apply deltas 2 and 3.

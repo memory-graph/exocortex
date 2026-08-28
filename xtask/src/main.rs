@@ -386,6 +386,7 @@ fn validate_fastembed_release(
             && embedding_source.contains(&format!(
                 "hf:Xenova/bge-small-en-v1.5@{REVISION}"
             ))
+            && embedding_source.contains("exocortex_wire::signing::content_digest_hex")
             && embedding_source.contains("actual_sha256 != expected_sha256"),
         "production embedder must verify local bytes, construct offline, and stamp the immutable revision"
     );
@@ -409,6 +410,12 @@ fn validate_fastembed_dependency_contract(
 ) -> Result<()> {
     anyhow::ensure!(
         workspace_manifest.contains(
+            "tonic       = { version = \"0.12\", features = [\"tls\", \"tls-native-roots\", \"gzip\"] }",
+        ),
+        "remote HTTPS gRPC clients must compile with an explicit trust-root source"
+    );
+    anyhow::ensure!(
+        workspace_manifest.contains(
             "fastembed = { version = \"=5.2.0\", default-features = false, features = [\"ort-download-binaries\"] }",
         ),
         "production FastEmbed must stay exact-pinned without an online model downloader"
@@ -419,12 +426,10 @@ fn validate_fastembed_dependency_contract(
         "production embedding dependencies must preserve the Rust 1.85 image boundary without a direct ort-sys resolver pin"
     );
     anyhow::ensure!(
-        ingest_manifest.contains(
-            "fastembed = [\"dep:fastembed\", \"dep:image\", \"dep:sha2\"]",
-        )
-            && ingest_manifest.contains("sha2 = { workspace = true, optional = true }")
+        ingest_manifest.contains("fastembed = [\"dep:fastembed\", \"dep:image\"]")
+            && !ingest_manifest.contains("sha2 =")
             && !ingest_manifest.contains("ort-sys ="),
-        "ingest FastEmbed feature must verify artifacts with sha2, preserve the Rust-1.85 image boundary, and avoid a direct ort-sys dependency"
+        "ingest FastEmbed feature must use wire-owned hashing, preserve the Rust-1.85 image boundary, and avoid direct sha2/ort-sys dependencies"
     );
     Ok(())
 }
@@ -1961,10 +1966,12 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
         .is_err());
         assert!(validate_fastembed_dependency_contract(
             workspace,
-            &ingest.replace(
-                "fastembed = [\"dep:fastembed\", \"dep:image\", \"dep:sha2\"]",
-                "fastembed = [\"dep:fastembed\", \"dep:image\"]"
-            )
+            &ingest.replace("fastembed = [\"dep:fastembed\", \"dep:image\"]", "fastembed = [\"dep:fastembed\", \"dep:image\", \"dep:sha2\"]\nsha2 = { workspace = true, optional = true }")
+        )
+        .is_err());
+        assert!(validate_fastembed_dependency_contract(
+            &workspace.replace(", \"tls-native-roots\"", ""),
+            ingest
         )
         .is_err());
     }

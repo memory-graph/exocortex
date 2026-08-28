@@ -551,41 +551,7 @@ fn subscription_url(backend: &str, since: u64, seed: bool) -> String {
     url
 }
 
-/// Base64 (standard alphabet) decode; rejects padding errors.
-pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let _ = T;
-    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let unpadded: Vec<u8> = bytes.iter().copied().take_while(|b| *b != b'=').collect();
-    if bytes.len() % 4 != 0 || bytes.len() - unpadded.len() > 2 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(unpadded.len() * 3 / 4);
-    for chunk in unpadded.chunks(4) {
-        let mut n: u32 = 0;
-        for (i, c) in chunk.iter().enumerate() {
-            n |= (val(*c)? as u32) << (18 - 6 * i);
-        }
-        out.push((n >> 16) as u8);
-        if chunk.len() > 2 {
-            out.push((n >> 8) as u8);
-        }
-        if chunk.len() > 3 {
-            out.push(n as u8);
-        }
-    }
-    Some(out)
-}
+pub use exocortex_wire::transport::base64_decode as b64_decode;
 
 #[cfg(test)]
 mod tests {

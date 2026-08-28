@@ -237,8 +237,7 @@ fn read_verified_artifact(
             bytes.len()
         ));
     }
-    use sha2::Digest as _;
-    let actual_sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let actual_sha256 = exocortex_wire::signing::content_digest_hex(&bytes);
     if actual_sha256 != expected_sha256 {
         return Err(format!(
             "model artifact {} has sha256 {actual_sha256}, expected {expected_sha256}",
@@ -282,7 +281,7 @@ pub type EmbedderRef = Arc<dyn Embedder>;
 
 #[cfg(all(test, feature = "fastembed"))]
 mod fastembed_tests {
-    use super::FastEmbedder;
+    use super::{read_verified_artifact, FastEmbedder};
 
     #[test]
     fn corrupt_or_incomplete_model_sidecar_fails_closed_before_runtime_load() {
@@ -297,6 +296,28 @@ mod fastembed_tests {
             Err(error) => error,
         };
         assert!(error.contains("has length 8, expected 133093490"));
+        std::fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn same_length_corruption_reaches_the_canonical_digest_guard() {
+        let root = std::env::temp_dir().join(format!(
+            "exocortex-corrupt-model-digest-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create fixture");
+        let path = root.join("artifact");
+        std::fs::write(&path, b"tampered").expect("write fixture");
+
+        let error = read_verified_artifact(
+            &path,
+            8,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap_err();
+        assert!(error.contains("has sha256"), "{error}");
+        assert!(error.contains("expected 0000000000000000"), "{error}");
         std::fs::remove_dir_all(root).expect("remove fixture");
     }
 }
