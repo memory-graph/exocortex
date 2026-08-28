@@ -465,3 +465,7 @@ fixtures install a scoped principal extension but their raw HTTP requests
 predate the handler's required bearer presence check, so reconnect correctly
 returned 401. Both direct-router live requests must carry explicit credentials;
 production authentication remains owned by the enclosing `HttpBind` middleware.
+
+R6-R146 is closed without an authentication bypass: both direct-router
+fixtures now send an explicit bearer header, and the live cluster matrix passes
+the node-loop, cluster, cross-node reconnect, and SSE delivery targets.

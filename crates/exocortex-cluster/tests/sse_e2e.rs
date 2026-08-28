@@ -116,6 +116,7 @@ async fn sse_client_observes_upsert_within_200ms() {
         format!(
             "GET /v1/changes HTTP/1.1
 Host: {addr}
+Authorization: Bearer sse-live-test
 Accept: text/event-stream
 Connection: close
 

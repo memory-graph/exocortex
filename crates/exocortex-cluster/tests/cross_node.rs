@@ -244,7 +244,7 @@ async fn cross_node_replay_window_serves_reconnects() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     sock.write_all(
         format!(
-            "GET /v1/changes?since_lsn={} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
+            "GET /v1/changes?since_lsn={} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer cross-node-replay-test\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
             c1.lsn - 1
         )
         .as_bytes(),
