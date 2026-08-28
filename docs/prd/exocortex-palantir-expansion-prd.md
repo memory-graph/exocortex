@@ -131,6 +131,8 @@ actions! {
 
 The kernel-generated MCP tool for `AttachRuleFinding` gets a typed schema, a preflight tool, and the same rejection-code discipline as the wrapup path. Every Action produces an audit row keyed by its name.
 
+**Unvalidated assumption — resolve before starting 1a.** That sketch assumes `actions!` bodies can be written in `macro_rules!`. `crates/exocortex-kernel/src/macros.rs:93` records the opposite constraint for the section next door: *"`macro_rules!` cannot tokenize past `;` inside a body, so the whole block is captured as text"* — which is why `CREPE_RULES_SRC` is a `stringify!`. The body above is semicolon-separated statements inside a body: the same shape. `functions!` is likely safer, since `datalog!` and `scheme!` bodies are already text compiled downstream by the reasoning and Steel engines; `actions!` is the exposed one, because an Action body constructs pack-typed memories and edges and there is no crate downstream of the pack that could compile that text. If the constraint holds, this deliverable needs a proc-macro — a new crate, new dependencies, and a materially larger D2 — and, more importantly, if bodies end up untyped then P3's "typed transforms" and this section's visibility-ceiling guarantee stop being compile-time properties. Master plan **PX2-S1** is the spike; it is not blocked by Wave 0.
+
 **Functions.** A pack-registered Function is a typed read with a compiled body (Datalog fragment or Scheme program), a signature, and a latency budget in the same `P50_BUDGET_US` / `P99_BUDGET_US` shape the kernel `Function` trait already declares. The kernel dispatches it, enforces the visibility filter of the caller, and returns typed results. No LLM.
 
 ```rust
@@ -372,7 +374,7 @@ as PX1-PX6 alongside the rest of the plan.
 
 | Step | Deliverable | Owner | Depends on |
 |---|---|---|---|
-| **1a** | `actions!` / `functions!` / `guidance!` on the `pack!` macro; dispatch via macro-generated `inventory::submit!`; audit, MCP+HTTP mount, preflight, visibility-ceiling enforcement (D2 kernel side) | Platform | **Wave 0** |
+| **1a** | *(needs PX2-S1's verdict first)* `actions!` / `functions!` / `guidance!` on the `pack!` macro; dispatch via macro-generated `inventory::submit!`; audit, MCP+HTTP mount, preflight, visibility-ceiling enforcement (D2 kernel side) | Platform | **Wave 0** |
 | **1b** | D2 supporting machinery: generated Function-SLO bench harness, `--dump-tools`, `--dump-fingerprint` | Platform | 1a |
 | **1c** | D3-S6 catalogue bijection — `GetChain`, `ExplainEdge`, `RetractEdge` implemented (smallest item in the PRD; `ExplainEdge` gates the explorer's provenance view) | Platform | — |
 | **1d** | D3-S1 three-way `Storage` corpus + `xtask seam-inventory` | Platform | — |
