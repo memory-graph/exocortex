@@ -153,3 +153,47 @@ fn installed_wrapper_rule_probe_enters_standalone_topology() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+#[cfg(unix)]
+fn archive_live_harness_leaves_sibling_runtime_resolution_to_wrapper() {
+    let dir = std::env::temp_dir().join(format!(
+        "exocortex-archive-live-harness-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let runtime = dir.join("standalone-runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    for path in [
+        dir.join("exocortex-node"),
+        dir.join("exocortex-mcp-client"),
+        runtime.join("redis-server"),
+    ] {
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(runtime.join("falkordb.so"), "fixture").unwrap();
+    let wrapper = dir.join("exocortex");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\n[ -z \"${EXOCORTEX_REDIS_SERVER:-}\" ]\n[ -z \"${EXOCORTEX_FALKORDB_MODULE:-}\" ]\nprintf '%s\\n' 'standalone live durable marker'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let status = Command::new("sh")
+        .arg(root.join("scripts/test-standalone-live.sh"))
+        .env("EXOCORTEX_BIN_DIR", &dir)
+        .env("EXOCORTEX_WRAPPER", &wrapper)
+        .env_remove("EXOCORTEX_REDIS_SERVER")
+        .env_remove("EXOCORTEX_FALKORDB_MODULE")
+        .current_dir(&root)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "the release workflow environment must exercise wrapper-owned sibling runtime discovery"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

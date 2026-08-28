@@ -1,18 +1,25 @@
 #!/bin/sh
-# Live R6-R226 acceptance: installed wrapper -> supervised Falkor -> loopback
-# backend -> MCP write/read, then a full wrapper restart -> durable read.
+# Live R6-R226 acceptance: archive or installed wrapper -> supervised Falkor ->
+# loopback backend -> MCP write/read, then a full wrapper restart -> durable read.
 set -eu
 
 bin_dir=${EXOCORTEX_BIN_DIR:-"$(pwd)/target/debug"}
+archive_runtime="$bin_dir/standalone-runtime"
 installed_runtime="$bin_dir/../share/exocortex/standalone"
-: "${EXOCORTEX_REDIS_SERVER:=$installed_runtime/redis-server}"
-: "${EXOCORTEX_FALKORDB_MODULE:=$installed_runtime/falkordb.so}"
-export EXOCORTEX_REDIS_SERVER EXOCORTEX_FALKORDB_MODULE
-if [ -z "${EXOCORTEX_REDIS_SERVER:-}" ] || [ -z "${EXOCORTEX_FALKORDB_MODULE:-}" ]; then
-  echo "UNEXECUTED: set EXOCORTEX_REDIS_SERVER and EXOCORTEX_FALKORDB_MODULE for live standalone validation" >&2
-  exit 77
+if [ -n "${EXOCORTEX_REDIS_SERVER:-}" ] || [ -n "${EXOCORTEX_FALKORDB_MODULE:-}" ]; then
+  runtime_redis=${EXOCORTEX_REDIS_SERVER:-}
+  runtime_module=${EXOCORTEX_FALKORDB_MODULE:-}
+elif [ -x "$archive_runtime/redis-server" ] && [ -f "$archive_runtime/falkordb.so" ]; then
+  runtime_redis="$archive_runtime/redis-server"
+  runtime_module="$archive_runtime/falkordb.so"
+elif [ -x "$installed_runtime/redis-server" ] && [ -f "$installed_runtime/falkordb.so" ]; then
+  runtime_redis="$installed_runtime/redis-server"
+  runtime_module="$installed_runtime/falkordb.so"
+else
+  runtime_redis=""
+  runtime_module=""
 fi
-if [ ! -x "$EXOCORTEX_REDIS_SERVER" ] || [ ! -f "$EXOCORTEX_FALKORDB_MODULE" ]; then
+if [ ! -x "$runtime_redis" ] || [ ! -f "$runtime_module" ]; then
   echo "UNEXECUTED: standalone Redis binary or FalkorDB module is unavailable" >&2
   exit 77
 fi

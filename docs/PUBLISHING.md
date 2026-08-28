@@ -79,9 +79,11 @@ source/license coordinates ride the packaged `RUNTIME-MANIFEST.txt`.
   and installs into `$CARGO_HOME/bin`. Linux x64 and macOS arm64 archives also
   carry the SHA-512-pinned official `@falkordblite` Redis 8.2.3/FalkorDB
   4.16.3 runtime under `$CARGO_HOME/share/exocortex/standalone`; release CI
-  executes its installed-wrapper write/read/restart target. macOS Intel ships
-  client/backend binaries only because upstream has no self-contained x64
-  runtime (deviation 19). No Rust toolchain or protoc required.
+  first executes the extracted archive's wrapper and sibling runtime through
+  the write/read/restart target. Installer tests separately verify resolution
+  from `$CARGO_HOME/share/exocortex/standalone`. macOS Intel ships client/backend
+  binaries only because upstream has no self-contained x64 runtime (deviation
+  19). No Rust toolchain or protoc required.
   The build and release jobs cannot start until `scripts/verify-release.sh`
   and the disposable publish regression pass on the tagged commit.
   CI and release builds install protobuf 28.3 from the upstream release ZIP

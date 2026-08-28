@@ -468,8 +468,9 @@ proto-sync-guarded copy).
 
 ### Round 6 infrastructure-only validation
 
-- `scripts/test-standalone-live.sh` is the executable installed-wrapper
+- `scripts/test-standalone-live.sh` is the executable archive-native
   write/read/restart persistence target. Its prior **UNEXECUTED** host result
   is superseded: the pinned official macOS-arm64 release runtime now supplies
-  both binaries, and the packaged-wrapper target passes locally and is a
-  mandatory release-matrix step for every supported standalone artifact.
+  both binaries, the extracted wrapper resolves its sibling runtime without CI
+  overrides, and the target passes locally and is mandatory for every supported
+  standalone artifact. Installer-layout resolution has separate fixture proof.
