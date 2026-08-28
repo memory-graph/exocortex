@@ -246,6 +246,11 @@ fn probe_deployed_rules(bin_dir: &std::path::Path) -> Result<()> {
             &source_policy,
             r#"[{"org_id":"org","source_uri":"deployment://probe","producer_id":"probe","ceiling":3,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
         )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&source_policy, std::fs::Permissions::from_mode(0o600))?;
+        }
         let backend = std::process::Command::new("scripts/exocortex")
             .args([
                 "--mode",

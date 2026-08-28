@@ -433,6 +433,7 @@ idea:
 | R6-R154 | Final strict review advisory: exercise non-null invalidation assertion rollback on live Falkor | Codex | Done — the live fenced-restore regression restores non-null `invalidated_by` and asserts current decoded state plus the current assertion's raw invalidation/valid-until/recorded-at scalars (commit pending) |
 | R6-R155 | Final strict review cleanup: replace stale atomic-write test locators in plan evidence | Codex | Done — R6-B20 names the canonical `bounded_io` atomic-replace regression and its shared callers (commit pending) |
 | R6-R156 | Full-gate convergence: make out-of-process source-policy fixtures owner-only | Codex | Done — both spawned-node fixtures create source and principal policies with Unix `0600`; the adapter SDK and worker out-of-process targets pass (commit pending) |
+| R6-R157 | Deployment-gate convergence: make the deployed-rule source policy owner-only | Codex | Done — the deployed-rule probe creates both credential files with Unix `0600`; `cargo xtask deployment-acceptance` passes all topology, rule, installer, and standalone checks (commit pending) |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence
