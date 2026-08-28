@@ -89,6 +89,7 @@ struct InMemoryInner {
 struct InMemoryIngestEffect {
     effect: PostIngestEffect,
     acknowledged: bool,
+    cleanup_complete: bool,
     claim: Option<(smol_str::SmolStr, std::time::Instant)>,
 }
 
@@ -566,6 +567,7 @@ impl InMemoryStorage {
                 InMemoryIngestEffect {
                     effect: effect.clone(),
                     acknowledged: false,
+                    cleanup_complete: false,
                     claim: None,
                 },
             );
@@ -881,6 +883,35 @@ impl Storage for InMemoryStorage {
         }
         row.acknowledged = true;
         row.claim = None;
+        Ok(true)
+    }
+    async fn pending_ingest_effect_cleanups(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<PostIngestEffect>, StorageError> {
+        let mut rows = self
+            .inner
+            .ingest_effects
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|row| row.acknowledged && !row.cleanup_complete)
+            .map(|row| row.effect.clone())
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.effect_id.cmp(&right.effect_id));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+    async fn complete_ingest_effect_cleanup(&self, effect_id: &str) -> Result<bool, StorageError> {
+        let _gate = self.inner.mutation_gate.lock().unwrap();
+        let mut effects = self.inner.ingest_effects.lock().unwrap();
+        let Some(row) = effects.get_mut(effect_id) else {
+            return Ok(false);
+        };
+        if !row.acknowledged {
+            return Ok(false);
+        }
+        row.cleanup_complete = true;
         Ok(true)
     }
     async fn promote_memory_visibility_audited(
@@ -1884,6 +1915,20 @@ impl Storage for InMemoryStorage {
             .unwrap()
             .contains_key(&(key.clone(), cycle_id.into())))
     }
+    async fn cycle_succeeded_fenced(
+        &self,
+        cycle_id: &str,
+        lease: &OwnerLease,
+    ) -> Result<bool, StorageError> {
+        let _gate = self.inner.mutation_gate.lock().unwrap();
+        self.check_lease_current(lease)?;
+        Ok(self
+            .inner
+            .succeeded_cycles
+            .lock()
+            .unwrap()
+            .contains_key(&(lease.key.clone(), cycle_id.into())))
+    }
     async fn settle_dreams_cycle_fenced(
         &self,
         cycle_id: &str,
@@ -2269,6 +2314,10 @@ mod atomic_fence_tests {
             .settle_dreams_cycle_fenced("cycle-b", &[], &lease)
             .await
             .unwrap();
+        assert!(storage
+            .cycle_succeeded_fenced("cycle-a", &lease)
+            .await
+            .unwrap());
         assert!(storage.cycle_succeeded(&key, "cycle-a").await.unwrap());
         assert!(storage.cycle_succeeded(&key, "cycle-b").await.unwrap());
 
@@ -2344,6 +2393,10 @@ mod atomic_fence_tests {
             .acquire_lease(&key, std::time::Duration::from_secs(60))
             .await
             .unwrap();
+        assert!(matches!(
+            storage.cycle_succeeded_fenced("cycle-a", &lease).await,
+            Err(StorageError::FencedWriteRejected { .. })
+        ));
         assert!(matches!(
             storage
                 .settle_dreams_cycle_fenced("cycle-a", std::slice::from_ref(&record), &lease,)

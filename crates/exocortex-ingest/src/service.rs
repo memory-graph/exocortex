@@ -1587,6 +1587,35 @@ impl<S: Storage + 'static> IngestServer<S> {
         if !acknowledged {
             return Err("post-ingest outbox acknowledgement lost its pending effect".into());
         }
+        self.reclaim_ingest_effect(effect).await
+    }
+
+    async fn reclaim_ingest_effect(&self, effect: &PostIngestEffect) -> Result<(), String> {
+        if let Some(dreams) = &self.dreams {
+            dreams
+                .settle_writes_once(
+                    effect.effect_id.as_str(),
+                    effect
+                        .region_deltas
+                        .iter()
+                        .map(|delta| delta.region.clone())
+                        .collect(),
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "post-ingest effect was acknowledged but Dreams identity reclamation failed: {error}"
+                    )
+                })?;
+        }
+        let completed = self
+            .storage
+            .complete_ingest_effect_cleanup(effect.effect_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        if !completed {
+            return Err("post-ingest cleanup lost its acknowledged effect".into());
+        }
         Ok(())
     }
 
@@ -1597,6 +1626,27 @@ impl<S: Storage + 'static> IngestServer<S> {
         const CLAIM_LEASE_MS: i64 = 30_000;
         let mut delay = std::time::Duration::from_millis(25);
         loop {
+            match self.storage.pending_ingest_effect_cleanups(1).await {
+                Ok(cleanups) if !cleanups.is_empty() => {
+                    let effect = &cleanups[0];
+                    match self.reclaim_ingest_effect(effect).await {
+                        Ok(()) => delay = std::time::Duration::from_millis(25),
+                        Err(error) => {
+                            tracing::warn!(%error, effect_id = %effect.effect_id, "post-ingest cleanup retrying");
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                        }
+                    }
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "post-ingest cleanup scan retrying");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                    continue;
+                }
+            }
             let claim_token = uuid::Uuid::now_v7().to_string();
             match self
                 .storage

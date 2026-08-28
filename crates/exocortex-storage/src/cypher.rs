@@ -267,13 +267,14 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
-        id: "lease_is_current",
+        id: "cycle_journal_succeeded_fenced",
         read_only: true,
-        required_params: &["lease_key", "token", "epoch", "now_ms"],
+        required_params: &["lease_key", "success_id", "token", "epoch", "now_ms"],
         cypher: r#"
             MATCH (lease:_ExocortexLease {lease_key: $lease_key, token: $token})
             WHERE lease.epoch = $epoch AND lease.expires_at_ms > $now_ms
-            RETURN count(lease)
+            OPTIONAL MATCH (success:_DreamsCycleSuccess {success_id: $success_id})
+            RETURN success.effect_digest
         "#,
     });
 
@@ -867,7 +868,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             SET d.state = 'settled', d.accepted = $accepted,
                 d.rejected = $rejected, d.assigned_lsn = $assigned_lsn,
                 d.effect_id = $effect_id, d.effect_json = $effect_json,
-                d.effect_acknowledged = CASE WHEN $effect_json IS NULL THEN true ELSE false END
+                d.effect_acknowledged = CASE WHEN $effect_json IS NULL THEN true ELSE false END,
+                d.effect_cleanup_complete = CASE WHEN $effect_json IS NULL THEN true ELSE false END
             REMOVE d.claim_token
         "#,
     });
@@ -925,6 +927,31 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
               AND d.effect_claim_until_ms > timestamp()
             SET d.effect_acknowledged = true
             REMOVE d.effect_claim_token, d.effect_claim_until_ms
+            RETURN d.effect_id
+        "#,
+    });
+
+    reg!(Template {
+        id: "ingest_effect_cleanups_pending",
+        read_only: true,
+        required_params: &["limit"],
+        cypher: r#"
+            MATCH (d:_IngestBatch)
+            WHERE d.state = 'settled' AND d.effect_json IS NOT NULL
+              AND d.effect_acknowledged = true
+              AND coalesce(d.effect_cleanup_complete, false) = false
+            RETURN d.effect_json ORDER BY d.effect_id ASC LIMIT $limit
+        "#,
+    });
+
+    reg!(Template {
+        id: "ingest_effect_cleanup_complete",
+        read_only: false,
+        required_params: &["effect_id"],
+        cypher: r#"
+            MATCH (d:_IngestBatch {effect_id: $effect_id})
+            WHERE d.state = 'settled' AND d.effect_acknowledged = true
+            SET d.effect_cleanup_complete = true
             RETURN d.effect_id
         "#,
     });

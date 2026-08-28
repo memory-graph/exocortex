@@ -485,9 +485,9 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         Ok(())
     }
 
-    /// Deliver one stable post-ingest effect. The durable outbox drains in
-    /// order, so retaining the last event per region is sufficient to make an
-    /// ambiguous response retry idempotent without an unbounded processed set.
+    /// Deliver one stable post-ingest effect. Distributed delivery retains all
+    /// still-unacknowledged identities because claims may interleave; local
+    /// delivery is serialized and only needs its latest identity.
     pub async fn on_writes_once(
         &self,
         event_id: &str,
@@ -523,6 +523,37 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         }
         self.on_writes(region.clone(), memories, edges).await?;
         self.last_local_write_event.insert(region, event_id.into());
+        Ok(())
+    }
+
+    /// Reclaim a delivered identity after the durable outbox has authoritatively
+    /// acknowledged it. Calling this before acknowledgement would reopen an
+    /// ambiguous retry and is therefore forbidden by the caller contract.
+    pub async fn settle_writes_once(
+        &self,
+        event_id: &str,
+        regions: Vec<RegionKey>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !event_id.is_empty(),
+            "Dreams write event id must not be empty"
+        );
+        if let Some(queue) = &self.distributed_fire {
+            let mut queue = queue.lock().await;
+            for region in regions {
+                queue.forget_write_once(&region, event_id).await?;
+            }
+            return Ok(());
+        }
+        for region in regions {
+            if self
+                .last_local_write_event
+                .get(&region)
+                .is_some_and(|seen| seen.as_str() == event_id)
+            {
+                self.last_local_write_event.remove(&region);
+            }
+        }
         Ok(())
     }
 
@@ -699,7 +730,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             .unwrap_or_else(|| format!("dream:{}", uuid::Uuid::new_v4()).into());
         if self
             .storage
-            .cycle_succeeded(&lease_key, cycle_id.as_str())
+            .cycle_succeeded_fenced(cycle_id.as_str(), &lease)
             .await
             .map_err(|error| anyhow::anyhow!("load Dreams cycle settlement: {error}"))?
         {

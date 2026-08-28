@@ -1370,13 +1370,18 @@ impl FalkorStorage {
         Ok(digest)
     }
 
-    async fn ensure_lease_current(&self, lease: &OwnerLease) -> Result<(), StorageError> {
+    async fn cycle_success_effect_digest_fenced(
+        &self,
+        lease: &OwnerLease,
+        cycle_id: &str,
+    ) -> Result<Option<String>, StorageError> {
         let rows = self
             .run_template(
-                "lease_is_current",
+                "cycle_journal_succeeded_fenced",
                 &serde_json::json!({
                     "lease_key": serde_json::to_string(&lease.key)
                         .map_err(|error| StorageError::Backend(error.to_string()))?,
+                    "success_id": Self::dreams_cycle_success_id(&lease.key, cycle_id)?,
                     "token": lease.fencing_token.as_str(),
                     "epoch": lease.epoch,
                     "now_ms": Utc::now().timestamp_millis(),
@@ -1384,16 +1389,34 @@ impl FalkorStorage {
                 true,
             )
             .await?;
-        match rows.first().and_then(|row| row.first()) {
-            Some(FalkorValue::I64(1)) => Ok(()),
-            Some(FalkorValue::I64(0)) => Err(StorageError::FencedWriteRejected {
+        if rows.is_empty() {
+            return Err(StorageError::FencedWriteRejected {
                 lease_epoch: lease.epoch,
-            }),
-            other => Err(StorageError::CorruptMetadata {
-                key: "lease current count",
-                detail: format!("expected 0 or 1, got {other:?}"),
-            }),
+            });
         }
+        let mut digest = None;
+        for value in rows.iter().filter_map(|row| row.first()) {
+            match value {
+                FalkorValue::None => {}
+                FalkorValue::String(value) => match &digest {
+                    Some(existing) if existing != value => {
+                        return Err(StorageError::CorruptMetadata {
+                            key: "cycle success effect digest",
+                            detail: "duplicate success identities disagree".into(),
+                        });
+                    }
+                    Some(_) => {}
+                    None => digest = Some(value.clone()),
+                },
+                other => {
+                    return Err(StorageError::CorruptMetadata {
+                        key: "cycle success effect digest",
+                        detail: format!("expected a string digest or null, got {other:?}"),
+                    });
+                }
+            }
+        }
+        Ok(digest)
     }
 
     fn proposal_params(proposal: &DiscoveryProposal) -> Result<serde_json::Value, StorageError> {
@@ -2313,6 +2336,44 @@ impl Storage for FalkorStorage {
                     "effect_id": effect_id,
                     "claim_token": claim_token,
                 }),
+                false,
+            )
+            .await?
+            .is_empty())
+    }
+
+    async fn pending_ingest_effect_cleanups(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<PostIngestEffect>, StorageError> {
+        let rows = self
+            .run_template(
+                "ingest_effect_cleanups_pending",
+                &serde_json::json!({ "limit": limit }),
+                true,
+            )
+            .await?;
+        rows.iter()
+            .map(|row| match row.first() {
+                Some(FalkorValue::String(json)) => {
+                    serde_json::from_str(json).map_err(|error| StorageError::CorruptMetadata {
+                        key: "ingest_effect_cleanup",
+                        detail: error.to_string(),
+                    })
+                }
+                other => Err(StorageError::CorruptMetadata {
+                    key: "ingest_effect_cleanup",
+                    detail: format!("expected string, found {other:?}"),
+                }),
+            })
+            .collect()
+    }
+
+    async fn complete_ingest_effect_cleanup(&self, effect_id: &str) -> Result<bool, StorageError> {
+        Ok(!self
+            .run_template(
+                "ingest_effect_cleanup_complete",
+                &serde_json::json!({ "effect_id": effect_id }),
                 false,
             )
             .await?
@@ -3670,6 +3731,17 @@ impl Storage for FalkorStorage {
             .is_some())
     }
 
+    async fn cycle_succeeded_fenced(
+        &self,
+        cycle_id: &str,
+        lease: &OwnerLease,
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .cycle_success_effect_digest_fenced(lease, cycle_id)
+            .await?
+            .is_some())
+    }
+
     async fn settle_dreams_cycle_fenced(
         &self,
         cycle_id: &str,
@@ -3677,11 +3749,11 @@ impl Storage for FalkorStorage {
         lease: &OwnerLease,
     ) -> Result<(), StorageError> {
         let effect_digest = crate::trait_::dreams_settlement_effect_digest(discoveries)?;
-        self.ensure_lease_current(lease).await?;
         // Avoid allocating Redis LSNs for a durable no-op. A reused identity
-        // with a different effect is corruption and fails closed.
+        // with a different effect is corruption and fails closed. Lease
+        // validation and this tombstone read share one graph linearization.
         if let Some(stored) = self
-            .cycle_success_effect_digest(&lease.key, cycle_id)
+            .cycle_success_effect_digest_fenced(lease, cycle_id)
             .await?
         {
             return if stored == effect_digest {

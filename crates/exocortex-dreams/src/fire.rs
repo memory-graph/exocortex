@@ -442,9 +442,9 @@ impl RedisFireQueue {
             .await
     }
 
-    /// Record one stable durable ingest effect. Every processed identity is
-    /// retained per region because outbox claims can interleave and an older
-    /// ambiguous delivery may retry after arbitrarily many newer effects.
+    /// Record one stable durable ingest effect. Identities remain until the
+    /// authoritative outbox acknowledges the effect, so interleaved ambiguous
+    /// retries remain exact without retaining settled traffic forever.
     pub async fn record_write_once(
         &mut self,
         region: &RegionKey,
@@ -500,6 +500,26 @@ impl RedisFireQueue {
             }
             _ => RecordWriteOutcome::Accumulated(snapshot),
         })
+    }
+
+    /// Reclaim one effect identity only after its authoritative outbox row has
+    /// been acknowledged. Pending identities must never be removed here.
+    pub async fn forget_write_once(
+        &mut self,
+        region: &RegionKey,
+        event_id: &str,
+    ) -> anyhow::Result<()> {
+        self.ensure_region(region)?;
+        anyhow::ensure!(
+            !event_id.is_empty(),
+            "Dreams write event id must not be empty"
+        );
+        let _: u64 = redis::cmd("SREM")
+            .arg(processed_event_key(region))
+            .arg(event_id)
+            .query_async(&mut self.conn)
+            .await?;
+        Ok(())
     }
 
     /// Acknowledge a distributed notification by its unique pending token.

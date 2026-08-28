@@ -1290,6 +1290,25 @@ itest!(
             .await
             .unwrap()
             .is_empty());
+        assert_eq!(
+            restarted.pending_ingest_effect_cleanups(10).await.unwrap(),
+            [effect.clone()],
+            "live acknowledgement durably exposes cleanup after restart"
+        );
+        assert!(restarted
+            .claim_ingest_effect("worker-after-ack", 30_000)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(restarted
+            .complete_ingest_effect_cleanup(effect.effect_id.as_str())
+            .await
+            .unwrap());
+        assert!(restarted
+            .pending_ingest_effect_cleanups(10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 );
 
@@ -2633,6 +2652,7 @@ itest!(dreams_cycle_settlement_is_atomic_and_idempotent, {
     s.settle_dreams_cycle_fenced(&cycle_id, std::slice::from_ref(&record), &lease)
         .await
         .unwrap();
+    assert!(s.cycle_succeeded_fenced(&cycle_id, &lease).await.unwrap());
     assert!(s.cycle_succeeded(&lease_key, &cycle_id).await.unwrap());
     assert_eq!(
         s.get_discovery(record.discovery_id.as_str()).await.unwrap(),
@@ -2772,6 +2792,10 @@ itest!(dreams_cycle_settlement_is_atomic_and_idempotent, {
         .acquire_lease(&lease_key, StdDuration::from_secs(30))
         .await
         .unwrap();
+    assert!(matches!(
+        s.cycle_succeeded_fenced(&cycle_id, &lease).await,
+        Err(StorageError::FencedWriteRejected { .. })
+    ));
     assert!(matches!(
         s.settle_dreams_cycle_fenced(&cycle_id, std::slice::from_ref(&record), &lease)
             .await,

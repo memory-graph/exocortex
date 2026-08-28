@@ -943,6 +943,28 @@ async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
         .await
         .unwrap());
     assert!(store.pending_ingest_effects(10).await.unwrap().is_empty());
+    assert_eq!(
+        store.pending_ingest_effect_cleanups(10).await.unwrap(),
+        [effect.clone()],
+        "acknowledgement leaves durable cleanup work after a crash window"
+    );
+    assert!(
+        store
+            .claim_ingest_effect("worker-after-ack", 30_000)
+            .await
+            .unwrap()
+            .is_none(),
+        "cleanup recovery must never re-execute the acknowledged effect"
+    );
+    assert!(store
+        .complete_ingest_effect_cleanup(effect.effect_id.as_str())
+        .await
+        .unwrap());
+    assert!(store
+        .pending_ingest_effect_cleanups(10)
+        .await
+        .unwrap()
+        .is_empty());
     assert!(!store
         .acknowledge_ingest_effect(effect.effect_id.as_str(), loser)
         .await

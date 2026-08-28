@@ -192,6 +192,24 @@ pub trait Storage: Send + Sync + 'static {
             "ingest effect outbox unsupported".into(),
         ))
     }
+    /// Acknowledged effects whose external idempotency metadata still needs
+    /// reclamation. Cleanup is idempotent and may be attempted concurrently.
+    async fn pending_ingest_effect_cleanups(
+        &self,
+        limit: u32,
+    ) -> crate::Result<Vec<PostIngestEffect>> {
+        let _ = limit;
+        Err(StorageError::Backend(
+            "ingest effect cleanup unsupported".into(),
+        ))
+    }
+    /// Mark external idempotency cleanup complete for an acknowledged effect.
+    async fn complete_ingest_effect_cleanup(&self, effect_id: &str) -> crate::Result<bool> {
+        let _ = effect_id;
+        Err(StorageError::Backend(
+            "ingest effect cleanup unsupported".into(),
+        ))
+    }
     /// Atomically upsert a protected memory mutation and its required audit
     /// event. Neither may commit without the other (R6-B18).
     async fn promote_memory_visibility_audited(
@@ -624,6 +642,19 @@ pub trait Storage: Send + Sync + 'static {
         let _ = (key, cycle_id);
         Err(StorageError::Backend(
             "durable cycle settlement unsupported".into(),
+        ))
+    }
+    /// Atomically verify that `lease` is current and read this cycle's durable
+    /// success identity. Exact fire replays use this owner-only form so lease
+    /// turnover cannot interleave between validation and the success result.
+    async fn cycle_succeeded_fenced(
+        &self,
+        cycle_id: &str,
+        lease: &OwnerLease,
+    ) -> crate::Result<bool> {
+        let _ = (cycle_id, lease);
+        Err(StorageError::Backend(
+            "fenced durable cycle settlement read unsupported".into(),
         ))
     }
     /// Atomically persist every discovery and mark the exact owner cycle and

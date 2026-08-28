@@ -573,12 +573,175 @@ async fn interleaved_effect_retry_is_counted_once() {
         .await
         .unwrap();
     assert_eq!(processed, 2);
+
+    queue
+        .forget_write_once(&region, &event_a)
+        .await
+        .expect("authoritatively settled effect is reclaimable");
+    assert!(matches!(
+        queue
+            .record_write_once(&region, 1, 1, trigger, "node", &event_b)
+            .await
+            .unwrap(),
+        RecordWriteOutcome::Accumulated(c)
+            if c.memories_since_last_cycle == 4 && c.edges_since_last_cycle == 3
+    ));
+    let processed: u64 = redis::cmd("SCARD")
+        .arg(format!("{counter_key}:processed-events"))
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+    assert_eq!(
+        processed, 1,
+        "settled A is reclaimed while still-pending B remains idempotent"
+    );
     let _: u64 = redis::cmd("DEL")
         .arg(&key)
         .arg(format!("{key}:deferred"))
         .arg(format!("{key}:processing"))
         .arg(&counter_key)
         .arg(format!("{counter_key}:processed-events"))
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn high_cardinality_settled_effects_do_not_accumulate_identities() {
+    let Some((client, mut queue, key)) = isolated_queue("settled-cardinality-org").await else {
+        return;
+    };
+    let region = RegionKey {
+        org: "settled-cardinality-org".into(),
+        project: "project".into(),
+        memory_type: 3,
+    };
+    let trigger = DreamsTrigger {
+        memory_threshold: u32::MAX,
+        edge_threshold: u32::MAX,
+        age_floor_days: u32::MAX,
+        min_interval_hours: 0,
+    };
+    for sequence in 0..2_000 {
+        let event = format!("settled-effect:{sequence}");
+        queue
+            .record_write_once(&region, 1, 0, trigger, "node", &event)
+            .await
+            .unwrap();
+        queue.forget_write_once(&region, &event).await.unwrap();
+    }
+
+    let counter_key = format!(
+        "exocortex:dreams:counters:{}",
+        serde_json::to_string(&region).unwrap()
+    );
+    let mut inspect = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("second Redis connection");
+    let processed: u64 = redis::cmd("SCARD")
+        .arg(format!("{counter_key}:processed-events"))
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+    assert_eq!(processed, 0, "acknowledged traffic must not accumulate");
+    let memories: u32 = redis::cmd("HGET")
+        .arg(&counter_key)
+        .arg("memories")
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+    assert_eq!(memories, 2_000);
+    let _: u64 = redis::cmd("DEL")
+        .arg(&key)
+        .arg(format!("{key}:deferred"))
+        .arg(format!("{key}:processing"))
+        .arg(&counter_key)
+        .arg(format!("{counter_key}:processed-events"))
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn partial_multi_region_cleanup_resumes_after_restart_without_reapplying() {
+    let Some((client, mut queue, key)) = isolated_queue("cleanup-recovery-org").await else {
+        return;
+    };
+    let regions = [
+        RegionKey {
+            org: "cleanup-recovery-org".into(),
+            project: "first".into(),
+            memory_type: 3,
+        },
+        RegionKey {
+            org: "cleanup-recovery-org".into(),
+            project: "second".into(),
+            memory_type: 3,
+        },
+    ];
+    let trigger = DreamsTrigger {
+        memory_threshold: u32::MAX,
+        edge_threshold: u32::MAX,
+        age_floor_days: u32::MAX,
+        min_interval_hours: 0,
+    };
+    let event = format!("recoverable-cleanup:{}", uuid::Uuid::new_v4());
+    for region in &regions {
+        queue
+            .record_write_once(region, 1, 0, trigger, "node", &event)
+            .await
+            .unwrap();
+    }
+    queue.forget_write_once(&regions[0], &event).await.unwrap();
+    drop(queue); // crash after cleaning only the first region
+
+    let conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("reconnect after partial cleanup");
+    let mut restarted = RedisFireQueue::new_with_queue_key(
+        conn,
+        QuietHours::none(),
+        regions[0].org.as_str(),
+        key.clone(),
+    );
+    for region in &regions {
+        restarted.forget_write_once(region, &event).await.unwrap();
+    }
+
+    let mut inspect = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("inspection connection");
+    for region in &regions {
+        let counter_key = format!(
+            "exocortex:dreams:counters:{}",
+            serde_json::to_string(region).unwrap()
+        );
+        let processed: u64 = redis::cmd("SCARD")
+            .arg(format!("{counter_key}:processed-events"))
+            .query_async(&mut inspect)
+            .await
+            .unwrap();
+        assert_eq!(processed, 0, "every resumed region identity is reclaimed");
+        let memories: u32 = redis::cmd("HGET")
+            .arg(&counter_key)
+            .arg("memories")
+            .query_async(&mut inspect)
+            .await
+            .unwrap();
+        assert_eq!(memories, 1, "cleanup recovery never reapplies the effect");
+        let _: u64 = redis::cmd("DEL")
+            .arg(counter_key)
+            .query_async(&mut inspect)
+            .await
+            .unwrap();
+    }
+    let _: u64 = redis::cmd("DEL")
+        .arg(&key)
+        .arg(format!("{key}:deferred"))
+        .arg(format!("{key}:processing"))
         .query_async(&mut inspect)
         .await
         .unwrap();
