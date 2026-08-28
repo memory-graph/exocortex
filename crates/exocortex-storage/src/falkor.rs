@@ -2395,8 +2395,15 @@ impl Storage for FalkorStorage {
                 }),
             ));
             push_record(next);
-            invalidations.push(Invalidation::RelationshipDeleted {
+            // The exact-owned purge may expose an interleaved concurrent
+            // assertion rather than remove the identity. Force an
+            // authoritative point fetch; a genuinely absent row triggers
+            // the cache bridge's fail-closed reseed path.
+            invalidations.push(Invalidation::RelationshipUpserted {
                 id: relationship.id,
+                from: relationship.from,
+                to: relationship.to,
+                kind: relationship.kind,
                 lsn: next,
             });
             next += 1;
@@ -2410,7 +2417,7 @@ impl Storage for FalkorStorage {
                 serde_json::json!({ "id": hex(&memory.id.0), "owned_lsns": owned_lsns }),
             ));
             push_record(next);
-            invalidations.push(Invalidation::MemoryDeleted {
+            invalidations.push(Invalidation::MemoryUpserted {
                 id: memory.id,
                 lsn: next,
             });
