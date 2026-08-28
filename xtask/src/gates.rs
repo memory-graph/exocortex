@@ -476,13 +476,10 @@ pub(crate) fn cypher_outside_storage_violations(root: &Path) -> Result<Vec<Strin
         if rel.starts_with("crates/exocortex-storage") {
             continue;
         }
-        let source = std::fs::read_to_string(&path)?.to_ascii_uppercase();
-        let query = source.contains("GRAPH.QUERY")
-            || source.contains("CYPHER ")
-            || (source.contains("MATCH (")
-                && [" RETURN ", " MERGE (", " CREATE (", " DELETE ", " SET "]
-                    .iter()
-                    .any(|marker| source.contains(marker)));
+        let source = std::fs::read_to_string(&path)?;
+        let query = rust_string_literals(&source)
+            .into_iter()
+            .any(|literal| looks_like_cypher(&literal));
         if query {
             violations.push(format!(
                 "{} contains executable-looking Cypher outside exocortex-storage",
@@ -491,6 +488,86 @@ pub(crate) fn cypher_outside_storage_violations(root: &Path) -> Result<Vec<Strin
         }
     }
     Ok(violations)
+}
+
+fn looks_like_cypher(literal: &str) -> bool {
+    let literal = literal.to_ascii_uppercase();
+    literal.contains("GRAPH.QUERY")
+        || literal.contains("CYPHER ")
+        || (literal.contains("MATCH (")
+            && [" RETURN ", " MERGE (", " CREATE (", " DELETE ", " SET "]
+                .iter()
+                .any(|marker| literal.contains(marker)))
+}
+
+/// Extract normal and raw Rust string literals. Inspecting each literal as a
+/// unit avoids combining unrelated words from comments, diagnostics, and
+/// identifiers into a query that does not exist in executable source.
+fn rust_string_literals(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut literals = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'"' || (bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"')) {
+            if bytes[index] == b'b' {
+                index += 1;
+            }
+            index += 1;
+            let mut literal = String::new();
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'\\' if index + 1 < bytes.len() => {
+                        literal.push(bytes[index + 1] as char);
+                        index += 2;
+                    }
+                    b'"' => {
+                        index += 1;
+                        break;
+                    }
+                    byte => {
+                        literal.push(byte as char);
+                        index += 1;
+                    }
+                }
+            }
+            literals.push(literal);
+            continue;
+        }
+        let raw_start = match bytes[index] {
+            b'r' => Some(index + 1),
+            b'b' if bytes.get(index + 1) == Some(&b'r') => Some(index + 2),
+            _ => None,
+        };
+        if let Some(mut cursor) = raw_start {
+            let mut hashes = 0usize;
+            while bytes.get(cursor) == Some(&b'#') {
+                hashes += 1;
+                cursor += 1;
+            }
+            if bytes.get(cursor) == Some(&b'"') {
+                cursor += 1;
+                let content_start = cursor;
+                let terminator = vec![b'#'; hashes];
+                let mut closed = false;
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'"'
+                        && bytes.get(cursor + 1..cursor + 1 + hashes) == Some(terminator.as_slice())
+                    {
+                        literals.push(source[content_start..cursor].to_owned());
+                        index = cursor + 1 + hashes;
+                        closed = true;
+                        break;
+                    }
+                    cursor += 1;
+                }
+                if closed {
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    literals
 }
 
 pub(crate) fn kernel_pack_coupling_violations(root: &Path) -> Result<Vec<String>> {
@@ -985,6 +1062,11 @@ mod tests {
             &root,
             "crates/exocortex-server/src/lib.rs",
             "fn query() -> &'static str { \"MATCH (n) RETURN n\" }\n",
+        );
+        write(
+            &root,
+            "crates/exocortex-client/src/lib.rs",
+            "// MATCH ( is documentation; unrelated strings must not combine.\nconst A: &str = \"MATCH (\"; const B: &str = \" RETURN \";\n",
         );
         assert_eq!(cypher_outside_storage_violations(&root).unwrap().len(), 1);
         write(
