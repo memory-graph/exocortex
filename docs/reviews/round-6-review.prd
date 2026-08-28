@@ -399,3 +399,8 @@ Falkor driver rejects graph-entity decoding on a single-thread Tokio runtime,
 and the test's row collector silently discarded that error as an empty graph.
 R6-R115 runs the live test on the driver's required multithread runtime and
 makes every stream error fail the regression.
+
+The full workspace run then exposed hash-order dependence in the backup
+fixture's ontology selection: it could choose a self-inverse or bidirectional
+kind while asserting that storage materialized two rows. R6-R116 constrains
+the fixture to a non-computed kind with a distinct inverse companion.

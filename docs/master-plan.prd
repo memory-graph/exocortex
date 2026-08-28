@@ -392,6 +392,7 @@ idea:
 | R6-R113 | Integrated-remediation Dreams accounting: preserve exact batched memory and edge deltas on the local transport | Codex | Done — local and Redis transports now retain exact batched deltas; `batched_local_writes_preserve_exact_memory_and_edge_counts` passes |
 | R6-R114 | Full-gate live cluster isolation: scope concurrent cross-node harnesses to distinct invalidation channels | Codex | Done — each live harness uses one unique org/graph while retaining two peers; five consecutive parallel two-test runs pass |
 | R6-R115 | Full-gate live restore evidence: execute the Falkor driver on its required multithread runtime and fail on stream errors | Codex | Done — the live restore harness uses multithread Tokio and unwraps every streamed row; governed failure preserves its sentinel in live Falkor |
+| R6-R116 | Full-gate backup fixture determinism: select a relationship kind that actually materializes a distinct inverse | Codex | Done — the fixture requires a non-computed, non-bidirectional kind with a distinct inverse; five consecutive exact round-trip runs pass |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence

@@ -132,10 +132,11 @@ fn valid_noncomputed_triple(
         .triples_by_kind
         .keys()
         .filter(|kind| {
-            ontology
-                .kinds_by_id
-                .get(kind)
-                .is_some_and(|metadata| !metadata.computed_only)
+            ontology.kinds_by_id.get(kind).is_some_and(|metadata| {
+                !metadata.computed_only
+                    && !metadata.bidirectional
+                    && metadata.inverse.is_some_and(|inverse| inverse != **kind)
+            })
         })
         .find_map(|kind| {
             (0..ontology.memory_type_names.len() as u8).find_map(|from| {
