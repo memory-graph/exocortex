@@ -596,6 +596,16 @@ harness to stage those dev-only policies at mode 0600 without embedding them in
 the release image, executable deployment-gate coverage that rejects the direct
 bind-mount regression, and a passing current-image failover run.
 
+### R6-R178 — The production FastEmbed path cannot acquire its model
+
+With the builder and policy staging defects removed, the freshly built nodes
+reached the real embedding backend and failed during startup with
+`RelativeUrlWithoutBase`. The pinned fastembed 3.14/hf-hub 0.3 downloader is
+not viable in the clean production image, and existing checks compiled the
+feature without constructing it. Closure requires a documented dependency
+update or equivalent deterministic repair, a real production-embedder startup
+probe, and a passing current-image cluster/chaos run.
+
 The complete mandatory gate matrix passed: formatting, workspace clippy,
 workspace tests with adapter SDK testing and `--no-fail-fast`, dependency
 policy, kernel purity, fingerprint (`e1f7d17b...ddc9b2`), schema/playbook
