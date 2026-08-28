@@ -469,3 +469,14 @@ production authentication remains owned by the enclosing `HttpBind` middleware.
 R6-R146 is closed without an authentication bypass: both direct-router
 fixtures now send an explicit bearer header, and the live cluster matrix passes
 the node-loop, cluster, cross-node reconnect, and SSE delivery targets.
+
+## Final strict review of `050fa84` (2026-08-28)
+
+A fresh detached-worktree review against `origin/main` ran the nine required
+lenses. After cross-lens deduplication it promoted R6-R147–R6-R155: durable
+reasoning settlement, ingress ownership, idle outbox polling, metric identity,
+source-policy permissions, source-registry failure atomicity, deterministic
+relationship-order evidence, live non-null assertion rollback evidence, and a
+stale plan locator. No verification question remained unresolved. The release
+remains blocked until these items are fixed and another fresh strict pass is
+clean.
