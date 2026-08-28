@@ -19,9 +19,10 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use exocortex_ops::{entries, OpContext, OpError, OperationEntry};
+#[cfg(test)]
 use exocortex_storage::VisibilityContext;
 
-use crate::principal::PrincipalRegistry;
+use crate::principal::{AuthenticatedPrincipal, PrincipalRegistry};
 
 /// Shared runtime health snapshot (R-O5/R-O6/R-M5), updated by the node
 /// loops and rendered by the health endpoints.
@@ -237,6 +238,7 @@ async fn auth(
         metrics::counter!("exocortex_http_auth_failures_total").increment(1);
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    req.extensions_mut().insert(principal.visibility.clone());
     req.extensions_mut().insert(principal);
     next.run(req).await
 }
@@ -249,20 +251,21 @@ fn op_route(
     ctx: Arc<OpContext>,
 ) -> impl Clone
        + Fn(
-    Extension<VisibilityContext>,
+    Extension<AuthenticatedPrincipal>,
     axum::extract::RawQuery,
     axum::body::Bytes,
 ) -> futures::future::BoxFuture<'static, Response<Body>>
        + Send
        + 'static {
-    move |Extension(visibility_ctx): Extension<VisibilityContext>,
+    move |Extension(principal): Extension<AuthenticatedPrincipal>,
           query: axum::extract::RawQuery,
           body: axum::body::Bytes| {
         // IN11 (audit): every request gets its OWN budget. The shared
         // startup context gave request #2 an already-expired deadline (and
         // nothing read it, so the REQUEST_TIMEOUT mapping was unreachable).
         let ctx = Arc::new(OpContext {
-            visibility_ctx,
+            visibility_ctx: principal.visibility,
+            audit_admin: principal.audit_admin,
             deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
             ..(*ctx).clone()
         });
@@ -403,7 +406,9 @@ mod tests {
             team_ids: Default::default(),
             max_visibility: exocortex_kernel::Visibility::Project,
         };
-        let principals = Arc::new(PrincipalRegistry::single("bob-token".into(), bob).unwrap());
+        let principals = Arc::new(
+            PrincipalRegistry::single_with_audit_admin("bob-token".into(), bob, false).unwrap(),
+        );
         let who = Router::new().route(
             "/who",
             get(
@@ -415,6 +420,7 @@ mod tests {
         let app = HttpBind::with_principals(ctx, principals).router(Some(who));
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/who")
@@ -429,5 +435,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"bob");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/audit?since_lsn=0")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer bob-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

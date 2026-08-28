@@ -1258,6 +1258,72 @@ impl Storage for FalkorStorage {
         }
     }
 
+    async fn store_discovery(&self, discovery: &DiscoveryRecord) -> Result<(), StorageError> {
+        let props_json = serde_json::to_string(discovery)
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        self.run_template(
+            "discovery_record_store",
+            &serde_json::json!({
+                "discovery_id": discovery.discovery_id,
+                "org_id": discovery.region.org,
+                "discovered_at": discovery.discovered_at.to_rfc3339(),
+                "props_json": props_json,
+            }),
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn get_discovery(
+        &self,
+        discovery_id: &str,
+    ) -> Result<Option<DiscoveryRecord>, StorageError> {
+        let rows = self
+            .run_template(
+                "discovery_record_get",
+                &serde_json::json!({ "discovery_id": discovery_id }),
+                true,
+            )
+            .await?;
+        let Some(FalkorValue::String(json)) = rows.first().and_then(|row| row.first()) else {
+            return Ok(None);
+        };
+        serde_json::from_str(json)
+            .map(Some)
+            .map_err(|error| StorageError::CorruptMetadata {
+                key: "discovery_record",
+                detail: error.to_string(),
+            })
+    }
+
+    async fn list_discoveries(
+        &self,
+        org_id: &str,
+        limit: u32,
+    ) -> Result<Vec<DiscoveryRecord>, StorageError> {
+        let rows = self
+            .run_template(
+                "discovery_record_list",
+                &serde_json::json!({ "org_id": org_id, "limit": limit.min(100) }),
+                true,
+            )
+            .await?;
+        rows.into_iter()
+            .filter_map(|row| match row.into_iter().next() {
+                Some(FalkorValue::String(json)) => {
+                    Some(serde_json::from_str(&json).map_err(|error| {
+                        StorageError::CorruptMetadata {
+                            key: "discovery_record",
+                            detail: error.to_string(),
+                        }
+                    }))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     async fn get_discovery_proposal(
         &self,
         discovery_id: &str,

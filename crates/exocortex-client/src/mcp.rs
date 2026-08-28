@@ -101,6 +101,7 @@ impl ExocortexMcp {
     fn registry_ctx(&self) -> std::sync::Arc<exocortex_ops::OpContext> {
         std::sync::Arc::new(exocortex_ops::OpContext {
             visibility_ctx: self.vc.clone(),
+            audit_admin: true,
             storage: std::sync::Arc::new(crate::no_backend::NoBackendStorage),
             cache: self.cache.clone(),
             deadline: chrono::Utc::now() + chrono::Duration::seconds(30),

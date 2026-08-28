@@ -26,6 +26,7 @@ fn boot_router() -> (axum::Router, Arc<InMemoryStorage>) {
             "backend",
             exocortex_kernel::Visibility::Org,
         ),
+        audit_admin: false,
         storage: storage.clone() as Arc<dyn Storage>,
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(30),

@@ -6,10 +6,10 @@ use futures::stream::BoxStream;
 use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId};
 
 use crate::types::{
-    AuditEvent, CommitRecord, CypherQuery, DiscoveryAcceptance, DiscoveryProposal, Embedding,
-    FencedRestore, GraphSnapshot, IngestBatchKey, IngestCommitOutcome, Invalidation, LeaseKey,
-    MemoryFilter, OwnerLease, RegionKey, ResultSet, StorageBackendId, StorageCapabilities,
-    TraversalSpec,
+    AuditEvent, CommitRecord, CypherQuery, DiscoveryAcceptance, DiscoveryProposal, DiscoveryRecord,
+    Embedding, FencedRestore, GraphSnapshot, IngestBatchKey, IngestCommitOutcome, Invalidation,
+    LeaseKey, MemoryFilter, OwnerLease, RegionKey, ResultSet, StorageBackendId,
+    StorageCapabilities, TraversalSpec,
 };
 
 /// Errors surfaced by every `Storage` implementation.
@@ -110,6 +110,31 @@ pub trait Storage: Send + Sync + 'static {
         let _ = proposal;
         Err(StorageError::Backend(
             "discovery proposals unsupported".into(),
+        ))
+    }
+    /// Persist an unasserted Dreams discovery for later presentation.
+    async fn store_discovery(&self, discovery: &DiscoveryRecord) -> crate::Result<()> {
+        let _ = discovery;
+        Err(StorageError::Backend(
+            "discovery records unsupported".into(),
+        ))
+    }
+    /// Load one durable unasserted discovery by id.
+    async fn get_discovery(&self, discovery_id: &str) -> crate::Result<Option<DiscoveryRecord>> {
+        let _ = discovery_id;
+        Err(StorageError::Backend(
+            "discovery records unsupported".into(),
+        ))
+    }
+    /// List a bounded set of durable discoveries for an organization.
+    async fn list_discoveries(
+        &self,
+        org_id: &str,
+        limit: u32,
+    ) -> crate::Result<Vec<DiscoveryRecord>> {
+        let _ = (org_id, limit);
+        Err(StorageError::Backend(
+            "discovery records unsupported".into(),
         ))
     }
     /// Load an unconsumed proposal by id for validation and edge construction.

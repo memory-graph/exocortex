@@ -625,19 +625,15 @@ impl<S: Storage> IngestServer<S> {
         {
             return Err(RejectCode::ComputedKindRejected);
         }
-        // W5 + §4.5: an edge is never more visible than the narrower
-        // endpoint. Within-batch, the client derives this; for a
-        // to_memory_id target the client CANNOT (it does not know the
-        // stored visibility), so the server derives it authoritatively.
-        let vis = if r.to_memory_id.is_empty() {
-            let v = Self::vis_from_i32(r.visibility)?;
-            if !v.within(ceiling) {
-                return Err(RejectCode::VisibilityWidening);
-            }
-            v
-        } else {
-            exocortex_kernel::relationship_visibility(from_mem.visibility, to_mem.visibility)
-        };
+        // W5 + §4.5: the server derives edge visibility authoritatively for
+        // both within-batch and existing-memory targets. A signed producer is
+        // still untrusted input and cannot widen or narrow an edge away from
+        // the endpoint-owned visibility contract.
+        Self::vis_from_i32(r.visibility)?;
+        let vis = exocortex_kernel::relationship_visibility(from_mem.visibility, to_mem.visibility);
+        if !vis.within(ceiling) {
+            return Err(RejectCode::VisibilityWidening);
+        }
         // R-T17 via the kernel's one triple check (W2): both sides
         // required, no local copy.
         if let Err(e) = exocortex_kernel::validator::validate_triple(

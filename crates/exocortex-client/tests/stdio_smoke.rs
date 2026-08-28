@@ -587,6 +587,7 @@ async fn mcp_get_memory_shape_matches_registry() {
     let ctx = Arc::new(exocortex_ops::OpContext {
         ontology: None,
         visibility_ctx: vc,
+        audit_admin: true,
         storage: Arc::new(exocortex_client::no_backend::NoBackendStorage),
         cache: cache.clone(),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),

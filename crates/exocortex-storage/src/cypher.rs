@@ -819,6 +819,41 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "discovery_record_store",
+        read_only: false,
+        required_params: &["discovery_id", "org_id", "discovered_at", "props_json"],
+        cypher: r#"
+            MERGE (d:_Discovery {discovery_id: $discovery_id})
+            ON CREATE SET d.org_id = $org_id,
+                          d.discovered_at = $discovered_at,
+                          d.props_json = $props_json
+            ON MATCH SET d.props_json = $props_json
+            RETURN d.discovery_id AS discovery_id
+        "#,
+    });
+
+    reg!(Template {
+        id: "discovery_record_get",
+        read_only: true,
+        required_params: &["discovery_id"],
+        cypher: r#"
+            MATCH (d:_Discovery {discovery_id: $discovery_id})
+            RETURN d.props_json AS props_json LIMIT 1
+        "#,
+    });
+
+    reg!(Template {
+        id: "discovery_record_list",
+        read_only: true,
+        required_params: &["org_id", "limit"],
+        cypher: r#"
+            MATCH (d:_Discovery {org_id: $org_id})
+            RETURN d.props_json AS props_json
+            ORDER BY d.discovered_at DESC, d.discovery_id ASC LIMIT $limit
+        "#,
+    });
+
+    reg!(Template {
         id: "discovery_proposal_get",
         read_only: true,
         required_params: &["discovery_id"],

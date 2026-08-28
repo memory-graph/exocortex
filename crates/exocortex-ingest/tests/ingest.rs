@@ -647,6 +647,42 @@ async fn visibility_widening_rejected_under_lowered_ceiling() {
 }
 
 #[tokio::test]
+async fn relationship_visibility_is_derived_from_narrowest_endpoint() {
+    use futures::StreamExt;
+
+    let srv = server();
+    registered(&srv, 3).await;
+    let mut b = batch(vec![draft("fix", "Fix", 1), draft("problem", "Problem", 0)]);
+    b.batch_id = "authoritative-relationship-visibility".into();
+    b.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    b.relationships = vec![exocortex_wire::ingest::v1::RelationshipDraft {
+        from_draft_key: "fix".into(),
+        to_draft_key: "problem".into(),
+        kind: "Fixes".into(),
+        visibility: 3,
+        strength: 0.8,
+        confidence: 0.8,
+        ..Default::default()
+    }];
+    let ack = srv
+        .submit(tonic::Request::new(sign(b, [5u8; 32])))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ack.rejected, 0, "{:?}", ack.rejections);
+
+    let fixes = srv.ontology.kind_id("Fixes").unwrap();
+    let mut relationships = srv.storage.stream_all_relationships().await;
+    let edge = loop {
+        let edge = relationships.next().await.unwrap().unwrap();
+        if edge.kind == fixes {
+            break edge;
+        }
+    };
+    assert_eq!(edge.visibility, exocortex_kernel::Visibility::Private);
+}
+
+#[tokio::test]
 async fn unknown_memory_type_rejected() {
     let srv = server();
     registered(&srv, 3).await;

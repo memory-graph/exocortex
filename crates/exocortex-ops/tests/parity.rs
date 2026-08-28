@@ -8,7 +8,7 @@ use exocortex_cache::{GraphSnapshot, LocalCache};
 use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
 use exocortex_ops::operations::{ops_vc, GetMemoryInput, PromoteVisibilityInput};
 use exocortex_ops::{entries, OpContext, Operation};
-use exocortex_storage::{DiscoveryProposal, InMemoryStorage, RegionKey};
+use exocortex_storage::{DiscoveryProposal, DiscoveryRecord, InMemoryStorage, RegionKey};
 
 fn ontology() -> Arc<exocortex_kernel::Ontology> {
     Arc::new(
@@ -142,6 +142,7 @@ fn ctx_sync() -> (OpContext, Memory) {
     (
         OpContext {
             visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+            audit_admin: true,
             storage: Arc::new(storage),
             cache: Arc::new(cache),
             deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
@@ -324,6 +325,81 @@ async fn accept_discovery_writes_audit_record_and_edge() {
     assert!(matches!(fabricated, Err(exocortex_ops::OpError::NotFound)));
 }
 
+#[tokio::test]
+async fn durable_discovery_survives_engine_restart_and_reaches_acceptance() {
+    let (ctx, _m) = ctx_sync();
+    let mut from = mem("durable-from");
+    from.memory_type = 0;
+    let mut to = mem("durable-to");
+    to.memory_type = 2;
+    ctx.storage.upsert_memory(&from).await.unwrap();
+    ctx.storage.upsert_memory(&to).await.unwrap();
+    let id = "durable-discovery-after-restart";
+    ctx.storage
+        .store_discovery(&DiscoveryRecord {
+            discovery_id: id.into(),
+            region: RegionKey {
+                org: "org".into(),
+                project: "*".into(),
+                memory_type: from.memory_type,
+            },
+            from: from.id,
+            to: to.id,
+            discovery_type: "transitive".into(),
+            quality: 0.6,
+            via_types: [1, 2],
+            discovery_cycle_id: "finished-engine-cycle".into(),
+            discovered_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    // No DreamsEngine handle participates below: storage is the restart-safe
+    // handoff between the completed production cycle and the registry.
+    let listed = exocortex_ops::operations::ListDiscoveriesOp
+        .handle(
+            &ctx,
+            exocortex_ops::operations::ListDiscoveriesInput { limit: 20 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.discoveries.len(), 1);
+    assert_eq!(listed.discoveries[0].quality, 0.6);
+
+    let issued = exocortex_ops::operations::IssueDiscoveryOp
+        .handle(
+            &ctx,
+            exocortex_ops::operations::IssueDiscoveryInput {
+                discovery_id: id.into(),
+                kind: "Causes".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(issued.discovery_id, id);
+    assert_eq!(issued.visibility, "org");
+
+    let accepted = exocortex_ops::operations::AcceptDiscoveryOp
+        .handle(
+            &ctx,
+            exocortex_ops::operations::AcceptDiscoveryInput {
+                discovery_id: id.into(),
+                from: hex(&from.id),
+                to: hex(&to.id),
+                kind: "Causes".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(accepted.audit_lsn > 0);
+    assert!(ctx
+        .storage
+        .get_discovery_proposal(id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
 #[test]
 fn openapi_and_mcp_json_generate_from_one_registry() {
     // The goldens: schema drift is caught by xtask gen-schemas; this test
@@ -345,6 +421,7 @@ async fn audit_ledger_is_org_scoped() {
         OpContext {
             ontology: None,
             visibility_ctx: ops_vc(org, "alice", Visibility::Org),
+            audit_admin: true,
             storage: Arc::new(InMemoryStorage::new(ontology())),
             cache: Arc::new(cache),
             deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
@@ -410,6 +487,7 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
 
     let ctx = OpContext {
         visibility_ctx: ops_vc("org", "alice", Visibility::Project),
+        audit_admin: false,
         storage: Arc::new(storage),
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
@@ -439,6 +517,7 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
     storage2.upsert_memory(&own).await.unwrap();
     let ctx2 = OpContext {
         visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        audit_admin: false,
         storage: Arc::new(storage2),
         cache: Arc::new(cache2),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
@@ -475,6 +554,7 @@ async fn promote_visibility_denies_invisible_target() {
 
     let ctx = OpContext {
         visibility_ctx: ops_vc("org", "alice", Visibility::Project),
+        audit_admin: false,
         storage: Arc::new(storage.clone()),
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
@@ -503,6 +583,68 @@ async fn promote_visibility_denies_invisible_target() {
     assert!(still.valid_until.is_none(), "no tombstone written");
 }
 
+/// R6-R18: visibility authorization is a ceiling on Actions as well as reads.
+#[tokio::test]
+async fn promote_visibility_denies_target_above_caller_ceiling() {
+    use exocortex_storage::Storage;
+    let onto = ontology();
+    let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
+    let storage = InMemoryStorage::new(onto);
+    let mut memory = mem("project-memory");
+    memory.visibility = Visibility::Project;
+    memory.context.project_id = Some("project-a".into());
+    storage.upsert_memory(&memory).await.unwrap();
+
+    let mut visibility_ctx = ops_vc("org", "alice", Visibility::Project);
+    visibility_ctx.project_ids.push("project-a".into());
+    let ctx = OpContext {
+        visibility_ctx,
+        audit_admin: false,
+        storage: Arc::new(storage.clone()),
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        ontology: None,
+    };
+    let error = exocortex_ops::operations::PromoteVisibilityOp
+        .handle(
+            &ctx,
+            PromoteVisibilityInput {
+                memory_id: hex(&memory.id),
+                to: "org".into(),
+            },
+        )
+        .await
+        .map(|_| ())
+        .expect_err("Project principal must not promote to Org");
+    assert!(matches!(error, exocortex_ops::OpError::Unauthorized(_)));
+    assert_eq!(
+        storage
+            .get_memory(&memory.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .visibility,
+        Visibility::Project
+    );
+    assert!(storage.audit_range("org", 0, 10).await.unwrap().is_empty());
+}
+
+/// R6-R19: the org-wide audit ledger requires an explicit administrator bit.
+#[tokio::test]
+async fn list_audit_records_denies_non_admin_context() {
+    let (mut ctx, _) = ctx_sync();
+    ctx.audit_admin = false;
+    let error = exocortex_ops::operations::ListAuditRecordsOp
+        .handle(
+            &ctx,
+            exocortex_ops::operations::ListAuditInput { since_lsn: 0 },
+        )
+        .await
+        .map(|_| ())
+        .expect_err("ordinary org principal must not read the audit ledger");
+    assert!(matches!(error, exocortex_ops::OpError::Unauthorized(_)));
+}
+
 /// IN11 (audit): a past deadline fails the operation with
 /// `DeadlineExceeded` — the variant was declared and HTTP-mapped but never
 /// constructed, so the REQUEST_TIMEOUT arm was unreachable.
@@ -512,6 +654,7 @@ async fn expired_deadline_returns_deadline_exceeded() {
     let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
     let ctx = OpContext {
         visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        audit_admin: false,
         storage: Arc::new(InMemoryStorage::new(onto.clone())),
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() - chrono::Duration::seconds(1), // already spent
@@ -597,6 +740,7 @@ async fn superseded_state_is_visible_on_reads() {
     cache.publish("org", Arc::new(snap));
     let ctx = OpContext {
         visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        audit_admin: false,
         storage: Arc::new(InMemoryStorage::new(onto.clone())),
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),

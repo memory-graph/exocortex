@@ -7,7 +7,7 @@ services:
   falkordb:
     image: falkordb/falkordb:latest
     ports:
-      - "16379:6379"
+      - "127.0.0.1:16379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "PING"]
       interval: 1s
@@ -26,7 +26,7 @@ services:
     command: ["--mode", "backend-node", "--bind", "0.0.0.0:8081", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node1", "--gossip-addr", "0.0.0.0:8101", "--principal-policy", "/etc/exocortex/principal-policy.json", "--source-policy", "/etc/exocortex/source-policy.json", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node2:8082,node3:8083"]
     volumes: ["./source-policy.empty.json:/etc/exocortex/source-policy.json:ro", "./principal-policy.dev.json:/etc/exocortex/principal-policy.json:ro", "../../exocortex-server/tests/fixtures/localhost-cert.pem:/etc/exocortex/tls-cert.pem:ro", "../../exocortex-server/tests/fixtures/localhost-key.pem:/etc/exocortex/tls-key.pem:ro"]
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
   node2:
     image: exocortex-node:local
     build:
@@ -40,7 +40,7 @@ services:
     command: ["--mode", "backend-node", "--bind", "0.0.0.0:8082", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node2", "--gossip-addr", "0.0.0.0:8102", "--principal-policy", "/etc/exocortex/principal-policy.json", "--source-policy", "/etc/exocortex/source-policy.json", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node3:8083"]
     volumes: ["./source-policy.empty.json:/etc/exocortex/source-policy.json:ro", "./principal-policy.dev.json:/etc/exocortex/principal-policy.json:ro", "../../exocortex-server/tests/fixtures/localhost-cert.pem:/etc/exocortex/tls-cert.pem:ro", "../../exocortex-server/tests/fixtures/localhost-key.pem:/etc/exocortex/tls-key.pem:ro"]
     ports:
-      - "8082:8082"
+      - "127.0.0.1:8082:8082"
   node3:
     image: exocortex-node:local
     build:
@@ -54,4 +54,4 @@ services:
     command: ["--mode", "backend-node", "--bind", "0.0.0.0:8083", "--tls-cert", "/etc/exocortex/tls-cert.pem", "--tls-key", "/etc/exocortex/tls-key.pem", "--node-id", "node3", "--gossip-addr", "0.0.0.0:8103", "--principal-policy", "/etc/exocortex/principal-policy.json", "--source-policy", "/etc/exocortex/source-policy.json", "--storage", "falkor://falkordb:6379", "--cluster-endpoints", "node1:8081,node2:8082"]
     volumes: ["./source-policy.empty.json:/etc/exocortex/source-policy.json:ro", "./principal-policy.dev.json:/etc/exocortex/principal-policy.json:ro", "../../exocortex-server/tests/fixtures/localhost-cert.pem:/etc/exocortex/tls-cert.pem:ro", "../../exocortex-server/tests/fixtures/localhost-key.pem:/etc/exocortex/tls-key.pem:ro"]
     ports:
-      - "8083:8083"
+      - "127.0.0.1:8083:8083"

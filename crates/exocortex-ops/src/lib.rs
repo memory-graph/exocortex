@@ -24,6 +24,8 @@ use serde::{de::DeserializeOwned, Serialize};
 pub struct OpContext {
     /// The caller's identity + visibility scope.
     pub visibility_ctx: exocortex_storage::VisibilityContext,
+    /// Explicit administrator permission for the org-wide audit ledger.
+    pub audit_admin: bool,
     /// Durable storage.
     pub storage: std::sync::Arc<dyn exocortex_storage::Storage>,
     /// The local cache (client + backend read path).
@@ -49,11 +51,18 @@ impl OpContext {
     ) -> Self {
         Self {
             visibility_ctx,
+            audit_admin: false,
             storage,
             cache,
             deadline: chrono::Utc::now() + budget,
             ontology: None,
         }
+    }
+
+    /// Attach the authenticated principal's audit-administrator capability.
+    pub fn with_audit_admin(mut self, audit_admin: bool) -> Self {
+        self.audit_admin = audit_admin;
+        self
     }
 
     /// Attach the effective ontology (preflight-capable surfaces).

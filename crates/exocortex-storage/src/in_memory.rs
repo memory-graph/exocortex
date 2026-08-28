@@ -36,6 +36,7 @@ struct InMemoryInner {
     /// Monotonic fencing-epoch counter per lease key (never resets).
     lease_epochs: Mutex<HashMap<LeaseKey, u64>>,
     proposals: Mutex<HashMap<smol_str::SmolStr, StoredProposal>>,
+    discoveries: Mutex<HashMap<smol_str::SmolStr, DiscoveryRecord>>,
     audits: Mutex<Vec<serde_json::Value>>,
     stream_memory_calls: AtomicU64,
     stream_relationship_calls: AtomicU64,
@@ -97,6 +98,7 @@ impl InMemoryStorage {
                 leases: Default::default(),
                 lease_epochs: Default::default(),
                 proposals: Default::default(),
+                discoveries: Default::default(),
                 audits: Default::default(),
                 stream_memory_calls: AtomicU64::new(0),
                 stream_relationship_calls: AtomicU64::new(0),
@@ -600,6 +602,52 @@ impl Storage for InMemoryStorage {
                 Ok(())
             }
         }
+    }
+
+    async fn store_discovery(&self, discovery: &DiscoveryRecord) -> Result<(), StorageError> {
+        self.inner
+            .discoveries
+            .lock()
+            .unwrap()
+            .insert(discovery.discovery_id.clone(), discovery.clone());
+        Ok(())
+    }
+
+    async fn get_discovery(
+        &self,
+        discovery_id: &str,
+    ) -> Result<Option<DiscoveryRecord>, StorageError> {
+        Ok(self
+            .inner
+            .discoveries
+            .lock()
+            .unwrap()
+            .get(discovery_id)
+            .cloned())
+    }
+
+    async fn list_discoveries(
+        &self,
+        org_id: &str,
+        limit: u32,
+    ) -> Result<Vec<DiscoveryRecord>, StorageError> {
+        let mut rows: Vec<_> = self
+            .inner
+            .discoveries
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|row| row.region.org == org_id)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| {
+            (
+                std::cmp::Reverse(row.discovered_at),
+                row.discovery_id.clone(),
+            )
+        });
+        rows.truncate(limit.min(100) as usize);
+        Ok(rows)
     }
 
     async fn get_discovery_proposal(

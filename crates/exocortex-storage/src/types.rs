@@ -154,6 +154,31 @@ pub struct DiscoveryProposal {
     pub issued_at: DateTime<Utc>,
 }
 
+/// Durable, unasserted candidate emitted by a Dreams discovery cycle. This is
+/// presentation state only: it cannot become an edge until a caller receives
+/// an immutable [`DiscoveryProposal`] and explicitly accepts it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DiscoveryRecord {
+    /// Opaque discovery identity.
+    pub discovery_id: SmolStr,
+    /// Region in which the candidate was found.
+    pub region: RegionKey,
+    /// Candidate source endpoint.
+    pub from: MemoryId,
+    /// Candidate destination endpoint.
+    pub to: MemoryId,
+    /// Stable finder name.
+    pub discovery_type: SmolStr,
+    /// Quality stamped once by the finder.
+    pub quality: f32,
+    /// Relationship kinds on the supporting two-hop path.
+    pub via_types: [u32; 2],
+    /// Dreams cycle that emitted the candidate.
+    pub discovery_cycle_id: SmolStr,
+    /// Server timestamp at discovery.
+    pub discovered_at: DateTime<Utc>,
+}
+
 /// Audit payload coupled to a protected mutation by storage (R6-B18).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuditEvent {

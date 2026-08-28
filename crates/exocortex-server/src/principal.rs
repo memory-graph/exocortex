@@ -18,12 +18,23 @@ struct PrincipalPolicyRow {
     #[serde(default)]
     team_ids: Vec<String>,
     max_visibility: u8,
+    #[serde(default)]
+    audit_admin: bool,
+}
+
+/// One authenticated bearer principal and its operation permissions.
+#[derive(Clone)]
+pub struct AuthenticatedPrincipal {
+    /// Exact tenant, membership, identity, and visibility scope.
+    pub visibility: VisibilityContext,
+    /// Explicit permission to read the organization-wide audit ledger.
+    pub audit_admin: bool,
 }
 
 /// Immutable credential registry installed at process startup.
 #[derive(Clone)]
 pub struct PrincipalRegistry {
-    entries: Vec<(Vec<u8>, VisibilityContext)>,
+    entries: Vec<(Vec<u8>, AuthenticatedPrincipal)>,
 }
 
 impl PrincipalRegistry {
@@ -40,9 +51,24 @@ impl PrincipalRegistry {
     /// Construct the single-principal registry used by embedded tests. The
     /// production node uses [`Self::load`] exclusively.
     pub fn single(token: String, principal: VisibilityContext) -> anyhow::Result<Self> {
+        Self::single_with_audit_admin(token, principal, true)
+    }
+
+    /// Construct one explicitly permissioned principal for embedded tests.
+    pub fn single_with_audit_admin(
+        token: String,
+        principal: VisibilityContext,
+        audit_admin: bool,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(!token.is_empty(), "bearer token must be non-empty");
         Ok(Self {
-            entries: vec![(token.into_bytes(), principal)],
+            entries: vec![(
+                token.into_bytes(),
+                AuthenticatedPrincipal {
+                    visibility: principal,
+                    audit_admin,
+                },
+            )],
         })
     }
 
@@ -74,12 +100,15 @@ impl PrincipalRegistry {
             };
             entries.push((
                 row.bearer_token.into_bytes(),
-                VisibilityContext {
-                    user_id: row.user_id.into(),
-                    org_id: row.org_id.into(),
-                    project_ids: row.project_ids.into_iter().map(Into::into).collect(),
-                    team_ids: row.team_ids.into_iter().map(Into::into).collect(),
-                    max_visibility,
+                AuthenticatedPrincipal {
+                    visibility: VisibilityContext {
+                        user_id: row.user_id.into(),
+                        org_id: row.org_id.into(),
+                        project_ids: row.project_ids.into_iter().map(Into::into).collect(),
+                        team_ids: row.team_ids.into_iter().map(Into::into).collect(),
+                        max_visibility,
+                    },
+                    audit_admin: row.audit_admin,
                 },
             ));
         }
@@ -87,7 +116,7 @@ impl PrincipalRegistry {
     }
 
     /// Authenticate a bearer token with a length-hiding full-registry scan.
-    pub fn authenticate(&self, token: &[u8]) -> Option<VisibilityContext> {
+    pub fn authenticate(&self, token: &[u8]) -> Option<AuthenticatedPrincipal> {
         self.entries
             .iter()
             .find(|(candidate, _)| constant_time_eq(token, candidate))
@@ -101,7 +130,7 @@ impl PrincipalRegistry {
         anyhow::ensure!(
             self.entries
                 .iter()
-                .all(|(_, principal)| principal.org_id.as_str() == expected),
+                .all(|(_, principal)| principal.visibility.org_id.as_str() == expected),
             "principal policy contains an org other than node org {expected}"
         );
         Ok(())
@@ -128,16 +157,17 @@ mod tests {
         let path = dir.path().join("principals.json");
         std::fs::write(
             &path,
-            r#"[{"bearer_token":"secret","org_id":"o","user_id":"u","project_ids":["p"],"team_ids":["t"],"max_visibility":2}]"#,
+            r#"[{"bearer_token":"secret","org_id":"o","user_id":"u","project_ids":["p"],"team_ids":["t"],"max_visibility":2,"audit_admin":true}]"#,
         )
         .unwrap();
         let registry = PrincipalRegistry::load(&path).unwrap();
         let principal = registry.authenticate(b"secret").unwrap();
-        assert_eq!(principal.org_id.as_str(), "o");
-        assert_eq!(principal.user_id.as_str(), "u");
-        assert_eq!(principal.project_ids[0].as_str(), "p");
-        assert_eq!(principal.team_ids[0].as_str(), "t");
-        assert_eq!(principal.max_visibility, Visibility::Team);
+        assert_eq!(principal.visibility.org_id.as_str(), "o");
+        assert_eq!(principal.visibility.user_id.as_str(), "u");
+        assert_eq!(principal.visibility.project_ids[0].as_str(), "p");
+        assert_eq!(principal.visibility.team_ids[0].as_str(), "t");
+        assert_eq!(principal.visibility.max_visibility, Visibility::Team);
+        assert!(principal.audit_admin);
         assert!(registry.authenticate(b"wrong").is_none());
         assert!(registry.ensure_org("o").is_ok());
         assert!(registry.ensure_org("another-org").is_err());

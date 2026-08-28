@@ -21,7 +21,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 defaults:
   run:
@@ -35,15 +35,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: "1.85.0"
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: taiki-e/install-action@cargo-deny
+      - uses: taiki-e/install-action@d865e9aac326f15b06ac52b57abb58cd0e3330e4 # cargo-deny
       - name: Tag matches coherent workspace version
         run: |
           version=$(cargo metadata --format-version 1 --no-deps | python3 -c '
@@ -83,8 +83,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: "1.85.0"
           targets: ${{ matrix.target }}
@@ -94,7 +94,7 @@ jobs:
       - name: Install protoc (macOS builds)
         if: runner.os == 'macOS'
         run: brew install protobuf
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -140,7 +140,7 @@ jobs:
           echo "checksum=dist/$DIST.tar.gz.sha256" >> "$GITHUB_OUTPUT"
           echo "dirname=$DIST" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.package.outputs.dirname }}
           path: dist/*
@@ -149,10 +149,12 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -168,7 +170,7 @@ jobs:
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
             --title "Exocortex $TAG" --generate-notes || true
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" dist/*tar.gz dist/*sha256 dist/install.sh --clobber
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: installers
           path: dist/install.sh

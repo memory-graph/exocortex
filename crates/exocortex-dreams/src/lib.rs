@@ -181,8 +181,11 @@ pub struct DreamsEngine<S: Storage> {
     /// Last successfully consolidated cycle, retained for health/acceptance
     /// observation without scraping logs or metrics.
     pub last_result: tokio::sync::RwLock<Option<ConsolidationResult>>,
+    lease_ttl: Duration,
     #[cfg(feature = "testing")]
     cycle_fault_after: Option<usize>,
+    #[cfg(feature = "testing")]
+    cycle_pause_after: Option<(usize, Duration)>,
 }
 
 impl<S: Storage + 'static> DreamsEngine<S> {
@@ -217,8 +220,11 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             node_id,
             discoveries: DashMap::new(),
             last_result: tokio::sync::RwLock::new(None),
+            lease_ttl: Duration::from_secs(60),
             #[cfg(feature = "testing")]
             cycle_fault_after: None,
+            #[cfg(feature = "testing")]
+            cycle_pause_after: None,
         }
     }
 
@@ -228,6 +234,23 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     #[cfg(feature = "testing")]
     pub fn with_cycle_fault_after(mut self, mutation: usize) -> Self {
         self.cycle_fault_after = Some(mutation);
+        self
+    }
+
+    /// Use a short owner lease in deterministic renewal regressions.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn with_lease_ttl(mut self, ttl: Duration) -> Self {
+        self.lease_ttl = ttl;
+        self
+    }
+
+    /// Pause after an owner mutation so tests can cross the original lease
+    /// expiry without relying on a slow backend.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn with_cycle_pause_after(mut self, mutation: usize, pause: Duration) -> Self {
+        self.cycle_pause_after = Some((mutation, pause));
         self
     }
 
@@ -315,12 +338,42 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         // R-Dr3: consolidation is owner-only; no lease, no work.
         let lease = self
             .storage
-            .acquire_lease(&lease_key, Duration::from_secs(60))
+            .acquire_lease(&lease_key, self.lease_ttl)
             .await
             .map_err(|e| anyhow::anyhow!("lease: {e}"))?;
+        // A cycle contains multiple scans and separately fenced mutations.
+        // Keep the same token/epoch alive until compensation has finished;
+        // otherwise an expiry after an early write makes rollback itself fail
+        // its fence and strands a partial cycle.
+        let renewal = self.spawn_lease_renewal(lease.clone());
         let outcome = self.consolidate_under(&lease, region).await;
+        renewal.abort();
         let _ = self.storage.release_lease(lease).await;
         outcome
+    }
+
+    fn spawn_lease_renewal(
+        &self,
+        lease: exocortex_storage::OwnerLease,
+    ) -> tokio::task::JoinHandle<()> {
+        let storage = self.storage.clone();
+        let ttl = (lease.expires_at - lease.acquired_at)
+            .to_std()
+            .unwrap_or(self.lease_ttl);
+        let interval = (ttl / 3).max(Duration::from_millis(1));
+        tokio::spawn(async move {
+            let mut current = lease;
+            loop {
+                tokio::time::sleep(interval).await;
+                match storage.renew_lease(&current).await {
+                    Ok(renewed) => current = renewed,
+                    Err(error) => {
+                        warn!(?error, "Dreams owner lease renewal failed");
+                        return;
+                    }
+                }
+            }
+        })
     }
 
     async fn consolidate_under(
@@ -404,7 +457,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 let merged_before = res.merged.len();
                 self.merge(&mut res, c, lease, region, journal).await?;
                 if res.merged.len() > merged_before {
-                    self.mutation_checkpoint(&mut mutations)?;
+                    self.mutation_checkpoint(&mut mutations).await?;
                 }
             }
         }
@@ -429,7 +482,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         }
         self.strengthen(&mut res, region, lease, journal).await?;
         if !res.strengthened.is_empty() {
-            self.mutation_checkpoint(&mut mutations)?;
+            self.mutation_checkpoint(&mut mutations).await?;
         }
         self.prune(&mut res, region).await?;
         res.memories_output = (res.memories_input as usize - res.merged.len()).max(0) as u32;
@@ -446,7 +499,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         self.write_similar_edges(&mut res, &survivors, lease, journal)
             .await?;
         if !res.similar_edges.is_empty() {
-            self.mutation_checkpoint(&mut mutations)?;
+            self.mutation_checkpoint(&mut mutations).await?;
         }
 
         // Re-score with the post-cycle set (merged anchors removed).
@@ -492,8 +545,19 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         Ok(res)
     }
 
-    fn mutation_checkpoint(&self, mutations: &mut usize) -> anyhow::Result<()> {
+    async fn mutation_checkpoint(&self, mutations: &mut usize) -> anyhow::Result<()> {
         *mutations += 1;
+        #[cfg(feature = "testing")]
+        if self
+            .cycle_pause_after
+            .is_some_and(|(mutation, _)| mutation == *mutations)
+        {
+            let pause = self
+                .cycle_pause_after
+                .expect("pause configuration checked")
+                .1;
+            tokio::time::sleep(pause).await;
+        }
         #[cfg(feature = "testing")]
         if self.cycle_fault_after == Some(*mutations) {
             anyhow::bail!("injected cycle failure after mutation {mutations}");
@@ -921,15 +985,22 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             .collect();
         self.discoveries.clear();
         for discovery in &out {
-            metrics::counter!(
-                "exocortex_dreams_discoveries_total",
-                "type" => "transitive",
-                "quality" => "0.6"
-            )
-            .increment(1);
+            self.storage
+                .store_discovery(&exocortex_storage::DiscoveryRecord {
+                    discovery_id: discovery.id.to_string().into(),
+                    region: region.clone(),
+                    from: discovery.endpoints.0,
+                    to: discovery.endpoints.1,
+                    discovery_type: "transitive".into(),
+                    quality: discovery.quality,
+                    via_types: [discovery.via_types.0, discovery.via_types.1],
+                    discovery_cycle_id: discovery.discovery_cycle_id.clone(),
+                    discovered_at: discovery.discovered_at,
+                })
+                .await?;
+            emit_discovery_metric(discovery);
             self.discoveries.insert(discovery.id, discovery.clone());
         }
-        let _ = region;
         Ok(out)
     }
 
@@ -1089,12 +1160,99 @@ impl Discovery {
     /// Quality is computed once at proposal time (R-Dr6): metrics emit this
     /// exact value.
     pub fn rate_quality(&self) -> f32 {
-        match self.kind {
-            DiscoveryKind::CrossDomain => 0.9,
-            DiscoveryKind::TemporalEcho => 0.7,
-            DiscoveryKind::Orphan => 0.4,
-            DiscoveryKind::Transitive => 0.6,
+        self.quality
+    }
+}
+
+fn emit_discovery_metric(discovery: &Discovery) {
+    match (discovery.kind, discovery.quality.to_bits()) {
+        (DiscoveryKind::CrossDomain, bits) if bits == 0.9_f32.to_bits() => {
+            metrics::counter!("exocortex_dreams_discoveries_total", "type" => "cross_domain", "quality" => "0.9").increment(1);
         }
+        (DiscoveryKind::TemporalEcho, bits) if bits == 0.7_f32.to_bits() => {
+            metrics::counter!("exocortex_dreams_discoveries_total", "type" => "temporal_echo", "quality" => "0.7").increment(1);
+        }
+        (DiscoveryKind::Orphan, bits) if bits == 0.4_f32.to_bits() => {
+            metrics::counter!("exocortex_dreams_discoveries_total", "type" => "orphan", "quality" => "0.4").increment(1);
+        }
+        (DiscoveryKind::Transitive, bits) if bits == 0.6_f32.to_bits() => {
+            metrics::counter!("exocortex_dreams_discoveries_total", "type" => "transitive", "quality" => "0.6").increment(1);
+        }
+        _ => metrics::counter!("exocortex_dreams_discoveries_total", "type" => "invalid", "quality" => "invalid").increment(1),
+    }
+}
+
+#[cfg(test)]
+mod discovery_metric_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct CaptureRecorder {
+        labels: Mutex<Vec<(String, String)>>,
+    }
+
+    impl metrics::Recorder for CaptureRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            self.labels.lock().unwrap().extend(
+                key.labels()
+                    .map(|label| (label.key().to_owned(), label.value().to_owned())),
+            );
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn discovery_metric_reports_the_stamped_quality() {
+        let recorder = CaptureRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let discovery = Discovery {
+            id: uuid::Uuid::nil(),
+            kind: DiscoveryKind::Transitive,
+            endpoints: (MemoryId([0; 16]), MemoryId([1; 16])),
+            quality: DiscoveryKind::Transitive.default_quality(),
+            via_types: (1, 2),
+            discovery_cycle_id: "cycle".into(),
+            discovered_at: chrono::Utc::now(),
+        };
+        emit_discovery_metric(&discovery);
+        let labels = recorder.labels.lock().unwrap();
+        assert!(labels.contains(&("quality".into(), discovery.rate_quality().to_string())));
     }
 }
 

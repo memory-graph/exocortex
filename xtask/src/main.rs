@@ -110,6 +110,11 @@ fn deployment_acceptance() -> Result<()> {
     );
     let compose =
         std::fs::read_to_string("crates/exocortex-cluster/tests/docker-compose-cluster.yml")?;
+    let storage_compose =
+        std::fs::read_to_string("crates/exocortex-storage/tests/docker-compose.yml")?;
+    let release = std::fs::read_to_string(".github/workflows/release.yml")?;
+    let dockerfile = std::fs::read_to_string("Dockerfile")?;
+    validate_release_hardening(&release, &dockerfile, &[&compose, &storage_compose])?;
     for node in ["node1", "node2", "node3"] {
         let marker = format!("  {node}:\n");
         let section = compose
@@ -180,6 +185,58 @@ fn deployment_acceptance() -> Result<()> {
         );
     }
     println!("deployment-acceptance ok: chaos nodes build the current image; one entrypoint selected the correct artifact for 3 modes; each executed 9 rules; no secret-bearing argv flags");
+    Ok(())
+}
+
+fn validate_release_hardening(
+    workflow: &str,
+    dockerfile: &str,
+    compose_files: &[&str],
+) -> Result<()> {
+    anyhow::ensure!(
+        workflow.contains("permissions:\n  contents: read\n"),
+        "release workflow must default to read-only repository permission"
+    );
+    let release_job = workflow
+        .split_once("\n  release:\n")
+        .map(|(_, section)| section)
+        .ok_or_else(|| anyhow::anyhow!("release workflow is missing the release job"))?;
+    anyhow::ensure!(
+        release_job.contains("    permissions:\n      contents: write\n"),
+        "only the release job may receive contents: write"
+    );
+    for line in workflow.lines() {
+        let directive = line.trim().trim_start_matches("- ");
+        if !directive.starts_with("uses:") {
+            continue;
+        }
+        let action = directive
+            .split_once('@')
+            .map(|(_, revision)| revision.split_whitespace().next().unwrap_or_default())
+            .unwrap_or_default();
+        anyhow::ensure!(
+            action.len() == 40 && action.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "release action must be pinned to a full commit SHA: {line}"
+        );
+    }
+    anyhow::ensure!(
+        dockerfile
+            .lines()
+            .any(|line| line.trim() == "USER 65532:65532"),
+        "runtime Dockerfile must select the unprivileged exocortex user"
+    );
+    for compose in compose_files {
+        for port in compose
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("- \"") && line.ends_with('"'))
+        {
+            anyhow::ensure!(
+                port.starts_with("- \"127.0.0.1:"),
+                "test service port must bind to loopback: {port}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1099,5 +1156,36 @@ mod metrics_hygiene_tests {
             metrics_hygiene_issues(r#"metrics::counter!("requests", "outcome" => "ok");"#)
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod release_hardening_tests {
+    use super::validate_release_hardening;
+
+    const SHA: &str = "11d5960a326750d5838078e36cf38b85af677262";
+
+    #[test]
+    fn rejects_mutable_actions_root_runtime_and_public_test_ports() {
+        let good_workflow = format!(
+            "permissions:\n  contents: read\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@{SHA}\n  release:\n    permissions:\n      contents: write\n"
+        );
+        let good_dockerfile = "FROM scratch\nUSER 65532:65532\n";
+        let good_compose = "ports:\n  - \"127.0.0.1:8080:8080\"\n";
+        assert!(
+            validate_release_hardening(&good_workflow, good_dockerfile, &[good_compose]).is_ok()
+        );
+
+        let mutable = good_workflow.replace(SHA, "v4");
+        assert!(validate_release_hardening(&mutable, good_dockerfile, &[good_compose]).is_err());
+        assert!(
+            validate_release_hardening(&good_workflow, "FROM scratch\n", &[good_compose]).is_err()
+        );
+        assert!(validate_release_hardening(
+            &good_workflow,
+            good_dockerfile,
+            &["ports:\n  - \"8080:8080\"\n"]
+        )
+        .is_err());
     }
 }

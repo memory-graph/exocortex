@@ -10,7 +10,7 @@ use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, 
 use exocortex_ops::operations::ops_vc;
 use exocortex_ops::{entries, OpContext};
 use exocortex_server::http_bind::HttpBind;
-use exocortex_storage::{DiscoveryProposal, InMemoryStorage, RegionKey, Storage};
+use exocortex_storage::{DiscoveryProposal, DiscoveryRecord, InMemoryStorage, RegionKey, Storage};
 
 fn ontology() -> Arc<exocortex_kernel::Ontology> {
     Arc::new(
@@ -117,8 +117,27 @@ async fn every_operation_answers_over_http_with_auth() {
     cache.publish("org", Arc::new(snap));
     storage.upsert_memory(&a).await.unwrap();
     storage.upsert_memory(&b).await.unwrap();
+    storage
+        .store_discovery(&DiscoveryRecord {
+            discovery_id: "http-parity-discovery".into(),
+            region: RegionKey {
+                org: "org".into(),
+                project: "*".into(),
+                memory_type: a.memory_type,
+            },
+            from: a.id,
+            to: b.id,
+            discovery_type: "transitive".into(),
+            quality: 0.6,
+            via_types: [1, 2],
+            discovery_cycle_id: "http-parity-cycle".into(),
+            discovered_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
     let ctx = Arc::new(OpContext {
         visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        audit_admin: true,
         storage: storage.clone() as Arc<dyn exocortex_storage::Storage>,
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
@@ -156,6 +175,11 @@ async fn every_operation_answers_over_http_with_auth() {
             "promote_visibility" => {
                 serde_json::json!({ "memory_id": hex(&b.id), "to": "org" })
             }
+            "list_discoveries" => serde_json::json!({ "limit": 20 }),
+            "issue_discovery" => serde_json::json!({
+                "discovery_id": "http-parity-discovery",
+                "kind": "RelatedTo",
+            }),
             "accept_discovery" => serde_json::json!({
                 "discovery_id": "22222222-2222-2222-2222-222222222222",
                 "from": hex(&a.id),

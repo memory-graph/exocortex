@@ -377,6 +377,11 @@ impl Operation for PromoteVisibilityOp {
                 "promotion capped at {max:?} (R-T11a)"
             )));
         }
+        if to > ctx.visibility_ctx.max_visibility {
+            return Err(OpError::Unauthorized(
+                "promotion exceeds caller visibility ceiling".into(),
+            ));
+        }
         // IN2 (audit): load through the CALLER-SCOPED read. The unscoped
         // `get_memory` reads at the historical Org ceiling, so a caller who
         // cannot even see the row could otherwise widen it to the whole org.
@@ -432,6 +437,254 @@ register_operation!(
     "/v1/promote_visibility",
     PromoteVisibilityInput,
     PromoteVisibilityOutput
+);
+
+/// `list_discoveries` — present durable, unasserted Dreams candidates.
+#[derive(Default)]
+pub struct ListDiscoveriesOp;
+
+/// Input for `list_discoveries`.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct ListDiscoveriesInput {
+    /// Maximum rows to return (hard-capped at 100).
+    #[serde(default = "default_discovery_limit")]
+    pub limit: u32,
+}
+
+fn default_discovery_limit() -> u32 {
+    20
+}
+
+/// Caller-visible discovery projection.
+#[derive(Serialize, JsonSchema)]
+pub struct DiscoveryJson {
+    /// Opaque discovery id accepted by `issue_discovery`.
+    pub discovery_id: String,
+    /// Source memory id.
+    pub from: String,
+    /// Destination memory id.
+    pub to: String,
+    /// Finder taxonomy value.
+    pub discovery_type: String,
+    /// Quality stamped by the finder.
+    pub quality: f32,
+    /// Supporting relationship kinds.
+    pub via_types: [u32; 2],
+}
+
+/// Output for `list_discoveries`.
+#[derive(Serialize, JsonSchema)]
+pub struct ListDiscoveriesOutput {
+    /// Candidates whose endpoints are visible to the current caller.
+    pub discoveries: Vec<DiscoveryJson>,
+}
+
+#[async_trait]
+impl Operation for ListDiscoveriesOp {
+    type Input = ListDiscoveriesInput;
+    type Output = ListDiscoveriesOutput;
+    fn name(&self) -> &'static str {
+        "list_discoveries"
+    }
+    fn mcp_tool_name(&self) -> &'static str {
+        "exocortex.list_discoveries"
+    }
+    fn http_method(&self) -> http::Method {
+        http::Method::GET
+    }
+    fn http_path(&self) -> &'static str {
+        "/v1/discoveries"
+    }
+
+    async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        ctx.check_deadline()?;
+        let records = ctx
+            .storage
+            .list_discoveries(&ctx.visibility_ctx.org_id, input.limit.min(100))
+            .await
+            .map_err(|error| OpError::Storage(error.to_string()))?;
+        let mut discoveries = Vec::new();
+        for record in records {
+            let from = ctx
+                .storage
+                .get_memory_for(&record.from, &ctx.visibility_ctx)
+                .await;
+            let to = ctx
+                .storage
+                .get_memory_for(&record.to, &ctx.visibility_ctx)
+                .await;
+            if matches!((&from, &to), (Ok(Some(_)), Ok(Some(_)))) {
+                discoveries.push(DiscoveryJson {
+                    discovery_id: record.discovery_id.to_string(),
+                    from: hex32(&record.from.0),
+                    to: hex32(&record.to.0),
+                    discovery_type: record.discovery_type.to_string(),
+                    quality: record.quality,
+                    via_types: record.via_types,
+                });
+            } else if let Err(error) = from {
+                if !matches!(error, exocortex_storage::StorageError::PermissionDenied) {
+                    return Err(OpError::Storage(error.to_string()));
+                }
+            } else if let Err(error) = to {
+                if !matches!(error, exocortex_storage::StorageError::PermissionDenied) {
+                    return Err(OpError::Storage(error.to_string()));
+                }
+            }
+        }
+        Ok(ListDiscoveriesOutput { discoveries })
+    }
+}
+
+register_operation!(
+    ListDiscoveriesOp,
+    "list_discoveries",
+    "exocortex.list_discoveries",
+    GET,
+    "/v1/discoveries",
+    ListDiscoveriesInput,
+    ListDiscoveriesOutput
+);
+
+/// `issue_discovery` — bind one durable candidate to this exact caller.
+#[derive(Default)]
+pub struct IssueDiscoveryOp;
+
+/// Input for `issue_discovery`.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct IssueDiscoveryInput {
+    /// Durable discovery id.
+    pub discovery_id: String,
+    /// Relationship kind the caller proposes to assert.
+    pub kind: String,
+}
+
+/// Immutable proposal returned to the caller for acceptance.
+#[derive(Serialize, JsonSchema)]
+pub struct IssueDiscoveryOutput {
+    /// Discovery id.
+    pub discovery_id: String,
+    /// Source endpoint.
+    pub from: String,
+    /// Destination endpoint.
+    pub to: String,
+    /// Validated kind.
+    pub kind: String,
+    /// Endpoint-derived visibility.
+    pub visibility: String,
+}
+
+#[async_trait]
+impl Operation for IssueDiscoveryOp {
+    type Input = IssueDiscoveryInput;
+    type Output = IssueDiscoveryOutput;
+    fn name(&self) -> &'static str {
+        "issue_discovery"
+    }
+    fn mcp_tool_name(&self) -> &'static str {
+        "exocortex.issue_discovery"
+    }
+    fn http_method(&self) -> http::Method {
+        http::Method::POST
+    }
+    fn http_path(&self) -> &'static str {
+        "/v1/issue_discovery"
+    }
+
+    async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        ctx.check_deadline()?;
+        let record = ctx
+            .storage
+            .get_discovery(&input.discovery_id)
+            .await
+            .map_err(|error| OpError::Storage(error.to_string()))?
+            .ok_or(OpError::NotFound)?;
+        if record.region.org != ctx.visibility_ctx.org_id {
+            return Err(OpError::NotFound);
+        }
+        let from = ctx
+            .storage
+            .get_memory_for(&record.from, &ctx.visibility_ctx)
+            .await
+            .map_err(|error| match error {
+                exocortex_storage::StorageError::PermissionDenied => {
+                    OpError::Unauthorized("discovery endpoint is outside caller scope".into())
+                }
+                other => OpError::Storage(other.to_string()),
+            })?
+            .ok_or(OpError::NotFound)?;
+        let to = ctx
+            .storage
+            .get_memory_for(&record.to, &ctx.visibility_ctx)
+            .await
+            .map_err(|error| match error {
+                exocortex_storage::StorageError::PermissionDenied => {
+                    OpError::Unauthorized("discovery endpoint is outside caller scope".into())
+                }
+                other => OpError::Storage(other.to_string()),
+            })?
+            .ok_or(OpError::NotFound)?;
+        let ontology = effective_ontology();
+        let kind = ontology
+            .kind_id(&input.kind)
+            .ok_or_else(|| OpError::BadInput(format!("unknown kind `{}`", input.kind)))?;
+        if ontology
+            .kinds_by_id
+            .get(&kind)
+            .is_some_and(|meta| meta.computed_only)
+        {
+            return Err(OpError::BadInput(
+                "computed-only kinds cannot be asserted".into(),
+            ));
+        }
+        exocortex_kernel::validator::validate_triple(
+            ontology,
+            from.memory_type,
+            kind,
+            to.memory_type,
+        )
+        .map_err(|error| OpError::BadInput(format!("R-T17: {error}")))?;
+        let proposed_visibility =
+            exocortex_kernel::visibility::relationship_visibility(from.visibility, to.visibility);
+        if proposed_visibility > ctx.visibility_ctx.max_visibility {
+            return Err(OpError::Unauthorized(
+                "discovery visibility exceeds caller ceiling".into(),
+            ));
+        }
+        let proposal = exocortex_storage::DiscoveryProposal {
+            discovery_id: record.discovery_id.clone(),
+            region: record.region,
+            from: record.from,
+            to: record.to,
+            kind,
+            proposed_visibility,
+            caller_scope: ctx.visibility_ctx.clone(),
+            // Stable issuance makes retries idempotent without weakening the
+            // immutable caller/kind/scope binding.
+            issued_at: record.discovered_at,
+        };
+        ctx.storage
+            .create_discovery_proposal(&proposal)
+            .await
+            .map_err(|error| OpError::Storage(error.to_string()))?;
+        Ok(IssueDiscoveryOutput {
+            discovery_id: proposal.discovery_id.to_string(),
+            from: hex32(&proposal.from.0),
+            to: hex32(&proposal.to.0),
+            kind: input.kind,
+            visibility: format!("{:?}", proposed_visibility).to_ascii_lowercase(),
+        })
+    }
+}
+
+register_operation!(
+    IssueDiscoveryOp,
+    "issue_discovery",
+    "exocortex.issue_discovery",
+    POST,
+    "/v1/issue_discovery",
+    IssueDiscoveryInput,
+    IssueDiscoveryOutput
 );
 
 /// `accept_discovery` — promote a Dreams proposal to an edge; audited.
@@ -640,6 +893,11 @@ impl Operation for ListAuditRecordsOp {
         "/v1/audit"
     }
     async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        if !ctx.audit_admin {
+            return Err(OpError::Unauthorized(
+                "audit ledger requires explicit administrator permission".into(),
+            ));
+        }
         let org = ctx.visibility_ctx.org_id.to_string();
         let rows = crate::audit::audit_range(ctx, &org, input.since_lsn).await?;
         Ok(ListAuditOutput { records: rows })

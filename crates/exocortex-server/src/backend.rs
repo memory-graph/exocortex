@@ -147,6 +147,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
             "backend",
             exocortex_kernel::Visibility::Org,
         ),
+        audit_admin: false,
         storage: storage.clone() as Arc<dyn exocortex_storage::Storage>,
         cache: cache.clone(),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
