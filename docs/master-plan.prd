@@ -1,11 +1,10 @@
 # Exocortex — Master Plan
 
-**Status (2026-08-27, Round 6):** RELEASE BLOCKED. A strict whole-project
-review at `f7bf463` reopened 30 blocking findings, eight advisory findings,
-and four verification questions. The authoritative ledger and closure
-criteria are `docs/reviews/round-6-review.prd`; accepted work is promoted in
-the Backlog below as R6-S1 through R6-Q1. The prior post-BR-PRD green-gate
-claim is historical, not the current release verdict.
+**Status (2026-08-28, Round 6):** CLOSED. All blocking findings, advisories,
+and verification questions in `docs/reviews/round-6-review.prd` have evidenced
+dispositions. Every mandatory gate passes, the live Falkor storage suite and
+Docker leader-failover harness pass, and a fresh strict whole-project review
+at `ce3a956` reports zero verified actionable findings.
 
 **Status (2026-08-27):** Palantir-expansion PRD drafted
 (`docs/prd/exocortex-palantir-expansion-prd.md`, rev 2) — five post-v1
@@ -129,7 +128,7 @@ A PRD that is not listed here is not accepted work.
 | `docs/bug-prd-standalone-readback.md` | Zero-setup mode's write→read loop | Closed (SR-PRD) |
 | `docs/bug-prd-external-key-identity.md` | `ExternalKey` identity stability | Closed |
 | `docs/prd/adapter-contract-prd.md` | Projection bounds, adapter-side validation, source-schema evolution — the contract every table/CDC/API adapter needs | **Wave 2** as D21 — blocks D1/D19/D20; its manifest step waits on Wave 0 |
-| `docs/reviews/round-<n>-review.prd` | Findings against completed work; 1, 2, 3 closed, **6 is the live release gate** | Round 6 open — RELEASE BLOCKED |
+| `docs/reviews/round-<n>-review.prd` | Findings against completed work; rounds 1, 2, 3, and 6 are closed | Round 6 closed — all gates and strict review clean |
 
 Bug PRDs keep their `docs/` paths because source comments cite them; feature
 PRDs live in `docs/prd/`.
@@ -264,11 +263,6 @@ idea:
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
-| R6-S1 | Fail-closed secrets and authorization (B01-B05, B19, B25-B26) | Codex | Implementation complete — mandatory gates and strict release review pending |
-| R6-S2 | Cache and reasoning correctness (B06-B07, B13, B21-B23) | Codex | Implementation complete — mandatory gates and strict release review pending |
-| R6-S3 | Atomicity and durability (B08-B10, B15-B18, B20) | Codex | Implementation complete — mandatory gates and strict release review pending |
-| R6-S4 | Backend/runtime completeness (B11-B12, B14, B24) | Codex | Implementation complete — mandatory gates and strict release review pending |
-| R6-S5 | Delivery truth (B27-B30) | Codex | Implementation complete — mandatory gates and strict release review pending |
 | R6-B30-14 | PRD §23 #14: stamp every stored embedding with its model/version, not only the MCR² aggregate | Codex | Done — vectors are inseparable from model name/version; ingest stamps each row and MCR² rejects mixed revisions while stamping the common input revision |
 | R6-B30-25 | PRD §23 #25: executable kernel-name absence and omit-dev-pack link failure | Codex | Done — production entrypoint requires the pack-owned link anchor; kernel purity builds packless and linked fixtures and verifies the former fails on the unresolved anchor |
 | R6-A1 | Advisory test quality and cleanup (A01-A08) | Codex | Done — every advisory has executable or focused-cleanup evidence below |
@@ -446,12 +440,12 @@ idea:
 | R6-R167 | Strict convergence: supervise and restart the reasoning consumer | Codex | Done — engine-owned receiver, health transition, backend supervisor restart, and retained-work regressions pass (`d68e1e6`) |
 | R6-R168 | Strict convergence: make reasoning effect replay atomically idempotent | Codex | Done — stable effect/seed identity feeds atomic `upsert_batch_once`; concurrent stale/replacement workers produce one temporal assertion (`d68e1e6`), including durable zero-output settlement and publication repair in R6-R170 |
 | R6-R169 | Strict convergence: reject expired-owner effect acknowledgement | Codex | Done — token match and storage-clock lease validity are required on both backends, with pre-reclaim expired-owner regressions (`d68e1e6`) |
-| R6-R170 | Strict convergence: replay invalidations after exactly-once graph commit | Codex | Done — atomic exact payloads, leased claims, empty production-shaped repair, contention fencing, and payload reclamation are live-tested (`6b46c76`, strengthened by live-deadline completion in commit pending) |
+| R6-R170 | Strict convergence: replay invalidations after exactly-once graph commit | Codex | Done — atomic exact payloads, leased claims, empty production-shaped repair, contention fencing, and payload reclamation are live-tested (`6b46c76`, strengthened by live-deadline completion in `ce3a956`) |
 | R6-R171 | Strict convergence advisory: canonicalize durable seed identity and align acknowledgement parity | Codex | Done — versioned length-framed raw-byte hex has golden coverage; both backends reject repeated acknowledgement; concurrent and zero-output once semantics are executable (`6dac03c`) |
-| R6-R172 | Strict convergence: fence publication through completion | Codex | Done — bounded publishes renew the storage-clock claim and completion requires a live token/deadline; forced expiry without takeover fails the owner before successor repair (`6b46c76` plus deadline regression in commit pending) |
+| R6-R172 | Strict convergence: fence publication through completion | Codex | Done — bounded publishes renew the storage-clock claim and completion requires a live token/deadline; forced expiry without takeover fails the owner before successor repair (`6b46c76` plus deadline regression in `ce3a956`) |
 | R6-R173 | Strict convergence advisory: reclaim completed publication payloads | Codex | Done — token-fenced completion removes serialized payloads; live raw-field assertion proves the marker remains key-sized (`6b46c76`) |
 | R6-R174 | Strict convergence advisory: prove live zero-output settlement | Codex | Done — two independent Falkor clients prove first empty settlement commits and its replay is a durable no-op (`6b46c76`) |
-| R6-R175 | Strict convergence advisory: prove reasoning-level zero-output settlement | Codex | Done — a durable no-output pass settles before relevant graph state changes; same-key replay derives nothing while a distinct key proves the later state is derivable (commit pending) |
+| R6-R175 | Strict convergence advisory: prove reasoning-level zero-output settlement | Codex | Done — a durable no-output pass settles before relevant graph state changes; same-key replay derives nothing while a distinct key proves the later state is derivable (`ce3a956`) |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence
@@ -588,6 +582,12 @@ are recorded in the "Rounds 4-5" section below.
 
 | ID | Item | Closed by |
 |----|------|-----------|
+| **Round 6 (2026-08-28, whole-project release review)** | | |
+| R6-S1 | Fail-closed secrets and authorization (B01-B05, B19, B25-B26) | Item-level evidence above; full workspace tests, `auth-coverage`, `metrics-hygiene`, and strict whole-project review pass |
+| R6-S2 | Cache and reasoning correctness (B06-B07, B13, B21-B23) | Item-level evidence above; full workspace tests, benchmark SLOs, `artifact-equivalence`, and strict whole-project review pass |
+| R6-S3 | Atomicity and durability (B08-B10, B15-B18, B20) | Item-level evidence above; in-memory and live Falkor storage conformance plus strict whole-project review pass |
+| R6-S4 | Backend/runtime completeness (B11-B12, B14, B24) | Item-level evidence above; deployment acceptance, live Docker failover, and strict whole-project review pass |
+| R6-S5 | Delivery truth (B27-B30) | Item-level evidence above; all mandatory drift/architecture gates, acceptance coverage, and strict whole-project review pass |
 | **Rounds 4-5 (2026-08-26, audit sweep)** | | |
 | W1-W7 | Write-path parity defects (WAL drain, shared validators, session context, reject detail, edge visibility, computed-only marker, persistent dedup) | `drain.rs` + `wal.rs` + kernel `validate_draft`/`validate_triple`; `wal_roundtrip.rs`, `ingest.rs`, `write_path_parity.rs` |
 | Phase A (CS1/WS1/WS2/IN2/CL3) | Network surface: SSE behind bearer auth, signed registrations, admin ceilings, scoped promote, hardened key decoding | `http_bind.rs`, `sse.rs`, `signing.rs`; `sse_replay.rs`, `ingest.rs`, `parity.rs`, `stdio_smoke.rs` |
