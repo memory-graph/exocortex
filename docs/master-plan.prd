@@ -5,6 +5,11 @@ whole-project review promoted R6-R208 through R6-R228 below; R6-R182 remains
 open until those items, the complete final gate matrix, and a subsequent clean
 strict review are evidenced.
 
+**Restart checkpoint:** Round 6 work is intentionally parked. Resume from
+[`docs/CONTINUE_ROUND_6.md`](CONTINUE_ROUND_6.md); R6-R275 and R6-R276 have
+uncommitted implementations but remain in progress pending their focused
+validation and same-commit closure evidence.
+
 **Status (2026-08-27):** Palantir-expansion PRD drafted
 (`docs/prd/exocortex-palantir-expansion-prd.md`, rev 2) — five post-v1
 capabilities promoted below as PX1-PX6. **None are release-blocking and
