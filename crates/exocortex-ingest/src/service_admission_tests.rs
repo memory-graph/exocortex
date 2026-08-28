@@ -32,6 +32,79 @@ fn assert_reject_code(ack: &IngestAck, code: RejectCode) {
     assert!(ack.rejections.iter().all(|row| row.code == code as i32));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_registry_persistence_serializes_snapshot_and_replace_order() {
+    use exocortex_wire::ingest::v1::ingest_service_server::IngestService as _;
+
+    let root = std::env::temp_dir().join(format!(
+        "exocortex-source-order-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("sources.json");
+    let mut persistent_server = server(4).with_sources_file(path.clone());
+    let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    persistent_server.source_persist_hook = Some(Arc::new(move |rows| {
+        if rows == 1 {
+            paused_tx.send(()).unwrap();
+            release_rx.lock().unwrap().take().unwrap().recv().unwrap();
+        }
+    }));
+
+    let shared_server = Arc::new(persistent_server);
+    let registration = |source: &str| {
+        tonic::Request::new(exocortex_wire::signing::registration(
+            &[5; 32],
+            "org",
+            source,
+            "producer",
+            3,
+            "session",
+            "node",
+            exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+        ))
+    };
+    let first_server = shared_server.clone();
+    let first = tokio::spawn(async move {
+        first_server
+            .register_source(registration("session://first"))
+            .await
+    });
+    tokio::task::spawn_blocking(move || paused_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    let second_server = shared_server.clone();
+    let mut second = tokio::spawn(async move {
+        second_server
+            .register_source(registration("session://second"))
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
+            .await
+            .is_err(),
+        "a later registry mutation must wait for the earlier snapshot replacement"
+    );
+    release_tx.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+
+    let restarted = server(1).with_sources_file(path.clone());
+    let mut sources = restarted.sources.lock().unwrap();
+    assert!(sources
+        .get(&("org".into(), "session://first".into(), "producer".into()))
+        .is_some());
+    assert!(sources
+        .get(&("org".into(), "session://second".into(), "producer".into()))
+        .is_some());
+    drop(sources);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn oversized_batch_is_rejected_before_hmac_and_checksum_work() {
     let server = server(1);

@@ -90,6 +90,11 @@ pub struct IngestServer<S: Storage> {
     pub sources: Arc<Mutex<SourceRegistry>>,
     /// Where the ceiling registry persists (M6.5); `None` = ephemeral.
     pub sources_file: Option<std::path::PathBuf>,
+    /// Serializes mutation snapshots with their durable replacement without
+    /// holding the registry map lock across filesystem I/O.
+    source_persistence: Arc<Mutex<()>>,
+    #[cfg(test)]
+    source_persist_hook: Option<Arc<dyn Fn(usize) + Send + Sync>>,
     /// Idempotency LRU: (producer_id, batch_id) -> original ack (§18.8.5).
     pub seen_batches: Arc<Mutex<SeenBatchRegistry>>,
     /// Backend-assigned embeddings (§7.5); `None` disables the embedding
@@ -165,6 +170,9 @@ impl<S: Storage> Clone for IngestServer<S> {
             default_producer_key: self.default_producer_key,
             sources: self.sources.clone(),
             sources_file: self.sources_file.clone(),
+            source_persistence: self.source_persistence.clone(),
+            #[cfg(test)]
+            source_persist_hook: self.source_persist_hook.clone(),
             seen_batches: self.seen_batches.clone(),
             embedder: self.embedder.clone(),
             embedding_permits: self.embedding_permits.clone(),
@@ -193,6 +201,9 @@ impl<S: Storage> IngestServer<S> {
                 std::num::NonZeroUsize::new(REGISTRY_LRU_CAP).unwrap(),
             ))),
             sources_file: None,
+            source_persistence: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            source_persist_hook: None,
             seen_batches: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(REGISTRY_LRU_CAP).unwrap(),
             ))),
@@ -299,22 +310,19 @@ impl<S: Storage> IngestServer<S> {
     }
 
     /// Flush a lock-free snapshot of the ceiling registry to disk (best effort).
-    fn persist_source_rows(&self, rows: &[((String, String, String), SourceEntry)]) {
+    fn persist_source_rows(
+        &self,
+        rows: &[((String, String, String), SourceEntry)],
+    ) -> std::io::Result<()> {
         let Some(path) = &self.sources_file else {
-            return;
+            return Ok(());
         };
-        let bytes = match serde_json::to_vec(rows) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::warn!(?e, "source registry serialization failed");
-                return;
-            }
-        };
-        if let Err(e) =
-            exocortex_storage::bounded_io::atomic_write_private(path, &bytes, "source registry")
-        {
-            tracing::warn!(?e, "source registry persist failed");
+        #[cfg(test)]
+        if let Some(hook) = &self.source_persist_hook {
+            hook(rows.len());
         }
+        let bytes = serde_json::to_vec(rows).map_err(std::io::Error::other)?;
+        exocortex_storage::bounded_io::atomic_write_private(path, &bytes, "source registry")
     }
 
     fn producer_key(&self, org: &str, source: &str, producer: &str) -> Result<[u8; 32], Status> {
@@ -1580,6 +1588,10 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         // different ceiling (the echo lets the SDK's R-I3 equality check
         // fire `CeilingMismatch` instead). The producer KIND follows the
         // same first-registration-wins rule for the same reason.
+        // Acquire the persistence sequencer before changing the map. Snapshot
+        // completion order therefore cannot differ from durable replacement
+        // order, while the map guard is still released before filesystem I/O.
+        let _persistence = self.source_persistence.lock().unwrap();
         let (effective, source_rows) = {
             let mut sources = self.sources.lock().unwrap();
             let admin = self.admin_policies.get(&key).copied();
@@ -1607,7 +1619,8 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             sources.put(key, entry);
             (entry, Self::source_rows(&sources))
         };
-        self.persist_source_rows(&source_rows);
+        self.persist_source_rows(&source_rows)
+            .map_err(|_| Status::internal("source registry persistence failed"))?;
         Ok(Response::new(RegisterSourceResponse {
             ceiling: effective.ceiling as i32,
         }))
