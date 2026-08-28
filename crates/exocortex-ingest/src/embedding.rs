@@ -90,9 +90,49 @@ impl Embedder for FakeEmbedder {
     }
 }
 
-/// The production embedder: fastembed bge-small (384-dim), the §16 default
-/// backend model. Constructed once at server start behind the backend
-/// config flag; construction downloads the model on first use.
+/// Immutable Hugging Face revision supplying the production model.
+#[cfg(feature = "fastembed")]
+pub const BGE_SMALL_REVISION: &str = "ea104dacec62c0de699686887e3f920caeb4f3e3";
+/// Revision-qualified identity stamped beside every production vector.
+#[cfg(feature = "fastembed")]
+pub const BGE_SMALL_VERSION: &str =
+    "hf:Xenova/bge-small-en-v1.5@ea104dacec62c0de699686887e3f920caeb4f3e3";
+/// Release-sidecar directory containing the verified model files.
+#[cfg(feature = "fastembed")]
+pub const BGE_SMALL_DIRECTORY: &str =
+    "Xenova_bge-small-en-v1.5-ea104dacec62c0de699686887e3f920caeb4f3e3";
+
+#[cfg(feature = "fastembed")]
+const MODEL_FILES: [(&str, usize, &str); 5] = [
+    (
+        "onnx/model.onnx",
+        133_093_490,
+        "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35",
+    ),
+    (
+        "tokenizer.json",
+        711_396,
+        "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+    ),
+    (
+        "config.json",
+        683,
+        "fa73f90bf92c8cace1fbcb709626306f2bdbc9ea3e5b5f94b440df9b6aa56350",
+    ),
+    (
+        "special_tokens_map.json",
+        125,
+        "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+    ),
+    (
+        "tokenizer_config.json",
+        366,
+        "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3",
+    ),
+];
+
+/// The production embedder: an offline, digest-verified fastembed bge-small
+/// model (384-dim), the §16 default backend model.
 #[cfg(feature = "fastembed")]
 pub struct FastEmbedder {
     model: std::sync::Mutex<fastembed::TextEmbedding>,
@@ -100,11 +140,41 @@ pub struct FastEmbedder {
 
 #[cfg(feature = "fastembed")]
 impl FastEmbedder {
-    /// Load the default bge-small model.
+    /// Load the pinned bge-small model from its installed release sidecar.
     pub fn bge_small() -> Result<Self, String> {
-        let options = fastembed::InitOptions::new(fastembed::EmbeddingModel::BGESmallENV15)
-            .with_show_download_progress(false);
-        let model = fastembed::TextEmbedding::try_new(options).map_err(|e| e.to_string())?;
+        let model_dir = resolve_bge_small_directory()?;
+        Self::bge_small_from_directory(&model_dir)
+    }
+
+    /// Load the pinned model from an explicit directory. All bytes are
+    /// verified before they are handed to ONNX Runtime; there is no network
+    /// fallback.
+    pub fn bge_small_from_directory(model_dir: &std::path::Path) -> Result<Self, String> {
+        let mut files = std::collections::HashMap::new();
+        for (relative, expected_len, expected_sha256) in MODEL_FILES {
+            let path = model_dir.join(relative);
+            let bytes = read_verified_artifact(&path, expected_len, expected_sha256)?;
+            files.insert(relative, bytes);
+        }
+        let take = |relative: &'static str,
+                    files: &mut std::collections::HashMap<&'static str, Vec<u8>>|
+         -> Result<Vec<u8>, String> {
+            files
+                .remove(relative)
+                .ok_or_else(|| format!("verified model artifact disappeared: {relative}"))
+        };
+        let onnx_file = take("onnx/model.onnx", &mut files)?;
+        let tokenizer_files = fastembed::TokenizerFiles {
+            tokenizer_file: take("tokenizer.json", &mut files)?,
+            config_file: take("config.json", &mut files)?,
+            special_tokens_map_file: take("special_tokens_map.json", &mut files)?,
+            tokenizer_config_file: take("tokenizer_config.json", &mut files)?,
+        };
+        let supplied = fastembed::UserDefinedEmbeddingModel::new(onnx_file, tokenizer_files)
+            .with_pooling(fastembed::Pooling::Cls);
+        let options = fastembed::InitOptionsUserDefined::new().with_max_length(384);
+        let model = fastembed::TextEmbedding::try_new_from_user_defined(supplied, options)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             model: std::sync::Mutex::new(model),
         })
@@ -132,7 +202,7 @@ impl Embedder for FastEmbedder {
     }
 
     fn model_version(&self) -> &'static str {
-        "v1"
+        BGE_SMALL_VERSION
     }
 
     fn dim(&self) -> usize {
@@ -140,5 +210,93 @@ impl Embedder for FastEmbedder {
     }
 }
 
+#[cfg(feature = "fastembed")]
+fn read_verified_artifact(
+    path: &std::path::Path,
+    expected_len: usize,
+    expected_sha256: &str,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("read model artifact {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("stat model artifact {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("model artifact {} is not a file", path.display()));
+    }
+    let mut bytes = Vec::with_capacity(expected_len);
+    file.take(expected_len as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read model artifact {}: {error}", path.display()))?;
+    if bytes.len() != expected_len {
+        return Err(format!(
+            "model artifact {} has length {}, expected {expected_len}",
+            path.display(),
+            bytes.len()
+        ));
+    }
+    use sha2::Digest as _;
+    let actual_sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+    if actual_sha256 != expected_sha256 {
+        return Err(format!(
+            "model artifact {} has sha256 {actual_sha256}, expected {expected_sha256}",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "fastembed")]
+fn resolve_bge_small_directory() -> Result<std::path::PathBuf, String> {
+    if let Some(explicit) = std::env::var_os("EXOCORTEX_BGE_SMALL_MODEL_DIR") {
+        return Ok(std::path::PathBuf::from(explicit));
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("resolve current executable for model sidecar: {error}"))?;
+    let bin_dir = executable
+        .parent()
+        .ok_or_else(|| "current executable has no parent directory".to_string())?;
+    let candidates = [
+        bin_dir.join("models").join(BGE_SMALL_DIRECTORY),
+        bin_dir
+            .parent()
+            .unwrap_or(bin_dir)
+            .join("share/exocortex/models")
+            .join(BGE_SMALL_DIRECTORY),
+        std::path::Path::new("/opt/exocortex/models").join(BGE_SMALL_DIRECTORY),
+    ];
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_dir())
+        .ok_or_else(|| {
+            format!(
+                "verified bge-small sidecar {BGE_SMALL_DIRECTORY} not found; set EXOCORTEX_BGE_SMALL_MODEL_DIR"
+            )
+        })
+}
+
 /// Convenience alias for the configured embedder handle.
 pub type EmbedderRef = Arc<dyn Embedder>;
+
+#[cfg(all(test, feature = "fastembed"))]
+mod fastembed_tests {
+    use super::FastEmbedder;
+
+    #[test]
+    fn corrupt_or_incomplete_model_sidecar_fails_closed_before_runtime_load() {
+        let root =
+            std::env::temp_dir().join(format!("exocortex-corrupt-model-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("onnx")).expect("create fixture");
+        std::fs::write(root.join("onnx/model.onnx"), b"tampered").expect("write fixture");
+
+        let error = match FastEmbedder::bge_small_from_directory(&root) {
+            Ok(_) => panic!("corrupt model was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("has length 8, expected 133093490"));
+        std::fs::remove_dir_all(root).expect("remove fixture");
+    }
+}

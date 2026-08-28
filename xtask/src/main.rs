@@ -132,14 +132,26 @@ fn deployment_acceptance() -> Result<()> {
     let ingest_manifest = std::fs::read_to_string("crates/exocortex-ingest/Cargo.toml")?;
     let chaos_script = std::fs::read_to_string("scripts/chaos-leader-kill.sh")?;
     let protoc_installer = std::fs::read_to_string("scripts/install-protoc.sh")?;
+    let model_fetcher = std::fs::read_to_string("scripts/fetch-embedding-model.sh")?;
+    let release_installer = std::fs::read_to_string("scripts/release-install.sh")?;
     let verify_release = std::fs::read_to_string("scripts/verify-release.sh")?;
+    let embedding_source = std::fs::read_to_string("crates/exocortex-ingest/src/embedding.rs")?;
+    let server_main = std::fs::read_to_string("crates/exocortex-server/src/main.rs")?;
     validate_release_hardening(
         &workflows,
         &dockerfile,
         &protoc_installer,
         &[&compose, &storage_compose],
     )?;
-    validate_fastembed_release(&workflows, &dockerfile, &verify_release)?;
+    validate_fastembed_release(
+        &workflows,
+        &dockerfile,
+        &verify_release,
+        &model_fetcher,
+        &release_installer,
+        &embedding_source,
+        &server_main,
+    )?;
     validate_fastembed_dependency_contract(&workspace_manifest, &ingest_manifest)?;
     validate_chaos_compose(&compose)?;
     validate_chaos_script(&chaos_script)?;
@@ -317,15 +329,29 @@ fn validate_fastembed_release(
     workflows: &[(&str, &str)],
     dockerfile: &str,
     verify_release: &str,
+    model_fetcher: &str,
+    release_installer: &str,
+    embedding_source: &str,
+    server_main: &str,
 ) -> Result<()> {
+    const REVISION: &str = "ea104dacec62c0de699686887e3f920caeb4f3e3";
+    const DIRECTORY: &str = "Xenova_bge-small-en-v1.5-ea104dacec62c0de699686887e3f920caeb4f3e3";
+    const DIGESTS: [&str; 5] = [
+        "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35",
+        "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+        "fa73f90bf92c8cace1fbcb709626306f2bdbc9ea3e5b5f94b440df9b6aa56350",
+        "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+        "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3",
+    ];
     let release = workflows
         .iter()
         .find(|(path, _)| path.ends_with("release.yml") || path.ends_with("release.yaml"))
         .map(|(_, source)| *source)
         .ok_or_else(|| anyhow::anyhow!("release workflow is missing"))?;
     anyhow::ensure!(
-        release.contains("--features exocortex-server/fastembed"),
-        "release artifacts must enable exocortex-server/fastembed"
+        release.contains("--features exocortex-server/fastembed")
+            && release.contains("scripts/fetch-embedding-model.sh \"dist/$DIST/models\""),
+        "release artifacts must enable FastEmbed and package its verified model sidecar"
     );
     anyhow::ensure!(
         dockerfile.contains("-p exocortex-server --bin exocortex-node --features fastembed"),
@@ -337,12 +363,42 @@ fn validate_fastembed_release(
         "verify-release must compile the exact production fastembed feature"
     );
     anyhow::ensure!(
-        dockerfile.contains(
-            "HF_HOME=/opt/exocortex/models /repo/target/release/exocortex-node --verify-embedder",
-        ) && dockerfile.contains(
+        dockerfile.contains(&format!("EXOCORTEX_BGE_SMALL_MODEL_DIR=/opt/exocortex/models/{DIRECTORY} /repo/target/release/exocortex-node --verify-embedder")) && dockerfile.contains(
             "COPY --from=build --chown=65532:65532 /opt/exocortex/models /opt/exocortex/models",
-        ) && dockerfile.contains("ENV HF_HOME=/opt/exocortex/models"),
-        "Docker image must execute the production embedder and carry its verified model cache"
+        ),
+        "Docker image must execute the production embedder and carry its verified immutable sidecar"
+    );
+    anyhow::ensure!(
+        !dockerfile.contains("/resolve/main/")
+            && !model_fetcher.contains("/resolve/main/")
+            && dockerfile.matches(&format!("/resolve/{REVISION}/")).count() == 5
+            && model_fetcher.contains(&format!("revision=\"{REVISION}\""))
+            && DIGESTS.iter().all(|digest| {
+                dockerfile.contains(&format!("--checksum=sha256:{digest}"))
+                    && model_fetcher.contains(digest)
+                    && embedding_source.contains(digest)
+            }),
+        "production model must use one immutable upstream revision and matching build, fetch, and runtime digests"
+    );
+    anyhow::ensure!(
+        embedding_source.contains("TextEmbedding::try_new_from_user_defined")
+            && !embedding_source.contains("TextEmbedding::try_new(")
+            && embedding_source.contains(&format!(
+                "hf:Xenova/bge-small-en-v1.5@{REVISION}"
+            ))
+            && embedding_source.contains("actual_sha256 != expected_sha256"),
+        "production embedder must verify local bytes, construct offline, and stamp the immutable revision"
+    );
+    anyhow::ensure!(
+        release_installer.contains("$src/models")
+            && release_installer.contains("share/exocortex/models"),
+        "release installer must install the packaged model sidecar"
+    );
+    anyhow::ensure!(
+        server_main.contains("const EXPECTED_PREFIX: [f32; 8]")
+            && server_main.contains("max_error <= 1.0e-4")
+            && server_main.contains("bge-small known-output mismatch"),
+        "release probe must enforce the pinned model's known output, not only its shape"
     );
     Ok(())
 }
@@ -353,9 +409,9 @@ fn validate_fastembed_dependency_contract(
 ) -> Result<()> {
     anyhow::ensure!(
         workspace_manifest.contains(
-            "fastembed = { version = \"=5.2.0\", default-features = false, features = [\"ort-download-binaries\", \"hf-hub-rustls-tls\"] }",
+            "fastembed = { version = \"=5.2.0\", default-features = false, features = [\"ort-download-binaries\"] }",
         ),
-        "production FastEmbed must stay exact-pinned on the Rustls model-download path"
+        "production FastEmbed must stay exact-pinned without an online model downloader"
     );
     anyhow::ensure!(
         workspace_manifest.contains("image = \"=0.25.5\"")
@@ -363,9 +419,12 @@ fn validate_fastembed_dependency_contract(
         "production embedding dependencies must preserve the Rust 1.85 image boundary without a direct ort-sys resolver pin"
     );
     anyhow::ensure!(
-        ingest_manifest.contains("fastembed = [\"dep:fastembed\", \"dep:image\"]")
+        ingest_manifest.contains(
+            "fastembed = [\"dep:fastembed\", \"dep:image\", \"dep:sha2\"]",
+        )
+            && ingest_manifest.contains("sha2 = { workspace = true, optional = true }")
             && !ingest_manifest.contains("ort-sys ="),
-        "ingest FastEmbed feature must carry the explicit Rust-1.85 image boundary and no direct ort-sys dependency"
+        "ingest FastEmbed feature must verify artifacts with sha2, preserve the Rust-1.85 image boundary, and avoid a direct ort-sys dependency"
     );
     Ok(())
 }
@@ -481,11 +540,11 @@ fn validate_dockerfile(dockerfile: &str) -> Result<()> {
         "Dockerfile must not resolve build or runtime inputs through a mutable package repository"
     );
     anyhow::ensure!(
-        dockerfile.matches("ADD --checksum=sha256:").count() == 2
+        dockerfile.matches("ADD --checksum=sha256:").count() == 7
             && dockerfile.contains("protoc-28.3-linux-x86_64.zip")
             && dockerfile.contains("protoc-28.3-linux-aarch_64.zip")
             && dockerfile.contains("gcr.io/distroless/cc-debian12:nonroot@sha256:"),
-        "Dockerfile must checksum both protoc platform archives and use the pinned CA-root runtime"
+        "Dockerfile must checksum both protoc archives and all five model artifacts, and use the pinned CA-root runtime"
     );
     anyhow::ensure!(
         dockerfile
@@ -1606,6 +1665,12 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
                 "ADD --checksum=sha256:{digest} https://example.invalid/protoc-28.3-linux-x86_64.zip /protoc.zip\n",
                 "FROM scratch AS protoc-arm64\n",
                 "ADD --checksum=sha256:{digest} https://example.invalid/protoc-28.3-linux-aarch_64.zip /protoc.zip\n",
+                "FROM scratch AS model\n",
+                "ADD --checksum=sha256:{digest} https://example.invalid/model-1 /model/1\n",
+                "ADD --checksum=sha256:{digest} https://example.invalid/model-2 /model/2\n",
+                "ADD --checksum=sha256:{digest} https://example.invalid/model-3 /model/3\n",
+                "ADD --checksum=sha256:{digest} https://example.invalid/model-4 /model/4\n",
+                "ADD --checksum=sha256:{digest} https://example.invalid/model-5 /model/5\n",
                 "FROM gcr.io/distroless/cc-debian12:nonroot@sha256:{digest}\n",
                 "RUN command -v pkg-config && pkg-config --exists openssl\n",
                 "RUN cargo build --release -p exocortex-server --bin exocortex-node --features fastembed\n",
@@ -1786,28 +1851,92 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
 
     #[test]
     fn fastembed_release_contract_rejects_each_missing_surface() {
-        let release = "--features exocortex-server/fastembed";
+        let release = include_str!("../../.github/workflows/release.yml");
         let workflows = [(".github/workflows/release.yml", release)];
-        let docker = concat!(
-            "cargo build -p exocortex-server --bin exocortex-node --features fastembed\n",
-            "HF_HOME=/opt/exocortex/models /repo/target/release/exocortex-node --verify-embedder\n",
-            "COPY --from=build --chown=65532:65532 /opt/exocortex/models /opt/exocortex/models\n",
-            "ENV HF_HOME=/opt/exocortex/models"
-        );
-        let verify = "cargo check -p exocortex-server --all-targets --features fastembed";
-        assert!(validate_fastembed_release(&workflows, docker, verify).is_ok());
+        let docker = include_str!("../../Dockerfile");
+        let verify = include_str!("../../scripts/verify-release.sh");
+        let fetcher = include_str!("../../scripts/fetch-embedding-model.sh");
+        let installer = include_str!("../../scripts/release-install.sh");
+        let embedding = include_str!("../../crates/exocortex-ingest/src/embedding.rs");
+        let server_main = include_str!("../../crates/exocortex-server/src/main.rs");
+        assert!(validate_fastembed_release(
+            &workflows,
+            docker,
+            verify,
+            fetcher,
+            installer,
+            embedding,
+            server_main,
+        )
+        .is_ok());
         assert!(validate_fastembed_release(
             &[(".github/workflows/release.yml", "cargo build")],
             docker,
-            verify
+            verify,
+            fetcher,
+            installer,
+            embedding,
+            server_main,
         )
         .is_err());
-        assert!(validate_fastembed_release(&workflows, "cargo build", verify).is_err());
-        assert!(validate_fastembed_release(&workflows, docker, "cargo check").is_err());
+        assert!(validate_fastembed_release(
+            &workflows,
+            "cargo build",
+            verify,
+            fetcher,
+            installer,
+            embedding,
+            server_main,
+        )
+        .is_err());
+        assert!(validate_fastembed_release(
+            &workflows,
+            docker,
+            "cargo check",
+            fetcher,
+            installer,
+            embedding,
+            server_main,
+        )
+        .is_err());
         assert!(validate_fastembed_release(
             &workflows,
             &docker.replace(" --verify-embedder", ""),
-            verify
+            verify,
+            fetcher,
+            installer,
+            embedding,
+            server_main,
+        )
+        .is_err());
+        assert!(validate_fastembed_release(
+            &workflows,
+            docker,
+            verify,
+            &fetcher.replace("ea104dacec62c0de699686887e3f920caeb4f3e3", "main"),
+            installer,
+            embedding,
+            server_main,
+        )
+        .is_err());
+        assert!(validate_fastembed_release(
+            &workflows,
+            docker,
+            verify,
+            fetcher,
+            installer,
+            &embedding.replace("try_new_from_user_defined", "try_new"),
+            server_main,
+        )
+        .is_err());
+        assert!(validate_fastembed_release(
+            &workflows,
+            docker,
+            verify,
+            fetcher,
+            installer,
+            embedding,
+            &server_main.replace("max_error <= 1.0e-4", "true"),
         )
         .is_err());
     }
@@ -1818,7 +1947,10 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
         let ingest = include_str!("../../crates/exocortex-ingest/Cargo.toml");
         assert!(validate_fastembed_dependency_contract(workspace, ingest).is_ok());
         assert!(validate_fastembed_dependency_contract(
-            &workspace.replace("hf-hub-rustls-tls", "online"),
+            &workspace.replace(
+                "features = [\"ort-download-binaries\"]",
+                "features = [\"ort-download-binaries\", \"hf-hub-rustls-tls\"]"
+            ),
             ingest
         )
         .is_err());
@@ -1830,8 +1962,8 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
         assert!(validate_fastembed_dependency_contract(
             workspace,
             &ingest.replace(
-                "fastembed = [\"dep:fastembed\", \"dep:image\"]",
-                "fastembed = [\"dep:fastembed\"]"
+                "fastembed = [\"dep:fastembed\", \"dep:image\", \"dep:sha2\"]",
+                "fastembed = [\"dep:fastembed\", \"dep:image\"]"
             )
         )
         .is_err());

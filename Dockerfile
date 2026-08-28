@@ -14,6 +14,14 @@ ADD --checksum=sha256:1de522032a8b194002fe35cab86d747848238b5e4de4f99648372079f5
 
 FROM protoc-${TARGETARCH} AS protoc-archive
 
+# BuildKit verifies every file from the immutable upstream model revision.
+FROM scratch AS bge-small-model
+ADD --checksum=sha256:828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35 https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/ea104dacec62c0de699686887e3f920caeb4f3e3/onnx/model.onnx /model/onnx/model.onnx
+ADD --checksum=sha256:d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66 https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/ea104dacec62c0de699686887e3f920caeb4f3e3/tokenizer.json /model/tokenizer.json
+ADD --checksum=sha256:fa73f90bf92c8cace1fbcb709626306f2bdbc9ea3e5b5f94b440df9b6aa56350 https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/ea104dacec62c0de699686887e3f920caeb4f3e3/config.json /model/config.json
+ADD --checksum=sha256:b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3 https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/ea104dacec62c0de699686887e3f920caeb4f3e3/special_tokens_map.json /model/special_tokens_map.json
+ADD --checksum=sha256:9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3 https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/ea104dacec62c0de699686887e3f920caeb4f3e3/tokenizer_config.json /model/tokenizer_config.json
+
 FROM busybox:1.36.1-musl@sha256:3c6ae8008e2c2eedd141725c30b20d9c36b026eb796688f88205845ef17aa213 AS protoc
 COPY --from=protoc-archive /protoc.zip /tmp/protoc.zip
 RUN mkdir -p /opt/protoc && unzip -q /tmp/protoc.zip -d /opt/protoc
@@ -26,18 +34,18 @@ RUN test "$(protoc --version)" = "libprotoc 28.3"
 # building. Prove the digest-pinned builder carries that build-only toolchain.
 RUN command -v pkg-config && pkg-config --exists openssl
 WORKDIR /repo
+COPY --from=bge-small-model /model /opt/exocortex/models/Xenova_bge-small-en-v1.5-ea104dacec62c0de699686887e3f920caeb4f3e3
 COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml ./
 COPY .cargo .cargo
 COPY xtask xtask
 COPY proto proto
 COPY crates crates
 RUN cargo build --release -p exocortex-server --bin exocortex-node --features fastembed
-RUN HF_HOME=/opt/exocortex/models /repo/target/release/exocortex-node --verify-embedder
+RUN EXOCORTEX_BGE_SMALL_MODEL_DIR=/opt/exocortex/models/Xenova_bge-small-en-v1.5-ea104dacec62c0de699686887e3f920caeb4f3e3 /repo/target/release/exocortex-node --verify-embedder
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=build --chown=65532:65532 /repo/target/release/exocortex-node /usr/local/bin/exocortex-node
 COPY --from=build --chown=65532:65532 /opt/exocortex/models /opt/exocortex/models
-ENV HF_HOME=/opt/exocortex/models
 # backend-node by default; the deployer must mount its TLS certificate and
 # private key at the paths below, plus the required auth/cluster policy flags.
 # mcp-standalone needs the redis-server binary plus the FalkorDB module on the

@@ -15,6 +15,9 @@ archive="exocortex-${tag#v}-$artifact_target.tar.gz"
 release="$tmp/releases/$tag"
 payload="$tmp/payload/exocortex-${tag#v}-$artifact_target"
 mkdir -p "$release" "$payload" "$tmp/cargo"
+model_dir="Xenova_bge-small-en-v1.5-ea104dacec62c0de699686887e3f920caeb4f3e3"
+mkdir -p "$payload/models/$model_dir"
+printf 'sidecar fixture\n' > "$payload/models/$model_dir/model.marker"
 for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
   printf '#!/bin/sh\nexit 0\n' > "$payload/$bin"
   chmod +x "$payload/$bin"
@@ -82,8 +85,19 @@ MOCK_CURL_LOG="$mock_log" \
 CARGO_HOME="$tmp/cargo" \
 sh scripts/release-install.sh >/dev/null
 test -x "$tmp/cargo/bin/exocortex-node"
+test "$(cat "$tmp/cargo/share/exocortex/models/$model_dir/model.marker")" = "sidecar fixture"
 test "$(wc -l < "$mock_log" | tr -d ' ')" -eq 2
 grep -q -- "--proto =https --tlsv1.2" "$mock_log"
+
+printf 'corrupt\n' > "$tmp/cargo/share/exocortex/models/$model_dir/model.marker"
+INSTALL_VERSION="$tag" \
+PATH="$tmp/mock-bin:$PATH" \
+MOCK_RELEASE_ROOT="$release" \
+MOCK_CURL_LOG="$mock_log" \
+CARGO_HOME="$tmp/cargo" \
+sh scripts/release-install.sh >/dev/null
+test "$(cat "$tmp/cargo/share/exocortex/models/$model_dir/model.marker")" = "sidecar fixture"
+test "$(wc -l < "$mock_log" | tr -d ' ')" -eq 4
 
 printf 'tampered' >> "$release/$archive"
 if INSTALL_VERSION="$tag" \

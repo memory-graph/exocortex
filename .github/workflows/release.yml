@@ -113,6 +113,7 @@ jobs:
           for bin in exocortex-mcp-client exocortex-node exocortex-worker; do
             cp "target/${{ matrix.target }}/release/$bin" "dist/$DIST/"
           done
+          sh scripts/fetch-embedding-model.sh "dist/$DIST/models"
           cp scripts/exocortex "dist/$DIST/exocortex"
           cp README.md LICENSE "dist/$DIST/"
           cat > "dist/$DIST/README-install.txt" <<EOF

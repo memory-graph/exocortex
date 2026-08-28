@@ -1,8 +1,8 @@
 # Exocortex v1 — Round 6 Whole-Project Review
 
-**Status:** REOPENED — strict release convergence promoted R6-R180 through
-R6-R183 after R6-R176 through R6-R179 closed; all earlier findings remain
-closed.
+**Status:** RELEASE BLOCKED pending R6-R182's complete final gate matrix and
+fresh strict review. R6-R180, R6-R181, and R6-R183 are implementation-complete;
+all earlier findings remain closed.
 
 **Review baseline:** `f7bf463aa4a77ac719c485bfe713541d79edeab1`
 (2026-08-27). Scope was the entire tracked repository: 199 files, of which
@@ -563,7 +563,7 @@ per-event renewal and a ten-second I/O bound keep the claim live, forced
 takeover makes the stale publisher fail, completion reclaims its serialized
 payload, and live Falkor covers empty successful settlement.
 
-## Final closure (2026-08-28)
+## Historical closure before post-release verification (2026-08-28)
 
 The strict implementation review at `ce3a956` found zero verified actionable
 correctness, security, runtime, storage, architecture, or test-quality
@@ -664,6 +664,17 @@ content moves. Closure requires an exact upstream commit, verified artifact
 digests, offline construction from those verified artifacts, an immutable model
 stamp, and negative release-gate plus known-output evidence.
 
+R6-R181 is closed by one immutable sidecar contract. Release packaging and
+Docker source all five files from Hugging Face commit
+`ea104dacec62c0de699686887e3f920caeb4f3e3`; the fetcher, BuildKit, and runtime
+enforce the same exact sizes and SHA-256 digests. The application has no
+FastEmbed Hugging Face feature or online fallback, constructs from verified
+bytes, and stamps the full repository plus commit. The hidden release probe
+checks a fixed eight-value output prefix as well as shape and finiteness.
+Focused corrupt-artifact and release-gate negative tests pass, as do a no-cache
+Docker build, its build-stage model execution, and execution from the final
+distroless image.
+
 ### R6-R182 — The reopened review carries contradictory closure state
 
 The current header and master plan correctly keep Round 6 open, but the prior
@@ -682,7 +693,16 @@ acquisition defect, but the required deviation record is absent from
 contract deviation without editing the PRD and correcting the plan evidence to
 distinguish the historical implementation from the current dependency state.
 
-The complete mandatory gate matrix passed: formatting, workspace clippy,
+R6-R183 is closed without changing the core PRD. Milestone deviation 16 records
+the clean-image acquisition failure that makes exact FastEmbed 5.2 necessary,
+the maintained offline constructor it supplies, and the direct artifact-hash
+dependency. Master-plan R6-R79 and R6-R178 now label their 3.14/rc.4 and interim
+hf-hub evidence as historical and point to R6-R181's current release contract.
+
+### Historical pre-R176 closure evidence (superseded)
+
+At the earlier closure point, the complete mandatory gate matrix passed:
+formatting, workspace clippy,
 workspace tests with adapter SDK testing and `--no-fail-fast`, dependency
 policy, kernel purity, fingerprint (`e1f7d17b...ddc9b2`), schema/playbook
 generation, no-LLM, proto sync, signing hygiene, wire standalone packaging,
@@ -692,5 +712,7 @@ reported the live target as `UNEXECUTED`; a separate configured run then
 passed the in-memory suite, all 35 live Falkor integration tests, and all seven
 live fencing tests. Metrics hygiene, acceptance coverage, deployment
 acceptance, and Docker leader failover also passed; the latter elected
-`node1` after killing `node3` in 1,723 ms. Round 6 is closed. PRD-backed v2 and
-post-v1 deferrals remain deferrals and are not release blockers.
+`node1` after killing `node3` in 1,723 ms. Round 6 was closed at that point,
+but R6-R176 through R6-R183 subsequently reopened it; this paragraph is
+historical evidence, not the current verdict. PRD-backed v2 and post-v1
+deferrals remain deferrals and are not release blockers.

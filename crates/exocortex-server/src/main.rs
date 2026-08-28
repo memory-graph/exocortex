@@ -209,7 +209,32 @@ fn verify_production_embedder() -> anyhow::Result<()> {
             vector.len() == 384 && vector.iter().all(|value| value.is_finite()),
             "bge-small embedder returned an invalid production vector"
         );
-        println!("embedder-ok model=bge-small version=v1 dim=384");
+        // Golden output from the exact artifact revision above. This catches a
+        // valid-but-wrong ONNX/tokenizer/pooling combination that shape and
+        // digest checks alone cannot distinguish.
+        const EXPECTED_PREFIX: [f32; 8] = [
+            -0.049_560_662,
+            0.057_678_916,
+            0.072_846_055,
+            -0.028_968_032,
+            0.036_817_014,
+            -0.001_249_432_3,
+            -0.072_116_114,
+            0.009_108_414,
+        ];
+        let max_error = vector
+            .iter()
+            .zip(EXPECTED_PREFIX)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        anyhow::ensure!(
+            max_error <= 1.0e-4,
+            "bge-small known-output mismatch (max prefix error {max_error})"
+        );
+        println!(
+            "embedder-ok model=bge-small version={} dim=384",
+            exocortex_ingest::embedding::BGE_SMALL_VERSION
+        );
         Ok(())
     }
     #[cfg(not(feature = "fastembed"))]

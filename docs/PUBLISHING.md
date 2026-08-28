@@ -107,16 +107,26 @@ provider before constructing that listener. Transitive workspace consumers
 enable both supported providers, so Rustls cannot infer one from the unified
 feature set at runtime.
 
-The optional `exocortex-ingest/fastembed` feature uses fastembed 5.2 with its
-Rustls Hugging Face downloader and pinned ONNX Runtime download feature.
+The optional `exocortex-ingest/fastembed` feature exact-pins fastembed 5.2 and
+does not enable its Hugging Face downloader. Releases package five files from
+`Xenova/bge-small-en-v1.5` commit
+`ea104dacec62c0de699686887e3f920caeb4f3e3`; Docker BuildKit, the release fetch
+script, and the runtime all enforce the same SHA-256 digests. The server loads
+only those verified in-memory bytes through fastembed's user-defined-model API,
+stamps the full upstream commit on every vector, and fails closed without the
+sidecar. `scripts/fetch-embedding-model.sh` builds the sidecar for release
+archives, and `scripts/release-install.sh` installs it under
+`${CARGO_HOME:-$HOME/.cargo}/share/exocortex/models`. There is no first-start
+network acquisition or mutable-revision fallback.
+
 Fastembed 3.14's hf-hub 0.3 path failed clean production startup with a
-relative redirect, while its native-TLS dependency also required an undeclared
-OpenSSL build toolchain. The maintained downloader restores real first-start
-model acquisition without making native TLS a runtime dependency; application
-code continues to use only fastembed's embedding API. The optional feature also
-pins `image` 0.25.5 as a resolver constraint because fastembed 5.2 includes its
-image surface unconditionally and later 0.25 patch releases exceed the pinned
-Rust 1.85 MSRV; Exocortex does not call the image API.
+relative redirect. Moving to 5.2 provides the maintained offline
+user-defined-model API used by the immutable sidecar; this PRD dependency
+deviation is recorded in `docs/MILESTONE_REPORT.md`. The optional feature also
+adds a direct `sha2` edge for runtime artifact verification and pins `image`
+0.25.5 as a resolver constraint because fastembed 5.2 includes its image
+surface unconditionally and later 0.25 patch releases exceed the pinned Rust
+1.85 MSRV; Exocortex does not call the image API.
 
 Fastembed's pinned ONNX Runtime download feature still selects `ort-sys`'s
 build-time native-TLS downloader. The digest-pinned Bookworm builder supplies

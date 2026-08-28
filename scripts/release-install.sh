@@ -39,14 +39,38 @@ fi
 tar -xzf "$tmp/$archive" -C "$tmp"
 src="$(find "$tmp" -maxdepth 2 -name exocortex-mcp-client -exec dirname {} \; | head -1)"
 [ -n "$src" ] || { echo "install refused: archive has no client binary" >&2; exit 1; }
+[ -d "$src/models" ] || { echo "install refused: archive has no embedding model sidecar" >&2; exit 1; }
+model_count=0
+for model in "$src"/models/*; do
+  [ -d "$model" ] || { echo "install refused: embedding model sidecar is empty" >&2; exit 1; }
+  model_count=$((model_count + 1))
+done
+[ "$model_count" -eq 1 ] || { echo "install refused: archive must contain exactly one embedding model" >&2; exit 1; }
 dest="${CARGO_HOME:-$HOME/.cargo}/bin"
 mkdir -p "$dest"
 for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
   install -m 0755 "$src/$bin" "$dest/$bin" 2>/dev/null || cp "$src/$bin" "$dest/$bin"
 done
+model_dest="${CARGO_HOME:-$HOME/.cargo}/share/exocortex/models"
+mkdir -p "$model_dest"
+for model in "$src"/models/*; do
+  model_name="$(basename "$model")"
+  staged="$model_dest/.$model_name.new.$$"
+  previous="$model_dest/.$model_name.old.$$"
+  cp -R "$model" "$staged"
+  if [ -e "$model_dest/$model_name" ]; then
+    mv "$model_dest/$model_name" "$previous"
+  fi
+  if mv "$staged" "$model_dest/$model_name"; then
+    [ ! -e "$previous" ] || rm -rf "$previous"
+  else
+    [ ! -e "$previous" ] || mv "$previous" "$model_dest/$model_name"
+    exit 1
+  fi
+done
 case ":$PATH:" in
   *":$dest:"*) ;;
   *) echo "note: add $dest to PATH" ;;
 esac
-echo "installed: exocortex, exocortex-mcp-client, exocortex-node, exocortex-worker"
+echo "installed: exocortex, exocortex-mcp-client, exocortex-node, exocortex-worker, verified model sidecar"
 echo "next: exocortex --mode mcp-standalone --org my-org --user me"

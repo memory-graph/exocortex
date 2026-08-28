@@ -125,6 +125,20 @@ cross-cutting gates (§3). Commits: one per milestone, `M<n>: <what and why>`.
     fallback; the HTTP parity binding (`http_bind.rs`) mounts every
     registered operation behind bearer auth with `/metrics` + `/health/*`.
 
+### Round 6
+
+16. **`fastembed` 3 → exact 5.2.0** (§2.2): the PRD-pinned 3.14/hf-hub 0.3
+    acquisition path fails in a clean production image with
+    `RelativeUrlWithoutBase`, so it cannot satisfy the same PRD's required
+    production BGE-small backend. Fastembed 5.2 supplies the maintained
+    user-defined-model constructor needed to remove runtime acquisition
+    entirely. Exocortex now packages `Xenova/bge-small-en-v1.5` at commit
+    `ea104dacec62c0de699686887e3f920caeb4f3e3`, verifies all five artifacts at
+    build, release-fetch, and runtime boundaries, constructs offline, and
+    stamps the full immutable revision. The feature's direct optional `sha2`
+    dependency exists solely for runtime artifact verification; `image`
+    remains exact-pinned at the Rust 1.85-compatible 0.25.5 resolver boundary.
+
 ## Post-review round 1 (2026-08-24)
 
 The deep review of the M0–M8 implementation found two correctness bugs and

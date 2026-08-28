@@ -86,9 +86,9 @@ rmcp        = "0.1"
 inventory   = "0.3"
 
 # --- embedding runtime (backend default) ---
-# Rustls avoids the native OpenSSL discovery that broke clean Linux images;
-# 5.2 also carries the maintained hf-hub downloader used at first startup.
-fastembed = { version = "=5.2.0", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
+# Model bytes are supplied and digest-verified by Exocortex; only the pinned
+# ONNX Runtime build downloader remains enabled in fastembed itself.
+fastembed = { version = "=5.2.0", default-features = false, features = ["ort-download-binaries"] }
 # fastembed 5.2 exposes image models unconditionally; newer image 0.25 patch
 # releases exceed Rust 1.85, so keep the compatible resolver boundary explicit.
 image = "=0.25.5"
