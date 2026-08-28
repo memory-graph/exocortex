@@ -189,12 +189,12 @@ fn contains_reachable_production_call(
             if !reachable[caller] {
                 continue;
             }
-            let body = &source[functions[caller].body_start..functions[caller].body_end];
+            let body = body_without_nested_functions(&source, &functions[caller], &functions);
             for callee in 0..functions.len() {
                 if !reachable[callee]
                     && !functions[callee].configured_out
                     && contains_call(
-                        body,
+                        &body,
                         &functions[callee].name,
                         Some(functions[callee].method),
                     )
@@ -218,18 +218,31 @@ fn contains_reachable_production_call(
         if !reachable[index] {
             return false;
         }
-        let body = &source[function.body_start..function.body_end];
+        let body = body_without_nested_functions(&source, function, &functions);
         if let Some(qualified_call) = qualified_call {
-            return qualified_call_offsets(body, qualified_call).any(|offset| {
-                !configured_out_at(body, offset) && !after_unconditional_exit(body, offset)
-            });
+            return qualified_call_offsets(&body, qualified_call)
+                .any(|offset| call_is_reachable(&body, offset));
         }
         body.match_indices(&needle).any(|(relative, _)| {
-            is_call_to(body, relative, target_is_method)
-                && !configured_out_at(body, relative)
-                && !after_unconditional_exit(body, relative)
+            is_call_to(&body, relative, target_is_method) && call_is_reachable(&body, relative)
         })
     })
+}
+
+fn body_without_nested_functions(
+    source: &str,
+    function: &RustFunction,
+    functions: &[RustFunction],
+) -> String {
+    let mut body = source.as_bytes()[function.body_start..function.body_end].to_vec();
+    for nested in functions.iter().filter(|nested| {
+        nested.body_start > function.body_start && nested.body_end < function.body_end
+    }) {
+        let start = nested.body_start - function.body_start;
+        let end = nested.body_end - function.body_start;
+        body[start..end].fill(b' ');
+    }
+    String::from_utf8(body).expect("masking Rust function bodies preserves UTF-8")
 }
 
 fn qualified_call_offsets<'a>(body: &'a str, pattern: &'a str) -> impl Iterator<Item = usize> + 'a {
@@ -267,10 +280,22 @@ fn qualified_call_offsets<'a>(body: &'a str, pattern: &'a str) -> impl Iterator<
 fn contains_call(body: &str, name: &str, method: Option<bool>) -> bool {
     let needle = format!("{name}(");
     body.match_indices(&needle)
-        .any(|(offset, _)| is_call_to(body, offset, method))
+        .any(|(offset, _)| is_call_to(body, offset, method) && call_is_reachable(body, offset))
 }
 
 fn is_call_to(body: &str, offset: usize, method: Option<bool>) -> bool {
+    if body[..offset]
+        .trim_end()
+        .strip_suffix("fn")
+        .is_some_and(|prefix| {
+            prefix
+                .chars()
+                .next_back()
+                .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+        })
+    {
+        return false;
+    }
     let preceding = body[..offset]
         .bytes()
         .rev()
@@ -282,8 +307,59 @@ fn is_call_to(body: &str, offset: usize, method: Option<bool>) -> bool {
     }
 }
 
+fn call_is_reachable(body: &str, offset: usize) -> bool {
+    !configured_out_at(body, offset)
+        && !after_unconditional_exit(body, offset)
+        && !inside_constant_false_block(body, offset)
+        && !inside_uncalled_closure(body, offset)
+}
+
+fn inside_constant_false_block(body: &str, offset: usize) -> bool {
+    let mut open_braces = Vec::new();
+    for (index, byte) in body.as_bytes()[..offset].iter().enumerate() {
+        match byte {
+            b'{' => open_braces.push(index),
+            b'}' => {
+                open_braces.pop();
+            }
+            _ => {}
+        }
+    }
+    open_braces.into_iter().any(|open| {
+        let header_start = body[..open].rfind([';', '{', '}']).map_or(0, |at| at + 1);
+        let header = body[header_start..open].trim();
+        header.ends_with("if false") || header.ends_with("while false")
+    })
+}
+
+fn inside_uncalled_closure(body: &str, offset: usize) -> bool {
+    let statement_start = body[..offset].rfind(';').map_or(0, |at| at + 1);
+    let prefix = &body[statement_start..offset];
+    let Some(let_at) = prefix.rfind("let ") else {
+        return false;
+    };
+    let declaration = &prefix[let_at + 4..];
+    let Some((binding, value)) = declaration.split_once('=') else {
+        return false;
+    };
+    let binding = binding
+        .split_whitespace()
+        .find(|token| *token != "mut")
+        .unwrap_or_default()
+        .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_');
+    if binding.is_empty() || !value.contains('|') {
+        return false;
+    }
+    !body[offset..]
+        .match_indices(&format!("{binding}("))
+        .any(|(at, _)| {
+            is_call_to(&body[offset..], at, Some(false))
+                && !after_unconditional_exit(&body[offset..], at)
+        })
+}
+
 fn rust_functions(source: &str) -> Vec<RustFunction> {
-    let mut functions = Vec::new();
+    let mut functions: Vec<RustFunction> = Vec::new();
     let mut cursor = 0;
     while let Some(relative) = source[cursor..].find("fn ") {
         let at = cursor + relative;
@@ -320,12 +396,16 @@ fn rust_functions(source: &str) -> Vec<RustFunction> {
             attribute_start = previous_start;
         }
         let header = &source[attribute_start..body_start];
-        let root = name == "main"
-            || name == "handle"
-            || inside_trait_impl(source, at)
-            || header
-                .split_whitespace()
-                .any(|token| token.starts_with("pub"));
+        let nested_in_function = functions
+            .iter()
+            .any(|function| at > function.body_start && at < function.body_end);
+        let root = !nested_in_function
+            && (name == "main"
+                || name == "handle"
+                || inside_trait_impl(source, at)
+                || header
+                    .split_whitespace()
+                    .any(|token| token.starts_with("pub")));
         functions.push(RustFunction {
             name,
             body_start: body_start + 1,
@@ -1118,23 +1198,20 @@ fn shell_evidence_is_executed(
     all_evidence: &str,
     command: &str,
 ) -> Result<bool> {
-    let tokens = command
-        .split_whitespace()
-        .map(|token| token.trim_matches(['\'', '"']))
-        .collect::<Vec<_>>();
-    if tokens.first().is_some_and(|token| *token == relative)
-        || tokens
-            .windows(2)
-            .any(|pair| matches!(pair[0], "sh" | "bash") && pair[1] == relative)
-    {
+    let invocations = command_invocations(command);
+    if invocations.iter().any(|tokens| {
+        tokens.first().is_some_and(|token| *token == relative)
+            || matches!(tokens.as_slice(), [shell, script, ..] if matches!(*shell, "sh" | "bash") && *script == relative)
+    }) {
         return Ok(true);
     }
-    let Some(position) = tokens.iter().position(|token| *token == "xtask") else {
+    let Some(tokens) = invocations
+        .iter()
+        .find(|tokens| matches!(tokens.as_slice(), ["cargo", "xtask", _, ..]))
+    else {
         return Ok(false);
     };
-    let Some(gate) = tokens.get(position + 1) else {
-        return Ok(false);
-    };
+    let gate = tokens[2];
     let function = gate.replace('-', "_");
     let locator = format!("xtask/src/main.rs::fn {function}()");
     if !all_evidence.split(';').any(|item| item == locator) {
@@ -1161,8 +1238,36 @@ fn shell_evidence_is_executed(
                 clean[offset..]
                     .get(..call.len())
                     .is_some_and(|candidate| candidate == call)
+                    && call_is_reachable(&clean, offset)
             })
         }))
+}
+
+fn command_invocations(command: &str) -> Vec<Vec<&str>> {
+    command
+        .split("&&")
+        .filter_map(|segment| {
+            let tokens = segment
+                .split_whitespace()
+                .map(|token| token.trim_matches(['\'', '"']))
+                .collect::<Vec<_>>();
+            let executable = tokens
+                .iter()
+                .position(|token| !is_environment_assignment(token))?;
+            Some(tokens[executable..].to_vec())
+        })
+        .collect()
+}
+
+fn is_environment_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn is_shell_source(relative: &str, source: &str) -> bool {
@@ -1298,9 +1403,8 @@ fn command_executes_test(command: &str, relative: &str, target: &str, symbol: &s
     let expected_package = relative
         .strip_prefix("crates/")
         .and_then(|path| path.split('/').next());
-    command.split("&&").any(|segment| {
-        let tokens = segment.split_whitespace().collect::<Vec<_>>();
-        if !tokens.windows(2).any(|pair| pair == ["cargo", "test"]) {
+    command_invocations(command).into_iter().any(|tokens| {
+        if !matches!(tokens.as_slice(), ["cargo", "test", ..]) {
             return false;
         }
         if let Some(package) = expected_package {
@@ -1744,6 +1848,35 @@ mod tests {
                 "qualified witnesses must still be executable and reachable"
             );
         }
+
+        for source in [
+            "pub fn root() { fn nested() { fence(); } } fn fence() {}\n",
+            "pub fn root() { let unused = || { fence(); }; let _ = unused; } fn fence() {}\n",
+        ] {
+            write(&root, "crates/example/src/lib.rs", source);
+            assert_eq!(
+                dead_enforcement_violations(
+                    &root,
+                    &[("fence", "crates/example/src/lib.rs", None)],
+                )
+                .unwrap()
+                .len(),
+                1,
+                "uncalled nested functions and closures are not production witnesses"
+            );
+        }
+
+        write(
+            &root,
+            "crates/example/src/lib.rs",
+            "pub fn root() { fn nested() { fence(); } nested(); } fn fence() {}\n",
+        );
+        assert!(dead_enforcement_violations(
+            &root,
+            &[("fence", "crates/example/src/lib.rs", None)],
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -2123,6 +2256,18 @@ mod tests {
             validate_acceptance_matrix(&root).is_err(),
             "a textual path argument is not execution"
         );
+        for inert_command in [
+            "printf sh scripts/check",
+            "printf bash scripts/check",
+            "printf cargo xtask inspect",
+        ] {
+            let inert_rows = shell_rows.replace("sh scripts/check", inert_command);
+            write(&root, "docs/acceptance/section-23.tsv", &inert_rows);
+            assert!(
+                validate_acceptance_matrix(&root).is_err(),
+                "an inert command must not satisfy shell evidence: {inert_command}"
+            );
+        }
         write(
             &root,
             "scripts/check",
@@ -2166,6 +2311,17 @@ mod tests {
             "fn inspect() { let _ = std::fs::read_to_string(\"scripts/check\"); }\n",
         );
         assert!(validate_acceptance_matrix(&root).is_ok());
+        for inert_body in [
+            "fn inspect() { return; let _ = std::fs::read_to_string(\"scripts/check\"); }\n",
+            "fn inspect() { #[cfg(any())] let _ = std::fs::read_to_string(\"scripts/check\"); }\n",
+            "fn inspect() { if false { let _ = std::fs::read_to_string(\"scripts/check\"); } }\n",
+        ] {
+            write(&root, "xtask/src/main.rs", inert_body);
+            assert!(
+                validate_acceptance_matrix(&root).is_err(),
+                "inspecting Rust I/O must be reachable"
+            );
+        }
         write(&root, "docs/acceptance/section-23.tsv", &rows);
 
         write(
@@ -2216,6 +2372,13 @@ mod tests {
         let mismatched = rows.replace("cargo test direct_case", "cargo test unrelated");
         write(&root, "docs/acceptance/section-23.tsv", &mismatched);
         assert!(validate_acceptance_matrix(&root).is_err());
+
+        let inert_test = rows.replace("cargo test direct_case", "printf cargo test direct_case");
+        write(&root, "docs/acceptance/section-23.tsv", &inert_test);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "an inert cargo-test mention must not satisfy Rust evidence"
+        );
 
         let prefix_collision =
             rows.replace("cargo test direct_case", "cargo test direct_case_removed");
