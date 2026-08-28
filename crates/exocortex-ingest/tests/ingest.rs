@@ -880,6 +880,107 @@ async fn durable_post_ingest_effects_release_admission_and_drain_once() {
     drainer.abort();
 }
 
+#[tokio::test]
+async fn durable_reasoning_effect_remains_pending_while_worker_queue_is_saturated() {
+    let base = server();
+    let reasoning = Arc::new(exocortex_reasoning::ReasoningEngine::new(
+        base.storage.clone(),
+        1,
+        3,
+    ));
+    reasoning
+        .enqueue(exocortex_reasoning::ReasoningWork::KHopOver {
+            seed: exocortex_kernel::MemoryId::new_v7(),
+            k: 1,
+        })
+        .await;
+    let srv = Arc::new(base.with_reasoning(reasoning.clone()));
+    registered(&srv, 3).await;
+
+    let mut submitted = signed_batch(&srv, vec![draft("durable-reasoning", "Fix", 1)]);
+    submitted.batch_id = "durable-reasoning-saturation".into();
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut submitted);
+    assert!(srv
+        .submit(tonic::Request::new(submitted))
+        .await
+        .unwrap()
+        .into_inner()
+        .rejections
+        .is_empty());
+
+    let drainer = tokio::spawn(srv.clone().run_post_ingest_effects());
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    assert_eq!(
+        srv.storage.pending_ingest_effects(10).await.unwrap().len(),
+        1,
+        "queue saturation must retain the outbox row until reasoning completes"
+    );
+
+    let worker = tokio::spawn(reasoning.run());
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if srv
+                .storage
+                .pending_ingest_effects(10)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable reasoning completion acknowledges the outbox row");
+    drainer.abort();
+    worker.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_effect_drainer_backs_off_and_new_commit_wakes_it() {
+    let srv = Arc::new(server());
+    registered(&srv, 3).await;
+    srv.storage.take_pending_ingest_effect_reads();
+    let drainer = tokio::spawn(srv.clone().run_post_ingest_effects());
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(std::time::Duration::from_millis(900)).await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    let idle_reads = srv.storage.take_pending_ingest_effect_reads();
+    assert!(
+        idle_reads <= 8,
+        "exponential idle backoff should bound reads, observed {idle_reads}"
+    );
+
+    let mut submitted = signed_batch(&srv, vec![draft("notify-wakeup", "Fix", 1)]);
+    submitted.batch_id = "notify-wakeup".into();
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut submitted);
+    assert!(srv
+        .submit(tonic::Request::new(submitted))
+        .await
+        .unwrap()
+        .into_inner()
+        .rejections
+        .is_empty());
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+        if srv
+            .storage
+            .pending_ingest_effects(10)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            drainer.abort();
+            return;
+        }
+    }
+    panic!("a commit notification must wake the idle drainer without advancing time");
+}
+
 /// H2 (§18.8.5): the ceiling registry persists across restarts — a source
 /// registered with ceiling 1 in one process is still ceiling-limited in a
 /// fresh process booted from the same sources file.

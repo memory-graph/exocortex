@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use exocortex_kernel::{Memory, MemoryId, Provenance, Relationship, RelationshipId};
-use exocortex_storage::Storage;
+use exocortex_storage::{Storage, StorageError};
 use tokio::sync::mpsc;
 use tracing::{instrument, warn};
 
@@ -24,6 +24,14 @@ pub enum ReasoningWork {
     SessionWrapup {
         /// The committed memories.
         memories: Vec<MemoryId>,
+    },
+    /// Durable session enrichment with completion acknowledgement.
+    #[doc(hidden)]
+    DurableSessionWrapup {
+        /// The committed memories.
+        memories: Vec<MemoryId>,
+        /// Signals only after all reasoning reads and writes succeed.
+        completion: tokio::sync::oneshot::Sender<Result<(), StorageError>>,
     },
 }
 
@@ -63,9 +71,39 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
             let Some(w) = w else { break };
             match w {
                 ReasoningWork::KHopOver { seed, k } => self.k_hop_reason(seed, k).await,
-                ReasoningWork::SessionWrapup { memories } => self.session_reason(&memories).await,
+                ReasoningWork::SessionWrapup { memories } => {
+                    if let Err(error) = self.process_session_wrapup(&memories).await {
+                        warn!(?error, "session reasoning failed");
+                    }
+                }
+                ReasoningWork::DurableSessionWrapup {
+                    memories,
+                    completion,
+                } => {
+                    let _ = completion.send(self.process_session_wrapup(&memories).await);
+                }
             }
         }
+    }
+
+    /// Enqueue durable session work and wait for successful read/write
+    /// completion. Queue saturation applies backpressure; worker failure is an
+    /// error, so callers retain their durable outbox record for retry.
+    pub async fn process_durable_session_wrapup(
+        &self,
+        memories: Vec<MemoryId>,
+    ) -> Result<(), StorageError> {
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        self.tx_work
+            .send(ReasoningWork::DurableSessionWrapup {
+                memories,
+                completion,
+            })
+            .await
+            .map_err(|_| StorageError::Backend("reasoning worker is unavailable".into()))?;
+        completed.await.map_err(|_| {
+            StorageError::Backend("reasoning worker stopped before completion".into())
+        })?
     }
 
     /// Bounded k-hop reasoning (§10.7 step 4): gather the neighborhood,
@@ -77,6 +115,12 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
     /// bounded by `k` and the CR-6 node caps. Previously O(hops·E).
     #[instrument(skip(self))]
     pub async fn k_hop_reason(&self, seed: MemoryId, k: u8) {
+        if let Err(error) = self.try_k_hop_reason(seed, k).await {
+            warn!(?error, "bounded reasoning pass failed");
+        }
+    }
+
+    async fn try_k_hop_reason(&self, seed: MemoryId, k: u8) -> Result<(), StorageError> {
         let k = k.clamp(1, self.k_hop.max(1));
         let mut edges: Vec<Edge> = Vec::new();
         let entities: Vec<EntityFact>;
@@ -101,10 +145,7 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
                 .await
             {
                 Ok(rows) => rows,
-                Err(error) => {
-                    warn!(?error, "bounded reasoning frontier query failed");
-                    return;
-                }
+                Err(error) => return Err(error),
             };
             for row in rows {
                 if !seen_edges.insert(row.id) {
@@ -149,10 +190,7 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         let neighborhood_ids: Vec<_> = neighborhood.iter().copied().collect();
         let mut memory_rows = match self.storage.get_memories(&neighborhood_ids).await {
             Ok(rows) => rows,
-            Err(error) => {
-                warn!(?error, "bounded reasoning memory query failed");
-                return;
-            }
+            Err(error) => return Err(error),
         };
         let attribute_tags: std::collections::HashSet<_> = memory_rows
             .iter()
@@ -173,10 +211,7 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
                 .await
             {
                 Ok(rows) => rows,
-                Err(error) => {
-                    warn!(?error, "bounded reasoning attribute query failed");
-                    return;
-                }
+                Err(error) => return Err(error),
             };
             let mut seen: std::collections::HashSet<_> =
                 memory_rows.iter().map(|memory| memory.id).collect();
@@ -250,13 +285,14 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
                 .increment((before - MAX_DERIVED_PAIRS) as u64);
         }
         self.write_back(derived, &memory_rows, &relationship_rows)
-            .await;
+            .await
     }
 
-    async fn session_reason(&self, ms: &[MemoryId]) {
+    async fn process_session_wrapup(&self, ms: &[MemoryId]) -> Result<(), StorageError> {
         for m in ms {
-            self.k_hop_reason(*m, 3).await;
+            self.try_k_hop_reason(*m, 3).await?;
         }
+        Ok(())
     }
 
     /// Write derived relationships not already present (idempotent by
@@ -269,7 +305,7 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         mut derived: rules::Derived,
         memory_rows: &[Memory],
         relationship_rows: &[Relationship],
-    ) {
+    ) -> Result<(), StorageError> {
         let ontology = self.storage_ontology();
         let mut new_rels: Vec<Relationship> = Vec::new();
         let now = chrono::Utc::now();
@@ -452,29 +488,23 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         }
 
         if new_rels.is_empty() {
-            return;
+            return Ok(());
         }
         // Idempotency uses indexed point reads over only the bounded derived
         // candidates, never a graph-wide relationship enumeration.
         let mut fresh = Vec::new();
         for relationship in new_rels {
-            match self.storage.get_relationship(&relationship.id).await {
-                Ok(Some(_)) => {}
-                Ok(None) => fresh.push(relationship),
-                Err(error) => {
-                    warn!(?error, "derived-edge existence check failed");
-                    return;
-                }
+            match self.storage.get_relationship(&relationship.id).await? {
+                Some(_) => {}
+                None => fresh.push(relationship),
             }
         }
         if !fresh.is_empty() {
-            if let Err(e) = self.storage.upsert_batch(&[], &fresh).await {
-                warn!(?e, "derived-edge writeback failed");
-            } else {
-                metrics::counter!("exocortex_rules_executed_total", "engine" => "crepe")
-                    .increment(fresh.len() as u64);
-            }
+            self.storage.upsert_batch(&[], &fresh).await?;
+            metrics::counter!("exocortex_rules_executed_total", "engine" => "crepe")
+                .increment(fresh.len() as u64);
         }
+        Ok(())
     }
 
     /// Last derived type for a memory (R1/R2/R3) — the "re-derived as

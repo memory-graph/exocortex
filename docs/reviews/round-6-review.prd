@@ -494,3 +494,13 @@ replacement test remains green.
 R6-R148 is closed: ingress is a retained node-owned task, node drop aborts it
 and clears leadership, and the CLI awaits unexpected ingress termination. A
 fixed-port regression proves drop releases the listener; server clippy passes.
+
+R6-R147 and R6-R149 are closed together at the durable-effect boundary.
+Session reasoning now enters the bounded worker with backpressure and returns a
+completion result only after every bounded read and derived-edge write
+succeeds; delivery failure leaves the outbox row pending. A saturated-queue
+regression proves acknowledgement cannot race ahead of processing. Empty
+outbox reads now back off exponentially to one second, while a successful
+commit sends an in-process notification that wakes the drainer without waiting
+for its timer. A paused-time regression bounds the idle read count and proves
+the prompt wakeup; focused ingest tests and reasoning/ingest clippy pass.

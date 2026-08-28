@@ -48,6 +48,8 @@ struct InMemoryInner {
     region_relationship_calls: AtomicU64,
     settled_ingest: Mutex<HashMap<IngestBatchKey, SettledIngestBatch>>,
     ingest_effects: Mutex<HashMap<smol_str::SmolStr, (PostIngestEffect, bool)>>,
+    #[cfg(feature = "testing")]
+    pending_ingest_effect_reads: AtomicU64,
     governed_imports: Mutex<std::collections::HashSet<String>>,
     cycle_journals: Mutex<HashMap<LeaseKey, CycleJournalRecord>>,
     point_reads: AtomicU64,
@@ -137,6 +139,8 @@ impl InMemoryStorage {
                 region_relationship_calls: AtomicU64::new(0),
                 settled_ingest: Default::default(),
                 ingest_effects: Default::default(),
+                #[cfg(feature = "testing")]
+                pending_ingest_effect_reads: AtomicU64::new(0),
                 governed_imports: Default::default(),
                 cycle_journals: Default::default(),
                 point_reads: Default::default(),
@@ -292,6 +296,17 @@ impl InMemoryStorage {
                 .load(Ordering::Relaxed),
             self.inner.attribute_memory_calls.load(Ordering::Relaxed),
         )
+    }
+
+    /// Return and reset the number of durable-effect polling reads.
+    ///
+    /// This is a test-only observability seam for proving idle-drainer bounds.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn take_pending_ingest_effect_reads(&self) -> u64 {
+        self.inner
+            .pending_ingest_effect_reads
+            .swap(0, Ordering::Relaxed)
     }
 
     /// Regional query counters used to prove one bounded working-set load per cycle.
@@ -730,6 +745,10 @@ impl Storage for InMemoryStorage {
         &self,
         limit: u32,
     ) -> Result<Vec<PostIngestEffect>, StorageError> {
+        #[cfg(feature = "testing")]
+        self.inner
+            .pending_ingest_effect_reads
+            .fetch_add(1, Ordering::Relaxed);
         let mut rows: Vec<_> = self
             .inner
             .ingest_effects

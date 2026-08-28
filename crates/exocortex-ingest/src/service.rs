@@ -134,6 +134,8 @@ pub struct IngestServer<S: Storage> {
     pub recent: Arc<Mutex<std::collections::VecDeque<RecentEmbedding>>>,
     /// Shared concurrency admission for expensive batch validation/commit.
     pub submit_permits: Arc<tokio::sync::Semaphore>,
+    /// Wakes the durable-effect drainer after a newly committed outbox row.
+    post_ingest_notify: Arc<tokio::sync::Notify>,
 }
 
 /// One ring entry.
@@ -189,6 +191,7 @@ impl<S: Storage> Clone for IngestServer<S> {
             require_request_principal: self.require_request_principal,
             recent: self.recent.clone(),
             submit_permits: self.submit_permits.clone(),
+            post_ingest_notify: self.post_ingest_notify.clone(),
         }
     }
 }
@@ -223,6 +226,7 @@ impl<S: Storage> IngestServer<S> {
             require_request_principal: false,
             recent: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             submit_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CONCURRENT_SUBMITS)),
+            post_ingest_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -1334,6 +1338,7 @@ impl<S: Storage + 'static> IngestServer<S> {
             .map_err(|error| Status::internal(format!("storage: {error}")))?;
         match outcome {
             IngestCommitOutcome::Committed { settled, .. } => {
+                self.post_ingest_notify.notify_one();
                 Ok(Ok((settled.assigned_lsn, accepted)))
             }
             IngestCommitOutcome::Duplicate(settled) => Ok(Err(IngestAck {
@@ -1430,10 +1435,9 @@ impl<S: Storage + 'static> IngestServer<S> {
         if !effect.session_memory_ids.is_empty() {
             if let Some(engine) = &self.reasoning {
                 engine
-                    .enqueue(exocortex_reasoning::ReasoningWork::SessionWrapup {
-                        memories: effect.session_memory_ids.clone(),
-                    })
-                    .await;
+                    .process_durable_session_wrapup(effect.session_memory_ids.clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
             }
         }
         let acknowledged = self
@@ -1455,8 +1459,14 @@ impl<S: Storage + 'static> IngestServer<S> {
         loop {
             match self.storage.pending_ingest_effects(1).await {
                 Ok(effects) if effects.is_empty() => {
-                    delay = std::time::Duration::from_millis(25);
-                    tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = self.post_ingest_notify.notified() => {
+                            delay = std::time::Duration::from_millis(25);
+                            continue;
+                        }
+                    }
+                    delay = (delay * 2).min(std::time::Duration::from_secs(1));
                 }
                 Ok(effects) => {
                     let effect = &effects[0];
