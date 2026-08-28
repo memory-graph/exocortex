@@ -455,3 +455,7 @@ control manifest still named the pre-outbox `on_writes` call at the ingest
 boundary. The production boundary now deliberately calls `on_writes_once` so
 ambiguous durable-effect retries cannot double-count. The gate must track that
 exact entrypoint and retain an executable manifest regression.
+
+R6-R145 is closed: the control manifest now names `on_writes_once`, its unit
+test rejects the superseded name, and `cargo xtask dead-enforcement` passes
+against the executable ingest call graph.

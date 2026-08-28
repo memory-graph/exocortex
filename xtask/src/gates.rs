@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 pub(crate) const DEAD_CONTROLS: &[(&str, &str)] = &[
     ("admit_and_publish", "crates/exocortex-cluster/src/node.rs"),
     ("check_deadline", "crates/exocortex-ops/src/operations.rs"),
-    ("on_writes", "crates/exocortex-ingest/src/service.rs"),
+    ("on_writes_once", "crates/exocortex-ingest/src/service.rs"),
     (
         "new_with_admin_policies",
         "crates/exocortex-server/src/backend.rs",
@@ -1171,6 +1171,14 @@ mod tests {
         let violations =
             dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")]).unwrap();
         assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn dead_control_manifest_tracks_the_idempotent_dreams_boundary() {
+        assert!(
+            DEAD_CONTROLS.contains(&("on_writes_once", "crates/exocortex-ingest/src/service.rs"))
+        );
+        assert!(!DEAD_CONTROLS.contains(&("on_writes", "crates/exocortex-ingest/src/service.rs")));
     }
 
     #[test]
