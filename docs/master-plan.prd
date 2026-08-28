@@ -1,11 +1,9 @@
 # Exocortex — Master Plan
 
-**Status (2026-08-28, Round 6):** RELEASE BLOCKED pending R6-R182's complete
-final gate matrix and a fresh strict whole-project review. R6-R180's live
-no-zombie Dreams proof, R6-R181's immutable offline model sidecar, and R6-R183's
-dependency-deviation reconciliation are complete; the R6-R184 test-harness
-race is repaired; R6-R176 through R6-R179 and all earlier findings remain
-closed.
+**Status (2026-08-28, Round 6):** RELEASE BLOCKED. The first fresh strict
+whole-project review promoted R6-R185 through R6-R202 below; R6-R182 remains
+open until those items, the complete final gate matrix, and a subsequent clean
+strict review are evidenced.
 
 **Status (2026-08-27):** Palantir-expansion PRD drafted
 (`docs/prd/exocortex-palantir-expansion-prd.md`, rev 2) — five post-v1
@@ -456,6 +454,24 @@ idea:
 | R6-R182 | Strict release convergence advisory: make the authoritative Round 6 closure state internally consistent | Codex | In progress — label historical closure evidence and align review/master status only after R6-R180/R181, gates, and fresh strict review are clean |
 | R6-R183 | Strict release convergence: reconcile the FastEmbed 5.2 migration with the authoritative PRD and historical plan evidence | Codex | Done — milestone deviation 16 records why clean production startup requires exact fastembed 5.2 without editing the PRD; R6-R79 and R6-R178 now distinguish their superseded dependency/acquisition evidence from R6-R181's current offline sidecar |
 | R6-R184 | Full-gate reliability: diagnose and repair the Crush SEP-2575 fallback child exit that reproduces only under the full workspace test command | Codex | Done — the regression now models Crush's real two-phase fallback by waiting for `server/discover` method-not-found before initialize, retains child status/stderr diagnostics, passes 10 focused repetitions, and passes the exact full workspace feature matrix without global serialization (this commit) |
+| R6-R185 | Strict review: make binary + immutable model installation failure-atomic and prove the real installed resolver path | Codex | In progress — stage/verify the whole release before publication and preserve the previous runnable installation on injected failure |
+| R6-R186 | Strict review: provision an explicit reviewed trust-root source for remote HTTPS gRPC clients | Codex | In progress — add executable TLS-client evidence and a dependency guard |
+| R6-R187 | Strict review: reject signing-key reuse across distinct administrator producer identities | Codex | In progress — duplicate decoded keys must fail startup with a regression |
+| R6-R188 | Strict review advisory: preserve secure Falkor/Redis schemes and reject remote plaintext data-plane URLs | Codex | In progress — support `falkors://`/`rediss://` and keep loopback-only plaintext explicit |
+| R6-R189 | Strict review: serialize schema migration against concurrent future-version installation | Codex | In progress — guard the 0→1 transition and row mutations with live two-client interleaving evidence |
+| R6-R190 | Strict review advisory: bound legacy schema migration memory use | Codex | In progress — process streamed rows incrementally and prove bounded retention |
+| R6-R191 | Strict review: bound session-cohort reasoning work and remove per-derived-edge point reads | Codex | In progress — one cohort evaluation, a total output ceiling, and counting-storage evidence |
+| R6-R192 | Strict review: remove serial per-row publish and cache hydration round trips | Codex | In progress — batch publication/hydration with maximum-batch counting and live evidence |
+| R6-R193 | Strict review: route embedding artifact digests through `exocortex_wire::signing` | Codex | In progress — remove the second SHA-256 implementation/dependency and strengthen signing hygiene |
+| R6-R194 | Strict review: make audited visibility promotion monotonic under concurrency | Codex | In progress — storage must atomically reject a stale narrowing write and its audit |
+| R6-R195 | Strict review advisory: exercise same-length corrupt model digest rejection | Codex | In progress — regression must reach the digest branch, not only the size guard |
+| R6-R196 | Strict review advisory: bound stdio response waits and retain timeout diagnostics | Codex | In progress — a silent live child must fail the gate rather than hang it |
+| R6-R197 | Strict review: couple the killed production Dreams leader to the in-flight stale-write proof | Codex | In progress — the Docker chaos path must kill the actual node at an executable Dreams mutation barrier |
+| R6-R198 | Strict review cleanup: remove the stranded singular cache-retry shim | Codex | In progress — callers move to the production plural seam |
+| R6-R199 | Strict review cleanup: remove six evidenced unused direct dependencies | Codex | In progress — Dreams/server manifests and architecture gates remain green |
+| R6-R200 | Strict review cleanup: canonicalize SSE base64 in the wire crate | Codex | In progress — client/server/tests consume one codec |
+| R6-R201 | Strict review verification: restore or disposition the prior 512-token production embedding ceiling | Codex | In progress — compare the named-model contract and version inference configuration explicitly |
+| R6-R202 | Strict review verification: disposition legacy `bge-small/v1` upgrade/backup compatibility and profile attribute lookup | Codex | In progress — record the PRD-backed migration boundary and obtain live planner evidence |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence

@@ -1,8 +1,9 @@
 # Exocortex v1 — Round 6 Whole-Project Review
 
-**Status:** RELEASE BLOCKED pending R6-R182's complete final gate matrix and a
-fresh strict review. R6-R180, R6-R181, R6-R183, and R6-R184 are
-implementation-complete; all earlier findings remain closed.
+**Status:** RELEASE BLOCKED. The first fresh strict review promoted R6-R185
+through R6-R202 into the master plan. R6-R182 remains open until their
+remediation, the complete final gate matrix, and a subsequent clean strict
+review.
 
 **Review baseline:** `f7bf463aa4a77ac719c485bfe713541d79edeab1`
 (2026-08-27). Scope was the entire tracked repository: 199 files, of which
