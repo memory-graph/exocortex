@@ -17,14 +17,15 @@ cleanup, and cross-boundary hazards. Every accepted finding was reopened and
 verified against the baseline before inclusion. The review was read-only and
 made no repository or GitHub changes.
 
-## Release verdict
+## Baseline release verdict
 
-**Changes requested.** Thirty verified blockers affect authentication,
+**Changes requested at the review baseline.** Thirty verified blockers affected authentication,
 visibility, durability, fencing, rollback, backend parity, resource bounds,
 release integrity, or formal acceptance coverage. Eight advisory findings are
-also accepted work. Seven items remain explicit PRD-backed deferrals. Four
-questions require targeted verification before they may be closed or promoted
-to defects.
+also recorded below as accepted work. Seven items remain explicit PRD-backed
+deferrals. Four questions required targeted verification before they could be
+closed or promoted to defects; their evidenced final dispositions appear in
+the closure ledger and final closure section below.
 
 Closure rules:
 
@@ -563,11 +564,13 @@ payload, and live Falkor covers empty successful settlement.
 
 ## Final closure (2026-08-28)
 
-The final strict whole-project review at `ce3a956` found zero verified
-actionable correctness, security, runtime, storage, architecture, cleanup, or
-test-quality findings. R6-R170, R6-R172, and R6-R175 received their final
-executable evidence in `ce3a956`: storage-clock publication ownership remains
-valid through completion, an expired publisher cannot acknowledge before a
+The strict implementation review at `ce3a956` found zero verified actionable
+correctness, security, runtime, storage, architecture, or test-quality
+findings. It identified only the pending-evidence documentation cleanup,
+closed in `daeaefb` and `61524f7`; the subsequent strict whole-project review
+is clean. R6-R170, R6-R172, and R6-R175 received their final executable
+evidence in `ce3a956`: storage-clock publication ownership remains valid
+through completion, an expired publisher cannot acknowledge before a
 successor repairs the exact persisted payload, and reasoning-level zero-output
 settlement remains stable when later graph state would otherwise create an
 output.

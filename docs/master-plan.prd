@@ -3,8 +3,9 @@
 **Status (2026-08-28, Round 6):** CLOSED. All blocking findings, advisories,
 and verification questions in `docs/reviews/round-6-review.prd` have evidenced
 dispositions. Every mandatory gate passes, the live Falkor storage suite and
-Docker leader-failover harness pass, and a fresh strict whole-project review
-at `ce3a956` reports zero verified actionable findings.
+Docker leader-failover harness pass. The strict implementation review at
+`ce3a956` found no code findings; documentation closure landed in `daeaefb`
+and `61524f7`, and the subsequent strict whole-project review is clean.
 
 **Status (2026-08-27):** Palantir-expansion PRD drafted
 (`docs/prd/exocortex-palantir-expansion-prd.md`, rev 2) — five post-v1
