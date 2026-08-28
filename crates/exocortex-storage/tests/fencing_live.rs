@@ -11,11 +11,21 @@ use exocortex_kernel::{
 };
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::types::LeaseKey;
-use exocortex_storage::{FalkorStorage, FencedRestore, Storage, StorageError};
+use exocortex_storage::{CypherQuery, FalkorStorage, FencedRestore, Storage, StorageError};
 use std::sync::Arc;
 
 fn falkor_url() -> Option<String> {
     std::env::var("FALKOR_URL").ok().filter(|u| !u.is_empty())
+}
+
+fn hex(bytes: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(32), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        })
 }
 
 async fn falkor(tag: &str) -> FalkorStorage {
@@ -366,6 +376,25 @@ async fn fenced_restore_preserves_live_concurrent_versions() {
     s.upsert_batch(&[concurrent_memory], &[concurrent_edge])
         .await
         .unwrap();
+    // Model a still-running pre-history node: its current-row overwrite has a
+    // valid LSN but no matching assertion row. The next new-node write must
+    // preserve that outgoing current value atomically before replacing it.
+    s.query_cypher(&CypherQuery {
+        template_id: "integration_remove_current_memory_assertion",
+        params: serde_json::json!({ "id": hex(&original.id.0) }),
+        read_only: false,
+        deadline: Utc::now() + chrono::Duration::seconds(5),
+    })
+    .await
+    .unwrap();
+    s.query_cypher(&CypherQuery {
+        template_id: "integration_remove_current_relationship_assertion",
+        params: serde_json::json!({ "rel_id": hex(&original_edge.id.0) }),
+        read_only: false,
+        deadline: Utc::now() + chrono::Duration::seconds(5),
+    })
+    .await
+    .unwrap();
     let mut later_cycle_memory = original.clone();
     later_cycle_memory.title = "later-cycle".into();
     let mut later_cycle_edge = original_edge.clone();

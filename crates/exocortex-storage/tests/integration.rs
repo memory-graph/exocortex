@@ -642,6 +642,49 @@ itest!(
     }
 );
 
+itest!(atomic_schema_guard_refuses_fingerprint_mutation_directly, {
+    let storage = connect("direct-schema-guard").await;
+    storage
+        .make_future_schema_without_fingerprint_for_testing()
+        .await
+        .unwrap();
+    storage
+        .query_cypher(&CypherQuery {
+            template_id: "write_fingerprint_if_schema_compatible",
+            params: serde_json::json!({
+                "fp": "direct-guard-must-not-persist",
+                "max_schema": 1,
+            }),
+            read_only: false,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+    let fingerprint = storage
+        .query_cypher(&CypherQuery {
+            template_id: "read_fingerprint",
+            params: serde_json::json!({}),
+            read_only: true,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+    assert!(
+        fingerprint.rows.is_empty(),
+        "atomic guard left fingerprint state unchanged"
+    );
+    let schema = storage
+        .query_cypher(&CypherQuery {
+            template_id: "read_schema_version",
+            params: serde_json::json!({}),
+            read_only: true,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+    assert_eq!(schema.rows, vec![serde_json::json!([2])]);
+});
+
 itest!(
     discovery_acceptance_is_scoped_consumed_and_audited_atomically,
     {
@@ -854,6 +897,129 @@ itest!(
                 ..
             })
         ));
+        let persisted = s
+            .query_cypher(&CypherQuery {
+                template_id: "discovery_proposal_get",
+                params: serde_json::json!({ "discovery_id": proposal.discovery_id }),
+                read_only: true,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted.rows,
+            vec![serde_json::json!(["not-json"])],
+            "failed acceptance preserves the unconsumed corrupt proposal verbatim"
+        );
+        assert!(s
+            .get_relationship(&relationship.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(s.audit_range("test-org", 0, 10).await.unwrap().is_empty());
+    }
+);
+
+itest!(
+    wrong_type_discovery_proposal_fails_closed_without_mutation,
+    {
+        let s = connect("wrong-type-proposal").await;
+        let from = mem("wrong-type-from", 3, Visibility::Org);
+        let to = mem("wrong-type-to", 3, Visibility::Org);
+        s.upsert_batch(&[from.clone(), to.clone()], &[])
+            .await
+            .unwrap();
+        let region = RegionKey {
+            org: "test-org".into(),
+            project: "*".into(),
+            memory_type: from.memory_type,
+        };
+        let record = DiscoveryRecord {
+            discovery_id: "wrong-type-proposal".into(),
+            region: region.clone(),
+            from: from.id,
+            to: to.id,
+            discovery_type: "transitive".into(),
+            quality: 0.6,
+            via_types: [1, 2],
+            discovery_cycle_id: "wrong-type-cycle".into(),
+            discovered_at: Utc::now(),
+        };
+        s.store_discovery(&record).await.unwrap();
+        let scope = VisibilityContext {
+            user_id: "user-1".into(),
+            org_id: "test-org".into(),
+            max_visibility: Visibility::Org,
+            ..Default::default()
+        };
+        let kind = exocortex_kernel::kinds::FIXES;
+        let proposal = DiscoveryProposal {
+            discovery_id: record.discovery_id.clone(),
+            region: region.clone(),
+            from: from.id,
+            to: to.id,
+            kind,
+            proposed_visibility: Visibility::Org,
+            caller_scope: scope.clone(),
+            issued_at: Utc::now(),
+        };
+        s.create_discovery_proposal(&proposal).await.unwrap();
+        s.query_cypher(&CypherQuery {
+            template_id: "integration_corrupt_discovery_proposal",
+            params: serde_json::json!({
+                "discovery_id": proposal.discovery_id,
+                "props_json": 17,
+            }),
+            read_only: false,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            s.get_discovery_proposal(&proposal.discovery_id).await,
+            Err(StorageError::CorruptMetadata {
+                key: "discovery_proposal",
+                ..
+            })
+        ));
+        let relationship = rel(from.id, to.id, kind.0);
+        assert!(matches!(
+            s.accept_discovery(&DiscoveryAcceptance {
+                discovery_id: proposal.discovery_id.clone(),
+                region,
+                caller_scope: scope,
+                relationship: relationship.clone(),
+                audit: AuditEvent {
+                    action: "accept_discovery".into(),
+                    actor: "user-1".into(),
+                    org_id: "test-org".into(),
+                    input_digest: [6; 32],
+                    output_ids: Default::default(),
+                    fingerprint: s.ontology_fingerprint(),
+                    lease_epoch: None,
+                    recorded_at: Utc::now(),
+                },
+            })
+            .await,
+            Err(StorageError::CorruptMetadata {
+                key: "discovery_proposal",
+                ..
+            })
+        ));
+        let persisted = s
+            .query_cypher(&CypherQuery {
+                template_id: "discovery_proposal_get",
+                params: serde_json::json!({ "discovery_id": proposal.discovery_id }),
+                read_only: true,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted.rows,
+            vec![serde_json::json!([17])],
+            "failed acceptance preserves the unconsumed wrong-type proposal verbatim"
+        );
         assert!(s
             .get_relationship(&relationship.id)
             .await

@@ -542,3 +542,119 @@ impl Invalidation {
         }
     }
 }
+
+/// Encode one Redis change-feed payload. `DiscoveryAvailable` deliberately
+/// rides an old `MemoryUpserted` envelope with an additive field: pre-Round-6
+/// consumers ignore the unknown field, refresh an existing endpoint, and still
+/// advance their LSN; current consumers recover the complete discovery event.
+pub(crate) fn encode_feed_invalidation(
+    invalidation: &Invalidation,
+) -> Result<String, serde_json::Error> {
+    if let Invalidation::DiscoveryAvailable { record, lsn } = invalidation {
+        let mut compatible = serde_json::to_value(Invalidation::MemoryUpserted {
+            id: record.from,
+            lsn: *lsn,
+        })?;
+        let fields = compatible
+            .get_mut("MemoryUpserted")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| serde::ser::Error::custom("invalid compatibility envelope"))?;
+        fields.insert("discovery_available".into(), serde_json::to_value(record)?);
+        serde_json::to_string(&compatible)
+    } else {
+        serde_json::to_string(invalidation)
+    }
+}
+
+/// Decode a Redis change-feed payload, including the additive compatibility
+/// envelope emitted for discoveries during rolling upgrades.
+pub(crate) fn decode_feed_invalidation(payload: &str) -> Result<Invalidation, serde_json::Error> {
+    use serde::de::Error as _;
+
+    let value: serde_json::Value = serde_json::from_str(payload)?;
+    if let Some(fields) = value
+        .get("MemoryUpserted")
+        .and_then(serde_json::Value::as_object)
+    {
+        if let Some(discovery) = fields.get("discovery_available") {
+            let record = serde_json::from_value(discovery.clone())?;
+            let lsn = fields
+                .get("lsn")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| serde_json::Error::custom("discovery envelope has invalid LSN"))?;
+            return Ok(Invalidation::DiscoveryAvailable { record, lsn });
+        }
+    }
+    serde_json::from_value(value)
+}
+
+#[cfg(test)]
+mod feed_compatibility_tests {
+    use super::*;
+
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize)]
+    enum LegacyInvalidation {
+        MemoryUpserted {
+            id: MemoryId,
+            lsn: u64,
+        },
+        MemoryDeleted {
+            id: MemoryId,
+            lsn: u64,
+        },
+        RelationshipUpserted {
+            id: RelationshipId,
+            from: MemoryId,
+            to: MemoryId,
+            kind: RelKindId,
+            lsn: u64,
+        },
+        RelationshipDeleted {
+            id: RelationshipId,
+            lsn: u64,
+        },
+    }
+
+    #[test]
+    fn discovery_feed_payload_preserves_legacy_progress_and_current_semantics() {
+        let record = DiscoveryRecord {
+            discovery_id: "rolling-discovery".into(),
+            region: RegionKey {
+                org: "org".into(),
+                project: "project".into(),
+                memory_type: 3,
+            },
+            from: MemoryId([1; 16]),
+            to: MemoryId([2; 16]),
+            discovery_type: "transitive".into(),
+            quality: 0.75,
+            via_types: [1, 2],
+            discovery_cycle_id: "cycle".into(),
+            discovered_at: Utc::now(),
+        };
+        let current = Invalidation::DiscoveryAvailable {
+            record: record.clone(),
+            lsn: 42,
+        };
+        let payload = encode_feed_invalidation(&current).unwrap();
+
+        match serde_json::from_str::<LegacyInvalidation>(&payload).unwrap() {
+            LegacyInvalidation::MemoryUpserted { id, lsn } => {
+                assert_eq!(id, record.from);
+                assert_eq!(lsn, 42);
+            }
+            other => panic!("unexpected legacy compatibility event: {other:?}"),
+        }
+        match decode_feed_invalidation(&payload).unwrap() {
+            Invalidation::DiscoveryAvailable {
+                record: decoded,
+                lsn,
+            } => {
+                assert_eq!(decoded, record);
+                assert_eq!(lsn, 42);
+            }
+            other => panic!("unexpected current event: {other:?}"),
+        }
+    }
+}

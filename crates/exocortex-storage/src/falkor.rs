@@ -653,7 +653,7 @@ impl FalkorStorage {
 
     /// Publish an invalidation to the org change-feed channel (§9.1).
     async fn publish(&self, inv: Invalidation) {
-        if let Ok(payload) = serde_json::to_string(&inv) {
+        if let Ok(payload) = crate::types::encode_feed_invalidation(&inv) {
             let _: Result<i64, _> = self.redis.clone().publish(&self.channel, payload).await;
         }
     }
@@ -2524,7 +2524,7 @@ impl Storage for FalkorStorage {
         });
         let stream = msgs.filter_map(|msg| async move {
             match msg.get_payload::<String>() {
-                Ok(payload) => match serde_json::from_str::<Invalidation>(&payload) {
+                Ok(payload) => match crate::types::decode_feed_invalidation(&payload) {
                     Ok(inv) => Some(Ok(inv)),
                     Err(e) => Some(Err(StorageError::Backend(format!("bad invalidation: {e}")))),
                 },

@@ -53,6 +53,19 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         ],
         cypher: r#"
             MERGE (m:Memory {id: $id})
+            WITH m
+            OPTIONAL MATCH (prior:_MemoryAssertion {id: $id})
+            WHERE prior.lsn = m.lsn
+            WITH m, count(prior) = 0 AND m.lsn IS NOT NULL AS preserve_outgoing
+            FOREACH (_ IN CASE WHEN preserve_outgoing THEN [1] ELSE [] END |
+                CREATE (legacy:_MemoryAssertion {id: m.id,
+                    memory_type_label: m.memory_type_label, memory_type_id: m.memory_type_id,
+                    visibility: m.visibility, valid_from: m.valid_from,
+                    valid_until: m.valid_until, recorded_at: m.recorded_at,
+                    invalidated_by: m.invalidated_by, props_json: m.props_json,
+                    tags: m.tags, entity_ids: m.entity_ids, tenant_id: m.tenant_id,
+                    user_id: m.user_id, project_id: m.project_id, team_id: m.team_id,
+                    lsn: m.lsn}))
             SET m.memory_type_label = $memory_type_label,
                 m.memory_type_id    = $memory_type_id,
                 m.visibility        = $visibility,
@@ -105,6 +118,19 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         ],
         cypher: r#"
             MERGE (m:Memory {id: $id})
+            WITH m
+            OPTIONAL MATCH (prior:_MemoryAssertion {id: $id})
+            WHERE prior.lsn = m.lsn
+            WITH m, count(prior) = 0 AND m.lsn IS NOT NULL AS preserve_outgoing
+            FOREACH (_ IN CASE WHEN preserve_outgoing THEN [1] ELSE [] END |
+                CREATE (legacy:_MemoryAssertion {id: m.id,
+                    memory_type_label: m.memory_type_label, memory_type_id: m.memory_type_id,
+                    visibility: m.visibility, valid_from: m.valid_from,
+                    valid_until: m.valid_until, recorded_at: m.recorded_at,
+                    invalidated_by: m.invalidated_by, props_json: m.props_json,
+                    tags: m.tags, entity_ids: m.entity_ids, tenant_id: m.tenant_id,
+                    user_id: m.user_id, project_id: m.project_id, team_id: m.team_id,
+                    lsn: m.lsn}))
             SET m.memory_type_label = $memory_type_label,
                 m.memory_type_id    = $memory_type_id,
                 m.visibility        = $visibility,
@@ -354,6 +380,16 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MATCH (a:Memory {id: $from}), (b:Memory {id: $to})
             OPTIONAL MATCH (a)-[old]->(b) WHERE old.id = $rel_id
+            OPTIONAL MATCH (prior:_RelationshipAssertion {id: $rel_id})
+            WHERE prior.lsn = old.lsn
+            WITH a, b, old, count(prior) = 0 AND old IS NOT NULL AS preserve_outgoing
+            FOREACH (_ IN CASE WHEN preserve_outgoing THEN [1] ELSE [] END |
+                CREATE (legacy:_RelationshipAssertion {id: old.id,
+                    from: a.id, to: b.id, kind_label: old.kind_label,
+                    visibility: old.visibility, valid_from: old.valid_from,
+                    valid_until: old.valid_until, recorded_at: old.recorded_at,
+                    invalidated_by: old.invalidated_by, props_json: old.props_json,
+                    lsn: old.lsn}))
             DELETE old
             WITH a, b
             CREATE (a)-[r:__KIND_TYPE__ {id: $rel_id,
@@ -393,6 +429,16 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MATCH (a:Memory {id: $from}), (b:Memory {id: $to})
             OPTIONAL MATCH (a)-[old]->(b) WHERE old.id = $rel_id
+            OPTIONAL MATCH (prior:_RelationshipAssertion {id: $rel_id})
+            WHERE prior.lsn = old.lsn
+            WITH a, b, old, count(prior) = 0 AND old IS NOT NULL AS preserve_outgoing
+            FOREACH (_ IN CASE WHEN preserve_outgoing THEN [1] ELSE [] END |
+                CREATE (legacy:_RelationshipAssertion {id: old.id,
+                    from: a.id, to: b.id, kind_label: old.kind_label,
+                    visibility: old.visibility, valid_from: old.valid_from,
+                    valid_until: old.valid_until, recorded_at: old.recorded_at,
+                    invalidated_by: old.invalidated_by, props_json: old.props_json,
+                    lsn: old.lsn}))
             DELETE old
             WITH a, b
             CREATE (a)-[r:__KIND_TYPE__ {id: $rel_id,
@@ -821,8 +867,9 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         read_only: false,
         required_params: &["fp", "max_schema"],
         cypher: r#"
-            OPTIONAL MATCH (v:_ExocortexMeta {key: 'schema_version'})
-            WITH v WHERE v IS NULL OR v.value <= $max_schema
+            MERGE (v:_ExocortexMeta {key: 'schema_version'})
+            ON CREATE SET v.value = 0
+            WITH v WHERE v.value <= toInteger($max_schema)
             MERGE (m:_ExocortexMeta {key: 'ontology_fingerprint'})
             SET m.value = $fp
             RETURN m.value
@@ -1189,6 +1236,32 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (p:_DiscoveryProposal {discovery_id: $discovery_id})
             SET p.props_json = $props_json
             RETURN p.discovery_id
+        "#,
+    });
+
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_remove_current_memory_assertion",
+        read_only: false,
+        required_params: &["id"],
+        cypher: r#"
+            MATCH (m:Memory {id: $id})
+            MATCH (h:_MemoryAssertion {id: $id}) WHERE h.lsn = m.lsn
+            DELETE h
+            RETURN m.lsn
+        "#,
+    });
+
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_remove_current_relationship_assertion",
+        read_only: false,
+        required_params: &["rel_id"],
+        cypher: r#"
+            MATCH ()-[r]->() WHERE r.id = $rel_id
+            MATCH (h:_RelationshipAssertion {id: $rel_id}) WHERE h.lsn = r.lsn
+            DELETE h
+            RETURN r.lsn
         "#,
     });
 
