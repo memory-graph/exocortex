@@ -368,3 +368,17 @@ flake in two tests even though the focused client suite passed. R6-R88 promotes
 that verification result: keep the exact production deadlines, but serialize
 the independent in-process network harnesses so sibling servers and reconnect
 loops cannot consume one another's wall-clock budgets.
+
+## Final strict-review remediation tranche (2026-08-27)
+
+A fresh nine-lens strict review of `ad33946` found 24 additional actionable
+items, promoted as R6-R89–R6-R112 in the master plan. The blocking set covers
+cross-node mutation/LSN order, cluster-feed supervision and admission, HTTP
+diagnostic containment, executable acceptance evidence, legacy tenancy and
+rolling-writer repair, old-client feed progress, bounded/coalesced distributed
+Dreams scheduling, explicit org configuration, governed backup restore,
+durable discovery delivery, and crash-recoverable Dreams journals. Strict-mode
+advisories cover reseed allocation, default storage ordering, quiet-hours
+configuration, obsolete fire DTOs, registry lock scope, idle wakeups, and live
+test synchronization. Duplicate reports of the dead cluster task and Redis
+queue defects remain owned by R6-R90 and R6-R98/R6-R109 respectively.
