@@ -765,6 +765,17 @@ the authoritative v1 interpretation that an external edge inherits the
 snapshot coordinates of its source draft rather than silently fabricating an
 identity.
 
+### R6-R217 — Auxiliary cache indexes retained replacement history
+
+The search arena's earlier compaction did not reclaim append-only tag strings
+or empty tag/entity buckets, so repeated retagging could grow heap state while
+resident rows and byte accounting stayed flat. Replacement now removes empty
+auxiliary buckets, and the existing live-row compaction walk rebuilds both the
+tag interner and handle-keyed index. A 2,000-version regression varies tag and
+entity identity on one stable memory and asserts one live row, interner entry,
+tag/entity bucket, bounded interner compaction residue, and a resident-sized
+estimate.
+
 ### Historical pre-R176 closure evidence (superseded)
 
 At the earlier closure point, the complete mandatory gate matrix passed:

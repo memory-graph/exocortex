@@ -187,17 +187,35 @@ impl GraphSnapshot {
 
     fn remove_memory_indexes(&mut self, memory: &Memory, ix: NodeIndex) {
         for entity in &memory.context.entities {
-            if let Some(mut ids) = self.by_entity.get_mut(entity) {
+            let empty = if let Some(mut ids) = self.by_entity.get_mut(entity) {
                 ids.retain(|id| id != &memory.id);
+                ids.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                self.by_entity.remove(entity);
             }
         }
-        if let Some(mut bitmap) = self.by_type.get_mut(&memory.memory_type) {
+        let type_empty = if let Some(mut bitmap) = self.by_type.get_mut(&memory.memory_type) {
             bitmap.remove_lsb(memory);
+            bitmap.is_empty()
+        } else {
+            false
+        };
+        if type_empty {
+            self.by_type.remove(&memory.memory_type);
         }
         for tag in &memory.tags {
             if let Some(spur) = self.interner.get(tag.as_str()) {
-                if let Some(mut bitmap) = self.by_tag.get_mut(&spur) {
+                let empty = if let Some(mut bitmap) = self.by_tag.get_mut(&spur) {
                     bitmap.remove_lsb(memory);
+                    bitmap.is_empty()
+                } else {
+                    false
+                };
+                if empty {
+                    self.by_tag.remove(&spur);
                 }
             }
         }
@@ -268,6 +286,19 @@ impl GraphSnapshot {
         self.search_arena = arena;
         self.search_offsets = offsets;
         self.search_nodes = nodes;
+        // ThreadedRodeo is append-only. Rebuild it and the handle-keyed tag
+        // map while the existing search compaction is already walking every
+        // live row, so replacement history cannot retain dead tag strings.
+        let interner = Arc::new(lasso::ThreadedRodeo::new());
+        let by_tag: DashMap<lasso::Spur, roaring::RoaringBitmap> = DashMap::new();
+        for memory in self.petgraph.node_weights() {
+            for tag in &memory.tags {
+                let spur = interner.get_or_intern(tag.as_str());
+                by_tag.entry(spur).or_default().union_with_lsb(memory);
+            }
+        }
+        self.interner = interner;
+        self.by_tag = by_tag;
         debug_assert_eq!(self.search_arena.len(), self.search_live_bytes);
     }
 

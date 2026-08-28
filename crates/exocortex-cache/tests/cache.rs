@@ -762,6 +762,48 @@ fn repeated_replacements_keep_search_index_bounded() {
     );
 }
 
+#[test]
+fn repeated_retagging_and_reentitying_keep_auxiliary_indexes_bounded() {
+    let mut snapshot = GraphSnapshot::empty();
+    let mut row = mem("stable", Visibility::Org, None);
+    let id = row.id;
+    for version in 0..2_000u16 {
+        row.tags.clear();
+        row.tags.push(format!("tag-{version:04}").into());
+        row.context.entities.clear();
+        let mut entity = [0u8; 16];
+        entity[..2].copy_from_slice(&version.to_be_bytes());
+        row.context
+            .entities
+            .push(exocortex_kernel::EntityId(entity));
+        snapshot.push_test_memory(row.clone());
+    }
+
+    assert_eq!(snapshot.petgraph.node_count(), 1);
+    assert_eq!(snapshot.by_tag.len(), 1, "dead tag buckets were retained");
+    assert!(
+        snapshot.interner.len() <= 64,
+        "tag history exceeded the bounded compaction residue: {}",
+        snapshot.interner.len()
+    );
+    assert_eq!(
+        snapshot.by_entity.len(),
+        1,
+        "dead entity buckets were retained"
+    );
+    assert!(
+        snapshot.est_bytes < 2_048,
+        "estimated allocation stopped following resident data: {}",
+        snapshot.est_bytes
+    );
+    let live_tag = snapshot.interner.get("tag-1999").unwrap();
+    assert!(snapshot
+        .by_tag
+        .get(&live_tag)
+        .unwrap()
+        .contains(u32::from_le_bytes([id.0[12], id.0[13], id.0[14], id.0[15]])));
+}
+
 #[tokio::test]
 async fn queued_invalidations_publish_one_delta_snapshot() {
     let onto = ontology();
