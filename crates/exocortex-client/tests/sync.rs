@@ -20,6 +20,10 @@ const HMAC_KEY: [u8; 32] = [9u8; 32];
 // Process/test scheduling is not part of the 500 ms change-propagation SLO.
 // Arm that exact deadline only after the authenticated initial image arrives.
 const HARNESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+// These integration probes each create a server, subscriber, and reconnect
+// loop. Running several in one test binary makes their wall-clock SLOs measure
+// sibling harness contention instead of the production path under test.
+static NETWORK_HARNESS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn hex16(b: &[u8; 16]) -> String {
     use std::fmt::Write as _;
@@ -94,6 +98,7 @@ fn lsn_gate_holds_out_of_order_and_releases_in_order() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn comment_only_stream_cannot_mask_an_expired_lsn_gap() {
+    let _harness = NETWORK_HARNESS.lock().await;
     use axum::response::sse::{Event, Sse};
     use axum::routing::get;
     use std::convert::Infallible;
@@ -247,6 +252,7 @@ fn visibility_advance_decodes_and_keeps_the_lsn_gate_gap_free() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn held_visibility_advance_forces_authenticated_reseed_when_gap_fills() {
+    let _harness = NETWORK_HARNESS.lock().await;
     use axum::extract::RawQuery;
     use axum::response::sse::{Event, Sse};
     use axum::routing::get;
@@ -470,6 +476,7 @@ async fn discovery_available_decodes_advances_cache_frontier_and_rejects_malform
 /// through the feed within 500ms.
 #[tokio::test(flavor = "multi_thread")]
 async fn sse_feed_observed_by_client_cache_within_500ms() {
+    let _harness = NETWORK_HARNESS.lock().await;
     let _ = tracing_subscriber::fmt()
         .with_env_filter("exocortex=debug,info")
         .with_writer(std::io::stderr)
@@ -577,6 +584,7 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn periodic_reseed_repairs_a_commit_with_no_change_feed_publication() {
+    let _harness = NETWORK_HARNESS.lock().await;
     let onto = Arc::new(
         exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
     );
@@ -650,6 +658,7 @@ async fn periodic_reseed_repairs_a_commit_with_no_change_feed_publication() {
 /// derived per-client key, and the wrong key rejects them.
 #[tokio::test(flavor = "multi_thread")]
 async fn per_client_sse_hmac_verifies_with_derived_key() {
+    let _harness = NETWORK_HARNESS.lock().await;
     use exocortex_server::sse::derive_client_sse_key;
 
     let onto = Arc::new(
@@ -792,6 +801,7 @@ fn test_memory(title: &str, n: u8) -> exocortex_kernel::Memory {
 
 #[tokio::test]
 async fn seed_ignorant_server_fails_initial_hydration_promptly() {
+    let _harness = NETWORK_HARNESS.lock().await;
     use axum::response::sse::{Event, Sse};
     use axum::routing::get;
     use std::convert::Infallible;
@@ -843,6 +853,7 @@ async fn seed_ignorant_server_fails_initial_hydration_promptly() {
 /// tasks must continue applying later commits.
 #[tokio::test(flavor = "multi_thread")]
 async fn production_backend_sync_hydrates_before_ready_and_stays_live() {
+    let _harness = NETWORK_HARNESS.lock().await;
     let onto = Arc::new(
         exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
     );
@@ -970,6 +981,7 @@ fn b64_encode(data: &[u8]) -> String {
 /// from LSN 1 — the client must replay-apply deltas 2 and 3.
 #[tokio::test(flavor = "multi_thread")]
 async fn deterministic_replay_probe() {
+    let _harness = NETWORK_HARNESS.lock().await;
     let onto = Arc::new(
         exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
     );

@@ -362,3 +362,9 @@ repository documents additive evolution and rollout work but no deployment
 order that permits an indefinite pre-readiness wait; the runtime must therefore
 either hydrate compatibly or fail promptly and explicitly. This is not closed
 by assumption or by the D10 rollout-test deferral.
+
+The mandatory full-workspace run then reproduced the historical SSE timing
+flake in two tests even though the focused client suite passed. R6-R88 promotes
+that verification result: keep the exact production deadlines, but serialize
+the independent in-process network harnesses so sibling servers and reconnect
+loops cannot consume one another's wall-clock budgets.
