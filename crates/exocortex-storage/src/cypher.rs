@@ -1139,6 +1139,29 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "claim_schema_v0",
+        read_only: false,
+        required_params: &[],
+        cypher: r#"
+            MERGE (m:_ExocortexMeta {key: 'schema_version'})
+            ON CREATE SET m.value = 0
+            WITH m WHERE m.value = 0
+            RETURN m.value
+        "#,
+    });
+
+    reg!(Template {
+        id: "finish_schema_migration_v1",
+        read_only: false,
+        required_params: &["from_version", "to_version"],
+        cypher: r#"
+            MATCH (m:_ExocortexMeta {key: 'schema_version', value: $from_version})
+            SET m.value = $to_version
+            RETURN m.value
+        "#,
+    });
+
+    reg!(Template {
         id: "mutation_lsn_guard",
         read_only: false,
         required_params: &["lsn"],
@@ -1179,9 +1202,12 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "valid_until",
             "invalidated_by",
             "recorded_at",
-            "lsn"
+            "lsn",
+            "expected_schema_version"
         ],
         cypher: r#"
+            MATCH (schema:_ExocortexMeta {key: 'schema_version', value: $expected_schema_version})
+            WITH schema
             MATCH (m:Memory {id: $id})
             WHERE m.lsn = $lsn
             SET m.memory_type_label = $memory_type_label,
@@ -1245,9 +1271,12 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "valid_until",
             "invalidated_by",
             "recorded_at",
-            "lsn"
+            "lsn",
+            "expected_schema_version"
         ],
         cypher: r#"
+            MATCH (schema:_ExocortexMeta {key: 'schema_version', value: $expected_schema_version})
+            WITH schema
             MATCH (m:Memory {id: $id})
             WHERE m.lsn = $lsn
             OPTIONAL MATCH (current:_MemoryAssertion {id: m.id, lsn: m.lsn})
@@ -1275,8 +1304,10 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "migrate_relationship_schema_v1",
         read_only: false,
-        required_params: &["rel_id"],
+        required_params: &["rel_id", "expected_schema_version"],
         cypher: r#"
+            MATCH (schema:_ExocortexMeta {key: 'schema_version', value: $expected_schema_version})
+            WITH schema
             MATCH ()-[r]->() WHERE r.id = $rel_id
             MERGE (h:_RelationshipAssertion {id: r.id, lsn: r.lsn})
             ON CREATE SET h.from = startNode(r).id,

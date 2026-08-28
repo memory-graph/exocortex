@@ -62,6 +62,8 @@ pub struct FalkorStorage {
     #[cfg(feature = "integration")]
     legacy_repair_queries: AtomicU64,
     #[cfg(feature = "integration")]
+    migration_peak_rows: AtomicU64,
+    #[cfg(feature = "integration")]
     fail_next_publish: std::sync::atomic::AtomicBool,
     #[cfg(feature = "integration")]
     pause_next_publish: std::sync::atomic::AtomicBool,
@@ -410,6 +412,8 @@ impl FalkorStorage {
             #[cfg(feature = "integration")]
             legacy_repair_queries: AtomicU64::new(0),
             #[cfg(feature = "integration")]
+            migration_peak_rows: AtomicU64::new(0),
+            #[cfg(feature = "integration")]
             fail_next_publish: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "integration")]
             pause_next_publish: std::sync::atomic::AtomicBool::new(false),
@@ -508,13 +512,21 @@ impl FalkorStorage {
             return Ok(());
         }
 
-        let mut memories = <Self as Storage>::stream_all_memories(self).await;
-        let mut current_memories = Vec::new();
-        while let Some(memory) = memories.next().await {
-            current_memories.push(memory?);
+        let claim = self
+            .run_template("claim_schema_v0", &serde_json::json!({}), false)
+            .await?;
+        if claim.is_empty() {
+            return Err(StorageError::CorruptMetadata {
+                key: "schema_version",
+                detail: "schema changed before v0 migration could claim it".into(),
+            });
         }
-        drop(memories);
-        for mut memory in current_memories {
+
+        let mut memories = <Self as Storage>::stream_all_memories(self).await;
+        while let Some(memory) = memories.next().await {
+            #[cfg(feature = "integration")]
+            self.migration_peak_rows.fetch_max(1, Ordering::SeqCst);
+            let mut memory = memory?;
             if memory.context.tenant_id.is_none() {
                 memory.context.tenant_id = Some(self.org_id.clone());
             }
@@ -525,43 +537,77 @@ impl FalkorStorage {
                 .ok_or_else(|| {
                     StorageError::Backend(format!("bad memory_type {}", memory.memory_type))
                 })?;
+            let mut params = self.memory_params(&memory, memory.lsn.value, memory_type_label);
+            params
+                .as_object_mut()
+                .expect("memory params are an object")
+                .insert("expected_schema_version".into(), serde_json::json!(0));
             let migrated = self
-                .run_template(
-                    "migrate_memory_schema_v1",
-                    &self.memory_params(&memory, memory.lsn.value, memory_type_label),
-                    false,
-                )
+                .run_template("migrate_memory_schema_v1", &params, false)
                 .await?;
             // A rolling writer may replace the captured row. The captured-LSN
             // CAS deliberately skips it; connect-time repair below adopts the
             // replacement only when it lacks canonical assertion history.
-            let _ = migrated;
+            if migrated.is_empty() {
+                self.ensure_schema_v0().await?;
+            }
         }
+        drop(memories);
 
         let mut relationships = <Self as Storage>::stream_all_relationships(self).await;
-        let mut current_relationships = Vec::new();
         while let Some(relationship) = relationships.next().await {
-            current_relationships.push(relationship?);
+            #[cfg(feature = "integration")]
+            self.migration_peak_rows.fetch_max(1, Ordering::SeqCst);
+            let relationship = relationship?;
+            let migrated = self
+                .run_template(
+                    "migrate_relationship_schema_v1",
+                    &serde_json::json!({
+                        "rel_id": hex(&relationship.id.0),
+                        "expected_schema_version": 0,
+                    }),
+                    false,
+                )
+                .await?;
+            if migrated.is_empty() {
+                self.ensure_schema_v0().await?;
+            }
         }
         drop(relationships);
-        for relationship in current_relationships {
-            self.run_template(
-                "migrate_relationship_schema_v1",
-                &serde_json::json!({ "rel_id": hex(&relationship.id.0) }),
-                false,
-            )
-            .await?;
-        }
 
         self.repair_legacy_memories().await?;
 
-        self.run_template(
-            "write_schema_version",
-            &serde_json::json!({ "version": STORAGE_SCHEMA_VERSION }),
-            false,
-        )
-        .await?;
+        let finished = self
+            .run_template(
+                "finish_schema_migration_v1",
+                &serde_json::json!({
+                    "from_version": 0,
+                    "to_version": STORAGE_SCHEMA_VERSION,
+                }),
+                false,
+            )
+            .await?;
+        if finished.is_empty() {
+            self.ensure_schema_v0().await?;
+            return Err(StorageError::CorruptMetadata {
+                key: "schema_version",
+                detail: "v0 migration lost its final schema transition".into(),
+            });
+        }
         Ok(())
+    }
+
+    async fn ensure_schema_v0(&self) -> Result<(), StorageError> {
+        let rows = self
+            .run_template("read_schema_version", &serde_json::json!({}), true)
+            .await?;
+        match rows.first().and_then(|row| row.first()) {
+            Some(FalkorValue::I64(0)) => Ok(()),
+            other => Err(StorageError::CorruptMetadata {
+                key: "schema_version",
+                detail: format!("schema changed during v0 migration: {other:?}"),
+            }),
+        }
     }
 
     /// Adopt only the unambiguous pre-v1 shape: a current row whose exact LSN
@@ -599,13 +645,17 @@ impl FalkorStorage {
                     .ok_or_else(|| {
                         StorageError::Backend(format!("bad memory_type {}", memory.memory_type))
                     })?;
+                let mut params = self.memory_params(&memory, memory.lsn.value, label);
+                params
+                    .as_object_mut()
+                    .expect("memory params are an object")
+                    .insert("expected_schema_version".into(), serde_json::json!(0));
                 let changed = self
-                    .run_template(
-                        "repair_legacy_memory_v1",
-                        &self.memory_params(&memory, memory.lsn.value, label),
-                        false,
-                    )
+                    .run_template("repair_legacy_memory_v1", &params, false)
                     .await?;
+                if changed.is_empty() {
+                    self.ensure_schema_v0().await?;
+                }
                 repaired += usize::from(!changed.is_empty());
             }
             if repaired == 0 {
@@ -3441,6 +3491,12 @@ impl FalkorStorage {
     #[cfg(feature = "integration")]
     pub fn take_legacy_repair_query_count(&self) -> u64 {
         self.legacy_repair_queries.swap(0, Ordering::Relaxed)
+    }
+    /// Maximum number of decoded legacy rows retained together by migration.
+    #[doc(hidden)]
+    #[cfg(feature = "integration")]
+    pub fn migration_peak_rows_for_testing(&self) -> u64 {
+        self.migration_peak_rows.load(Ordering::Relaxed)
     }
     /// Fail the next Redis publication after its durable graph mutation.
     #[cfg(feature = "integration")]

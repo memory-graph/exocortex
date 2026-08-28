@@ -315,6 +315,7 @@ itest!(
                 "invalidated_by": captured.invalidated_by.map(|id| id_hex(&id.0)),
                 "recorded_at": captured.recorded_at.to_rfc3339(),
                 "lsn": captured_lsn,
+                "expected_schema_version": 1,
             }),
             read_only: false,
             deadline: Utc::now() + Duration::seconds(5),
@@ -328,6 +329,94 @@ itest!(
         let current = storage.get_memory(&memory.id).await.unwrap().unwrap();
         assert_eq!(current.title.as_str(), "migration-concurrent");
         assert!(current.lsn.value > captured_lsn);
+    }
+);
+
+itest!(
+    future_schema_transition_blocks_every_stale_v0_migration_write,
+    {
+        let storage = connect("migration-future-race").await;
+        let memory = mem("future-owned", 3, Visibility::Org);
+        storage.upsert_memory(&memory).await.unwrap();
+        storage.make_legacy_schema_for_testing().await.unwrap();
+        let captured = storage.get_memory(&memory.id).await.unwrap().unwrap();
+        storage
+            .query_cypher(&CypherQuery {
+                template_id: "claim_schema_v0",
+                params: serde_json::json!({}),
+                read_only: false,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        storage
+            .query_cypher(&CypherQuery {
+                template_id: "integration_make_future_schema_without_fingerprint",
+                params: serde_json::json!({ "version": 2 }),
+                read_only: false,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        let attempted = storage
+        .query_cypher(&CypherQuery {
+            template_id: "migrate_memory_schema_v1",
+            params: serde_json::json!({
+                "id": id_hex(&captured.id.0),
+                "memory_type_label": ontology().memory_type_names[captured.memory_type as usize],
+                "memory_type_id": captured.memory_type,
+                "props_json": serde_json::to_string(&captured).unwrap(),
+                "tags": Vec::<String>::new(),
+                "entity_ids": Vec::<String>::new(),
+                "tenant_id": "wrong-future-overwrite",
+                "user_id": captured.context.user_id,
+                "project_id": captured.context.project_id,
+                "team_id": captured.context.team_id,
+                "visibility": captured.visibility as u8,
+                "valid_from": captured.valid_from.to_rfc3339(),
+                "valid_until": captured.valid_until.map(|time| time.to_rfc3339()),
+                "invalidated_by": captured.invalidated_by.map(|id| id_hex(&id.0)),
+                "recorded_at": captured.recorded_at.to_rfc3339(),
+                "lsn": captured.lsn.value,
+                "expected_schema_version": 0,
+            }),
+            read_only: false,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+        assert!(attempted.rows.is_empty());
+        let finish = storage
+            .query_cypher(&CypherQuery {
+                template_id: "finish_schema_migration_v1",
+                params: serde_json::json!({ "from_version": 0, "to_version": 1 }),
+                read_only: false,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        assert!(finish.rows.is_empty());
+        assert_ne!(
+            storage
+                .get_memory(&memory.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .context
+                .tenant_id
+                .as_deref(),
+            Some("wrong-future-overwrite")
+        );
+        let schema = storage
+            .query_cypher(&CypherQuery {
+                template_id: "read_schema_version",
+                params: serde_json::json!({}),
+                read_only: true,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(schema.rows, vec![serde_json::json!([2])]);
     }
 );
 
@@ -503,6 +592,11 @@ itest!(
         )
         .await
         .expect("startup migration succeeds");
+        assert_eq!(
+            restarted.migration_peak_rows_for_testing(),
+            1,
+            "migration retains only the row currently being transformed"
+        );
 
         let rows = restarted
             .find_by_entity(
