@@ -1,7 +1,7 @@
 # Exocortex — Master Plan
 
-**Status (2026-08-28, Round 6):** RELEASE BLOCKED. The first fresh strict
-whole-project review promoted R6-R185 through R6-R202 below; R6-R182 remains
+**Status (2026-08-28, Round 6):** RELEASE BLOCKED. The latest fresh strict
+whole-project review promoted R6-R208 through R6-R228 below; R6-R182 remains
 open until those items, the complete final gate matrix, and a subsequent clean
 strict review are evidenced.
 
@@ -477,6 +477,27 @@ idea:
 | R6-R205 | R6-R197 live verification defect: bind the production Falkor and Dreams lease identities to the configured backend node and enable the shared Dreams queue for Falkor-backed nodes by default | Codex | Done — backend assembly passes the configured node id into Falkor lease ownership and derives the default Redis Dreams transport from Falkor storage unless explicitly overridden; `falkor_backend_enables_its_shared_dreams_transport_by_default` passes, and the current-image chaos barrier owner exactly matched elected node3 (this commit) |
 | R6-R206 | R6-R197 live verification defect: clear stale Dreams ownership from follower health | Codex | Done — both explicit election stop and every lease-loss path atomically clear `leader_node_id` and epoch together with the leader gate; `three_node_p95_handoff_no_duplicate_and_stale_fence` asserts the former owner reports neither identity nor epoch, and the current-image harness selected the authoritative barrier owner before kill (this commit) |
 | R6-R207 | Full-gate reliability: express the stdio reader shutdown without a nested early return that the mandatory zombie-process lint attributes to the spawned MCP child | Codex | Done — the reader exits its loop with `break`, keeping process ownership visibly in `Client`, whose failure and drop paths kill and wait; client all-target clippy with `-D warnings` and `silent_child_response_wait_is_bounded` pass (this commit) |
+| R6-R208 | Strict review: preserve and validate authenticated ingest temporal coordinates instead of restamping or silently opening them | Codex | In progress — preserve batch observed/recorded and draft valid intervals, reject malformed timestamps atomically, and prove exact readback/no mutation |
+| R6-R209 | Strict review: report accepted producer rows rather than backend-generated grouping/inverse rows | Codex | In progress — settle authored memory/relationship count and prove replay keeps the original producer-visible count |
+| R6-R210 | Strict review: persist registered source flavor and make grouping/session context resolve from that authority | Codex | In progress — migrate old registry rows to no flavor, enforce first-registration flavor, and cover session/custom/synthetic flavor behavior |
+| R6-R211 | Strict review: stamp relationship provenance from the authenticated producer or external snapshot | Codex | In progress — share batch provenance shaping, prove ordinary/external edge readback, and record the missing relationship-level external-key wire coordinate as a genuine PRD/schema conflict |
+| R6-R212 | Strict review advisory: redact gRPC storage failures while retaining server-side diagnostics | Codex | In progress — return generic INTERNAL statuses and prove sentinel backend details do not cross either ingest read/commit boundary |
+| R6-R213 | Strict review advisory: bound encoded SSE events before expensive decode/authentication work | Codex | In progress — establish one wire-owned ceiling and cover boundary values without weakening valid reseed capacity |
+| R6-R214 | Strict review: make deployment acceptance recognize executable chaos commands rather than comment substrings | Codex | In progress — parse active shell lines/order and add a commented-out-command negative fixture |
+| R6-R215 | Strict review cleanup: remove the redundant live invalidation subscription sleep | Codex | In progress — subscription readiness is already awaited; focused live delivery coverage must remain green |
+| R6-R216 | Strict review: make compatible concurrent schema migration single-owner and recoverable | Codex | In progress — durable ownership/wait semantics and a live two-connector regression must make both compatible startups succeed |
+| R6-R217 | Strict review: bound cache tag/entity auxiliary history across repeated replacement | Codex | In progress — prune empty buckets, rebuild live interning during compaction, and assert allocation/index growth follows resident data |
+| R6-R218 | Strict review: eliminate delimiter collisions in external identity framing | Codex | In progress — use unambiguous raw-byte framing with exact cross-org collision regression and document compatibility consequences |
+| R6-R219 | Strict review advisory: close kernel-purity root-alias I/O bypasses | Codex | In progress — resolve aliased `std` roots and fail the exact `system::fs` fixture |
+| R6-R220 | Strict review advisory: close executable runtime string-composition bypasses in Cypher confinement | Codex | In progress — recognize standard composed query construction while preserving harmless split constants |
+| R6-R221 | Strict review cleanup: align publishing documentation with the macOS runner used by release automation | Codex | In progress — document `macos-14` consistently |
+| R6-R222 | Strict review advisory: record the org-scoped Dreams queue and bounded metric-label PRD conflicts | Codex | In progress — retain the safer implementation and add explicit milestone deviations/rollout consequences without editing the PRD |
+| R6-R223 | Strict review advisory: bound every MCP child-response wait used by mandatory tests | Codex | In progress — share or mirror timeout/kill/wait diagnostics and prove a silent child cannot hang the suite |
+| R6-R224 | Strict review cleanup: make the chaos operator comment match the enforced successor-completion contract | Codex | In progress — describe the exact one-closed-duplicate success condition |
+| R6-R225 | Strict review cleanup: reject the currently unsupported worker `--config` path instead of silently ignoring it | Codex | In progress — preserve the PRD option and fail with a clear v1 diagnostic plus regression |
+| R6-R226 | Strict review: connect the shipped standalone MCP runtime to its supervised Falkor backend | Codex | In progress — remove ornamental topology and prove installed write/read/restart persistence through the real backend |
+| R6-R227 | Strict review: guarantee backend-local cache convergence after terminal invalidation publication failure | Codex | In progress — add authoritative reconciliation or durable publication retry and a live no-follow-up-write regression |
+| R6-R228 | Strict review: keep discovery persistence inside the Dreams owner fence | Codex | In progress — retain/renew ownership through discovery, use fenced atomic storage writes, and prove demoted owners persist no candidates |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence
