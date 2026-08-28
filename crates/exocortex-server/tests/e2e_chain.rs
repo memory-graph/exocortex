@@ -128,6 +128,7 @@ async fn boot() -> (
                     ),
                     exocortex_ingest::service::AdminSourcePolicy {
                         ceiling: exocortex_kernel::Visibility::Org,
+                        kind: exocortex_kernel::ProducerKind::AnalyticsAdapter,
                         signing_key: PRODUCER_KEY,
                     },
                 ),
@@ -139,6 +140,7 @@ async fn boot() -> (
                     ),
                     exocortex_ingest::service::AdminSourcePolicy {
                         ceiling: exocortex_kernel::Visibility::Org,
+                        kind: exocortex_kernel::ProducerKind::CodingAgent,
                         signing_key: PRODUCER_KEY,
                     },
                 ),

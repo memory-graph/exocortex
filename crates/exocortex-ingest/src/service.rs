@@ -54,6 +54,9 @@ pub struct SourceEntry {
 pub struct AdminSourcePolicy {
     /// Maximum visibility the producer may assert.
     pub ceiling: Visibility,
+    /// Administrator-pinned producer provenance class. Production never
+    /// derives this authority from restart-local registration state.
+    pub kind: exocortex_kernel::ProducerKind,
     /// Producer-specific HMAC key (R-I8); never the cluster peer key.
     pub signing_key: [u8; 32],
 }
@@ -240,6 +243,18 @@ impl<S: Storage> IngestServer<S> {
         let mut server = Self::new(storage, ontology, [0; 32]);
         server.default_producer_key = None;
         server.admin_policies = policies.into_iter().collect();
+        {
+            let mut sources = server.sources.lock().unwrap();
+            for (key, policy) in &server.admin_policies {
+                sources.put(
+                    key.clone(),
+                    SourceEntry {
+                        ceiling: policy.ceiling,
+                        kind: policy.kind,
+                    },
+                );
+            }
+        }
         server.require_admin_policy = true;
         server
     }
@@ -1418,7 +1433,11 @@ impl<S: Storage + 'static> IngestServer<S> {
         }
     }
 
-    async fn deliver_post_ingest_effect(&self, effect: &PostIngestEffect) -> Result<(), String> {
+    async fn deliver_post_ingest_effect(
+        &self,
+        effect: &PostIngestEffect,
+        claim_token: &str,
+    ) -> Result<(), String> {
         if let Some(dreams) = &self.dreams {
             for delta in &effect.region_deltas {
                 dreams
@@ -1442,7 +1461,7 @@ impl<S: Storage + 'static> IngestServer<S> {
         }
         let acknowledged = self
             .storage
-            .acknowledge_ingest_effect(effect.effect_id.as_str())
+            .acknowledge_ingest_effect(effect.effect_id.as_str(), claim_token)
             .await
             .map_err(|error| error.to_string())?;
         if !acknowledged {
@@ -1457,8 +1476,14 @@ impl<S: Storage + 'static> IngestServer<S> {
     pub async fn run_post_ingest_effects(self: Arc<Self>) {
         let mut delay = std::time::Duration::from_millis(25);
         loop {
-            match self.storage.pending_ingest_effects(1).await {
-                Ok(effects) if effects.is_empty() => {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let claim_token = uuid::Uuid::now_v7().to_string();
+            match self
+                .storage
+                .claim_ingest_effect(&claim_token, now_ms, now_ms + 30_000)
+                .await
+            {
+                Ok(None) => {
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
                         _ = self.post_ingest_notify.notified() => {
@@ -1468,12 +1493,11 @@ impl<S: Storage + 'static> IngestServer<S> {
                     }
                     delay = (delay * 2).min(std::time::Duration::from_secs(1));
                 }
-                Ok(effects) => {
-                    let effect = &effects[0];
-                    match self.deliver_post_ingest_effect(effect).await {
+                Ok(Some(effect)) => {
+                    match self.deliver_post_ingest_effect(&effect, &claim_token).await {
                         Ok(()) => delay = std::time::Duration::from_millis(25),
                         Err(error) => {
-                            tracing::warn!(%error, effect_id = %effect.effect_id, "post-ingest effect delivery retrying");
+                            tracing::warn!(%error, effect_id = %effect.effect_id, "post-ingest effect delivery retrying after claim expiry");
                             tokio::time::sleep(delay).await;
                             delay = (delay * 2).min(std::time::Duration::from_secs(5));
                         }

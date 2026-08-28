@@ -21,6 +21,24 @@ fn ontology() -> Arc<exocortex_kernel::Ontology> {
     Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap())
 }
 
+#[tokio::test]
+async fn durable_submission_fails_after_worker_termination() {
+    let storage = Arc::new(InMemoryStorage::new(ontology()));
+    let engine = Arc::new(ReasoningEngine::new(storage, 1, 1));
+    let worker = tokio::spawn(engine.clone().run());
+    tokio::task::yield_now().await;
+    worker.abort();
+    let _ = worker.await;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        engine.process_durable_session_wrapup(vec![MemoryId::new_v7()]),
+    )
+    .await
+    .expect("worker termination must not leave durable submission hanging");
+    assert!(result.is_err());
+}
+
 fn kind(name: &str) -> u32 {
     ontology().kind_id(name).unwrap().0
 }

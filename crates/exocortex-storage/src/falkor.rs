@@ -1569,11 +1569,52 @@ impl Storage for FalkorStorage {
             .collect()
     }
 
-    async fn acknowledge_ingest_effect(&self, effect_id: &str) -> Result<bool, StorageError> {
+    async fn claim_ingest_effect(
+        &self,
+        claim_token: &str,
+        now_ms: i64,
+        claim_until_ms: i64,
+    ) -> Result<Option<PostIngestEffect>, StorageError> {
+        let rows = self
+            .run_template(
+                "ingest_effect_claim",
+                &serde_json::json!({
+                    "claim_token": claim_token,
+                    "now_ms": now_ms,
+                    "claim_until_ms": claim_until_ms,
+                }),
+                false,
+            )
+            .await?;
+        match rows.first().and_then(|row| row.first()) {
+            None => Ok(None),
+            Some(FalkorValue::String(json)) => {
+                serde_json::from_str(json).map(Some).map_err(|error| {
+                    StorageError::CorruptMetadata {
+                        key: "ingest_effect",
+                        detail: error.to_string(),
+                    }
+                })
+            }
+            other => Err(StorageError::CorruptMetadata {
+                key: "ingest_effect",
+                detail: format!("expected string, found {other:?}"),
+            }),
+        }
+    }
+
+    async fn acknowledge_ingest_effect(
+        &self,
+        effect_id: &str,
+        claim_token: &str,
+    ) -> Result<bool, StorageError> {
         Ok(!self
             .run_template(
                 "ingest_effect_acknowledge",
-                &serde_json::json!({ "effect_id": effect_id }),
+                &serde_json::json!({
+                    "effect_id": effect_id,
+                    "claim_token": claim_token,
+                }),
                 false,
             )
             .await?

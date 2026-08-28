@@ -662,13 +662,31 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "ingest_effect_claim",
+        read_only: false,
+        required_params: &["claim_token", "now_ms", "claim_until_ms"],
+        cypher: r#"
+            MATCH (d:_IngestBatch)
+            WHERE d.state = 'settled' AND d.effect_json IS NOT NULL
+              AND d.effect_acknowledged = false
+              AND (d.effect_claim_until_ms IS NULL OR d.effect_claim_until_ms <= $now_ms)
+            WITH d ORDER BY d.effect_id ASC LIMIT 1
+            SET d.effect_claim_token = $claim_token,
+                d.effect_claim_until_ms = $claim_until_ms
+            RETURN d.effect_json
+        "#,
+    });
+
+    reg!(Template {
         id: "ingest_effect_acknowledge",
         read_only: false,
-        required_params: &["effect_id"],
+        required_params: &["effect_id", "claim_token"],
         cypher: r#"
             MATCH (d:_IngestBatch {effect_id: $effect_id})
             WHERE d.state = 'settled' AND d.effect_json IS NOT NULL
+              AND d.effect_claim_token = $claim_token
             SET d.effect_acknowledged = true
+            REMOVE d.effect_claim_token, d.effect_claim_until_ms
             RETURN d.effect_id
         "#,
     });

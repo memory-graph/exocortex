@@ -602,8 +602,32 @@ itest!(
             restarted.pending_ingest_effects(10).await.unwrap(),
             [effect.clone()]
         );
+        assert_eq!(
+            restarted
+                .claim_ingest_effect("worker-a", 1_000, 2_000)
+                .await
+                .unwrap(),
+            Some(effect.clone())
+        );
         assert!(restarted
-            .acknowledge_ingest_effect(effect.effect_id.as_str())
+            .claim_ingest_effect("worker-b", 1_000, 2_000)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            restarted
+                .claim_ingest_effect("worker-b", 2_001, 32_001)
+                .await
+                .unwrap(),
+            Some(effect.clone()),
+            "an abandoned claim becomes retryable after its deadline"
+        );
+        assert!(!restarted
+            .acknowledge_ingest_effect(effect.effect_id.as_str(), "worker-a")
+            .await
+            .unwrap());
+        assert!(restarted
+            .acknowledge_ingest_effect(effect.effect_id.as_str(), "worker-b")
             .await
             .unwrap());
         assert!(restarted

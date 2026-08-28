@@ -525,3 +525,17 @@ contract at its packaged-binary rule probe. Its source policy is now owner-only,
 and the complete deployment gate passes installer integrity, hardened build,
 three entrypoint topologies, all nine deployed rules, and standalone MCP
 supervision.
+
+## Clean strict review remediation (2026-08-28)
+
+The fresh `300c765` strict pass promoted R6-R158–R6-R162. Backend shutdown is
+now cancellation-safe and owns every long-lived task; the fixed-port regression
+also proves detached tasks release their storage references. Durable ingest
+effects use atomic expiring claims with token-bound acknowledgement, preventing
+multiple backend nodes from processing one reasoning effect while preserving
+crash recovery. The reasoning receiver is worker-owned, so worker termination
+closes the queue and returns an error instead of wedging delivery. Finally,
+administrator source policy pins and preloads producer kind on every fresh
+production server, so restart-local registration cannot change provenance.
+Focused in-memory/live Falkor, reasoning, ingest, backend lifecycle, and
+workspace clippy evidence passes.

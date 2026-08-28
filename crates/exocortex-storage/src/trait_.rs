@@ -129,9 +129,27 @@ pub trait Storage: Send + Sync + 'static {
             "ingest effect outbox unsupported".into(),
         ))
     }
-    /// Idempotently acknowledge one delivered post-ingest effect.
-    async fn acknowledge_ingest_effect(&self, effect_id: &str) -> crate::Result<bool> {
-        let _ = effect_id;
+    /// Atomically claim the oldest retryable post-ingest effect until the
+    /// supplied Unix-millisecond deadline. An active claim is invisible to
+    /// other workers and becomes retryable after expiry.
+    async fn claim_ingest_effect(
+        &self,
+        claim_token: &str,
+        now_ms: i64,
+        claim_until_ms: i64,
+    ) -> crate::Result<Option<PostIngestEffect>> {
+        let _ = (claim_token, now_ms, claim_until_ms);
+        Err(StorageError::Backend(
+            "ingest effect claiming unsupported".into(),
+        ))
+    }
+    /// Acknowledge one delivered post-ingest effect only for its active claim.
+    async fn acknowledge_ingest_effect(
+        &self,
+        effect_id: &str,
+        claim_token: &str,
+    ) -> crate::Result<bool> {
+        let _ = (effect_id, claim_token);
         Err(StorageError::Backend(
             "ingest effect outbox unsupported".into(),
         ))

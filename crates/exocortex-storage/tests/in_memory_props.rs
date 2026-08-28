@@ -825,13 +825,37 @@ async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
         store.pending_ingest_effects(10).await.unwrap(),
         [effect.clone()]
     );
+    assert_eq!(
+        store
+            .claim_ingest_effect("worker-a", 1_000, 2_000)
+            .await
+            .unwrap(),
+        Some(effect.clone())
+    );
     assert!(store
-        .acknowledge_ingest_effect(effect.effect_id.as_str())
+        .claim_ingest_effect("worker-b", 1_000, 2_000)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .claim_ingest_effect("worker-b", 2_001, 32_001)
+            .await
+            .unwrap(),
+        Some(effect.clone()),
+        "an abandoned claim becomes retryable after its deadline"
+    );
+    assert!(!store
+        .acknowledge_ingest_effect(effect.effect_id.as_str(), "worker-a")
+        .await
+        .unwrap());
+    assert!(store
+        .acknowledge_ingest_effect(effect.effect_id.as_str(), "worker-b")
         .await
         .unwrap());
     assert!(store.pending_ingest_effects(10).await.unwrap().is_empty());
     assert!(store
-        .acknowledge_ingest_effect(effect.effect_id.as_str())
+        .acknowledge_ingest_effect(effect.effect_id.as_str(), "worker-b")
         .await
         .unwrap());
 }

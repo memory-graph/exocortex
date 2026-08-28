@@ -62,11 +62,19 @@ async fn dropping_backend_node_stops_ingress_and_releases_its_port() {
         exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
     );
     let storage = Arc::new(InMemoryStorage::new(onto.clone()));
-    let node = run_backend_node(storage, onto, args("127.0.0.1:0", 41991, vec![]))
+    let storage_lifetime = Arc::downgrade(&storage);
+    let mut node = run_backend_node(storage.clone(), onto, args("127.0.0.1:0", 41991, vec![]))
         .await
         .unwrap();
+    drop(storage);
     let addr = node.local_addr;
     assert!(std::net::TcpStream::connect(addr).is_ok());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), node.wait_for_ingress())
+            .await
+            .is_err(),
+        "cancelling a healthy ingress wait must leave its task owned by the node"
+    );
     drop(node);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -80,6 +88,14 @@ async fn dropping_backend_node_stops_ingress_and_releases_its_port() {
             "dropping BackendNode must release {addr}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while storage_lifetime.upgrade().is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "dropping BackendNode must release storage retained by background tasks"
+        );
+        tokio::task::yield_now().await;
     }
 }
 

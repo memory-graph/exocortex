@@ -43,7 +43,7 @@ fn spawn_node() -> Node {
     let policy = policy_dir.path().join("sources.json");
     std::fs::write(
         &policy,
-        r#"[{"org_id":"org","source_uri":"fixture://oop","producer_id":"oop-fixture","ceiling":3,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
+        r#"[{"org_id":"org","source_uri":"fixture://oop","producer_id":"oop-fixture","ceiling":3,"producer_kind":4,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
     )
     .unwrap();
     #[cfg(unix)]

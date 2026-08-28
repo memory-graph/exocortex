@@ -92,7 +92,7 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
     let source_policy = policy_dir.path().join("sources.json");
     std::fs::write(
         &source_policy,
-        r#"[{"org_id":"org","source_uri":"fixture://fixture-e2e","producer_id":"fixture-e2e","ceiling":3,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
+        r#"[{"org_id":"org","source_uri":"fixture://fixture-e2e","producer_id":"fixture-e2e","ceiling":3,"producer_kind":4,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
     )
     .unwrap();
     #[cfg(unix)]

@@ -424,6 +424,7 @@ struct SourcePolicyRow {
     source_uri: String,
     producer_id: String,
     ceiling: u8,
+    producer_kind: i32,
     hmac_key: String,
 }
 
@@ -482,10 +483,19 @@ fn load_source_policy(path: Option<&std::path::Path>) -> anyhow::Result<Vec<Sour
             );
             let signing_key = exocortex_wire::signing::decode_hex32(&row.hmac_key)
                 .map_err(|error| anyhow::anyhow!("source policy hmac_key: {error}"))?;
+            let kind = match row.producer_kind {
+                1 => exocortex_kernel::ProducerKind::CodingAgent,
+                2 => exocortex_kernel::ProducerKind::ResearchAgent,
+                3 => exocortex_kernel::ProducerKind::DocsAdapter,
+                4 => exocortex_kernel::ProducerKind::AnalyticsAdapter,
+                5 => exocortex_kernel::ProducerKind::Custom,
+                _ => anyhow::bail!("source policy producer_kind is invalid"),
+            };
             Ok((
                 key,
                 exocortex_ingest::service::AdminSourcePolicy {
                     ceiling: visibility,
+                    kind,
                     signing_key,
                 },
             ))
@@ -571,7 +581,7 @@ mod tests {
         let path = dir.path().join("policy.json");
         std::fs::write(
             &path,
-            r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":3,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
+            r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":3,"producer_kind":4,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
         )
         .unwrap();
         #[cfg(unix)]
@@ -595,7 +605,7 @@ mod tests {
         assert!(load_source_policy(Some(&path)).is_err());
         std::fs::write(
             &path,
-            r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":9,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
+            r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":9,"producer_kind":4,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
         )
         .unwrap();
         assert!(load_source_policy(Some(&path)).is_err());

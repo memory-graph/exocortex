@@ -47,7 +47,7 @@ struct InMemoryInner {
     #[cfg(feature = "testing")]
     region_relationship_calls: AtomicU64,
     settled_ingest: Mutex<HashMap<IngestBatchKey, SettledIngestBatch>>,
-    ingest_effects: Mutex<HashMap<smol_str::SmolStr, (PostIngestEffect, bool)>>,
+    ingest_effects: Mutex<HashMap<smol_str::SmolStr, InMemoryIngestEffect>>,
     #[cfg(feature = "testing")]
     pending_ingest_effect_reads: AtomicU64,
     governed_imports: Mutex<std::collections::HashSet<String>>,
@@ -78,6 +78,12 @@ struct InMemoryInner {
             std::sync::Arc<tokio::sync::Notify>,
         )>,
     >,
+}
+
+struct InMemoryIngestEffect {
+    effect: PostIngestEffect,
+    acknowledged: bool,
+    claim: Option<(smol_str::SmolStr, i64)>,
 }
 
 #[derive(Clone)]
@@ -504,14 +510,14 @@ impl InMemoryStorage {
             return Ok((IngestCommitOutcome::Duplicate(settled), Vec::new()));
         }
         if let Some(effect) = effect {
-            if let Some((stored, _)) = self
+            if let Some(stored) = self
                 .inner
                 .ingest_effects
                 .lock()
                 .unwrap()
                 .get(&effect.effect_id)
             {
-                if stored != effect {
+                if &stored.effect != effect {
                     return Err(StorageError::Backend(format!(
                         "ingest effect {} already exists with different content",
                         effect.effect_id
@@ -531,11 +537,14 @@ impl InMemoryStorage {
             .unwrap()
             .insert(key.clone(), settled);
         if let Some(effect) = effect {
-            self.inner
-                .ingest_effects
-                .lock()
-                .unwrap()
-                .insert(effect.effect_id.clone(), (effect.clone(), false));
+            self.inner.ingest_effects.lock().unwrap().insert(
+                effect.effect_id.clone(),
+                InMemoryIngestEffect {
+                    effect: effect.clone(),
+                    acknowledged: false,
+                    claim: None,
+                },
+            );
         }
         Ok((
             IngestCommitOutcome::Committed { records, settled },
@@ -755,20 +764,50 @@ impl Storage for InMemoryStorage {
             .lock()
             .unwrap()
             .values()
-            .filter(|(_, acknowledged)| !acknowledged)
-            .map(|(effect, _)| effect.clone())
+            .filter(|row| !row.acknowledged)
+            .map(|row| row.effect.clone())
             .collect();
         rows.sort_by(|a, b| a.effect_id.cmp(&b.effect_id));
         rows.truncate(limit as usize);
         Ok(rows)
     }
-    async fn acknowledge_ingest_effect(&self, effect_id: &str) -> Result<bool, StorageError> {
+    async fn claim_ingest_effect(
+        &self,
+        claim_token: &str,
+        now_ms: i64,
+        claim_until_ms: i64,
+    ) -> Result<Option<PostIngestEffect>, StorageError> {
         let _gate = self.inner.mutation_gate.lock().unwrap();
         let mut effects = self.inner.ingest_effects.lock().unwrap();
-        let Some((_, acknowledged)) = effects.get_mut(effect_id) else {
+        let mut eligible = effects
+            .iter()
+            .filter(|(_, row)| {
+                !row.acknowledged && row.claim.as_ref().is_none_or(|(_, until)| *until <= now_ms)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        eligible.sort();
+        let Some(effect_id) = eligible.first() else {
+            return Ok(None);
+        };
+        let row = effects.get_mut(effect_id).expect("selected effect exists");
+        row.claim = Some((claim_token.into(), claim_until_ms));
+        Ok(Some(row.effect.clone()))
+    }
+    async fn acknowledge_ingest_effect(
+        &self,
+        effect_id: &str,
+        claim_token: &str,
+    ) -> Result<bool, StorageError> {
+        let _gate = self.inner.mutation_gate.lock().unwrap();
+        let mut effects = self.inner.ingest_effects.lock().unwrap();
+        let Some(row) = effects.get_mut(effect_id) else {
             return Ok(false);
         };
-        *acknowledged = true;
+        if !matches!(&row.claim, Some((token, _)) if token.as_str() == claim_token) {
+            return Ok(false);
+        }
+        row.acknowledged = true;
         Ok(true)
     }
     async fn upsert_memory_audited(

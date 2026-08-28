@@ -1233,6 +1233,7 @@ async fn admin_ceiling_caps_self_registration() {
             ("org".into(), "session://s1".into(), "session-wrapup".into()),
             exocortex_ingest::service::AdminSourcePolicy {
                 ceiling: exocortex_kernel::Visibility::Project,
+                kind: exocortex_kernel::ProducerKind::CodingAgent,
                 signing_key: [5u8; 32],
             },
         )],
@@ -1274,6 +1275,51 @@ async fn admin_ceiling_caps_self_registration() {
         echo.ceiling, 1,
         "admin Project ceiling echoed, not the proposal"
     );
+
+    // A fresh production server starts from the administrator-pinned kind;
+    // registration cannot rewrite provenance authority after a restart.
+    srv.register_source(tonic::Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://s1",
+        "session-wrapup",
+        1,
+        "session",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::DocsAdapter,
+    )))
+    .await
+    .unwrap();
+    let mut submitted = signed_batch(&srv, vec![draft("policy-kind", "Fix", 1)]);
+    submitted.batch_id = "policy-kind".into();
+    submitted.ceiling = 1;
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut submitted);
+    assert!(srv
+        .submit(tonic::Request::new(submitted))
+        .await
+        .unwrap()
+        .into_inner()
+        .rejections
+        .is_empty());
+    use futures::StreamExt as _;
+    let rows = srv
+        .storage
+        .stream_all_memories()
+        .await
+        .collect::<Vec<_>>()
+        .await;
+    let stored = rows
+        .into_iter()
+        .map(Result::unwrap)
+        .find(|memory| memory.title.as_str() == "title policy-kind")
+        .unwrap();
+    assert!(matches!(
+        stored.provenance,
+        exocortex_kernel::Provenance::Asserted {
+            producer_kind: Some(exocortex_kernel::ProducerKind::CodingAgent),
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -1291,6 +1337,7 @@ async fn production_policy_selects_signing_key_by_exact_producer_identity() {
                 ("org".into(), "session://alpha".into(), "producer".into()),
                 AdminSourcePolicy {
                     ceiling: exocortex_kernel::Visibility::Org,
+                    kind: exocortex_kernel::ProducerKind::CodingAgent,
                     signing_key: ALPHA_KEY,
                 },
             ),
@@ -1298,6 +1345,7 @@ async fn production_policy_selects_signing_key_by_exact_producer_identity() {
                 ("org".into(), "session://beta".into(), "producer".into()),
                 AdminSourcePolicy {
                     ceiling: exocortex_kernel::Visibility::Org,
+                    kind: exocortex_kernel::ProducerKind::CodingAgent,
                     signing_key: BETA_KEY,
                 },
             ),

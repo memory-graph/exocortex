@@ -244,7 +244,7 @@ fn probe_deployed_rules(bin_dir: &std::path::Path) -> Result<()> {
         let source_policy = fixture.join("sources.json");
         std::fs::write(
             &source_policy,
-            r#"[{"org_id":"org","source_uri":"deployment://probe","producer_id":"probe","ceiling":3,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
+            r#"[{"org_id":"org","source_uri":"deployment://probe","producer_id":"probe","ceiling":3,"producer_kind":4,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
         )?;
         #[cfg(unix)]
         {

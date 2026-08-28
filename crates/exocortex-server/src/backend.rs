@@ -77,6 +77,23 @@ const CACHE_BRIDGE_BURST: usize = 256;
 const CACHE_RESEED_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const CACHE_RESEED_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
+#[derive(Default)]
+struct BackgroundTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl BackgroundTasks {
+    fn push(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.0.push(task);
+    }
+}
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        for task in self.0.drain(..) {
+            task.abort();
+        }
+    }
+}
+
 /// The Dreams lease every backend node re-elects for (§9.2).
 fn dreams_lease_key(org: &str) -> LeaseKey {
     LeaseKey::Dreams {
@@ -104,6 +121,7 @@ pub struct BackendNode<S: Storage> {
     post_ingest_effects: Option<tokio::task::JoinHandle<()>>,
     leader_election: Option<tokio::task::JoinHandle<()>>,
     ingress: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    _background_tasks: BackgroundTasks,
 }
 
 impl<S: Storage> BackendNode<S> {
@@ -121,9 +139,11 @@ impl<S: Storage> BackendNode<S> {
     pub async fn wait_for_ingress(&mut self) -> anyhow::Result<()> {
         let task = self
             .ingress
-            .take()
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("backend ingress task is not running"))?;
-        match task.await {
+        let result = task.await;
+        self.ingress.take();
+        match result {
             Ok(Ok(())) => anyhow::bail!("backend ingress stopped unexpectedly"),
             Ok(Err(error)) => Err(error),
             Err(error) => Err(anyhow::anyhow!("backend ingress task failed: {error}")),
@@ -401,6 +421,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
     let ingress = BoundIngress::bind(&args.bind, &args.transport).await?;
     let local_addr = ingress.local_addr()?;
     let org: Arc<str> = args.org.clone().into();
+    let mut background_tasks = BackgroundTasks::default();
 
     // Read path: cache + writer loop over the same storage. The writer
     // consumes first so the reseed flows through it (§8.2).
@@ -409,7 +430,9 @@ pub async fn run_backend_node<S: Storage + 'static>(
     {
         let cache = cache.clone();
         let storage = storage.clone();
-        tokio::spawn(async move { cache.run(storage, writer_rx).await });
+        background_tasks.push(tokio::spawn(
+            async move { cache.run(storage, writer_rx).await },
+        ));
     }
     // Op context + HTTP bind are created before hydration because the
     // change-feed bridge stamps its acknowledged publication frontier here.
@@ -572,7 +595,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
     ));
     {
         let engine = reasoning.clone();
-        tokio::spawn(async move { engine.run().await });
+        background_tasks.push(tokio::spawn(async move { engine.run().await }));
     }
 
     // Shared Dreams transport uses separate Redis connections for blocking
@@ -619,7 +642,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
     let dreams = Arc::new(dreams_engine);
     {
         let engine = dreams.clone();
-        tokio::spawn(async move { engine.run().await });
+        background_tasks.push(tokio::spawn(async move { engine.run().await }));
     }
 
     // Only the elected owner drains shared fires. Notifications move through
@@ -628,7 +651,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
     if let Some(mut queue) = fire_drainer {
         let dreams = dreams.clone();
         let elected = leader_gate.clone();
-        tokio::spawn(async move {
+        background_tasks.push(tokio::spawn(async move {
             loop {
                 if !elected.load(std::sync::atomic::Ordering::SeqCst) {
                     tokio::time::sleep(LEASE_RENEW).await;
@@ -648,7 +671,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
                     }
                 }
             }
-        });
+        }));
     }
 
     // Ingest: gRPC IngestService, embedding-enabled, reasoning-wired.
@@ -678,7 +701,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
     {
         let storage = storage.clone();
         let health = health.clone();
-        tokio::spawn(async move {
+        background_tasks.push(tokio::spawn(async move {
             loop {
                 let ok = storage.ping().await.is_ok();
                 health.rcu(|h| {
@@ -688,7 +711,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
                 });
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-        });
+        }));
     }
     health.rcu(|h| {
         let mut next = (**h).clone();
@@ -810,6 +833,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
         post_ingest_effects: Some(post_ingest_effects),
         leader_election: Some(leader_election),
         ingress: Some(ingress),
+        _background_tasks: background_tasks,
     })
 }
 
