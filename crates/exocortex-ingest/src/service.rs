@@ -85,7 +85,8 @@ pub struct IngestServer<S: Storage> {
     pub org_guard: Option<SmolStrLike>,
     /// Registered source ceilings: (org, source_uri, producer_id) -> ceiling
     /// (R-I3 / R-T11a). LRU-bounded (§18.8.5) and Arc-shared across clones.
-    /// std::Mutex: critical sections are pure map ops, never held across awaits.
+    /// The mutex protects only map access and snapshot cloning; serialization
+    /// and durable file replacement happen after the guard is released.
     pub sources: Arc<Mutex<SourceRegistry>>,
     /// Where the ceiling registry persists (M6.5); `None` = ephemeral.
     pub sources_file: Option<std::path::PathBuf>,
@@ -290,16 +291,30 @@ impl<S: Storage> IngestServer<S> {
         self
     }
 
-    /// Flush the ceiling registry to disk (best effort).
-    fn persist_sources(&self, sources: &SourceRegistry) {
+    fn source_rows(
+        sources: &SourceRegistry,
+    ) -> Vec<((String, String, String), SourceEntry)> {
+        sources
+            .iter()
+            .map(|((o, u, p), v)| ((o.clone(), u.clone(), p.clone()), *v))
+            .collect()
+    }
+
+    /// Flush a lock-free snapshot of the ceiling registry to disk (best effort).
+    fn persist_source_rows(&self, rows: &[((String, String, String), SourceEntry)]) {
         let Some(path) = &self.sources_file else {
             return;
         };
-        let rows: Vec<((String, String, String), SourceEntry)> = sources
-            .iter()
-            .map(|((o, u, p), v)| ((o.clone(), u.clone(), p.clone()), *v))
-            .collect();
-        if let Err(e) = std::fs::write(path, serde_json::to_vec(&rows).unwrap_or_default()) {
+        let bytes = match serde_json::to_vec(rows) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(?e, "source registry serialization failed");
+                return;
+            }
+        };
+        if let Err(e) =
+            exocortex_storage::bounded_io::atomic_write_private(path, &bytes, "source registry")
+        {
             tracing::warn!(?e, "source registry persist failed");
         }
     }
@@ -1554,7 +1569,7 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         // different ceiling (the echo lets the SDK's R-I3 equality check
         // fire `CeilingMismatch` instead). The producer KIND follows the
         // same first-registration-wins rule for the same reason.
-        let effective = {
+        let (effective, source_rows) = {
             let mut sources = self.sources.lock().unwrap();
             let admin = self.admin_policies.get(&key).copied();
             let existing = sources.get(&key).copied();
@@ -1579,9 +1594,9 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             let kind = existing.map(|e| e.kind).unwrap_or(declared_kind);
             let entry = SourceEntry { ceiling, kind };
             sources.put(key, entry);
-            self.persist_sources(&sources);
-            entry
+            (entry, Self::source_rows(&sources))
         };
+        self.persist_source_rows(&source_rows);
         Ok(Response::new(RegisterSourceResponse {
             ceiling: effective.ceiling as i32,
         }))
