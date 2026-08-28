@@ -304,6 +304,85 @@ async fn shared_counters_coalesce_and_acknowledge_exact_fired_snapshot() {
 }
 
 #[tokio::test]
+async fn ambiguous_success_retry_preserves_post_fire_writes() {
+    let Some((client, mut queue, key)) = isolated_queue("snapshot-org").await else {
+        return;
+    };
+    let region = RegionKey {
+        org: "snapshot-org".into(),
+        project: "snapshot-project".into(),
+        memory_type: 3,
+    };
+    let trigger = DreamsTrigger {
+        memory_threshold: 1,
+        edge_threshold: u32::MAX,
+        age_floor_days: u32::MAX,
+        min_interval_hours: 0,
+    };
+    assert!(matches!(
+        queue
+            .record_write(&region, 2, 0, trigger, "writer")
+            .await
+            .unwrap(),
+        RecordWriteOutcome::Queued(c) if c.memories_since_last_cycle == 2
+    ));
+    let original = match queue.drain(Duration::from_secs(1)).await.unwrap() {
+        DrainResult::Ready(notification) => notification,
+        other => panic!("expected original notification, got {other:?}"),
+    };
+    assert!(matches!(
+        queue
+            .record_write(&region, 1, 0, trigger, "writer")
+            .await
+            .unwrap(),
+        RecordWriteOutcome::Accumulated(c) if c.memories_since_last_cycle == 3
+    ));
+    assert!(matches!(
+        queue
+            .acknowledge(&original, false, trigger, "owner")
+            .await
+            .unwrap(),
+        AcknowledgeOutcome::Requeued(c) if c.memories_since_last_cycle == 3
+    ));
+    let retry = match queue.drain(Duration::from_secs(1)).await.unwrap() {
+        DrainResult::Ready(notification) => notification,
+        other => panic!("expected ambiguous retry, got {other:?}"),
+    };
+    assert_eq!(retry.fire_id, original.fire_id);
+    assert_eq!(retry.fired_at, original.fired_at);
+    assert!(matches!(
+        queue
+            .acknowledge(&retry, true, trigger, "owner")
+            .await
+            .unwrap(),
+        AcknowledgeOutcome::Requeued(c) if c.memories_since_last_cycle == 1
+    ));
+    let follow_up = match queue.drain(Duration::from_secs(1)).await.unwrap() {
+        DrainResult::Ready(notification) => notification,
+        other => panic!("expected post-fire follow-up, got {other:?}"),
+    };
+    assert_ne!(follow_up.fire_id, original.fire_id);
+    assert_eq!(follow_up.fired_at.unwrap().memories_since_last_cycle, 1);
+
+    let mut inspect = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("second Redis connection");
+    let counter_key = format!(
+        "exocortex:dreams:counters:{}",
+        serde_json::to_string(&region).unwrap()
+    );
+    let _: u64 = redis::cmd("DEL")
+        .arg(&key)
+        .arg(format!("{key}:deferred"))
+        .arg(format!("{key}:processing"))
+        .arg(counter_key)
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn engine_on_write_uses_shared_transport_even_as_follower() {
     let Some((client, queue, key)) = isolated_queue("engine-org").await else {
         return;

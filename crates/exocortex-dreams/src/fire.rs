@@ -82,9 +82,13 @@ end
 redis.call('LREM', processing, 1, ARGV[16])
 local memories = tonumber(redis.call('HGET', counters, 'memories') or '0')
 local edges = tonumber(redis.call('HGET', counters, 'edges') or '0')
+local retry_memories = tonumber(ARGV[3])
+local retry_edges = tonumber(ARGV[4])
 if ARGV[2] == '1' then
     memories = math.max(0, memories - tonumber(ARGV[3]))
     edges = math.max(0, edges - tonumber(ARGV[4]))
+    retry_memories = memories
+    retry_edges = edges
     redis.call('HSET', counters, 'memories', memories, 'edges', edges, 'last_success', ARGV[5])
 end
 redis.call('HDEL', counters, 'pending')
@@ -102,8 +106,8 @@ local payload = cjson.encode({
     region = {org = ARGV[11], project = ARGV[12], memory_type = tonumber(ARGV[13])},
     fired_by = ARGV[14],
     fired_at = {
-        memories_since_last_cycle = memories,
-        edges_since_last_cycle = edges,
+        memories_since_last_cycle = retry_memories,
+        edges_since_last_cycle = retry_edges,
         seconds_since_last_cycle = elapsed
     },
     fire_id = ARGV[15]
@@ -511,6 +515,11 @@ impl RedisFireQueue {
             return Ok(AcknowledgeOutcome::Stale);
         };
         let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let retry_fire_id = if success {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            fire_id.to_string()
+        };
         let values: (u32, u32, u8) = redis::Script::new(ACKNOWLEDGE_LUA)
             .key(self.queue_key.as_str())
             .key(counter_key(&notification.region))
@@ -530,10 +539,10 @@ impl RedisFireQueue {
             .arg(notification.region.project.as_str())
             .arg(notification.region.memory_type)
             .arg(fired_by)
-            // A failure may be an ambiguous success after graph settlement.
-            // Preserve the identity so the durable success tombstone makes
-            // the retry a no-op; a genuinely failed cycle has no tombstone.
-            .arg(fire_id.as_str())
+            // A failure may be an ambiguous success after graph settlement,
+            // so it retains the identity and exact snapshot. A successful
+            // cycle's post-fire writes instead receive a fresh identity.
+            .arg(retry_fire_id)
             .arg(payload)
             .invoke_async(&mut self.conn)
             .await?;

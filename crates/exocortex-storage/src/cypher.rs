@@ -262,7 +262,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         required_params: &["success_id"],
         cypher: r#"
             MATCH (success:_DreamsCycleSuccess {success_id: $success_id})
-            RETURN count(success)
+            RETURN success.effect_digest
         "#,
     });
 
@@ -280,6 +280,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "lease_key",
             "cycle_id",
             "success_id",
+            "effect_digest",
             "token",
             "epoch",
             "now_ms",
@@ -302,6 +303,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             OPTIONAL MATCH (success:_DreamsCycleSuccess {
                 success_id: $success_id
             })
+            WITH lease, existing, success
+            WHERE success IS NULL OR success.effect_digest = $effect_digest
             WITH lease, existing, success
             WHERE success IS NOT NULL OR existing IS NULL
                   OR existing.state <> 'Active' OR existing.cycle_id = $cycle_id
@@ -345,7 +348,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                 })
                 ON CREATE SET settled.lease_key = $lease_key,
                               settled.cycle_id = $cycle_id,
-                              settled.lease_epoch = $epoch)
+                              settled.lease_epoch = $epoch,
+                              settled.effect_digest = $effect_digest)
             RETURN $cycle_id
         "#,
     });

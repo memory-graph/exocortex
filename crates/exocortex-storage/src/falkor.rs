@@ -1334,6 +1334,42 @@ impl FalkorStorage {
             .map_err(|error| StorageError::Backend(error.to_string()))
     }
 
+    async fn cycle_success_effect_digest(
+        &self,
+        key: &LeaseKey,
+        cycle_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let rows = self
+            .run_template(
+                "cycle_journal_succeeded",
+                &serde_json::json!({
+                    "success_id": Self::dreams_cycle_success_id(key, cycle_id)?,
+                }),
+                true,
+            )
+            .await?;
+        let mut digest = None;
+        for value in rows.iter().filter_map(|row| row.first()) {
+            let FalkorValue::String(value) = value else {
+                return Err(StorageError::CorruptMetadata {
+                    key: "cycle success effect digest",
+                    detail: format!("expected a string digest, got {value:?}"),
+                });
+            };
+            match &digest {
+                Some(existing) if existing != value => {
+                    return Err(StorageError::CorruptMetadata {
+                        key: "cycle success effect digest",
+                        detail: "duplicate success identities disagree".into(),
+                    });
+                }
+                Some(_) => {}
+                None => digest = Some(value.clone()),
+            }
+        }
+        Ok(digest)
+    }
+
     fn proposal_params(proposal: &DiscoveryProposal) -> Result<serde_json::Value, StorageError> {
         Ok(serde_json::json!({
             "discovery_id": proposal.discovery_id,
@@ -3602,23 +3638,10 @@ impl Storage for FalkorStorage {
     }
 
     async fn cycle_succeeded(&self, key: &LeaseKey, cycle_id: &str) -> Result<bool, StorageError> {
-        let rows = self
-            .run_template(
-                "cycle_journal_succeeded",
-                &serde_json::json!({
-                    "success_id": Self::dreams_cycle_success_id(key, cycle_id)?,
-                }),
-                true,
-            )
-            .await?;
-        match rows.first().and_then(|row| row.first()) {
-            Some(FalkorValue::I64(0)) => Ok(false),
-            Some(FalkorValue::I64(value)) if *value > 0 => Ok(true),
-            other => Err(StorageError::CorruptMetadata {
-                key: "cycle journal success count",
-                detail: format!("expected a non-negative count, got {other:?}"),
-            }),
-        }
+        Ok(self
+            .cycle_success_effect_digest(key, cycle_id)
+            .await?
+            .is_some())
     }
 
     async fn settle_dreams_cycle_fenced(
@@ -3627,11 +3650,18 @@ impl Storage for FalkorStorage {
         discoveries: &[DiscoveryRecord],
         lease: &OwnerLease,
     ) -> Result<(), StorageError> {
-        // Avoid allocating Redis LSNs for a durable no-op. The graph query
-        // below independently handles a concurrent same-cycle settlement,
-        // but the ordinary replay path must leave the public frontier exact.
-        if self.cycle_succeeded(&lease.key, cycle_id).await? {
-            return Ok(());
+        let effect_digest = crate::trait_::dreams_settlement_effect_digest(discoveries)?;
+        // Avoid allocating Redis LSNs for a durable no-op. A reused identity
+        // with a different effect is corruption and fails closed.
+        if let Some(stored) = self
+            .cycle_success_effect_digest(&lease.key, cycle_id)
+            .await?
+        {
+            return if stored == effect_digest {
+                Ok(())
+            } else {
+                Err(StorageError::ProposalMismatch)
+            };
         }
         let mut discovery_ids = Vec::with_capacity(discoveries.len());
         let mut org_ids = Vec::with_capacity(discoveries.len());
@@ -3660,7 +3690,7 @@ impl Storage for FalkorStorage {
             discovery_lsns.push(lsn);
         }
         let discovery_indexes = (0..discoveries.len() as u64).collect::<Vec<_>>();
-        let settled = self
+        let rows = self
             .run_template(
                 "dreams_cycle_settle_fenced",
                 &serde_json::json!({
@@ -3668,6 +3698,7 @@ impl Storage for FalkorStorage {
                         .map_err(|error| StorageError::Backend(error.to_string()))?,
                     "cycle_id": cycle_id,
                     "success_id": Self::dreams_cycle_success_id(&lease.key, cycle_id)?,
+                    "effect_digest": effect_digest.as_str(),
                     "token": lease.fencing_token.as_str(),
                     "epoch": lease.epoch,
                     "now_ms": Utc::now().timestamp_millis(),
@@ -3686,7 +3717,14 @@ impl Storage for FalkorStorage {
                 false,
             )
             .await?;
-        if settled.is_empty() {
+        if rows.is_empty() {
+            if self
+                .cycle_success_effect_digest(&lease.key, cycle_id)
+                .await?
+                .is_some_and(|stored| stored != effect_digest)
+            {
+                return Err(StorageError::ProposalMismatch);
+            }
             for discovery in discoveries {
                 if self
                     .get_discovery_proposal(discovery.discovery_id.as_str())

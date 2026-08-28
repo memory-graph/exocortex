@@ -2639,6 +2639,33 @@ itest!(dreams_cycle_settlement_is_atomic_and_idempotent, {
         Some(record.clone())
     );
     let frontier_after_first = s.graph_committed_lsn_for_testing().await.unwrap();
+    let late_record = DiscoveryRecord {
+        discovery_id: format!("discovery:{}", graph_suffix()).into(),
+        discovery_cycle_id: cycle_id.clone().into(),
+        ..record.clone()
+    };
+    assert!(matches!(
+        s.settle_dreams_cycle_fenced(&cycle_id, std::slice::from_ref(&late_record), &lease)
+            .await,
+        Err(StorageError::ProposalMismatch)
+    ));
+    assert!(s
+        .get_discovery(late_record.discovery_id.as_str())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        s.graph_committed_lsn_for_testing().await.unwrap(),
+        frontier_after_first,
+        "a rejected changed replay must allocate no graph LSN"
+    );
+    let mut changed_replay = record.clone();
+    changed_replay.quality = 0.7;
+    assert!(matches!(
+        s.settle_dreams_cycle_fenced(&cycle_id, &[changed_replay], &lease)
+            .await,
+        Err(StorageError::ProposalMismatch)
+    ));
     let newer_cycle_id = format!("dream-fire:{}", graph_suffix());
     s.settle_dreams_cycle_fenced(&newer_cycle_id, &[], &lease)
         .await
@@ -2711,6 +2738,33 @@ itest!(dreams_cycle_settlement_is_atomic_and_idempotent, {
     ));
     assert!(!s
         .cycle_succeeded(&lease_key, &proposal_cycle)
+        .await
+        .unwrap());
+
+    let duplicate = DiscoveryRecord {
+        discovery_id: format!("discovery:{}", graph_suffix()).into(),
+        discovery_cycle_id: "duplicate-cycle".into(),
+        ..record.clone()
+    };
+    let mut conflicting_duplicate = duplicate.clone();
+    conflicting_duplicate.quality = 0.9;
+    let duplicate_cycle = format!("dream-fire:{}", graph_suffix());
+    assert!(matches!(
+        s.settle_dreams_cycle_fenced(
+            &duplicate_cycle,
+            &[duplicate.clone(), conflicting_duplicate],
+            &lease,
+        )
+        .await,
+        Err(StorageError::ProposalMismatch)
+    ));
+    assert!(s
+        .get_discovery(duplicate.discovery_id.as_str())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!s
+        .cycle_succeeded(&lease_key, &duplicate_cycle)
         .await
         .unwrap());
     s.release_lease(lease).await.unwrap();

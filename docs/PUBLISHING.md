@@ -49,6 +49,9 @@ workspace license/repository metadata applies).
 - Every crate manifest carries a `description`
 - Internal deps use `path + version` (crates.io rewrites to the registry
   version at publish)
+- `exocortex-storage` depends on `exocortex-wire` only to reuse the canonical
+  signing-owned content digest for durable Dreams settlement effect identity;
+  this prevents a second checksum implementation at the storage boundary.
 - `cargo publish -p exocortex-kernel --dry-run` passes (verified:
   packages, compiles from the packaged tarball, uploads cleanly)
 

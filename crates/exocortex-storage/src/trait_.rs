@@ -56,6 +56,22 @@ pub enum StorageError {
     ProposalMismatch,
 }
 
+pub(crate) fn dreams_settlement_effect_digest(
+    records: &[DiscoveryRecord],
+) -> Result<String, StorageError> {
+    let mut ordered = records.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.discovery_id.cmp(&right.discovery_id));
+    if ordered
+        .windows(2)
+        .any(|pair| pair[0].discovery_id == pair[1].discovery_id)
+    {
+        return Err(StorageError::ProposalMismatch);
+    }
+    let encoded =
+        serde_json::to_vec(&ordered).map_err(|error| StorageError::Backend(error.to_string()))?;
+    Ok(exocortex_wire::signing::content_digest_hex(&encoded))
+}
+
 /// The one deliberate seam (§6.0): every subsystem above storage depends on
 /// this trait, never on FalkorDB. Cypher stays inside implementations (CR-10).
 #[async_trait]
@@ -610,9 +626,10 @@ pub trait Storage: Send + Sync + 'static {
             "durable cycle settlement unsupported".into(),
         ))
     }
-    /// Atomically persist every discovery and mark the exact owner cycle as
-    /// successful. A crash before this operation leaves an active mutation
-    /// journal; a crash after it leaves an idempotent success tombstone.
+    /// Atomically persist every discovery and mark the exact owner cycle and
+    /// canonical discovery effect as successful. A crash before this operation
+    /// leaves an active mutation journal; a crash after it leaves an idempotent
+    /// effect-bound success tombstone. A replay with a different effect fails.
     async fn settle_dreams_cycle_fenced(
         &self,
         cycle_id: &str,

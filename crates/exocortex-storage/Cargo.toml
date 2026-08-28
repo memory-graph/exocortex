@@ -9,6 +9,7 @@ description = "The Exocortex storage seam: the Storage trait, the registered Cyp
 
 [dependencies]
 exocortex-kernel = { workspace = true }
+exocortex-wire = { workspace = true }
 async-trait = { workspace = true }
 falkordb = { workspace = true }
 tokio = { workspace = true }

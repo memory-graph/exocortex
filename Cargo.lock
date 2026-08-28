@@ -1356,6 +1356,7 @@ dependencies = [
  "chrono",
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
+ "exocortex-wire",
  "falkordb",
  "futures",
  "once_cell",

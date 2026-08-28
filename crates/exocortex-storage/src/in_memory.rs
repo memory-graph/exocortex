@@ -55,7 +55,7 @@ struct InMemoryInner {
     // Redis fire messages have no expiry, so pruning a success identity could
     // make a delayed replay mutate the graph twice. Retain exact identities
     // indefinitely; the live backend follows the same correctness contract.
-    succeeded_cycles: Mutex<std::collections::HashSet<(LeaseKey, smol_str::SmolStr)>>,
+    succeeded_cycles: Mutex<HashMap<(LeaseKey, smol_str::SmolStr), String>>,
     point_reads: AtomicU64,
     batch_reads: AtomicU64,
     fail_next_batch_read: AtomicBool,
@@ -1882,7 +1882,7 @@ impl Storage for InMemoryStorage {
             .succeeded_cycles
             .lock()
             .unwrap()
-            .contains(&(key.clone(), cycle_id.into())))
+            .contains_key(&(key.clone(), cycle_id.into())))
     }
     async fn settle_dreams_cycle_fenced(
         &self,
@@ -1890,9 +1890,16 @@ impl Storage for InMemoryStorage {
         records: &[DiscoveryRecord],
         lease: &OwnerLease,
     ) -> Result<(), StorageError> {
+        let effect_digest = crate::trait_::dreams_settlement_effect_digest(records)?;
         let invalidations = {
             let _gate = self.inner.mutation_gate.lock().unwrap();
             self.check_lease_current(lease)?;
+            let mut succeeded = self.inner.succeeded_cycles.lock().unwrap();
+            match succeeded.get(&(lease.key.clone(), cycle_id.into())) {
+                Some(stored) if stored == &effect_digest => return Ok(()),
+                Some(_) => return Err(StorageError::ProposalMismatch),
+                None => {}
+            }
             let mut journals = self.inner.cycle_journals.lock().unwrap();
             if journals.get(&lease.key).is_some_and(|journal| {
                 journal.state == CycleJournalState::Active && journal.cycle_id != cycle_id
@@ -1935,11 +1942,7 @@ impl Storage for InMemoryStorage {
                     state: CycleJournalState::Completed,
                 },
             );
-            self.inner
-                .succeeded_cycles
-                .lock()
-                .unwrap()
-                .insert((lease.key.clone(), cycle_id.into()));
+            succeeded.insert((lease.key.clone(), cycle_id.into()), effect_digest);
             invalidations
         };
         for invalidation in invalidations {
@@ -2237,6 +2240,31 @@ mod atomic_fence_tests {
             .settle_dreams_cycle_fenced("cycle-a", std::slice::from_ref(&record), &lease)
             .await
             .unwrap();
+        let frontier_after_first = storage.get_state_at(Utc::now()).await.unwrap().backend_lsn;
+        let late_record = discovery("late-replay-discovery");
+        assert!(matches!(
+            storage
+                .settle_dreams_cycle_fenced("cycle-a", std::slice::from_ref(&late_record), &lease,)
+                .await,
+            Err(StorageError::ProposalMismatch)
+        ));
+        assert!(storage
+            .get_discovery(late_record.discovery_id.as_str())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage.get_state_at(Utc::now()).await.unwrap().backend_lsn,
+            frontier_after_first
+        );
+        let mut changed_replay = record.clone();
+        changed_replay.quality = 0.7;
+        assert!(matches!(
+            storage
+                .settle_dreams_cycle_fenced("cycle-a", &[changed_replay], &lease)
+                .await,
+            Err(StorageError::ProposalMismatch)
+        ));
         storage
             .settle_dreams_cycle_fenced("cycle-b", &[], &lease)
             .await
@@ -2286,6 +2314,29 @@ mod atomic_fence_tests {
         ));
         assert!(!storage
             .cycle_succeeded(&key, "cycle-proposal")
+            .await
+            .unwrap());
+
+        let duplicate = discovery("duplicate-in-batch");
+        let mut conflicting_duplicate = duplicate.clone();
+        conflicting_duplicate.quality = 0.9;
+        assert!(matches!(
+            storage
+                .settle_dreams_cycle_fenced(
+                    "cycle-duplicate",
+                    &[duplicate.clone(), conflicting_duplicate],
+                    &lease,
+                )
+                .await,
+            Err(StorageError::ProposalMismatch)
+        ));
+        assert!(storage
+            .get_discovery(duplicate.discovery_id.as_str())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!storage
+            .cycle_succeeded(&key, "cycle-duplicate")
             .await
             .unwrap());
     }
