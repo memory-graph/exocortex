@@ -163,7 +163,7 @@ Callers hit these over MCP by name — `exocortex.pack.mortgage.is_categorically
 - The MCP↔HTTP parity suite (D3-S2) covers pack Actions and Functions in the same shape it covers kernel ops.
 - The `visibility` ceiling declared per Action is enforced by the framework, not by pack code (kernel test: pack author cannot bypass it).
 - `exocortex-mcp-client --dump-tools` lists every pack Action and Function with its typed schema.
-- Preflight exists for every pack Action, generalized from the existing `PreflightWrapupOp`.
+- Preflight exists for every pack Action, generalized from the existing `PreflightWrapupOp`. **One implementation, not three:** `preflight_wrapup`, `preflight_action`, and the adapter-contract PRD's `PreflightBatch` share a mechanism and a rejection vocabulary. Three near-identical preflight paths is the divergence D3 exists to prevent, arriving through the front door.
 
 ### 3.3 D3 — Seam conformance suite and inventory
 
@@ -424,6 +424,7 @@ Recorded, not blocking.
 - Does **not** amend `docs/prd/exocortex-core-prd.md` — additive product scope, not a kernel rewrite.
 - Does **not** replace `agent-instructions-prd.md` — the CLAUDE.md/AGENTS.md block from that PRD is kept, and pack guidance composes into it through that PRD's own `gen-playbook` mechanism (§4.2).
 - Does **not** replace `docs/prd/mintlify-docs-integration-prd.md` — D4 is the *first end-to-end run* of what that PRD specified; the mechanics stay unchanged.
+- Does **not** own the adapter contract. `docs/prd/adapter-contract-prd.md` does; its conformance gate belongs in this PRD's seam inventory (D3) rather than standing beside it.
 - Does **not** own the fingerprint. `docs/prd/ontology-compatibility-prd.md` does, and this PRD depends on it (§4.1, §7 Wave 0).
 - Does **not** contradict `docs/master-plan.prd` — it feeds it. These deliverables live there as PX1-PX6, and the master plan's sequenced backlog is authoritative for ordering. Note that the structured-source adapters (iceberg/delta/parquet, master plan D1) are **no longer deferred**: they are Wave 2 work alongside this PRD's docs producer, not behind it.
 - Does **not** own, restate, or schedule anything in `docs/bug-prd-codebase-audit.md` (§8).
