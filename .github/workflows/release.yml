@@ -41,8 +41,10 @@ jobs:
           toolchain: "1.85.0"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install checksum-verified protoc
+        run: |
+          bash scripts/install-protoc.sh "$RUNNER_TEMP/protoc"
+          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
       - uses: taiki-e/install-action@d865e9aac326f15b06ac52b57abb58cd0e3330e4 # cargo-deny
       - name: Tag matches coherent workspace version
         run: |
@@ -88,12 +90,10 @@ jobs:
         with:
           toolchain: "1.85.0"
           targets: ${{ matrix.target }}
-      - name: Install protoc (Linux builds)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
-      - name: Install protoc (macOS builds)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
+      - name: Install checksum-verified protoc
+        run: |
+          bash scripts/install-protoc.sh "$RUNNER_TEMP/protoc"
+          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}

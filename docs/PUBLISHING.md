@@ -70,6 +70,12 @@ workspace license/repository metadata applies).
   toolchain or protoc required — that was the point.
   The build and release jobs cannot start until `scripts/verify-release.sh`
   and the disposable publish regression pass on the tagged commit.
+  CI and release builds install protobuf 28.3 from the upstream release ZIP
+  through `scripts/install-protoc.sh`: the version and all supported-host
+  SHA-256 values are committed, so neither a moving package repository nor an
+  unchecked archive can change generated build inputs. Container base tags
+  retain readable names but are resolved by committed multi-platform manifest
+  digests for the same reason.
 - **git install**: `cargo install --git
   https://github.com/memory-graph/exocortex --bin exocortex-node` (needs
   `protoc`)

@@ -128,7 +128,13 @@ fn deployment_acceptance() -> Result<()> {
         .map(|(path, source)| (path.as_str(), source.as_str()))
         .collect::<Vec<_>>();
     let dockerfile = std::fs::read_to_string("Dockerfile")?;
-    validate_release_hardening(&workflows, &dockerfile, &[&compose, &storage_compose])?;
+    let protoc_installer = std::fs::read_to_string("scripts/install-protoc.sh")?;
+    validate_release_hardening(
+        &workflows,
+        &dockerfile,
+        &protoc_installer,
+        &[&compose, &storage_compose],
+    )?;
     for node in ["node1", "node2", "node3"] {
         let marker = format!("  {node}:\n");
         let section = compose
@@ -205,6 +211,7 @@ fn deployment_acceptance() -> Result<()> {
 fn validate_release_hardening(
     workflows: &[(&str, &str)],
     dockerfile: &str,
+    protoc_installer: &str,
     compose_files: &[&str],
 ) -> Result<()> {
     anyhow::ensure!(!workflows.is_empty(), "no GitHub workflows found");
@@ -213,6 +220,23 @@ fn validate_release_hardening(
         anyhow::ensure!(
             workflow.contains("permissions:\n  contents: read\n"),
             "{path} must default to read-only repository permission"
+        );
+        anyhow::ensure!(
+            !workflow.contains("protobuf-compiler")
+                && !workflow.contains("brew install protobuf")
+                && !workflow.contains("apt install protobuf"),
+            "{path} must not install protoc from a mutable package repository"
+        );
+        let required_installs = if path.ends_with("release.yml") || path.ends_with("release.yaml") {
+            2
+        } else if path.ends_with("ci.yml") || path.ends_with("ci.yaml") {
+            1
+        } else {
+            0
+        };
+        anyhow::ensure!(
+            workflow.matches("scripts/install-protoc.sh").count() >= required_installs,
+            "{path} must install checksum-verified protoc in every build environment"
         );
         if path.ends_with("release.yml") || path.ends_with("release.yaml") {
             saw_release = true;
@@ -249,11 +273,55 @@ fn validate_release_hardening(
         }
     }
     anyhow::ensure!(saw_release, "release workflow is missing");
+    let docker_bases = dockerfile
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("FROM "))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(!docker_bases.is_empty(), "Dockerfile has no base image");
+    for base in docker_bases {
+        let image = base
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| anyhow::anyhow!("malformed Dockerfile base: {base}"))?;
+        let digest = image
+            .rsplit_once("@sha256:")
+            .map(|(_, digest)| digest)
+            .unwrap_or_default();
+        anyhow::ensure!(
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "Dockerfile base image must be pinned to a full sha256 digest: {base}"
+        );
+    }
     anyhow::ensure!(
         dockerfile
             .lines()
             .any(|line| line.trim() == "USER 65532:65532"),
         "runtime Dockerfile must select the unprivileged exocortex user"
+    );
+    anyhow::ensure!(
+        protoc_installer.contains("readonly PROTOC_VERSION=")
+            && protoc_installer.contains(
+                "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}",
+            )
+            && protoc_installer.contains(
+                "curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error",
+            )
+            && protoc_installer.contains("actual_sha256")
+            && protoc_installer.contains("actual_sha256\" != \"$expected_sha256"),
+        "protoc installer must use a fixed upstream release and fail closed on checksum mismatch"
+    );
+    let checksums = protoc_installer
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("readonly expected_sha256="))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        checksums.len() == 4
+            && checksums.iter().all(|checksum| {
+                checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+        "protoc installer must pin a full sha256 checksum for every supported host"
     );
     for compose in compose_files {
         for port in compose
@@ -1228,22 +1296,38 @@ mod release_hardening_tests {
     use super::validate_release_hardening;
 
     const SHA: &str = "11d5960a326750d5838078e36cf38b85af677262";
+    const PROTOC_INSTALLER: &str = r#"readonly PROTOC_VERSION=28.3
+readonly RELEASE_ROOT="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}"
+curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error "$url"
+actual_sha256=x
+if [[ "$actual_sha256" != "$expected_sha256" ]]; then exit 1; fi
+readonly expected_sha256=0000000000000000000000000000000000000000000000000000000000000000
+readonly expected_sha256=1111111111111111111111111111111111111111111111111111111111111111
+readonly expected_sha256=2222222222222222222222222222222222222222222222222222222222222222
+readonly expected_sha256=3333333333333333333333333333333333333333333333333333333333333333
+"#;
 
     #[test]
-    fn rejects_mutable_actions_root_runtime_and_public_test_ports() {
+    fn rejects_mutable_actions_build_inputs_root_runtime_and_public_test_ports() {
         let good_release = format!(
-            "permissions:\n  contents: read\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@{SHA}\n  release:\n    permissions:\n      contents: write\n    steps:\n      - run: bash scripts/publish-release-assets.sh \"$TAG\" \"$GITHUB_REPOSITORY\" dist\n"
+            "permissions:\n  contents: read\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@{SHA}\n      - run: bash scripts/install-protoc.sh /tmp/protoc\n      - run: bash scripts/install-protoc.sh /tmp/protoc-2\n  release:\n    permissions:\n      contents: write\n    steps:\n      - run: bash scripts/publish-release-assets.sh \"$TAG\" \"$GITHUB_REPOSITORY\" dist\n"
         );
         let good_ci = format!(
-            "permissions:\n  contents: read\njobs:\n  gates:\n    steps:\n      - uses: actions/checkout@{SHA}\n"
+            "permissions:\n  contents: read\njobs:\n  gates:\n    steps:\n      - uses: actions/checkout@{SHA}\n      - run: bash scripts/install-protoc.sh /tmp/protoc\n"
         );
-        let good_dockerfile = "FROM scratch\nUSER 65532:65532\n";
+        let good_dockerfile = format!("FROM debian@sha256:{}\nUSER 65532:65532\n", "a".repeat(64));
         let good_compose = "ports:\n  - \"127.0.0.1:8080:8080\"\n";
         let workflows = [
             (".github/workflows/release.yml", good_release.as_str()),
             (".github/workflows/ci.yml", good_ci.as_str()),
         ];
-        assert!(validate_release_hardening(&workflows, good_dockerfile, &[good_compose]).is_ok());
+        assert!(validate_release_hardening(
+            &workflows,
+            &good_dockerfile,
+            PROTOC_INSTALLER,
+            &[good_compose]
+        )
+        .is_ok());
 
         let mutable_ci = good_ci.replace(SHA, "v4");
         let workflows_with_mutable_ci = [
@@ -1252,7 +1336,8 @@ mod release_hardening_tests {
         ];
         assert!(validate_release_hardening(
             &workflows_with_mutable_ci,
-            good_dockerfile,
+            &good_dockerfile,
+            PROTOC_INSTALLER,
             &[good_compose]
         )
         .is_err());
@@ -1263,14 +1348,22 @@ mod release_hardening_tests {
         ];
         assert!(validate_release_hardening(
             &workflows_without_ci_permissions,
-            good_dockerfile,
+            &good_dockerfile,
+            PROTOC_INSTALLER,
             &[good_compose]
         )
         .is_err());
-        assert!(validate_release_hardening(&workflows, "FROM scratch\n", &[good_compose]).is_err());
         assert!(validate_release_hardening(
             &workflows,
-            good_dockerfile,
+            "FROM debian:bookworm-slim\nUSER 65532:65532\n",
+            PROTOC_INSTALLER,
+            &[good_compose]
+        )
+        .is_err());
+        assert!(validate_release_hardening(
+            &workflows,
+            &good_dockerfile,
+            PROTOC_INSTALLER,
             &["ports:\n  - \"8080:8080\"\n"]
         )
         .is_err());
@@ -1288,10 +1381,39 @@ mod release_hardening_tests {
             ];
             assert!(validate_release_hardening(
                 &unsafe_workflows,
-                good_dockerfile,
+                &good_dockerfile,
+                PROTOC_INSTALLER,
                 &[good_compose]
             )
             .is_err());
         }
+
+        let mutable_protoc_workflow = good_ci.replace(
+            "bash scripts/install-protoc.sh /tmp/protoc",
+            "sudo apt-get install -y protobuf-compiler",
+        );
+        let mutable_workflows = [
+            (".github/workflows/release.yml", good_release.as_str()),
+            (".github/workflows/ci.yml", mutable_protoc_workflow.as_str()),
+        ];
+        assert!(validate_release_hardening(
+            &mutable_workflows,
+            &good_dockerfile,
+            PROTOC_INSTALLER,
+            &[good_compose]
+        )
+        .is_err());
+
+        let unchecked_installer = PROTOC_INSTALLER.replace(
+            "if [[ \"$actual_sha256\" != \"$expected_sha256\" ]]; then exit 1; fi",
+            "true",
+        );
+        assert!(validate_release_hardening(
+            &workflows,
+            &good_dockerfile,
+            &unchecked_installer,
+            &[good_compose]
+        )
+        .is_err());
     }
 }

@@ -2,7 +2,7 @@
 # Build:  docker build -t exocortex-node:local .
 # The cluster compose harness (crates/exocortex-cluster/tests/
 # docker-compose-cluster.yml) references this tag.
-FROM rust:1.85-slim AS build
+FROM rust:1.85-slim@sha256:9f841bbe9e7d8e37ceb96ed907265a3a0df7f44e3737d0b100e7907a679acb36 AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -14,7 +14,7 @@ COPY proto proto
 COPY crates crates
 RUN cargo build --release -p exocortex-server --bin exocortex-node
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
