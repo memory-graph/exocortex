@@ -10,7 +10,9 @@ use exocortex_cache::{CacheWrite, LocalCache};
 use exocortex_client::sync::{b64_decode, decode_envelope, run_sse_sync, LsnGate, SseSyncConfig};
 use exocortex_cluster::ClusterNode;
 use exocortex_kernel::{MemoryId, RelKindId};
-use exocortex_storage::{InMemoryStorage, Invalidation, Storage, VisibilityContext};
+use exocortex_storage::{
+    DiscoveryRecord, InMemoryStorage, Invalidation, RegionKey, Storage, VisibilityContext,
+};
 use exocortex_wire::WIRE_VERSION;
 use prost::Message;
 
@@ -85,6 +87,79 @@ fn lsn_gate_holds_out_of_order_and_releases_in_order() {
         Some(4),
         "resubscribe from the missing LSN"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn comment_only_stream_cannot_mask_an_expired_lsn_gap() {
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::get;
+    use std::convert::Infallible;
+
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let node = ClusterNode::new(
+        Arc::new(InMemoryStorage::new(onto.clone())),
+        "comment-gap".into(),
+        onto.fingerprint,
+        HMAC_KEY,
+    );
+    let payload = b64_encode(
+        &node
+            .envelope(Invalidation::MemoryUpserted {
+                id: MemoryId([2; 16]),
+                lsn: 2,
+            })
+            .encode_to_vec(),
+    );
+    let app = axum::Router::new().route(
+        "/v1/changes",
+        get(move || {
+            let payload = payload.clone();
+            async move {
+                let stream = async_stream::stream! {
+                    yield Ok::<Event, Infallible>(Event::default().event("inv").data(payload));
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        yield Ok(Event::default().comment("heartbeat"));
+                    }
+                };
+                Sse::new(stream)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (cache, _writer_rx) = LocalCache::new(1024 * 1024);
+    let resynced = Arc::new(tokio::sync::Notify::new());
+    let connected = Arc::new(tokio::sync::Notify::new());
+    let callback = {
+        let resynced = resynced.clone();
+        Box::new(move || {
+            let resynced = resynced.clone();
+            Box::pin(async move { resynced.notify_one() })
+                as futures::future::BoxFuture<'static, ()>
+        }) as exocortex_client::sync::ResyncFn
+    };
+    let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+    cfg.gap_timeout = Duration::from_millis(30);
+    cfg.reconcile_interval = Duration::from_secs(10);
+    cfg.stall_timeout = Duration::from_secs(10);
+    cfg.backoff = Duration::from_secs(1);
+    cfg.connection_ready = Some(connected.clone());
+    let sync = tokio::spawn(run_sse_sync(cfg, Arc::new(cache), 1, Some(callback)));
+
+    tokio::time::timeout(Duration::from_secs(3), connected.notified())
+        .await
+        .expect("comment-only SSE stream connects");
+    tokio::time::timeout(Duration::from_millis(500), resynced.notified())
+        .await
+        .expect("gap timer forces resync while comments keep the transport live");
+    sync.abort();
 }
 
 #[test]
@@ -165,6 +240,97 @@ fn visibility_advance_decodes_and_keeps_the_lsn_gate_gap_free() {
     };
     assert_eq!(gate.push(8, visible).len(), 1);
     assert_eq!(gate.next_lsn(), 9, "hidden LSN never creates a gap loop");
+}
+
+#[tokio::test]
+async fn discovery_available_decodes_advances_cache_frontier_and_rejects_malformed_record() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let node = ClusterNode::new(
+        storage.clone(),
+        "discovery-client".into(),
+        onto.fingerprint,
+        HMAC_KEY,
+    );
+    let record = DiscoveryRecord {
+        discovery_id: "discovery-7".into(),
+        region: RegionKey {
+            org: "org".into(),
+            project: "project".into(),
+            memory_type: 3,
+        },
+        from: MemoryId([1; 16]),
+        to: MemoryId([2; 16]),
+        discovery_type: "two-hop".into(),
+        quality: 0.75,
+        via_types: [1, 2],
+        discovery_cycle_id: "cycle-7".into(),
+        discovered_at: chrono::Utc::now(),
+    };
+    let envelope = node.envelope(Invalidation::DiscoveryAvailable {
+        record: record.clone(),
+        lsn: 7,
+    });
+    let payload = b64_encode(&envelope.encode_to_vec());
+    let (decoded, lsn) = decode_envelope(&HMAC_KEY, &onto.fingerprint.0, &payload)
+        .expect("signed discovery invalidation decodes");
+    assert_eq!(lsn, 7);
+    assert!(matches!(
+        &decoded,
+        Invalidation::DiscoveryAvailable {
+            record: decoded_record,
+            lsn: 7
+        } if decoded_record == &record
+    ));
+
+    let mut gate = LsnGate::new(7);
+    let released = gate.push(lsn, decoded);
+    assert_eq!(released.len(), 1);
+    assert_eq!(gate.next_lsn(), 8);
+
+    let (cache, rx) = LocalCache::new(1024 * 1024);
+    let cached_memory = test_memory("unchanged", 1);
+    cache.seed_local("org", std::slice::from_ref(&cached_memory), &[], 3);
+    let before = cache.graphs_snapshot("org").unwrap();
+    let before_nodes = before.petgraph.node_count();
+    let before_edges = before.petgraph.edge_count();
+    let cache = Arc::new(cache);
+    let runner = {
+        let cache = cache.clone();
+        tokio::spawn(async move { cache.run(storage, rx).await })
+    };
+    cache
+        .submit(CacheWrite::Apply(released.into_iter().next().unwrap()))
+        .await;
+    cache.flush().await;
+    let after = cache.graphs_snapshot("org").unwrap();
+    assert_eq!(after.last_backend_lsn, 7);
+    assert_eq!(after.last_local_lsn, 3);
+    assert_eq!(after.petgraph.node_count(), before_nodes);
+    assert_eq!(after.petgraph.edge_count(), before_edges);
+    let retained = after.petgraph.node_weights().next().unwrap();
+    assert_eq!(retained.id, cached_memory.id);
+    assert_eq!(retained.title, cached_memory.title);
+    runner.abort();
+
+    let mut malformed = envelope;
+    let discovery = match malformed.inv.as_mut().and_then(|inv| inv.kind.as_mut()) {
+        Some(exocortex_wire::sse::v1::invalidation::Kind::DiscoveryAvailable(discovery)) => {
+            discovery
+        }
+        _ => panic!("expected discovery payload"),
+    };
+    discovery.record_json = b"not-json".to_vec();
+    exocortex_wire::signing::sign_invalidation_envelope(&HMAC_KEY, &mut malformed);
+    let error = decode_envelope(
+        &HMAC_KEY,
+        &onto.fingerprint.0,
+        &b64_encode(&malformed.encode_to_vec()),
+    )
+    .expect_err("a valid signature does not admit a malformed discovery record");
+    assert!(error.to_string().contains("discovery record"));
 }
 
 /// Live server + SSE + cache: a committed upsert reaches the client cache

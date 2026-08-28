@@ -245,6 +245,11 @@ fn decode_event(
                 .map_err(|error| SyncError::BadPayload(format!("graph snapshot: {error}")))?;
             return Ok(DecodedEvent::Reseed(snapshot, lsn));
         }
+        Some(exocortex_wire::sse::v1::invalidation::Kind::DiscoveryAvailable(discovery)) => {
+            let record = serde_json::from_slice(&discovery.record_json)
+                .map_err(|error| SyncError::BadPayload(format!("discovery record: {error}")))?;
+            Invalidation::DiscoveryAvailable { record, lsn }
+        }
         None => return Err(SyncError::BadPayload("no kind".into())),
     };
     Ok(DecodedEvent::Change(inv, lsn))
@@ -307,8 +312,16 @@ impl LsnGate {
     /// LSN to resubscribe from.
     pub fn gap_expired(&self, timeout: Duration) -> Option<u64> {
         match (self.held.is_empty(), self.gap_since) {
-            (false, Some(t)) if t.elapsed() > timeout => Some(self.next),
+            (false, Some(t)) if t.elapsed() >= timeout => Some(self.next),
             _ => None,
+        }
+    }
+
+    fn gap_deadline(&self, timeout: Duration) -> Option<Instant> {
+        if self.held.is_empty() {
+            None
+        } else {
+            self.gap_since.map(|started| started + timeout)
         }
     }
 }
@@ -357,10 +370,30 @@ pub async fn run_sse_sync(
             let reconcile = tokio::time::sleep(cfg.reconcile_interval);
             tokio::pin!(reconcile);
             loop {
+                let gap_deadline = gate.gap_deadline(cfg.gap_timeout);
+                let gap_timer = async move {
+                    match gap_deadline {
+                        Some(deadline) => {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                        }
+                        None => futures::future::pending::<()>().await,
+                    }
+                };
+                tokio::pin!(gap_timer);
                 let item = tokio::select! {
                     _ = &mut reconcile => {
                         needs_seed = true;
                         reconnect_reason = "periodic authoritative reconciliation";
+                        break;
+                    }
+                    _ = &mut gap_timer => {
+                        let missing = gate
+                            .gap_expired(cfg.gap_timeout)
+                            .expect("gap timer is armed only for a held gap");
+                        tracing::warn!(missing, "lsn gap; resubscribing");
+                        next_lsn = missing;
+                        needs_seed = true;
+                        reconnect_reason = "lsn gap";
                         break;
                     }
                     item = stream.next() => item,

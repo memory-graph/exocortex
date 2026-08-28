@@ -81,7 +81,6 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         let mut edges: Vec<Edge> = Vec::new();
         let entities: Vec<EntityFact>;
         let tags: Vec<TagFact>;
-        let mut evidence: Vec<RelationshipId> = Vec::new();
 
         // Delta-driven BFS from the changed seed. Each hop asks storage for
         // only edges touching the current frontier; it never enumerates the
@@ -111,7 +110,6 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
                 if !seen_edges.insert(row.id) {
                     continue;
                 }
-                evidence.push(row.id);
                 for other in [row.from, row.to] {
                     if neighborhood.len() < MAX_NODES && neighborhood.insert(other) {
                         next.push(other);
@@ -251,10 +249,6 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
             metrics::counter!("exocortex_reasoning_derived_pairs_capped_total")
                 .increment((before - MAX_DERIVED_PAIRS) as u64);
         }
-        // CR12 (audit): evidence is per-rule (write_back resolves the
-        // supporting edges for each derivation); the k-hop neighborhood
-        // list is no longer stamped wholesale on every row.
-        let _ = &evidence;
         self.write_back(derived, &memory_rows, &relationship_rows)
             .await;
     }

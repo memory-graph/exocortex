@@ -210,12 +210,15 @@ impl Operation for GetMemory {
             });
         }
         match ctx.storage.get_memory_for(&id, &ctx.visibility_ctx).await {
-            Ok(Some(m)) => Ok(GetMemoryOutput {
-                memory: Some(MemoryJson {
-                    superseded_by: superseded_by(ctx, &org, &id),
-                    ..mem_json(&m)
-                }),
-            }),
+            Ok(Some(m)) => {
+                ctx.cache.hydrate_memory(&org, m.clone());
+                Ok(GetMemoryOutput {
+                    memory: Some(MemoryJson {
+                        superseded_by: superseded_by(ctx, &org, &id),
+                        ..mem_json(&m)
+                    }),
+                })
+            }
             Ok(None) => Ok(GetMemoryOutput { memory: None }),
             Err(exocortex_storage::StorageError::PermissionDenied) => Err(OpError::Unauthorized(
                 "memory outside caller visibility".into(),
@@ -503,17 +506,21 @@ impl Operation for ListDiscoveriesOp {
             .list_discoveries(&ctx.visibility_ctx.org_id, input.limit.min(100))
             .await
             .map_err(|error| OpError::Storage(error.to_string()))?;
+        let endpoint_ids: Vec<_> = records
+            .iter()
+            .flat_map(|record| [record.from, record.to])
+            .collect();
+        let endpoints: std::collections::HashSet<_> = ctx
+            .storage
+            .get_visible_memories(&endpoint_ids, &ctx.visibility_ctx)
+            .await
+            .map_err(|error| OpError::Storage(error.to_string()))?
+            .into_iter()
+            .map(|memory| memory.id)
+            .collect();
         let mut discoveries = Vec::new();
         for record in records {
-            let from = ctx
-                .storage
-                .get_memory_for(&record.from, &ctx.visibility_ctx)
-                .await;
-            let to = ctx
-                .storage
-                .get_memory_for(&record.to, &ctx.visibility_ctx)
-                .await;
-            if matches!((&from, &to), (Ok(Some(_)), Ok(Some(_)))) {
+            if endpoints.contains(&record.from) && endpoints.contains(&record.to) {
                 discoveries.push(DiscoveryJson {
                     discovery_id: record.discovery_id.to_string(),
                     from: hex32(&record.from.0),
@@ -522,14 +529,6 @@ impl Operation for ListDiscoveriesOp {
                     quality: record.quality,
                     via_types: record.via_types,
                 });
-            } else if let Err(error) = from {
-                if !matches!(error, exocortex_storage::StorageError::PermissionDenied) {
-                    return Err(OpError::Storage(error.to_string()));
-                }
-            } else if let Err(error) = to {
-                if !matches!(error, exocortex_storage::StorageError::PermissionDenied) {
-                    return Err(OpError::Storage(error.to_string()));
-                }
             }
         }
         Ok(ListDiscoveriesOutput { discoveries })

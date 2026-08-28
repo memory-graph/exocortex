@@ -826,6 +826,50 @@ fn discovery_test_relationship(from: MemoryId, to: MemoryId) -> exocortex_kernel
 }
 
 #[tokio::test]
+async fn discovery_never_crosses_an_out_of_region_intermediate() {
+    let storage = InMemoryStorage::new(ontology());
+    let a = MemoryId([21; 16]);
+    let hidden_b = MemoryId([22; 16]);
+    let c = MemoryId([23; 16]);
+    for (index, id, project) in [(0, a, "p"), (1, hidden_b, "other"), (2, c, "p")] {
+        let mut memory = mem_with_embedding(index, None, unit(index));
+        memory.id = id;
+        memory.context.project_id = Some(project.into());
+        storage.upsert_memory(&memory).await.unwrap();
+    }
+    storage
+        .upsert_relationship(&discovery_test_relationship(a, hidden_b))
+        .await
+        .unwrap();
+    storage
+        .upsert_relationship(&discovery_test_relationship(hidden_b, c))
+        .await
+        .unwrap();
+    let engine = DreamsEngine::new(
+        Arc::new(storage),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        false,
+        "scoped-discovery".into(),
+    );
+
+    let discoveries = engine
+        .run_discovery(&RegionKey {
+            org: "o".into(),
+            project: "p".into(),
+            memory_type: 3,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        discoveries.is_empty(),
+        "an out-of-region intermediate must not influence a regional proposal"
+    );
+}
+
+#[tokio::test]
 async fn production_cycle_runs_discovery_after_consolidation() {
     let storage = InMemoryStorage::new(ontology());
     let [a, b, c] = [MemoryId([11; 16]), MemoryId([12; 16]), MemoryId([13; 16])];

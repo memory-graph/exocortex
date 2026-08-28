@@ -37,7 +37,30 @@ const MAX_CONCURRENT_RESEEDS: usize = 2;
 struct SseState<S: Storage> {
     cluster: Arc<ClusterNode<S>>,
     reseeds: Arc<tokio::sync::Semaphore>,
+    hydration: SharedEventHydration,
 }
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct HydrationKey {
+    lsn: u64,
+    kind: u8,
+    id: Vec<u8>,
+}
+
+#[derive(Clone)]
+enum HydratedEvent {
+    Memory(Option<Memory>),
+    Relationship(Option<(Relationship, Vec<Memory>)>),
+    Discovery(Option<(exocortex_storage::DiscoveryRecord, Vec<Memory>)>),
+}
+
+#[derive(Default)]
+struct SharedEventHydration {
+    entries: std::sync::Mutex<HydrationEntries>,
+}
+
+type HydrationCell = Arc<tokio::sync::OnceCell<Result<Arc<HydratedEvent>, String>>>;
+type HydrationEntries = std::collections::BTreeMap<HydrationKey, HydrationCell>;
 
 /// The `/v1/changes` SSE router over a cluster node's local hub.
 pub fn sse_router<S: Storage + 'static>(cluster: Arc<ClusterNode<S>>) -> axum::Router {
@@ -46,6 +69,7 @@ pub fn sse_router<S: Storage + 'static>(cluster: Arc<ClusterNode<S>>) -> axum::R
         .with_state(Arc::new(SseState {
             cluster,
             reseeds: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESEEDS)),
+            hydration: SharedEventHydration::default(),
         }))
 }
 
@@ -152,7 +176,12 @@ async fn handler<S: Storage + 'static>(
         // R-C6 replay first (LSN order); the client's LSN gate dedups any
         // overlap with the live stream that follows.
         for env in replay {
-            let mut env = match prepare_for_subscriber(&cluster, env, visibility.as_ref()).await {
+            let mut env = match prepare_for_subscriber(
+                &cluster,
+                &state.hydration,
+                env,
+                visibility.as_ref(),
+            ).await {
                 Ok(env) => env,
                 Err(error) => {
                     tracing::warn!(?error, "closing SSE stream after visibility lookup failure");
@@ -175,7 +204,12 @@ async fn handler<S: Storage + 'static>(
                     return;
                 }
             };
-            let mut env = match prepare_for_subscriber(&cluster, env, visibility.as_ref()).await {
+            let mut env = match prepare_for_subscriber(
+                &cluster,
+                &state.hydration,
+                env,
+                visibility.as_ref(),
+            ).await {
                 Ok(env) => env,
                 Err(error) => {
                     tracing::warn!(?error, "closing SSE stream after visibility lookup failure");
@@ -202,150 +236,276 @@ async fn handler<S: Storage + 'static>(
 /// change from this subscriber.
 async fn prepare_for_subscriber<S: Storage + 'static>(
     cluster: &ClusterNode<S>,
+    hydration: &SharedEventHydration,
     env: InvalidationEnvelope,
     visibility: Option<&VisibilityContext>,
 ) -> Result<InvalidationEnvelope, StorageError> {
-    let Some(vc) = visibility else {
-        return hydrate_upsert(cluster, env, None).await;
-    };
     let inv = env
         .inv
         .as_ref()
         .ok_or_else(|| StorageError::Backend("SSE envelope missing invalidation".into()))?;
     let lsn = inv.backend_lsn;
     let kind = inv.kind.clone();
-    let visible = match kind.as_ref() {
+    match kind.as_ref() {
         Some(Kind::MemoryUpserted(row)) => {
-            return match memory_event_row(cluster.storage.as_ref(), &row.id, Some(vc)).await? {
+            let hydrated = hydration
+                .load(
+                    cluster.storage.as_ref(),
+                    HydrationKey {
+                        lsn,
+                        kind: 1,
+                        id: row.id.clone(),
+                    },
+                )
+                .await?;
+            let HydratedEvent::Memory(memory) = hydrated.as_ref() else {
+                return Err(StorageError::Backend("SSE hydration kind mismatch".into()));
+            };
+            match memory
+                .as_ref()
+                .filter(|memory| visibility.is_none_or(|vc| memory_visible(memory, vc)))
+            {
                 Some(memory) => Ok(cluster.envelope(Invalidation::MemorySnapshotUpserted {
-                    memory: Box::new(memory),
+                    memory: Box::new(memory.clone()),
                     lsn,
                 })),
                 None => Ok(cluster.envelope(Invalidation::VisibilityAdvance { lsn })),
-            };
+            }
         }
         Some(Kind::MemoryDeleted(row)) => {
-            memory_event_visible(cluster.storage.as_ref(), &row.id, vc).await?
+            let hydrated = hydration
+                .load(
+                    cluster.storage.as_ref(),
+                    HydrationKey {
+                        lsn,
+                        kind: 1,
+                        id: row.id.clone(),
+                    },
+                )
+                .await?;
+            let HydratedEvent::Memory(memory) = hydrated.as_ref() else {
+                return Err(StorageError::Backend("SSE hydration kind mismatch".into()));
+            };
+            if visibility.is_none_or(|vc| memory.as_ref().is_some_and(|m| memory_visible(m, vc))) {
+                Ok(env)
+            } else {
+                Ok(cluster.envelope(Invalidation::VisibilityAdvance { lsn }))
+            }
         }
         Some(Kind::RelationshipUpserted(row)) => {
-            return match relationship_event_row(cluster.storage.as_ref(), &row.id, Some(vc)).await?
-            {
-                Some(relationship) => Ok(cluster.envelope(
+            let hydrated = hydration
+                .load(
+                    cluster.storage.as_ref(),
+                    HydrationKey {
+                        lsn,
+                        kind: 2,
+                        id: row.id.clone(),
+                    },
+                )
+                .await?;
+            let HydratedEvent::Relationship(relationship) = hydrated.as_ref() else {
+                return Err(StorageError::Backend("SSE hydration kind mismatch".into()));
+            };
+            let visible = relationship.as_ref().filter(|(relationship, endpoints)| {
+                visibility.is_none_or(|vc| {
+                    relationship_visible_with_endpoints(relationship, endpoints, vc)
+                })
+            });
+            match visible {
+                Some((relationship, _)) => Ok(cluster.envelope(
                     Invalidation::RelationshipSnapshotUpserted {
-                        relationship: Box::new(relationship),
+                        relationship: Box::new(relationship.clone()),
                         lsn,
                     },
                 )),
                 None => Ok(cluster.envelope(Invalidation::VisibilityAdvance { lsn })),
-            };
+            }
         }
         Some(Kind::RelationshipDeleted(row)) => {
-            relationship_event_visible(cluster.storage.as_ref(), &row.id, vc).await?
+            let hydrated = hydration
+                .load(
+                    cluster.storage.as_ref(),
+                    HydrationKey {
+                        lsn,
+                        kind: 2,
+                        id: row.id.clone(),
+                    },
+                )
+                .await?;
+            let HydratedEvent::Relationship(relationship) = hydrated.as_ref() else {
+                return Err(StorageError::Backend("SSE hydration kind mismatch".into()));
+            };
+            let visible = visibility.is_none_or(|vc| {
+                relationship
+                    .as_ref()
+                    .is_some_and(|(relationship, endpoints)| {
+                        relationship_visible_with_endpoints(relationship, endpoints, vc)
+                    })
+            });
+            if visible {
+                Ok(env)
+            } else {
+                Ok(cluster.envelope(Invalidation::VisibilityAdvance { lsn }))
+            }
         }
-        Some(Kind::VisibilityAdvance(_)) => true,
-        Some(Kind::GraphReseed(_)) => true,
-        None => {
-            return Err(StorageError::Backend(
-                "SSE invalidation missing event kind".into(),
-            ));
-        }
-    };
-    if visible {
-        hydrate_upsert(cluster, env, Some(vc)).await
-    } else {
-        Ok(cluster.envelope(Invalidation::VisibilityAdvance { lsn }))
-    }
-}
-
-async fn hydrate_upsert<S: Storage + 'static>(
-    cluster: &ClusterNode<S>,
-    env: InvalidationEnvelope,
-    vc: Option<&VisibilityContext>,
-) -> Result<InvalidationEnvelope, StorageError> {
-    let kind = env.inv.as_ref().and_then(|inv| inv.kind.clone());
-    let lsn = env.inv.as_ref().map(|inv| inv.backend_lsn).unwrap_or(0);
-    match kind {
-        Some(Kind::MemoryUpserted(row)) => {
-            let memory = memory_event_row(cluster.storage.as_ref(), &row.id, vc)
-                .await?
-                .ok_or_else(|| StorageError::Backend("visible SSE memory disappeared".into()))?;
-            Ok(cluster.envelope(Invalidation::MemorySnapshotUpserted {
-                memory: Box::new(memory),
-                lsn,
-            }))
-        }
-        Some(Kind::RelationshipUpserted(row)) => {
-            let relationship = relationship_event_row(cluster.storage.as_ref(), &row.id, vc)
-                .await?
-                .ok_or_else(|| {
-                    StorageError::Backend("visible SSE relationship disappeared".into())
+        Some(Kind::DiscoveryAvailable(row)) => {
+            let encoded_record: exocortex_storage::DiscoveryRecord =
+                serde_json::from_slice(&row.record_json).map_err(|error| {
+                    StorageError::Backend(format!("SSE discovery record malformed: {error}"))
                 })?;
-            Ok(
-                cluster.envelope(Invalidation::RelationshipSnapshotUpserted {
-                    relationship: Box::new(relationship),
-                    lsn,
-                }),
-            )
+            let hydrated = hydration
+                .load(
+                    cluster.storage.as_ref(),
+                    HydrationKey {
+                        lsn,
+                        kind: 3,
+                        id: encoded_record.discovery_id.as_bytes().to_vec(),
+                    },
+                )
+                .await?;
+            let HydratedEvent::Discovery(discovery) = hydrated.as_ref() else {
+                return Err(StorageError::Backend("SSE hydration kind mismatch".into()));
+            };
+            let visible = discovery.as_ref().is_some_and(|(record, endpoints)| {
+                record == &encoded_record
+                    && visibility.is_none_or(|vc| discovery_visible(record, endpoints, vc))
+            });
+            if visible {
+                Ok(env)
+            } else {
+                Ok(cluster.envelope(Invalidation::VisibilityAdvance { lsn }))
+            }
         }
-        _ => Ok(env),
+        Some(Kind::VisibilityAdvance(_)) | Some(Kind::GraphReseed(_)) => Ok(env),
+        None => Err(StorageError::Backend(
+            "SSE invalidation missing event kind".into(),
+        )),
     }
 }
 
-async fn memory_event_visible<S: Storage>(
+impl SharedEventHydration {
+    async fn load<S: Storage>(
+        &self,
+        storage: &S,
+        key: HydrationKey,
+    ) -> Result<Arc<HydratedEvent>, StorageError> {
+        self.load_with(
+            key.clone(),
+            || async move { hydrate_event(storage, &key).await },
+        )
+        .await
+    }
+
+    async fn load_with<F, Fut>(
+        &self,
+        key: HydrationKey,
+        loader: F,
+    ) -> Result<Arc<HydratedEvent>, StorageError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<HydratedEvent, StorageError>>,
+    {
+        const MAX_SHARED_EVENTS: usize = 1_024;
+        let cell = {
+            let mut entries = self.entries.lock().expect("SSE hydration cache poisoned");
+            if let Some(cell) = entries.get(&key) {
+                cell.clone()
+            } else {
+                if entries.len() >= MAX_SHARED_EVENTS {
+                    if let Some(oldest) = entries.keys().next().cloned() {
+                        entries.remove(&oldest);
+                    }
+                }
+                let cell = Arc::new(tokio::sync::OnceCell::new());
+                entries.insert(key.clone(), cell.clone());
+                cell
+            }
+        };
+        let result = cell
+            .get_or_init(|| async {
+                loader()
+                    .await
+                    .map(Arc::new)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .clone();
+        if result.is_err() {
+            // A backend outage is recoverable. Do not turn one failed lookup
+            // into a permanent reconnect failure for this LSN.
+            let mut entries = self.entries.lock().expect("SSE hydration cache poisoned");
+            if entries
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &cell))
+            {
+                entries.remove(&key);
+            }
+        }
+        result.map_err(StorageError::Backend)
+    }
+}
+
+async fn hydrate_event<S: Storage>(
     storage: &S,
-    raw_id: &[u8],
+    key: &HydrationKey,
+) -> Result<HydratedEvent, StorageError> {
+    match key.kind {
+        1 => Ok(HydratedEvent::Memory(
+            storage.get_memory(&MemoryId(decode_id(&key.id)?)).await?,
+        )),
+        2 => {
+            let Some(relationship) = storage
+                .get_relationship(&RelationshipId(decode_id(&key.id)?))
+                .await?
+            else {
+                return Ok(HydratedEvent::Relationship(None));
+            };
+            let endpoints = storage
+                .get_memories(&[relationship.from, relationship.to])
+                .await?;
+            Ok(HydratedEvent::Relationship(Some((relationship, endpoints))))
+        }
+        3 => {
+            let discovery_id = std::str::from_utf8(&key.id)
+                .map_err(|_| StorageError::Backend("discovery id is not UTF-8".into()))?;
+            let Some(record) = storage.get_discovery(discovery_id).await? else {
+                return Ok(HydratedEvent::Discovery(None));
+            };
+            let endpoints = storage.get_memories(&[record.from, record.to]).await?;
+            Ok(HydratedEvent::Discovery(Some((record, endpoints))))
+        }
+        _ => Err(StorageError::Backend(
+            "unsupported SSE hydration event kind".into(),
+        )),
+    }
+}
+
+fn discovery_visible(
+    record: &exocortex_storage::DiscoveryRecord,
+    endpoints: &[Memory],
     vc: &VisibilityContext,
-) -> Result<bool, StorageError> {
-    Ok(memory_event_row(storage, raw_id, Some(vc)).await?.is_some())
+) -> bool {
+    if record.region.org != "*" && record.region.org.as_str() != vc.org_id.as_str() {
+        return false;
+    }
+    if record.region.project != "*" && !vc.project_ids.contains(&record.region.project) {
+        return false;
+    }
+    let from = endpoints.iter().find(|memory| memory.id == record.from);
+    let to = endpoints.iter().find(|memory| memory.id == record.to);
+    matches!((from, to), (Some(from), Some(to)) if memory_visible(from, vc) && memory_visible(to, vc))
 }
 
-async fn memory_event_row<S: Storage>(
-    storage: &S,
-    raw_id: &[u8],
-    vc: Option<&VisibilityContext>,
-) -> Result<Option<Memory>, StorageError> {
-    let id = MemoryId(decode_id(raw_id)?);
-    Ok(storage
-        .get_memory(&id)
-        .await?
-        .filter(|memory| vc.is_none_or(|vc| memory_visible(memory, vc))))
-}
-
-async fn relationship_event_visible<S: Storage>(
-    storage: &S,
-    raw_id: &[u8],
+fn relationship_visible_with_endpoints(
+    relationship: &Relationship,
+    endpoints: &[Memory],
     vc: &VisibilityContext,
-) -> Result<bool, StorageError> {
-    Ok(relationship_event_row(storage, raw_id, Some(vc))
-        .await?
-        .is_some())
-}
-
-async fn relationship_event_row<S: Storage>(
-    storage: &S,
-    raw_id: &[u8],
-    vc: Option<&VisibilityContext>,
-) -> Result<Option<Relationship>, StorageError> {
-    let id = RelationshipId(decode_id(raw_id)?);
-    let Some(relationship) = storage.get_relationship(&id).await? else {
-        return Ok(None);
-    };
-    let Some(vc) = vc else {
-        return Ok(Some(relationship));
-    };
-    let endpoints = storage
-        .get_memories(&[relationship.from, relationship.to])
-        .await?;
+) -> bool {
     let from = endpoints
         .iter()
         .find(|memory| memory.id == relationship.from);
     let to = endpoints.iter().find(|memory| memory.id == relationship.to);
-    Ok(match (from, to) {
-        (Some(from), Some(to)) if relationship_visible(&relationship, from, to, vc) => {
-            Some(relationship)
-        }
-        _ => None,
-    })
+    matches!((from, to), (Some(from), Some(to)) if relationship_visible(relationship, from, to, vc))
 }
 
 async fn graph_reseed_envelope<S: Storage + 'static>(
@@ -538,7 +698,9 @@ mod tests {
     };
     use exocortex_cluster::ClusterNode;
     use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
-    use exocortex_storage::{InMemoryStorage, Storage};
+    use exocortex_storage::{
+        DiscoveryRecord, InMemoryStorage, Invalidation, RegionKey, Storage, VisibilityContext,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -621,9 +783,7 @@ mod tests {
                 id: MemoryId::new_v7(),
                 memory_type: 3,
                 title: format!("oversized-{index}").into(),
-                content: "x"
-                    .repeat(exocortex_wire::limits::MAX_MEMORY_CONTENT_BYTES)
-                    .into(),
+                content: "x".repeat(exocortex_wire::limits::MAX_MEMORY_CONTENT_BYTES),
                 summary: None,
                 tags: Default::default(),
                 visibility: Visibility::Org,
@@ -671,5 +831,161 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("hydration exceeds"));
+    }
+
+    #[tokio::test]
+    async fn subscribers_share_event_hydration_and_discoveries_are_visibility_filtered() {
+        let ontology = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = Arc::new(InMemoryStorage::new(ontology.clone()));
+        let now = chrono::Utc::now();
+        let make_memory = |title: &str| Memory {
+            id: MemoryId::new_v7(),
+            memory_type: 3,
+            title: title.into(),
+            content: "row".into(),
+            summary: None,
+            tags: Default::default(),
+            visibility: Visibility::Project,
+            provenance: Provenance::Asserted {
+                author: "test".into(),
+                producer_kind: None,
+            },
+            context: MemoryContext {
+                timestamp: now,
+                project_id: Some("project-a".into()),
+                project_path: None,
+                team_id: None,
+                tenant_id: Some("org".into()),
+                session_id: None,
+                user_id: Some("user".into()),
+                created_by: None,
+                files_involved: Default::default(),
+                languages: Default::default(),
+                frameworks: Default::default(),
+                technologies: Default::default(),
+                git_commit: None,
+                git_branch: None,
+                working_directory: None,
+                entities: Default::default(),
+                additional_metadata: serde_json::Value::Null,
+            },
+            importance: exocortex_kernel::memory::F01::new(0.5).unwrap(),
+            confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
+            effectiveness: None,
+            usage_count: 0,
+            valid_from: now,
+            valid_until: None,
+            recorded_at: now,
+            invalidated_by: None,
+            embedding: None,
+            lsn: LSN::new_local(0),
+        };
+        let from = make_memory("from");
+        let to = make_memory("to");
+        storage
+            .upsert_batch(&[from.clone(), to.clone()], &[])
+            .await
+            .unwrap();
+        let record = DiscoveryRecord {
+            discovery_id: "discovery-shared".into(),
+            region: RegionKey {
+                org: "org".into(),
+                project: "project-a".into(),
+                memory_type: 3,
+            },
+            from: from.id,
+            to: to.id,
+            discovery_type: "transitive".into(),
+            quality: 0.8,
+            via_types: [1, 2],
+            discovery_cycle_id: "cycle".into(),
+            discovered_at: now,
+        };
+        storage.store_discovery(&record).await.unwrap();
+        let cluster = ClusterNode::new(
+            storage.clone(),
+            "shared".into(),
+            ontology.fingerprint,
+            [7; 32],
+        );
+        let hydration = super::SharedEventHydration::default();
+        let mut visible = VisibilityContext {
+            user_id: "user".into(),
+            org_id: "org".into(),
+            project_ids: Default::default(),
+            team_ids: Default::default(),
+            max_visibility: Visibility::Org,
+        };
+        visible.project_ids.push("project-a".into());
+        let mut hidden = visible.clone();
+        hidden.project_ids.clear();
+
+        storage.take_read_counts();
+        let memory_env = cluster.envelope(Invalidation::MemoryUpserted {
+            id: from.id,
+            lsn: 20,
+        });
+        for _ in 0..2 {
+            super::prepare_for_subscriber(&cluster, &hydration, memory_env.clone(), Some(&visible))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            storage.take_read_counts(),
+            (1, 0),
+            "subscriber count must not multiply backend reads"
+        );
+
+        let discovery_env = cluster.envelope(Invalidation::DiscoveryAvailable {
+            record: record.clone(),
+            lsn: 21,
+        });
+        let delivered = super::prepare_for_subscriber(
+            &cluster,
+            &hydration,
+            discovery_env.clone(),
+            Some(&visible),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            delivered.inv.unwrap().kind,
+            Some(exocortex_wire::sse::v1::invalidation::Kind::DiscoveryAvailable(_))
+        ));
+        let hidden =
+            super::prepare_for_subscriber(&cluster, &hydration, discovery_env, Some(&hidden))
+                .await
+                .unwrap();
+        assert!(matches!(
+            hidden.inv.unwrap().kind,
+            Some(exocortex_wire::sse::v1::invalidation::Kind::VisibilityAdvance(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_hydration_retries_after_a_transient_failure() {
+        let hydration = super::SharedEventHydration::default();
+        let key = super::HydrationKey {
+            lsn: 9,
+            kind: 1,
+            id: vec![1; 16],
+        };
+        let first = hydration
+            .load_with(key.clone(), || async {
+                Err(exocortex_storage::StorageError::Backend("temporary".into()))
+            })
+            .await;
+        assert!(first.is_err());
+
+        let second = hydration
+            .load_with(key, || async { Ok(super::HydratedEvent::Memory(None)) })
+            .await;
+        assert!(
+            second.is_ok(),
+            "a transient lookup failure must not poison reconnects"
+        );
     }
 }

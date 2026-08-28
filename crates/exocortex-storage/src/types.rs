@@ -443,6 +443,15 @@ pub enum Invalidation {
         /// Backend LSN of the commit.
         lsn: u64,
     },
+    /// A durable, unasserted Dreams discovery became available. This is
+    /// presentation state only; it never implies an asserted relationship.
+    DiscoveryAvailable {
+        /// Complete durable discovery record, visibility-filtered above the
+        /// storage seam before external delivery.
+        record: DiscoveryRecord,
+        /// Backend LSN allocated by the persistence commit.
+        lsn: u64,
+    },
     /// Identifier-free LSN advancement substituted for a row that is outside
     /// an authenticated change-feed subscriber's visibility context.
     VisibilityAdvance {
@@ -505,6 +514,7 @@ impl Invalidation {
             | Invalidation::MemoryDeleted { lsn, .. }
             | Invalidation::RelationshipUpserted { lsn, .. }
             | Invalidation::RelationshipDeleted { lsn, .. }
+            | Invalidation::DiscoveryAvailable { lsn, .. }
             | Invalidation::VisibilityAdvance { lsn }
             | Invalidation::MemorySnapshotUpserted { lsn, .. }
             | Invalidation::RelationshipSnapshotUpserted { lsn, .. }

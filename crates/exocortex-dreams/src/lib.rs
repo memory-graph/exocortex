@@ -911,12 +911,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     }
 
     async fn write_audit(&self, res: &ConsolidationResult) -> anyhow::Result<()> {
-        // R-O2 metric surface; the ΔR gauge needs a Gauge handle in
-        // metrics 0.23 (registration-only macro) — exported via the result
-        // audit stamp until the recorder wiring lands with the server.
         metrics::counter!("exocortex_dreams_discoveries_total", "quality" => "consolidation")
             .increment((res.merged.len() + res.pruned.len()) as u64);
-        let _ = res.mcr2_after.delta_r;
         Ok(())
     }
 }
@@ -952,22 +948,21 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     /// `accept_discovery`.
     pub async fn run_discovery(&self, region: &RegionKey) -> anyhow::Result<Vec<Discovery>> {
         self.validate_region(region).await?;
-        use futures::StreamExt;
-        let mut edges: Vec<DiscoveryEdge> = Vec::new(); // (from, to, kind, derived)
-        let mut rs = self.storage.stream_all_relationships().await;
-        while let Some(row) = rs.next().await {
-            let r = row?;
-            let derived = matches!(r.provenance, Provenance::Derived { .. });
-            let open = r.valid_until.is_none();
-            if open {
-                edges.push((r.from, r.to, r.kind.0, derived));
-            }
-        }
-        drop(rs);
-        // Storage iteration order is intentionally unspecified. Stable input
-        // ordering makes the capped proposal set reproducible across adapters
-        // and process restarts.
-        edges.sort_by_key(|(from, to, kind, derived)| (*from, *to, *kind, *derived));
+        let relationships = self
+            .storage
+            .relationships_in_region(region, MAX_DISCOVERY_PATH_INSPECTIONS as u32)
+            .await?;
+        let edges: Vec<DiscoveryEdge> = relationships
+            .into_iter()
+            .map(|relationship| {
+                (
+                    relationship.from,
+                    relationship.to,
+                    relationship.kind.0,
+                    matches!(relationship.provenance, Provenance::Derived { .. }),
+                )
+            })
+            .collect();
         let (candidates, _) = transitive_candidates(&edges, MAX_DISCOVERY_PATH_INSPECTIONS);
 
         let cycle: SmolStr = format!("dream:{}", uuid::Uuid::new_v4()).into();

@@ -15,9 +15,9 @@ use exocortex_kernel::{
 };
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{
-    AuditEvent, CypherQuery, DiscoveryAcceptance, DiscoveryProposal, FalkorConfig, FalkorStorage,
-    IngestBatchKey, IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter, OwnerLease,
-    RegionKey, Storage, StorageError, TraversalSpec, VisibilityContext,
+    AuditEvent, CypherQuery, DiscoveryAcceptance, DiscoveryProposal, DiscoveryRecord, FalkorConfig,
+    FalkorStorage, IngestBatchKey, IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter,
+    OwnerLease, RegionKey, Storage, StorageError, TraversalSpec, VisibilityContext,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -40,12 +40,16 @@ fn graph_suffix() -> String {
 }
 
 async fn connect(node: &str) -> FalkorStorage {
+    connect_graph(node, format!("exocortex_test_{}", graph_suffix())).await
+}
+
+async fn connect_graph(node: &str, graph_name: String) -> FalkorStorage {
     let url = falkor_url().expect("FALKOR_URL set (checked by runner)");
     let cfg = FalkorConfig {
         falkor_url: url.clone(),
         redis_url: std::env::var("REDIS_URL")
             .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
-        graph_name: format!("exocortex_test_{}", graph_suffix()),
+        graph_name,
         org_id: "test-org".into(),
         node_id: node.into(),
     };
@@ -458,7 +462,23 @@ itest!(
             caller_scope: scope.clone(),
             issued_at: Utc::now(),
         };
+        s.store_discovery(&DiscoveryRecord {
+            discovery_id: proposal.discovery_id.clone(),
+            region: region.clone(),
+            from: from.id,
+            to: to.id,
+            discovery_type: "transitive".into(),
+            quality: 0.6,
+            via_types: [1, 2],
+            discovery_cycle_id: "live-cycle".into(),
+            discovered_at: proposal.issued_at,
+        })
+        .await
+        .unwrap();
         s.create_discovery_proposal(&proposal).await.unwrap();
+        s.create_discovery_proposal(&proposal).await.unwrap();
+        assert!(s.get_discovery("live-proposal").await.unwrap().is_none());
+        assert!(s.list_discoveries("test-org", 10).await.unwrap().is_empty());
         let mut conflicting = proposal.clone();
         conflicting.to = MemoryId::new_v7();
         assert!(matches!(
@@ -495,6 +515,10 @@ itest!(
             s.accept_discovery(&acceptance).await,
             Err(StorageError::ProposalMismatch)
         ));
+        assert!(matches!(
+            s.create_discovery_proposal(&proposal).await,
+            Err(StorageError::ProposalNotFound)
+        ));
         let audits = s.audit_range("test-org", 0, 10).await.unwrap();
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0]["action"], "accept_discovery");
@@ -529,6 +553,180 @@ itest!(three_hop_traverse, {
     let one = s.traverse(&a.id, &spec(1, 100)).await.unwrap();
     assert_eq!(one.len(), 1, "depth bound respected");
 });
+
+itest!(traverse_applies_exact_caller_visibility, {
+    let s = connect("traverse-visibility").await;
+    let seed = mem("seed", 4, Visibility::Org);
+    let mut private_ok = mem("private-ok", 4, Visibility::Private);
+    private_ok.context.user_id = Some("user-1".into());
+    let mut private_foreign = mem("private-foreign", 4, Visibility::Private);
+    private_foreign.context.user_id = Some("user-2".into());
+    let mut project_ok = mem("project-ok", 4, Visibility::Project);
+    project_ok.context.project_id = Some("allowed-project".into());
+    let mut project_foreign = mem("project-foreign", 4, Visibility::Project);
+    project_foreign.context.project_id = Some("other-project".into());
+    let mut team_ok = mem("team-ok", 4, Visibility::Team);
+    team_ok.context.team_id = Some("allowed-team".into());
+    let mut team_foreign = mem("team-foreign", 4, Visibility::Team);
+    team_foreign.context.team_id = Some("other-team".into());
+    let mut tenant_foreign = mem("tenant-foreign", 4, Visibility::Org);
+    tenant_foreign.context.tenant_id = Some("other-org".into());
+    let rows = [
+        seed.clone(),
+        private_ok.clone(),
+        private_foreign.clone(),
+        project_ok.clone(),
+        project_foreign.clone(),
+        team_ok.clone(),
+        team_foreign.clone(),
+        tenant_foreign.clone(),
+    ];
+    s.upsert_batch(&rows, &[]).await.unwrap();
+    let kind = exocortex_kernel::kinds::SOLVES;
+    let edges: Vec<_> = rows
+        .iter()
+        .skip(1)
+        .map(|target| rel(seed.id, target.id, kind.0))
+        .collect();
+    s.upsert_batch(&[], &edges).await.unwrap();
+    let mut traversal = spec(1, 100);
+    traversal.visibility_ctx.project_ids = ["allowed-project".into()].into_iter().collect();
+    traversal.visibility_ctx.team_ids = ["allowed-team".into()].into_iter().collect();
+    let visible = s.traverse(&seed.id, &traversal).await.unwrap();
+    let titles: std::collections::HashSet<_> =
+        visible.iter().map(|memory| memory.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        ["private-ok", "project-ok", "team-ok"]
+            .into_iter()
+            .collect()
+    );
+});
+
+itest!(
+    discovery_records_survive_reconnect_and_fail_closed_on_corruption,
+    {
+        let graph = format!("exocortex_test_{}", graph_suffix());
+        let s = connect_graph("discovery-record-writer", graph.clone()).await;
+        let now = Utc::now();
+        let make_record = |id: &str, org: &str, seconds: i64| DiscoveryRecord {
+            discovery_id: id.into(),
+            region: RegionKey {
+                org: org.into(),
+                project: "proj".into(),
+                memory_type: 3,
+            },
+            from: MemoryId::new_v7(),
+            to: MemoryId::new_v7(),
+            discovery_type: "transitive".into(),
+            quality: 0.6,
+            via_types: [1, 2],
+            discovery_cycle_id: "cycle".into(),
+            discovered_at: now + Duration::seconds(seconds),
+        };
+        let old = make_record("record-old", "test-org", 0);
+        let new = make_record("record-new", "test-org", 1);
+        let foreign = make_record("record-foreign", "foreign-org", 2);
+        for record in [&old, &new, &foreign] {
+            s.store_discovery(record).await.unwrap();
+        }
+        s.store_discovery(&old).await.unwrap();
+        let mut conflict = old.clone();
+        conflict.quality = 0.9;
+        assert!(matches!(
+            s.store_discovery(&conflict).await,
+            Err(StorageError::ProposalMismatch)
+        ));
+        drop(s);
+
+        let reconnected = connect_graph("discovery-record-reader", graph).await;
+        assert_eq!(
+            reconnected.get_discovery("record-old").await.unwrap(),
+            Some(old)
+        );
+        let listed = reconnected.list_discoveries("test-org", 1).await.unwrap();
+        assert_eq!(listed, vec![new]);
+        assert!(reconnected
+            .list_discoveries("missing-org", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        reconnected
+            .query_cypher(&CypherQuery {
+                template_id: "integration_corrupt_discovery_record",
+                params: serde_json::json!({
+                    "discovery_id": "record-new",
+                    "props_json": "not-json",
+                }),
+                read_only: false,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            reconnected.get_discovery("record-new").await,
+            Err(StorageError::CorruptMetadata {
+                key: "discovery_record",
+                ..
+            })
+        ));
+        assert!(matches!(
+            reconnected.list_discoveries("test-org", 10).await,
+            Err(StorageError::CorruptMetadata {
+                key: "discovery_record",
+                ..
+            })
+        ));
+    }
+);
+
+itest!(
+    relationships_in_region_is_exact_ordered_and_budgeted_live,
+    {
+        let s = connect("region-relationships").await;
+        let mut a = mem("region-a", 3, Visibility::Org);
+        let mut b = mem("region-b", 3, Visibility::Org);
+        let mut foreign_project = mem("region-foreign-project", 3, Visibility::Org);
+        foreign_project.context.project_id = Some("other".into());
+        let foreign_type = mem("region-foreign-type", 4, Visibility::Org);
+        for memory in [&mut a, &mut b] {
+            memory.context.project_id = Some("proj".into());
+        }
+        s.upsert_batch(
+            &[
+                a.clone(),
+                b.clone(),
+                foreign_project.clone(),
+                foreign_type.clone(),
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+        s.upsert_batch(
+            &[],
+            &[
+                rel(a.id, foreign_project.id, 1),
+                rel(a.id, foreign_type.id, 1),
+                rel(a.id, b.id, 1),
+            ],
+        )
+        .await
+        .unwrap();
+        let region = RegionKey {
+            org: "test-org".into(),
+            project: "proj".into(),
+            memory_type: 3,
+        };
+        let rows = s.relationships_in_region(&region, 2).await.unwrap();
+        assert_eq!(rows.len(), 2, "forward plus inverse in-region edge");
+        assert!(rows.windows(2).all(|pair| {
+            (pair[0].from, pair[0].to, pair[0].kind, pair[0].id)
+                <= (pair[1].from, pair[1].to, pair[1].kind, pair[1].id)
+        }));
+        assert!(s.relationships_in_region(&region, 1).await.is_err());
+    }
+);
 
 itest!(bi_temporal_valid_at, {
     let s = connect("node-1").await;
@@ -720,4 +918,32 @@ itest!(stream_memories_roundtrip, {
         n += 1;
     }
     assert_eq!(n, 10, "stream returns every upserted memory");
+});
+
+itest!(bulk_streams_fetch_pages_only_when_consumed, {
+    let s = connect("lazy-streams").await;
+    let a = mem("lazy-a", 3, Visibility::Org);
+    let b = mem("lazy-b", 3, Visibility::Org);
+    s.upsert_batch(&[a.clone(), b.clone()], &[rel(a.id, b.id, 1)])
+        .await
+        .unwrap();
+    s.take_stream_page_counts();
+
+    let mut memories = s.stream_all_memories().await;
+    memories.next().await.unwrap().unwrap();
+    drop(memories);
+    assert_eq!(
+        s.take_stream_page_counts(),
+        (1, 0),
+        "dropping an early memory consumer must not fetch the terminal page"
+    );
+
+    let mut relationships = s.stream_all_relationships().await;
+    relationships.next().await.unwrap().unwrap();
+    drop(relationships);
+    assert_eq!(
+        s.take_stream_page_counts(),
+        (0, 1),
+        "dropping an early relationship consumer must not fetch the terminal page"
+    );
 });

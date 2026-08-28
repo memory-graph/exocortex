@@ -151,7 +151,6 @@ impl ExplainEngine {
                     queue.push_back(*p);
                 }
             }
-            let _ = MemoryId::new_v7();
             chain.push(EdgeFacts {
                 edge_hex: hex(&eid.0),
                 from_hex: hex(&row.from.0),

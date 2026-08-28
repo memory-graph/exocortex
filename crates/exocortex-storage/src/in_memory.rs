@@ -544,7 +544,7 @@ impl Storage for InMemoryStorage {
             let now = Utc::now();
             let mut row = memory.clone();
             row.lsn = exocortex_kernel::LSN::new_backend(lsn);
-            memories.insert(row.id, vec![row]);
+            memories.entry(row.id).or_default().push(row);
             #[cfg(test)]
             if self.take_atomic_fault(AtomicFault::Mutation) {
                 return Err(StorageError::Backend("injected mutation failure".into()));
@@ -589,9 +589,20 @@ impl Storage for InMemoryStorage {
         let _gate = self.inner.mutation_gate.lock().unwrap();
         let mut proposals = self.inner.proposals.lock().unwrap();
         match proposals.get(&proposal.discovery_id) {
-            Some(stored) if stored.proposal == *proposal => Ok(()),
+            Some(stored) if stored.proposal == *proposal && !stored.consumed => Ok(()),
+            Some(stored) if stored.proposal == *proposal => Err(StorageError::ProposalNotFound),
             Some(_) => Err(StorageError::ProposalMismatch),
             None => {
+                let mut discoveries = self.inner.discoveries.lock().unwrap();
+                let discovery = discoveries
+                    .get(&proposal.discovery_id)
+                    .ok_or(StorageError::ProposalNotFound)?;
+                if discovery.region != proposal.region
+                    || discovery.from != proposal.from
+                    || discovery.to != proposal.to
+                {
+                    return Err(StorageError::ProposalMismatch);
+                }
                 proposals.insert(
                     proposal.discovery_id.clone(),
                     StoredProposal {
@@ -599,17 +610,40 @@ impl Storage for InMemoryStorage {
                         consumed: false,
                     },
                 );
+                discoveries.remove(&proposal.discovery_id);
                 Ok(())
             }
         }
     }
 
     async fn store_discovery(&self, discovery: &DiscoveryRecord) -> Result<(), StorageError> {
-        self.inner
-            .discoveries
-            .lock()
-            .unwrap()
-            .insert(discovery.discovery_id.clone(), discovery.clone());
+        let lsn = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            if self
+                .inner
+                .proposals
+                .lock()
+                .unwrap()
+                .contains_key(&discovery.discovery_id)
+            {
+                return Err(StorageError::ProposalMismatch);
+            }
+            let mut discoveries = self.inner.discoveries.lock().unwrap();
+            match discoveries.get(&discovery.discovery_id) {
+                Some(stored) if stored == discovery => return Ok(()),
+                Some(_) => return Err(StorageError::ProposalMismatch),
+                None => {
+                    let lsn = self.lsn.load(Ordering::SeqCst) + 1;
+                    discoveries.insert(discovery.discovery_id.clone(), discovery.clone());
+                    self.lsn.store(lsn, Ordering::SeqCst);
+                    lsn
+                }
+            }
+        };
+        let _ = self.feed.send(Invalidation::DiscoveryAvailable {
+            record: discovery.clone(),
+            lsn,
+        });
         Ok(())
     }
 
@@ -698,7 +732,7 @@ impl Storage for InMemoryStorage {
             let now = Utc::now();
             let mut row = relationship.clone();
             row.lsn = exocortex_kernel::LSN::new_backend(lsn);
-            relationships.insert(row.id, vec![row.clone()]);
+            relationships.entry(row.id).or_default().push(row.clone());
             let mut next_lsn = lsn;
             let mut invalidations = vec![Invalidation::RelationshipUpserted {
                 id: row.id,
@@ -712,7 +746,10 @@ impl Storage for InMemoryStorage {
             {
                 next_lsn += 1;
                 inverse.lsn = exocortex_kernel::LSN::new_backend(next_lsn);
-                relationships.insert(inverse.id, vec![inverse.clone()]);
+                relationships
+                    .entry(inverse.id)
+                    .or_default()
+                    .push(inverse.clone());
                 invalidations.push(Invalidation::RelationshipUpserted {
                     id: inverse.id,
                     from: inverse.from,
@@ -808,6 +845,20 @@ impl Storage for InMemoryStorage {
             .filter_map(|id| store.get(id).and_then(|h| h.last().cloned()))
             .collect())
     }
+    async fn get_visible_memories(
+        &self,
+        ids: &[MemoryId],
+        vc: &crate::VisibilityContext,
+    ) -> Result<Vec<Memory>, StorageError> {
+        self.inner.batch_reads.fetch_add(1, Ordering::SeqCst);
+        let store = self.inner.memories.lock().unwrap();
+        Ok(ids
+            .iter()
+            .filter_map(|id| store.get(id).and_then(|history| history.last()))
+            .filter(|memory| crate::memory_visible(memory, vc))
+            .cloned()
+            .collect())
+    }
     async fn get_relationship(
         &self,
         id: &RelationshipId,
@@ -844,6 +895,52 @@ impl Storage for InMemoryStorage {
             .take(limit as usize)
             .cloned()
             .collect())
+    }
+    async fn relationships_in_region(
+        &self,
+        region: &RegionKey,
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        let memories = self.inner.memories.lock().unwrap();
+        let relationships = self.inner.rels.lock().unwrap();
+        let in_region = |id: &MemoryId| {
+            memories
+                .get(id)
+                .and_then(|history| history.last())
+                .is_some_and(|memory| {
+                    memory.memory_type == region.memory_type
+                        && (region.org == "*"
+                            || memory.context.tenant_id.as_deref() == Some(region.org.as_str()))
+                        && (region.project == "*"
+                            || memory.context.project_id.as_deref()
+                                == Some(region.project.as_str()))
+                })
+        };
+        let mut rows: Vec<_> = relationships
+            .values()
+            .filter_map(|history| history.last())
+            .filter(|relationship| {
+                relationship.valid_until.is_none()
+                    && relationship.invalidated_by.is_none()
+                    && in_region(&relationship.from)
+                    && in_region(&relationship.to)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|relationship| {
+            (
+                relationship.from,
+                relationship.to,
+                relationship.kind,
+                relationship.id,
+            )
+        });
+        if rows.len() > limit as usize {
+            return Err(StorageError::Backend(format!(
+                "region relationship budget exceeded: more than {limit} rows"
+            )));
+        }
+        Ok(rows)
     }
     async fn memories_sharing_attributes(
         &self,
@@ -1365,6 +1462,21 @@ mod atomic_fence_tests {
                 memory_type: from.memory_type,
             };
             let kind = exocortex_kernel::kinds::SOLVES;
+            let issued_at = Utc::now();
+            storage
+                .store_discovery(&DiscoveryRecord {
+                    discovery_id: discovery_id.clone(),
+                    region: region.clone(),
+                    from: from.id,
+                    to: to.id,
+                    discovery_type: "transitive".into(),
+                    quality: 0.6,
+                    via_types: [1, 2],
+                    discovery_cycle_id: "atomic-cycle".into(),
+                    discovered_at: issued_at,
+                })
+                .await
+                .unwrap();
             storage
                 .create_discovery_proposal(&DiscoveryProposal {
                     discovery_id: discovery_id.clone(),
@@ -1374,7 +1486,7 @@ mod atomic_fence_tests {
                     kind,
                     proposed_visibility: Visibility::Org,
                     caller_scope: scope.clone(),
-                    issued_at: Utc::now(),
+                    issued_at,
                 })
                 .await
                 .unwrap();

@@ -87,5 +87,13 @@ pub fn invalidation_to_pb(inv: &StorageInv) -> pb::Invalidation {
             })),
             backend_lsn: *lsn,
         },
+        StorageInv::DiscoveryAvailable { record, lsn } => pb::Invalidation {
+            kind: Some(pb::invalidation::Kind::DiscoveryAvailable(
+                pb::DiscoveryAvailable {
+                    record_json: serde_json::to_vec(record).expect("discovery record serializes"),
+                },
+            )),
+            backend_lsn: *lsn,
+        },
     }
 }

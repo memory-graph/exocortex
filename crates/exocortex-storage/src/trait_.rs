@@ -185,6 +185,21 @@ pub trait Storage: Send + Sync + 'static {
     ) -> crate::Result<Option<Memory>>;
     /// Point read of several memories; missing ids are omitted.
     async fn get_memories(&self, ids: &[MemoryId]) -> crate::Result<Vec<Memory>>;
+    /// Batch-read current memories visible to one authenticated caller.
+    /// Missing and forbidden ids are omitted; returned rows preserve input
+    /// id order. Implementations must not widen beyond [`crate::memory_visible`].
+    async fn get_visible_memories(
+        &self,
+        ids: &[MemoryId],
+        vc: &crate::VisibilityContext,
+    ) -> crate::Result<Vec<Memory>> {
+        Ok(self
+            .get_memories(ids)
+            .await?
+            .into_iter()
+            .filter(|memory| crate::memory_visible(memory, vc))
+            .collect())
+    }
     /// Indexed point read of one current relationship row.
     async fn get_relationship(&self, id: &RelationshipId) -> crate::Result<Option<Relationship>> {
         use futures::StreamExt;
@@ -219,6 +234,61 @@ pub trait Storage: Send + Sync + 'static {
             }
         }
         Ok(out)
+    }
+    /// Current open relationships whose two endpoints both belong to the
+    /// exact Dreams region. Results use canonical `(from,to,kind,id)` order.
+    /// Implementations query at most `limit + 1` matching rows and reject an
+    /// overflowing region instead of silently truncating discovery input.
+    async fn relationships_in_region(
+        &self,
+        region: &RegionKey,
+        limit: u32,
+    ) -> crate::Result<Vec<Relationship>> {
+        use futures::StreamExt;
+        let mut stream = self.stream_all_relationships().await;
+        let mut candidates = Vec::new();
+        while let Some(row) = stream.next().await {
+            let relationship = row?;
+            if relationship.valid_until.is_none() && relationship.invalidated_by.is_none() {
+                candidates.push(relationship);
+            }
+        }
+        drop(stream);
+        let endpoint_ids: Vec<_> = candidates
+            .iter()
+            .flat_map(|relationship| [relationship.from, relationship.to])
+            .collect();
+        let endpoints: std::collections::HashMap<_, _> = self
+            .get_memories(&endpoint_ids)
+            .await?
+            .into_iter()
+            .map(|memory| (memory.id, memory))
+            .collect();
+        let in_region = |memory: &Memory| {
+            memory.memory_type == region.memory_type
+                && (region.org == "*"
+                    || memory.context.tenant_id.as_deref() == Some(region.org.as_str()))
+                && (region.project == "*"
+                    || memory.context.project_id.as_deref() == Some(region.project.as_str()))
+        };
+        candidates.retain(|relationship| {
+            endpoints.get(&relationship.from).is_some_and(in_region)
+                && endpoints.get(&relationship.to).is_some_and(in_region)
+        });
+        candidates.sort_by_key(|relationship| {
+            (
+                relationship.from,
+                relationship.to,
+                relationship.kind,
+                relationship.id,
+            )
+        });
+        if candidates.len() > limit as usize {
+            return Err(StorageError::Backend(format!(
+                "region relationship budget exceeded: more than {limit} rows"
+            )));
+        }
+        Ok(candidates)
     }
     /// Bounded attribute-posting expansion for reasoning rules R7/R9.
     async fn memories_sharing_attributes(

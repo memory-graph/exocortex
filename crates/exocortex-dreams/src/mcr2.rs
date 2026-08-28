@@ -354,14 +354,6 @@ pub fn compute_sparsity(
     for (_id, _) in nodes {
         *by_node_count.entry(0).or_default() += 1;
     }
-    let cluster_sizes: HashMap<ClusterId, usize> = {
-        let mut m = HashMap::new();
-        for (_from, _to, _kind, cluster, _c) in edges {
-            *m.entry(*cluster).or_default() += 0; // placeholder sizing below
-        }
-        m
-    };
-    let _ = cluster_sizes;
     let weighted_density_by_cluster = densities
         .into_iter()
         .map(|(cluster, (conf_sum, edge_n))| {

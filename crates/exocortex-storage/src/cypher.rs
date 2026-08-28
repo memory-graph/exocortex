@@ -437,6 +437,49 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "get_visible_memories_by_ids",
+        read_only: true,
+        required_params: &[
+            "ids",
+            "max_visibility",
+            "org_id",
+            "user_id",
+            "project_ids",
+            "team_ids"
+        ],
+        cypher: r#"
+            MATCH (m:Memory)
+            WHERE m.id IN $ids
+              AND m.visibility <= $max_visibility
+              AND m.tenant_id = $org_id
+              AND (m.visibility >= 3
+                   OR (m.visibility = 0 AND m.user_id = $user_id)
+                   OR (m.visibility = 1 AND m.project_id IN $project_ids)
+                   OR (m.visibility = 2 AND m.team_id IN $team_ids))
+            RETURN m
+        "#,
+    });
+
+    reg!(Template {
+        id: "relationships_in_region",
+        read_only: true,
+        required_params: &["org_id", "project_id", "memory_type", "limit"],
+        cypher: r#"
+            MATCH (a:Memory)-[r]->(b:Memory)
+            WHERE r.lsn IS NOT NULL
+              AND r.valid_until IS NULL AND r.invalidated_by IS NULL
+              AND a.memory_type_id = $memory_type
+              AND b.memory_type_id = $memory_type
+              AND ($org_id = '*' OR (a.tenant_id = $org_id AND b.tenant_id = $org_id))
+              AND ($project_id = '*' OR
+                   (a.project_id = $project_id AND b.project_id = $project_id))
+            RETURN r
+            ORDER BY a.id ASC, b.id ASC, type(r) ASC, r.rel_id ASC
+            LIMIT $limit
+        "#,
+    });
+
+    reg!(Template {
         id: "traverse_bounded",
         read_only: true,
         required_params: &[
@@ -444,7 +487,11 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "kind_labels",
             "max_depth",
             "max_nodes",
-            "max_visibility"
+            "max_visibility",
+            "org_id",
+            "user_id",
+            "project_ids",
+            "team_ids"
         ],
         // M2 amendment (recorded): the pinned FalkorDB server cannot evaluate
         // `ALL(r IN rels ...)` predicates over var-length edge lists, so kind
@@ -460,7 +507,13 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
               // The seed anchors the neighborhood; with inverse
               // materialization (R-T4) a round-trip path would otherwise
               // return the seed itself.
-              WHERE b.visibility <= $max_visibility AND b.id <> $from
+              WHERE b.visibility <= $max_visibility
+                AND b.tenant_id = $org_id
+                AND (b.visibility >= 3
+                     OR (b.visibility = 0 AND b.user_id = $user_id)
+                     OR (b.visibility = 1 AND b.project_id IN $project_ids)
+                     OR (b.visibility = 2 AND b.team_id IN $team_ids))
+                AND b.id <> $from
               RETURN DISTINCT b LIMIT $max_nodes
             }
             RETURN b
@@ -797,6 +850,11 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "props_json"
         ],
         cypher: r#"
+            MATCH (d:_Discovery {discovery_id: $discovery_id})
+            WHERE d.org_id = $org_id
+              AND d.region_project = $region_project
+              AND d.region_memory_type = $region_memory_type
+              AND d.from = $from AND d.to = $to
             MERGE (p:_DiscoveryProposal {discovery_id: $discovery_id})
             ON CREATE SET p.org_id = $org_id,
                           p.region_project = $region_project,
@@ -806,7 +864,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                           p.caller_scope_json = $caller_scope_json,
                           p.issued_at = $issued_at,
                           p.props_json = $props_json
-            WITH p
+            WITH d, p
             WHERE p.org_id = $org_id
               AND p.region_project = $region_project
               AND p.region_memory_type = $region_memory_type
@@ -814,6 +872,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
               AND p.visibility = $visibility
               AND p.caller_scope_json = $caller_scope_json
               AND p.issued_at = $issued_at
+            DELETE d
             RETURN p.discovery_id AS discovery_id
         "#,
     });
@@ -821,14 +880,35 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "discovery_record_store",
         read_only: false,
-        required_params: &["discovery_id", "org_id", "discovered_at", "props_json"],
+        required_params: &[
+            "discovery_id",
+            "org_id",
+            "region_project",
+            "region_memory_type",
+            "from",
+            "to",
+            "discovered_at",
+            "props_json",
+            "lsn"
+        ],
         cypher: r#"
             MERGE (d:_Discovery {discovery_id: $discovery_id})
             ON CREATE SET d.org_id = $org_id,
+                          d.region_project = $region_project,
+                          d.region_memory_type = $region_memory_type,
+                          d.from = $from,
+                          d.to = $to,
                           d.discovered_at = $discovered_at,
-                          d.props_json = $props_json
-            ON MATCH SET d.props_json = $props_json
-            RETURN d.discovery_id AS discovery_id
+                          d.props_json = $props_json,
+                          d.lsn = $lsn
+            WITH d
+            WHERE d.org_id = $org_id
+              AND d.region_project = $region_project
+              AND d.region_memory_type = $region_memory_type
+              AND d.from = $from AND d.to = $to
+              AND d.discovered_at = $discovered_at
+              AND d.props_json = $props_json
+            RETURN d.discovery_id AS discovery_id, d.lsn AS discovery_lsn
         "#,
     });
 
@@ -850,6 +930,17 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (d:_Discovery {org_id: $org_id})
             RETURN d.props_json AS props_json
             ORDER BY d.discovered_at DESC, d.discovery_id ASC LIMIT $limit
+        "#,
+    });
+
+    reg!(Template {
+        id: "integration_corrupt_discovery_record",
+        read_only: false,
+        required_params: &["discovery_id", "props_json"],
+        cypher: r#"
+            MATCH (d:_Discovery {discovery_id: $discovery_id})
+            SET d.props_json = $props_json
+            RETURN d.discovery_id AS discovery_id
         "#,
     });
 

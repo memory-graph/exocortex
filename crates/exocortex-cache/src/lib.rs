@@ -745,6 +745,12 @@ impl LocalCache {
                 Invalidation::VisibilityAdvance { lsn } => {
                     delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
                 }
+                Invalidation::DiscoveryAvailable { lsn, .. } => {
+                    // Discoveries are presentation records rather than graph
+                    // rows. The cache does not retain them, but consuming the
+                    // event must advance the ordered frontier.
+                    delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
+                }
                 Invalidation::MemorySnapshotUpserted { memory, lsn } => {
                     delta.push(SnapshotDelta::UpsertMemory(memory));
                     delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
@@ -1122,6 +1128,35 @@ impl LocalCache {
         let Some((old_bytes, new_bytes)) = g.apply_local(memories, relationships, local_lsn) else {
             return;
         };
+        {
+            let mut tq = self.tq.lock();
+            if new_bytes >= old_bytes {
+                tq.bytes += new_bytes - old_bytes;
+            } else {
+                tq.bytes = tq.bytes.saturating_sub(old_bytes - new_bytes);
+            }
+        }
+        self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
+        self.admit(&org.into());
+    }
+
+    /// Hydrate one authorized storage fallback into the resident backend image.
+    /// This is the R-C8 point-read miss path: the fetched row and its backend
+    /// frontier become visible in one generation-safe publication.
+    pub fn hydrate_memory(&self, org: &str, memory: Memory) {
+        let backend_lsn = memory.lsn.value;
+        let graph = self
+            .graphs
+            .entry(org.into())
+            .or_insert_with(|| Arc::new(GraphSlot::new(Arc::new(GraphSnapshot::empty()))))
+            .clone();
+        let (old_bytes, new_bytes) = graph.publish_delta(
+            vec![
+                SnapshotDelta::UpsertMemory(Box::new(memory)),
+                SnapshotDelta::AdvanceBackendLsn(backend_lsn),
+            ],
+            &self.full_snapshot_clones,
+        );
         {
             let mut tq = self.tq.lock();
             if new_bytes >= old_bytes {

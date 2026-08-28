@@ -133,8 +133,13 @@ async fn both_surfaces_identical_outputs() {
 }
 
 fn ctx_sync() -> (OpContext, Memory) {
+    let (ctx, memory, _) = ctx_with_storage();
+    (ctx, memory)
+}
+
+fn ctx_with_storage() -> (OpContext, Memory, Arc<InMemoryStorage>) {
     let (cache, _rx) = LocalCache::new(64 * 1024 * 1024);
-    let storage = InMemoryStorage::new(ontology());
+    let storage = Arc::new(InMemoryStorage::new(ontology()));
     let m = mem("parity-target");
     let mut snap = GraphSnapshot::empty();
     snap.push_test_memory(m.clone());
@@ -143,13 +148,14 @@ fn ctx_sync() -> (OpContext, Memory) {
         OpContext {
             visibility_ctx: ops_vc("org", "alice", Visibility::Org),
             audit_admin: true,
-            storage: Arc::new(storage),
+            storage: storage.clone(),
             cache: Arc::new(cache),
             deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
 
             ontology: None,
         },
         m,
+        storage,
     )
 }
 
@@ -208,6 +214,20 @@ async fn accept_discovery_writes_audit_record_and_edge() {
         issued_at: chrono::Utc::now(),
     };
     ctx.storage
+        .store_discovery(&DiscoveryRecord {
+            discovery_id: proposal.discovery_id.clone(),
+            region: proposal.region.clone(),
+            from: proposal.from,
+            to: proposal.to,
+            discovery_type: "transitive".into(),
+            quality: 0.6,
+            via_types: [1, 2],
+            discovery_cycle_id: "acceptance-cycle".into(),
+            discovered_at: proposal.issued_at,
+        })
+        .await
+        .unwrap();
+    ctx.storage
         .create_discovery_proposal(&proposal)
         .await
         .unwrap();
@@ -220,6 +240,20 @@ async fn accept_discovery_writes_audit_record_and_edge() {
     ));
     let mut endpoint_mismatch = proposal.clone();
     endpoint_mismatch.discovery_id = "endpoint-mismatch".into();
+    ctx.storage
+        .store_discovery(&DiscoveryRecord {
+            discovery_id: endpoint_mismatch.discovery_id.clone(),
+            region: endpoint_mismatch.region.clone(),
+            from: endpoint_mismatch.from,
+            to: endpoint_mismatch.to,
+            discovery_type: "transitive".into(),
+            quality: 0.6,
+            via_types: [1, 2],
+            discovery_cycle_id: "mismatch-cycle".into(),
+            discovered_at: endpoint_mismatch.issued_at,
+        })
+        .await
+        .unwrap();
     ctx.storage
         .create_discovery_proposal(&endpoint_mismatch)
         .await
@@ -279,21 +313,36 @@ async fn accept_discovery_writes_audit_record_and_edge() {
     );
 
     // An illegal triple is rejected (R-T17 now enforced here).
+    let illegal = DiscoveryProposal {
+        discovery_id: "22222222-2222-2222-2222-222222222222".into(),
+        region: RegionKey {
+            org: "org".into(),
+            project: "*".into(),
+            memory_type: a.memory_type,
+        },
+        from: a.id,
+        to: b.id,
+        kind: onto.kind_id("Solves").unwrap(),
+        proposed_visibility: Visibility::Org,
+        caller_scope: ctx.visibility_ctx.clone(),
+        issued_at: chrono::Utc::now(),
+    };
     ctx.storage
-        .create_discovery_proposal(&DiscoveryProposal {
-            discovery_id: "22222222-2222-2222-2222-222222222222".into(),
-            region: RegionKey {
-                org: "org".into(),
-                project: "*".into(),
-                memory_type: a.memory_type,
-            },
-            from: a.id,
-            to: b.id,
-            kind: onto.kind_id("Solves").unwrap(),
-            proposed_visibility: Visibility::Org,
-            caller_scope: ctx.visibility_ctx.clone(),
-            issued_at: chrono::Utc::now(),
+        .store_discovery(&DiscoveryRecord {
+            discovery_id: illegal.discovery_id.clone(),
+            region: illegal.region.clone(),
+            from: illegal.from,
+            to: illegal.to,
+            discovery_type: "transitive".into(),
+            quality: 0.6,
+            via_types: [1, 2],
+            discovery_cycle_id: "illegal-cycle".into(),
+            discovered_at: illegal.issued_at,
         })
+        .await
+        .unwrap();
+    ctx.storage
+        .create_discovery_proposal(&illegal)
         .await
         .unwrap();
     let err = exocortex_ops::operations::AcceptDiscoveryOp
@@ -327,7 +376,7 @@ async fn accept_discovery_writes_audit_record_and_edge() {
 
 #[tokio::test]
 async fn durable_discovery_survives_engine_restart_and_reaches_acceptance() {
-    let (ctx, _m) = ctx_sync();
+    let (ctx, _m, storage) = ctx_with_storage();
     let mut from = mem("durable-from");
     from.memory_type = 0;
     let mut to = mem("durable-to");
@@ -356,6 +405,7 @@ async fn durable_discovery_survives_engine_restart_and_reaches_acceptance() {
 
     // No DreamsEngine handle participates below: storage is the restart-safe
     // handoff between the completed production cycle and the registry.
+    storage.take_read_counts();
     let listed = exocortex_ops::operations::ListDiscoveriesOp
         .handle(
             &ctx,
@@ -365,6 +415,11 @@ async fn durable_discovery_survives_engine_restart_and_reaches_acceptance() {
         .unwrap();
     assert_eq!(listed.discoveries.len(), 1);
     assert_eq!(listed.discoveries[0].quality, 0.6);
+    assert_eq!(
+        storage.take_read_counts(),
+        (0, 1),
+        "discovery endpoint visibility uses one batch read, never per-row N+1 reads"
+    );
 
     let issued = exocortex_ops::operations::IssueDiscoveryOp
         .handle(
@@ -378,6 +433,16 @@ async fn durable_discovery_survives_engine_restart_and_reaches_acceptance() {
         .unwrap();
     assert_eq!(issued.discovery_id, id);
     assert_eq!(issued.visibility, "org");
+    assert!(ctx.storage.get_discovery(id).await.unwrap().is_none());
+    assert!(exocortex_ops::operations::ListDiscoveriesOp
+        .handle(
+            &ctx,
+            exocortex_ops::operations::ListDiscoveriesInput { limit: 20 }
+        )
+        .await
+        .unwrap()
+        .discoveries
+        .is_empty());
 
     let accepted = exocortex_ops::operations::AcceptDiscoveryOp
         .handle(
@@ -398,6 +463,18 @@ async fn durable_discovery_survives_engine_restart_and_reaches_acceptance() {
         .await
         .unwrap()
         .is_none());
+    assert!(matches!(
+        exocortex_ops::operations::IssueDiscoveryOp
+            .handle(
+                &ctx,
+                exocortex_ops::operations::IssueDiscoveryInput {
+                    discovery_id: id.into(),
+                    kind: "Causes".into(),
+                },
+            )
+            .await,
+        Err(exocortex_ops::OpError::NotFound)
+    ));
 }
 
 #[test]
@@ -532,6 +609,24 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
         .await
         .expect("author reads own private memory");
     assert!(out.memory.is_some(), "cold-cache miss fills from storage");
+    assert!(
+        ctx2.cache
+            .get_memory("org", &own.id, &ctx2.visibility_ctx)
+            .is_some(),
+        "authorized storage fallback hydrates the local cache"
+    );
+    ctx2.storage.delete_memory(&own.id).await.unwrap();
+    let cached = exocortex_ops::operations::GetMemory
+        .handle(
+            &ctx2,
+            exocortex_ops::operations::GetMemoryInput { id: hex(&own.id) },
+        )
+        .await
+        .expect("second read is served from the hydrated cache");
+    assert!(
+        cached.memory.is_some(),
+        "storage deletion after hydration proves the second read did not fall through"
+    );
 }
 
 /// IN2 (audit): promote_visibility loads through the caller-scoped read —

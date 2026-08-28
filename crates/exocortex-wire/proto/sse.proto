@@ -8,6 +8,7 @@ message Invalidation {
     RelationshipDeleted  relationship_deleted  = 4;
     VisibilityAdvance    visibility_advance     = 5;
     GraphReseed          graph_reseed           = 6;
+    DiscoveryAvailable   discovery_available    = 7;
   }
   uint64 backend_lsn = 10;
 }
@@ -20,3 +21,6 @@ message RelationshipDeleted  { bytes id = 1; }
 message VisibilityAdvance {}
 // Complete caller-visible cache image used for initial hydration and recovery.
 message GraphReseed { bytes snapshot_json = 1; }
+// Newly persisted structured proposal. The SSE boundary removes this event
+// for subscribers that cannot see both endpoints.
+message DiscoveryAvailable { bytes record_json = 1; }

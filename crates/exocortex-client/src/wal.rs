@@ -452,7 +452,19 @@ fn decode_entry(bytes: &[u8]) -> Result<WalEntry, String> {
     if bytes.first() != Some(&WAL_CODEC_VERSION) {
         return Err(format!("unknown wal codec version {bytes:?}"));
     }
+    let declared = bytes
+        .get(1..5)
+        .ok_or("short wal entry")?
+        .try_into()
+        .map(u32::from_be_bytes)
+        .map_err(|_| "short wal entry")? as usize;
     let json = bytes.get(5..).ok_or("short wal entry")?;
+    if json.len() != declared {
+        return Err(format!(
+            "wal entry length mismatch: declared {declared}, actual {}",
+            json.len()
+        ));
+    }
     serde_json::from_slice(json).map_err(|x| x.to_string())
 }
 
@@ -601,6 +613,32 @@ mod tests {
         ));
         drop(wal);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn framed_length_mismatch_is_rejected_in_both_directions() {
+        let entry = WalEntry {
+            local_lsn: 1,
+            session_id: "framing".into(),
+            memories: vec![draft("framing")],
+            memory_ids: vec![MemoryId::new_v7()],
+            state: WalState::Pending,
+            batch_id: "framing".into(),
+            draft_keys: vec!["k".into()],
+            tags: vec![vec![]],
+        };
+        let encoded = encode_entry(&entry).unwrap();
+        let actual = u32::try_from(encoded.len() - 5).unwrap();
+
+        for declared in [actual - 1, actual + 1] {
+            let mut corrupt = encoded.clone();
+            corrupt[1..5].copy_from_slice(&declared.to_be_bytes());
+            let error = decode_entry(&corrupt).unwrap_err();
+            assert!(
+                error.contains("length mismatch"),
+                "declared {declared}, actual {actual}: {error}"
+            );
+        }
     }
 
     #[test]

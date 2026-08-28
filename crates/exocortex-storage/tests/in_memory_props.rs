@@ -8,8 +8,9 @@ use exocortex_kernel::{
 };
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{
-    memory_visible, FencedRestore, InMemoryStorage, IngestBatchKey, IngestCommitOutcome, LeaseKey,
-    MemoryFilter, Storage, VisibilityContext,
+    memory_visible, AuditEvent, DiscoveryAcceptance, DiscoveryProposal, DiscoveryRecord,
+    FencedRestore, InMemoryStorage, IngestBatchKey, IngestCommitOutcome, LeaseKey, MemoryFilter,
+    RegionKey, Storage, StorageError, VisibilityContext,
 };
 use proptest::prelude::*;
 use std::sync::Arc;
@@ -200,6 +201,252 @@ async fn relationship_assertion_history_is_bitemporal() {
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].properties.evidence_count, 1);
     assert_eq!(history[1].properties.evidence_count, 2);
+}
+
+fn audit(action: &str) -> AuditEvent {
+    AuditEvent {
+        action: action.into(),
+        actor: "user".into(),
+        org_id: "org".into(),
+        input_digest: [7; 32],
+        output_ids: Default::default(),
+        fingerprint: [9; 32],
+        lease_epoch: None,
+        recorded_at: Utc::now(),
+    }
+}
+
+fn caller_scope() -> VisibilityContext {
+    VisibilityContext {
+        org_id: "org".into(),
+        user_id: "user".into(),
+        project_ids: ["project".into()].into_iter().collect(),
+        max_visibility: Visibility::Org,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn audited_memory_and_discovery_edges_append_history() {
+    let storage = InMemoryStorage::new(ontology());
+    let mut memory = base_memory("before".into(), "content".into(), 3, 3);
+    memory.context.user_id = Some("user".into());
+    storage.upsert_memory(&memory).await.unwrap();
+    let mut promoted = memory.clone();
+    promoted.title = "after".into();
+    promoted.recorded_at += Duration::seconds(1);
+    storage
+        .upsert_memory_audited(&promoted, &audit("promote_visibility"))
+        .await
+        .unwrap();
+    let memory_history = storage.memory_history(&memory.id);
+    assert_eq!(memory_history.len(), 2);
+    assert_eq!(memory_history[0].title.as_str(), "before");
+    assert_eq!(memory_history[1].title.as_str(), "after");
+
+    let mut to = base_memory("to".into(), "content".into(), 3, 3);
+    to.context.user_id = Some("user".into());
+    storage.upsert_memory(&to).await.unwrap();
+    let relationship = base_relationship(memory.id, to.id);
+    storage.upsert_relationship(&relationship).await.unwrap();
+    let discovery_id = "history-discovery";
+    let region = RegionKey {
+        org: "org".into(),
+        project: "*".into(),
+        memory_type: memory.memory_type,
+    };
+    storage
+        .store_discovery(&DiscoveryRecord {
+            discovery_id: discovery_id.into(),
+            region: region.clone(),
+            from: memory.id,
+            to: to.id,
+            discovery_type: "transitive".into(),
+            quality: 0.6,
+            via_types: [1, 2],
+            discovery_cycle_id: "cycle".into(),
+            discovered_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let proposal = DiscoveryProposal {
+        discovery_id: discovery_id.into(),
+        region: region.clone(),
+        from: memory.id,
+        to: to.id,
+        kind: relationship.kind,
+        proposed_visibility: relationship.visibility,
+        caller_scope: caller_scope(),
+        issued_at: Utc::now(),
+    };
+    storage.create_discovery_proposal(&proposal).await.unwrap();
+    let mut accepted = relationship.clone();
+    accepted.properties.evidence_count = 2;
+    accepted.recorded_at += Duration::seconds(2);
+    storage
+        .accept_discovery(&DiscoveryAcceptance {
+            discovery_id: discovery_id.into(),
+            region,
+            caller_scope: caller_scope(),
+            relationship: accepted,
+            audit: audit("accept_discovery"),
+        })
+        .await
+        .unwrap();
+    let relationship_history = storage.relationship_history(&relationship.id);
+    assert_eq!(relationship_history.len(), 2);
+    assert_eq!(relationship_history[0].properties.evidence_count, 1);
+    assert_eq!(relationship_history[1].properties.evidence_count, 2);
+}
+
+#[tokio::test]
+async fn discovery_issue_retires_record_and_consumed_reissue_is_rejected() {
+    let storage = InMemoryStorage::new(ontology());
+    let from = base_memory("from".into(), "content".into(), 3, 3);
+    let to = base_memory("to".into(), "content".into(), 3, 3);
+    storage
+        .upsert_batch(&[from.clone(), to.clone()], &[])
+        .await
+        .unwrap();
+    let id = "retired-discovery";
+    let region = RegionKey {
+        org: "org".into(),
+        project: "*".into(),
+        memory_type: from.memory_type,
+    };
+    let record = DiscoveryRecord {
+        discovery_id: id.into(),
+        region: region.clone(),
+        from: from.id,
+        to: to.id,
+        discovery_type: "transitive".into(),
+        quality: 0.6,
+        via_types: [1, 2],
+        discovery_cycle_id: "cycle".into(),
+        discovered_at: Utc::now(),
+    };
+    storage.store_discovery(&record).await.unwrap();
+    storage.store_discovery(&record).await.unwrap();
+    let mut conflicting = record.clone();
+    conflicting.quality = 0.9;
+    assert!(matches!(
+        storage.store_discovery(&conflicting).await,
+        Err(StorageError::ProposalMismatch)
+    ));
+    let relationship = base_relationship(from.id, to.id);
+    let proposal = DiscoveryProposal {
+        discovery_id: id.into(),
+        region: region.clone(),
+        from: from.id,
+        to: to.id,
+        kind: relationship.kind,
+        proposed_visibility: relationship.visibility,
+        caller_scope: caller_scope(),
+        issued_at: record.discovered_at,
+    };
+    storage.create_discovery_proposal(&proposal).await.unwrap();
+    storage.create_discovery_proposal(&proposal).await.unwrap();
+    assert!(storage.get_discovery(id).await.unwrap().is_none());
+    assert!(storage
+        .list_discoveries("org", 10)
+        .await
+        .unwrap()
+        .is_empty());
+    storage
+        .accept_discovery(&DiscoveryAcceptance {
+            discovery_id: id.into(),
+            region,
+            caller_scope: caller_scope(),
+            relationship,
+            audit: audit("accept_discovery"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        storage.create_discovery_proposal(&proposal).await,
+        Err(StorageError::ProposalNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn discovery_persistence_precedes_one_available_invalidation() {
+    use futures::StreamExt;
+    let storage = InMemoryStorage::new(ontology());
+    let region = RegionKey {
+        org: "org".into(),
+        project: "project".into(),
+        memory_type: 3,
+    };
+    let mut feed = storage.subscribe_invalidations(&region).await.unwrap();
+    let record = DiscoveryRecord {
+        discovery_id: "available-discovery".into(),
+        region,
+        from: MemoryId::new_v7(),
+        to: MemoryId::new_v7(),
+        discovery_type: "transitive".into(),
+        quality: 0.6,
+        via_types: [1, 2],
+        discovery_cycle_id: "cycle".into(),
+        discovered_at: Utc::now(),
+    };
+    storage.store_discovery(&record).await.unwrap();
+    let invalidation = feed.next().await.unwrap().unwrap();
+    match invalidation {
+        exocortex_storage::Invalidation::DiscoveryAvailable {
+            record: published,
+            lsn,
+        } => {
+            assert_eq!(published, record);
+            assert!(lsn > 0);
+            assert_eq!(
+                storage.get_discovery("available-discovery").await.unwrap(),
+                Some(record.clone())
+            );
+        }
+        other => panic!("expected DiscoveryAvailable, got {other:?}"),
+    }
+    storage.store_discovery(&record).await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), feed.next())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn relationships_in_region_is_exact_ordered_and_fail_closed_at_limit() {
+    let storage = InMemoryStorage::new(ontology());
+    let mut a = base_memory("a".into(), "content".into(), 3, 3);
+    let mut b = base_memory("b".into(), "content".into(), 3, 3);
+    let mut foreign = base_memory("foreign".into(), "content".into(), 3, 3);
+    for memory in [&mut a, &mut b] {
+        memory.context.project_id = Some("project".into());
+    }
+    foreign.context.project_id = Some("other".into());
+    storage
+        .upsert_batch(&[a.clone(), b.clone(), foreign.clone()], &[])
+        .await
+        .unwrap();
+    let in_region = base_relationship(a.id, b.id);
+    let unrelated = base_relationship(a.id, foreign.id);
+    storage
+        .upsert_batch(&[], &[unrelated, in_region.clone()])
+        .await
+        .unwrap();
+    let region = RegionKey {
+        org: "org".into(),
+        project: "project".into(),
+        memory_type: 3,
+    };
+    let rows = storage.relationships_in_region(&region, 2).await.unwrap();
+    assert!(rows.iter().all(|row| {
+        (row.from == a.id && row.to == b.id) || (row.from == b.id && row.to == a.id)
+    }));
+    assert!(rows.windows(2).all(|pair| {
+        (pair[0].from, pair[0].to, pair[0].kind, pair[0].id)
+            <= (pair[1].from, pair[1].to, pair[1].kind, pair[1].id)
+    }));
+    assert!(storage.relationships_in_region(&region, 1).await.is_err());
 }
 
 /// Strip the storage-assigned LSN so caller-supplied rows compare equal to

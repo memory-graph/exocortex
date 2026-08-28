@@ -7,6 +7,7 @@
 // invalidation is published to the org channel (§9.1).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -50,6 +51,8 @@ pub struct FalkorStorage {
     ontology: Arc<Ontology>,
     lsn_key: String,
     channel: String,
+    stream_memory_pages: AtomicU64,
+    stream_relationship_pages: AtomicU64,
 }
 
 /// Encode a param value as a Cypher literal for the `CYPHER k=v` prefix the
@@ -211,6 +214,25 @@ fn decode_persisted_fingerprint(
     Ok(Some(fingerprint))
 }
 
+const STORAGE_SCHEMA_VERSION: i64 = 1;
+
+fn schema_needs_migration(rows: &[Vec<FalkorValue>]) -> Result<bool, StorageError> {
+    match rows.first().and_then(|row| row.first()) {
+        Some(FalkorValue::I64(STORAGE_SCHEMA_VERSION)) => Ok(false),
+        Some(FalkorValue::I64(0)) | None | Some(FalkorValue::None) => Ok(true),
+        Some(FalkorValue::I64(version)) => Err(StorageError::CorruptMetadata {
+            key: "schema_version",
+            detail: format!(
+                "unsupported schema version {version}; this build supports {STORAGE_SCHEMA_VERSION}"
+            ),
+        }),
+        Some(other) => Err(StorageError::CorruptMetadata {
+            key: "schema_version",
+            detail: format!("expected integer, found {other:?}"),
+        }),
+    }
+}
+
 fn hex(id: &[u8; 16]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(32);
@@ -269,6 +291,8 @@ impl FalkorStorage {
             ontology,
             lsn_key: format!("exocortex:{}:lsn", cfg.org_id),
             channel: format!("exocortex:{}:inv", cfg.org_id),
+            stream_memory_pages: AtomicU64::new(0),
+            stream_relationship_pages: AtomicU64::new(0),
         };
         this.pin_fingerprint().await?;
         this.migrate_schema().await?;
@@ -322,15 +346,8 @@ impl FalkorStorage {
         let rows = self
             .run_template("read_schema_version", &serde_json::json!({}), true)
             .await?;
-        match rows.first().and_then(|row| row.first()) {
-            Some(FalkorValue::I64(version)) if *version >= 1 => return Ok(()),
-            Some(FalkorValue::I64(_)) | None | Some(FalkorValue::None) => {}
-            Some(other) => {
-                return Err(StorageError::CorruptMetadata {
-                    key: "schema_version",
-                    detail: format!("expected integer, found {other:?}"),
-                });
-            }
+        if !schema_needs_migration(&rows)? {
+            return Ok(());
         }
 
         let mut memories = <Self as Storage>::stream_all_memories(self).await;
@@ -370,7 +387,7 @@ impl FalkorStorage {
 
         self.run_template(
             "write_schema_version",
-            &serde_json::json!({ "version": 1 }),
+            &serde_json::json!({ "version": STORAGE_SCHEMA_VERSION }),
             false,
         )
         .await?;
@@ -1244,6 +1261,13 @@ impl Storage for FalkorStorage {
         {
             return Err(StorageError::ProposalMismatch);
         }
+        if let Some(existing) = self.get_discovery_proposal(&proposal.discovery_id).await? {
+            return if existing == *proposal {
+                Ok(())
+            } else {
+                Err(StorageError::ProposalMismatch)
+            };
+        }
         let rows = self
             .run_template(
                 "discovery_proposal_create",
@@ -1252,26 +1276,51 @@ impl Storage for FalkorStorage {
             )
             .await?;
         if rows.is_empty() {
-            Err(StorageError::ProposalMismatch)
+            match self.get_discovery_proposal(&proposal.discovery_id).await? {
+                Some(existing) if existing == *proposal => Ok(()),
+                Some(_) => Err(StorageError::ProposalMismatch),
+                None => Err(StorageError::ProposalNotFound),
+            }
         } else {
             Ok(())
         }
     }
 
     async fn store_discovery(&self, discovery: &DiscoveryRecord) -> Result<(), StorageError> {
+        let lsn = self.next_lsn().await?;
         let props_json = serde_json::to_string(discovery)
             .map_err(|error| StorageError::Backend(error.to_string()))?;
-        self.run_template(
-            "discovery_record_store",
-            &serde_json::json!({
-                "discovery_id": discovery.discovery_id,
-                "org_id": discovery.region.org,
-                "discovered_at": discovery.discovered_at.to_rfc3339(),
-                "props_json": props_json,
-            }),
-            false,
-        )
-        .await?;
+        let rows = self
+            .run_template(
+                "discovery_record_store",
+                &serde_json::json!({
+                    "discovery_id": discovery.discovery_id,
+                    "org_id": discovery.region.org,
+                    "region_project": discovery.region.project,
+                    "region_memory_type": discovery.region.memory_type,
+                    "from": hex(&discovery.from.0),
+                    "to": hex(&discovery.to.0),
+                    "discovered_at": discovery.discovered_at.to_rfc3339(),
+                    "props_json": props_json,
+                    "lsn": lsn,
+                }),
+                false,
+            )
+            .await?;
+        if rows.is_empty() {
+            return Err(StorageError::ProposalMismatch);
+        }
+        let created = matches!(
+            rows.first().and_then(|row| row.get(1)),
+            Some(FalkorValue::I64(stored_lsn)) if *stored_lsn as u64 == lsn
+        );
+        if created {
+            self.publish(Invalidation::DiscoveryAvailable {
+                record: discovery.clone(),
+                lsn,
+            })
+            .await;
+        }
         Ok(())
     }
 
@@ -1286,15 +1335,21 @@ impl Storage for FalkorStorage {
                 true,
             )
             .await?;
-        let Some(FalkorValue::String(json)) = rows.first().and_then(|row| row.first()) else {
-            return Ok(None);
-        };
-        serde_json::from_str(json)
-            .map(Some)
-            .map_err(|error| StorageError::CorruptMetadata {
+        match rows.first().and_then(|row| row.first()) {
+            None | Some(FalkorValue::None) => Ok(None),
+            Some(FalkorValue::String(json)) => {
+                serde_json::from_str(json).map(Some).map_err(|error| {
+                    StorageError::CorruptMetadata {
+                        key: "discovery_record",
+                        detail: error.to_string(),
+                    }
+                })
+            }
+            Some(other) => Err(StorageError::CorruptMetadata {
                 key: "discovery_record",
-                detail: error.to_string(),
-            })
+                detail: format!("expected JSON string, found {other:?}"),
+            }),
+        }
     }
 
     async fn list_discoveries(
@@ -1310,16 +1365,17 @@ impl Storage for FalkorStorage {
             )
             .await?;
         rows.into_iter()
-            .filter_map(|row| match row.into_iter().next() {
+            .map(|row| match row.into_iter().next() {
                 Some(FalkorValue::String(json)) => {
-                    Some(serde_json::from_str(&json).map_err(|error| {
-                        StorageError::CorruptMetadata {
-                            key: "discovery_record",
-                            detail: error.to_string(),
-                        }
-                    }))
+                    serde_json::from_str(&json).map_err(|error| StorageError::CorruptMetadata {
+                        key: "discovery_record",
+                        detail: error.to_string(),
+                    })
                 }
-                _ => None,
+                other => Err(StorageError::CorruptMetadata {
+                    key: "discovery_record",
+                    detail: format!("expected JSON string, found {other:?}"),
+                }),
             })
             .collect()
     }
@@ -1503,6 +1559,34 @@ impl Storage for FalkorStorage {
         Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
     }
 
+    async fn get_visible_memories(
+        &self,
+        ids: &[MemoryId],
+        vc: &crate::VisibilityContext,
+    ) -> Result<Vec<Memory>, StorageError> {
+        let rows = self
+            .run_template(
+                "get_visible_memories_by_ids",
+                &serde_json::json!({
+                    "ids": ids.iter().map(|id| hex(&id.0)).collect::<Vec<_>>(),
+                    "max_visibility": fetch_ceiling(vc.max_visibility),
+                    "org_id": vc.org_id,
+                    "user_id": vc.user_id,
+                    "project_ids": vc.project_ids,
+                    "team_ids": vc.team_ids,
+                }),
+                true,
+            )
+            .await?;
+        let by_id = memories_by_id(&rows)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| by_id.get(id))
+            .filter(|memory| crate::memory_visible(memory, vc))
+            .cloned()
+            .collect())
+    }
+
     async fn get_relationship(
         &self,
         id: &RelationshipId,
@@ -1539,6 +1623,45 @@ impl Storage for FalkorStorage {
             .filter_map(|row| row.first())
             .map(relationship_from_value)
             .collect()
+    }
+
+    async fn relationships_in_region(
+        &self,
+        region: &RegionKey,
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        let query_limit = limit.saturating_add(1);
+        let rows = self
+            .run_template(
+                "relationships_in_region",
+                &serde_json::json!({
+                    "org_id": region.org,
+                    "project_id": region.project,
+                    "memory_type": region.memory_type,
+                    "limit": query_limit,
+                }),
+                true,
+            )
+            .await?;
+        if rows.len() > limit as usize {
+            return Err(StorageError::Backend(format!(
+                "region relationship budget exceeded: more than {limit} rows"
+            )));
+        }
+        let mut relationships: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.first())
+            .map(relationship_from_value)
+            .collect::<Result<_, _>>()?;
+        relationships.sort_by_key(|relationship| {
+            (
+                relationship.from,
+                relationship.to,
+                relationship.kind,
+                relationship.id,
+            )
+        });
+        Ok(relationships)
     }
 
     async fn memories_sharing_attributes(
@@ -1587,6 +1710,10 @@ impl Storage for FalkorStorage {
             // R-T11: Public reads as Org, so an Org-scoped traversal fetches
             // at the widest internal ceiling (ST3 parity with the double).
             "max_visibility": fetch_ceiling(spec.visibility_ctx.max_visibility),
+            "org_id": spec.visibility_ctx.org_id,
+            "user_id": spec.visibility_ctx.user_id,
+            "project_ids": spec.visibility_ctx.project_ids,
+            "team_ids": spec.visibility_ctx.team_ids,
         });
         let rows = self.run_template("traverse_bounded", &params, true).await?;
         let mut out: Vec<Memory> = Vec::new();
@@ -1594,7 +1721,10 @@ impl Storage for FalkorStorage {
         for row in &rows {
             if let Some(v) = row.first() {
                 let m = memory_from_value(v)?;
-                if seen.insert(m.id) && out.len() < spec.max_nodes as usize {
+                if crate::memory_visible(&m, &spec.visibility_ctx)
+                    && seen.insert(m.id)
+                    && out.len() < spec.max_nodes as usize
+                {
                     out.push(m);
                 }
             }
@@ -1706,99 +1836,110 @@ impl Storage for FalkorStorage {
     }
 
     async fn stream_all_memories(&self) -> BoxStream<'_, Result<Memory, StorageError>> {
-        // Eager pagination via the stream_memories template. The falkordb
-        // client is not `Clone`, and `async_trait` cannot hand a `&self`
-        // borrow into an escaping stream; a lazily-paged stream needs the
-        // client refactor tracked for M8 (Dreams is the only consumer).
-        let mut all: Vec<Result<Memory, StorageError>> = Vec::new();
-        let mut cursor = 0_u64;
-        loop {
-            let params = serde_json::json!({ "after_lsn": cursor, "limit": 500_u32 });
-            let rows = match self.run_template("stream_memories", &params, true).await {
-                Ok(r) => r,
-                Err(e) => {
-                    all.push(Err(e));
-                    break;
-                }
-            };
-            if rows.is_empty() {
-                break;
-            }
-            // ST2 (audit): advance from the node LSN the query FILTERED on
-            // (returned as the second column), never the possibly-stale
-            // copy inside props_json — and never loop when a page fails to
-            // advance the cursor.
-            let mut advanced = false;
-            for row in &rows {
-                if let Some(FalkorValue::I64(n)) = row.get(1) {
-                    if (*n as u64) > cursor {
-                        cursor = *n as u64;
-                        advanced = true;
+        let stream = futures::stream::unfold(
+            (self, 0_u64, std::collections::VecDeque::new(), false),
+            |(storage, mut cursor, mut buffered, mut done)| async move {
+                loop {
+                    if let Some(item) = buffered.pop_front() {
+                        return Some((item, (storage, cursor, buffered, done)));
                     }
-                }
-                if let Some(v) = row.first() {
-                    match memory_from_value(v) {
-                        Ok(m) => all.push(Ok(m)),
-                        Err(e) => all.push(Err(e)),
+                    if done {
+                        return None;
                     }
-                }
-            }
-            if !advanced {
-                tracing::warn!(cursor, "memory stream page did not advance; stopping");
-                break;
-            }
-        }
-        Box::pin(futures::stream::iter(all))
-    }
-
-    async fn stream_all_relationships(&self) -> BoxStream<'_, Result<Relationship, StorageError>> {
-        // Same eager pagination over RELATES rows (props_json carries the row).
-        let mut all: Vec<Result<Relationship, StorageError>> = Vec::new();
-        let mut cursor = 0_u64;
-        loop {
-            let params = serde_json::json!({ "after_lsn": cursor, "limit": 500_u32 });
-            let rows = match self
-                .run_template("stream_relationships", &params, true)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    all.push(Err(e));
-                    break;
-                }
-            };
-            if rows.is_empty() {
-                break;
-            }
-            let mut advanced = false;
-            for row in &rows {
-                if let Some(FalkorValue::I64(n)) = row.get(1) {
-                    if (*n as u64) > cursor {
-                        cursor = *n as u64;
-                        advanced = true;
-                    }
-                }
-                if let Some(v) = row.first() {
-                    let props = match v {
-                        FalkorValue::Edge(e) => e.properties.get("props_json").cloned(),
-                        _ => None,
+                    let params = serde_json::json!({ "after_lsn": cursor, "limit": 500_u32 });
+                    storage.stream_memory_pages.fetch_add(1, Ordering::Relaxed);
+                    let rows = match storage.run_template("stream_memories", &params, true).await {
+                        Ok(rows) => rows,
+                        Err(error) => {
+                            done = true;
+                            buffered.push_back(Err(error));
+                            continue;
+                        }
                     };
-                    if let Some(FalkorValue::String(json_str)) = props {
-                        match serde_json::from_str::<Relationship>(&json_str) {
-                            Ok(r) => all.push(Ok(r)),
-                            Err(e) => all.push(Err(StorageError::Backend(format!(
-                                "bad rel props_json: {e}"
-                            )))),
+                    if rows.is_empty() {
+                        done = true;
+                        continue;
+                    }
+                    let mut advanced = false;
+                    for row in &rows {
+                        if let Some(FalkorValue::I64(lsn)) = row.get(1) {
+                            if (*lsn as u64) > cursor {
+                                cursor = *lsn as u64;
+                                advanced = true;
+                            }
+                        }
+                        if let Some(value) = row.first() {
+                            buffered.push_back(memory_from_value(value));
+                        }
+                    }
+                    if !advanced {
+                        done = true;
+                        if buffered.is_empty() {
+                            buffered.push_back(Err(StorageError::Backend(
+                                "memory stream page did not advance".into(),
+                            )));
                         }
                     }
                 }
-            }
-            if !advanced {
-                tracing::warn!(cursor, "rel stream page did not advance; stopping");
-                break;
-            }
-        }
-        Box::pin(futures::stream::iter(all))
+            },
+        );
+        Box::pin(stream)
+    }
+
+    async fn stream_all_relationships(&self) -> BoxStream<'_, Result<Relationship, StorageError>> {
+        let stream = futures::stream::unfold(
+            (self, 0_u64, std::collections::VecDeque::new(), false),
+            |(storage, mut cursor, mut buffered, mut done)| async move {
+                loop {
+                    if let Some(item) = buffered.pop_front() {
+                        return Some((item, (storage, cursor, buffered, done)));
+                    }
+                    if done {
+                        return None;
+                    }
+                    let params = serde_json::json!({ "after_lsn": cursor, "limit": 500_u32 });
+                    storage
+                        .stream_relationship_pages
+                        .fetch_add(1, Ordering::Relaxed);
+                    let rows = match storage
+                        .run_template("stream_relationships", &params, true)
+                        .await
+                    {
+                        Ok(rows) => rows,
+                        Err(error) => {
+                            done = true;
+                            buffered.push_back(Err(error));
+                            continue;
+                        }
+                    };
+                    if rows.is_empty() {
+                        done = true;
+                        continue;
+                    }
+                    let mut advanced = false;
+                    for row in &rows {
+                        if let Some(FalkorValue::I64(lsn)) = row.get(1) {
+                            if (*lsn as u64) > cursor {
+                                cursor = *lsn as u64;
+                                advanced = true;
+                            }
+                        }
+                        if let Some(value) = row.first() {
+                            buffered.push_back(relationship_from_value(value));
+                        }
+                    }
+                    if !advanced {
+                        done = true;
+                        if buffered.is_empty() {
+                            buffered.push_back(Err(StorageError::Backend(
+                                "relationship stream page did not advance".into(),
+                            )));
+                        }
+                    }
+                }
+            },
+        );
+        Box::pin(stream)
     }
 
     async fn find_similar_offline(
@@ -2200,6 +2341,15 @@ impl FalkorStorage {
     pub fn graph_name_clone(&self) -> String {
         self.graph.clone()
     }
+    /// Reset and return `(memory pages, relationship pages)` fetched by the
+    /// lazy bulk streams. Exposed for backend paging acceptance tests.
+    #[doc(hidden)]
+    pub fn take_stream_page_counts(&self) -> (u64, u64) {
+        (
+            self.stream_memory_pages.swap(0, Ordering::Relaxed),
+            self.stream_relationship_pages.swap(0, Ordering::Relaxed),
+        )
+    }
     /// Current backend LSN frontier (Redis GET).
     async fn last_backend_lsn(&self) -> u64 {
         self.redis.clone().get(&self.lsn_key).await.unwrap_or(0)
@@ -2226,6 +2376,21 @@ mod fingerprint_decode_tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn future_schema_version_fails_closed() {
+        assert!(
+            !schema_needs_migration(&[vec![FalkorValue::I64(STORAGE_SCHEMA_VERSION,)]]).unwrap()
+        );
+        assert!(schema_needs_migration(&[]).unwrap());
+        assert!(matches!(
+            schema_needs_migration(&[vec![FalkorValue::I64(STORAGE_SCHEMA_VERSION + 1)]]),
+            Err(StorageError::CorruptMetadata {
+                key: "schema_version",
+                ..
+            })
+        ));
     }
 }
 
