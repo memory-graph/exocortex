@@ -10,7 +10,44 @@ use std::sync::Arc;
 struct McpProcess {
     child: std::process::Child,
     input: std::process::ChildStdin,
-    output: std::io::BufReader<std::process::ChildStdout>,
+    output: std::sync::mpsc::Receiver<Result<String, String>>,
+}
+
+fn bounded_lines(
+    mut stdout: std::process::ChildStdout,
+) -> std::sync::mpsc::Receiver<Result<String, String>> {
+    let (sender, output) = std::sync::mpsc::channel();
+    std::thread::spawn(move || loop {
+        use std::io::Read as _;
+        let mut line = Vec::new();
+        let result = loop {
+            let mut byte = [0_u8; 1];
+            match stdout.read(&mut byte) {
+                Ok(0) if line.is_empty() => break None,
+                Ok(0) => break Some(Err("MCP child closed stdout mid-response".into())),
+                Ok(_) if byte[0] == b'\n' => {
+                    break Some(
+                        String::from_utf8(line)
+                            .map_err(|_| "MCP child response was not UTF-8".into()),
+                    )
+                }
+                Ok(_) if line.len() == exocortex_wire::limits::MAX_MCP_REQUEST_BYTES => {
+                    break Some(Err("MCP child response exceeded 1 MiB".into()));
+                }
+                Ok(_) => line.push(byte[0]),
+                Err(error) => {
+                    break Some(Err(format!("MCP child stdout failed: {error}")));
+                }
+            }
+        };
+        let Some(result) = result else {
+            break;
+        };
+        if sender.send(result).is_err() {
+            break;
+        }
+    });
+    output
 }
 
 impl McpProcess {
@@ -32,9 +69,10 @@ impl McpProcess {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("the acceptance gate builds exocortex-mcp-client");
+        let output = bounded_lines(child.stdout.take().unwrap());
         Self {
             input: child.stdin.take().unwrap(),
-            output: std::io::BufReader::new(child.stdout.take().unwrap()),
+            output,
             child,
         }
     }
@@ -48,10 +86,14 @@ impl McpProcess {
     }
 
     fn read(&mut self) -> serde_json::Value {
-        use std::io::BufRead;
-        let mut line = String::new();
-        self.output.read_line(&mut line).unwrap();
-        serde_json::from_str(&line).unwrap()
+        match self.output.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(line)) => serde_json::from_str(&line).unwrap(),
+            result => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("MCP child response failed or timed out: {result:?}");
+            }
+        }
     }
 }
 
@@ -504,7 +546,7 @@ async fn two_sync_snapshot_bump_upserts_same_row_new_pk_appends() {
             "iceberg://warehouse/orders",
             "external-sync",
             3,
-            "external",
+            "custom",
             "n",
             exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
         )))

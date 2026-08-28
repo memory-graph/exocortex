@@ -1,7 +1,9 @@
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::process::{Command, Stdio};
+
+mod support;
 
 #[test]
 #[cfg(unix)]
@@ -43,9 +45,10 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
         .env("EXOCORTEX_STANDALONE_NODE_BIN", &fake_node)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
+    let responses = support::BoundedLineReader::new(child.stdout.take().unwrap());
     writeln!(
         child.stdin.as_mut().unwrap(),
         "{}",
@@ -59,16 +62,7 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
     )
     .unwrap();
     child.stdin.as_mut().unwrap().flush().unwrap();
-    let mut response = String::new();
-    BufReader::new(child.stdout.as_mut().unwrap())
-        .read_line(&mut response)
-        .unwrap();
-    if response.is_empty() {
-        let mut stderr = String::new();
-        std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
-        panic!("installed wrapper closed before MCP response: {stderr}");
-    }
-    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let response = responses.read_json(&mut child);
     assert!(response.get("result").is_some(), "{response}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while !marker.exists() && std::time::Instant::now() < deadline {

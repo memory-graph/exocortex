@@ -44,6 +44,11 @@ fn main() -> anyhow::Result<()> {
             .with_writer(std::io::stderr)
             .init();
         let args = Args::parse();
+        if args.config.is_some() {
+            anyhow::bail!(
+                "--config is reserved by the adapter protocol but is not supported in v1; use explicit adapter flags"
+            );
+        }
         exocortex_wire::transport::validate_backend_url(&args.backend)
             .map_err(|error| anyhow::anyhow!("--backend: {error}"))?;
         match args.adapter.as_str() {

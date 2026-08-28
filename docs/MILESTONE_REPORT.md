@@ -443,3 +443,14 @@ proto-sync-guarded copy).
   source-policy row also requires numeric `producer_kind` (1–5). Missing,
   unspecified, or unknown values stop startup; the administrator value, not a
   producer registration or restart-local LRU entry, controls provenance.
+- **Dreams fire transport is org-scoped rather than globally keyed.** PRD
+  §12.2 names one `exocortex:dreams:queue`, but a global queue lets one org's
+  worker drain another org's work. The shipped Redis keys include the org for
+  tenant isolation. Operators upgrading from a prototype global queue must
+  drain or explicitly migrate it; workers intentionally do not consume it.
+- **Dreams overflow metrics use a bounded reason label rather than a region
+  label.** PRD R-Dr13 sketches `exocortex_dreams_fires_dropped_total{region}`;
+  emitting tenant-derived region values conflicts with Round 6's privacy and
+  cardinality contract. The implementation reports `reason="capacity"` and
+  keeps region identity in protected operational state, so dashboards must
+  aggregate overflow rather than group it by raw region.

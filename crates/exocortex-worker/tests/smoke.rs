@@ -53,6 +53,18 @@ fn backend_userinfo_is_rejected_without_reaching_startup_tracing() {
     assert!(!stderr.contains("sentinel-password"));
 }
 
+#[test]
+fn reserved_config_flag_is_rejected_instead_of_silently_ignored() {
+    let out = Command::new(env!("CARGO_BIN_EXE_exocortex-worker"))
+        .args(["--adapter", "noop", "--config", "adapter.toml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--config"));
+    assert!(stderr.contains("not supported in v1"));
+}
+
 /// Round-3 C2 + PRD R16's second verify clause: the worker BINARY runs
 /// `--adapter fixture` end-to-end against a real backend-node process
 /// and its batches authenticate (default dev key matches the server's).

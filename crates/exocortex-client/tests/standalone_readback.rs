@@ -9,8 +9,11 @@
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
+mod support;
+
 struct Client {
     child: Child,
+    responses: support::BoundedLineReader,
 }
 
 impl Client {
@@ -24,13 +27,14 @@ impl Client {
             "--data-dir",
             dir.to_str().unwrap(),
         ]);
-        let child = cmd
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn exocortex-mcp-client");
-        Self { child }
+        let responses = support::BoundedLineReader::new(child.stdout.take().expect("stdout"));
+        Self { child, responses }
     }
 
     fn send_all(&mut self, msgs: &[serde_json::Value]) {
@@ -42,20 +46,7 @@ impl Client {
     }
 
     fn read_line(&mut self) -> serde_json::Value {
-        let stdout = self.child.stdout.as_mut().expect("stdout");
-        let mut line = String::new();
-        let mut byte = [0u8; 1];
-        loop {
-            use std::io::Read;
-            if stdout.read(&mut byte).unwrap() == 0 {
-                panic!("server closed stdout");
-            }
-            if byte[0] == b'\n' {
-                break;
-            }
-            line.push(byte[0] as char);
-        }
-        serde_json::from_str(&line).expect("valid JSON-RPC line")
+        self.responses.read_json(&mut self.child)
     }
 
     /// initialize + notifications/initialized prelude.
