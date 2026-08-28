@@ -485,3 +485,8 @@ R6-R150 and R6-R151 are closed: Dreams queue-drop metrics expose only a
 bounded literal reason, and both administrator credential files now use the
 same owner-only, single-open-handle loading posture. Metrics hygiene, the
 source-policy mode regression, and the live Redis fire suite pass.
+
+R6-R152 is closed by fail-closed recovery and publish-after-persist ordering.
+Malformed existing state and failed atomic replacement regressions prove that
+neither path installs widened live authority; the serialized concurrent
+replacement test remains green.

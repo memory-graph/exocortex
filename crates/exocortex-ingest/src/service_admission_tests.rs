@@ -105,6 +105,71 @@ async fn source_registry_persistence_serializes_snapshot_and_replace_order() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test]
+async fn malformed_source_registry_blocks_reregistration_instead_of_widening() {
+    use exocortex_wire::ingest::v1::ingest_service_server::IngestService as _;
+
+    let root = std::env::temp_dir().join(format!(
+        "exocortex-source-corrupt-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("sources.json");
+    std::fs::write(&path, "not valid registry JSON").unwrap();
+    let persistent_server = server(1).with_sources_file(path);
+    let request = tonic::Request::new(exocortex_wire::signing::registration(
+        &[5; 32],
+        "org",
+        "session://previously-private",
+        "producer",
+        3,
+        "session",
+        "node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    ));
+    let error = persistent_server
+        .register_source(request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(persistent_server.sources.lock().unwrap().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn failed_source_registry_replacement_never_publishes_live_authority() {
+    use exocortex_wire::ingest::v1::ingest_service_server::IngestService as _;
+
+    let root = std::env::temp_dir().join(format!(
+        "exocortex-source-failure-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let blocked_parent = root.join("blocked");
+    let path = blocked_parent.join("sources.json");
+    let persistent_server = server(1).with_sources_file(path);
+    std::fs::write(&blocked_parent, "not a directory").unwrap();
+    let request = tonic::Request::new(exocortex_wire::signing::registration(
+        &[5; 32],
+        "org",
+        "session://uncommitted",
+        "producer",
+        3,
+        "session",
+        "node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    ));
+    let error = persistent_server
+        .register_source(request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert!(persistent_server.sources.lock().unwrap().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn oversized_batch_is_rejected_before_hmac_and_checksum_work() {
     let server = server(1);

@@ -428,7 +428,7 @@ idea:
 | R6-R149 | Final strict review advisory: bound idle durable-effect polling | Codex | In progress — an empty outbox currently causes roughly 40 storage reads per second per node |
 | R6-R150 | Final strict review: remove raw region identity from Dreams metrics | Codex | Done — all queue-drop counters use the bounded literal `reason=capacity`; metrics-hygiene and Redis fire tests pass |
 | R6-R151 | Final strict review: require owner-only administrator source-policy credentials | Codex | Done — the loader validates mode and reads from one opened handle; the 0640 rejection/0600 acceptance regression passes |
-| R6-R152 | Final strict review: fail closed and publish-after-persist for dynamic source registration | Codex | In progress — corrupt state starts empty and a failed replacement leaves the live authorization map mutated |
+| R6-R152 | Final strict review: fail closed and publish-after-persist for dynamic source registration | Codex | Done — existing unreadable/malformed state blocks use, candidate registries publish only after atomic replacement, and corrupt-state/write-failure regressions pass |
 | R6-R153 | Final strict review advisory: make relationship-id ordering evidence deterministic on both storage backends | Codex | In progress — current fixtures do not force a same-endpoint/kind reverse-ID insertion |
 | R6-R154 | Final strict review advisory: exercise non-null invalidation assertion rollback on live Falkor | Codex | In progress — closure evidence does not cover the asserted non-null scalar/JSON shape |
 | R6-R155 | Final strict review cleanup: replace stale atomic-write test locators in plan evidence | Codex | In progress — the cited client/server hook tests were consolidated into the canonical storage regression |

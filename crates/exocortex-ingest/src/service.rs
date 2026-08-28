@@ -91,6 +91,9 @@ pub struct IngestServer<S: Storage> {
     pub sources: Arc<Mutex<SourceRegistry>>,
     /// Where the ceiling registry persists (M6.5); `None` = ephemeral.
     pub sources_file: Option<std::path::PathBuf>,
+    /// Existing unreadable or malformed durable state blocks both registration
+    /// and submit. Treating it as empty could widen a previously narrow source.
+    source_registry_error: Option<Arc<str>>,
     /// Serializes mutation snapshots with their durable replacement without
     /// holding the registry map lock across filesystem I/O.
     source_persistence: Arc<Mutex<()>>,
@@ -171,6 +174,7 @@ impl<S: Storage> Clone for IngestServer<S> {
             default_producer_key: self.default_producer_key,
             sources: self.sources.clone(),
             sources_file: self.sources_file.clone(),
+            source_registry_error: self.source_registry_error.clone(),
             source_persistence: self.source_persistence.clone(),
             #[cfg(test)]
             source_persist_hook: self.source_persist_hook.clone(),
@@ -202,6 +206,7 @@ impl<S: Storage> IngestServer<S> {
                 std::num::NonZeroUsize::new(REGISTRY_LRU_CAP).unwrap(),
             ))),
             sources_file: None,
+            source_registry_error: None,
             source_persistence: Arc::new(Mutex::new(())),
             #[cfg(test)]
             source_persist_hook: None,
@@ -284,19 +289,34 @@ impl<S: Storage> IngestServer<S> {
         self
     }
 
-    /// Persist the ceiling registry to `path` on every registration, and
-    /// load it now (M6.5). Failures are logged, never fatal: an unreadable
-    /// registry degrades to re-registration, not an outage.
+    /// Persist the ceiling registry to `path` on every registration, and load
+    /// it now (M6.5). Existing unreadable or malformed state fails closed.
     pub fn with_sources_file(mut self, path: std::path::PathBuf) -> Self {
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            match serde_json::from_str::<Vec<((String, String, String), SourceEntry)>>(&raw) {
-                Ok(rows) => {
-                    let mut sources = self.sources.lock().unwrap();
-                    for ((org, uri, producer), entry) in rows {
-                        sources.put((org, uri, producer), entry);
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => {
+                match serde_json::from_str::<Vec<((String, String, String), SourceEntry)>>(&raw) {
+                    Ok(rows) => {
+                        let mut sources = self.sources.lock().unwrap();
+                        for ((org, uri, producer), entry) in rows {
+                            sources.put((org, uri, producer), entry);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            ?error,
+                            "source registry is malformed; registration disabled"
+                        );
+                        self.source_registry_error = Some("source registry is malformed".into());
                     }
                 }
-                Err(e) => tracing::warn!(?e, "source registry unreadable (pre-D8 rows re-register on first use); starting empty"),
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::error!(
+                    ?error,
+                    "source registry is unreadable; registration disabled"
+                );
+                self.source_registry_error = Some("source registry is unreadable".into());
             }
         }
         self.sources_file = Some(path);
@@ -941,6 +961,13 @@ impl<S: Storage + 'static> IngestServer<S> {
     }
 
     fn registered_source(&self, batch: &IngestBatch) -> Result<SourceEntry, IngestAck> {
+        if self.source_registry_error.is_some() {
+            return Err(ack_reject_all(
+                batch,
+                RejectCode::UnknownSource,
+                "source registry unavailable",
+            ));
+        }
         let source = self
             .sources
             .lock()
@@ -1650,6 +1677,9 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                 "authenticated principal cannot register another org",
             ));
         }
+        if self.source_registry_error.is_some() {
+            return Err(Status::failed_precondition("source registry unavailable"));
+        }
         let requested = Self::vis_from_i32(r.ceiling)
             .map_err(|_| Status::invalid_argument("unknown source ceiling discriminant"))?;
         if principal
@@ -1684,10 +1714,11 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         // completion order therefore cannot differ from durable replacement
         // order, while the map guard is still released before filesystem I/O.
         let _persistence = self.source_persistence.lock().unwrap();
-        let (effective, source_rows) = {
-            let mut sources = self.sources.lock().unwrap();
+        let (effective, candidate, source_rows) = {
+            let sources = self.sources.lock().unwrap();
+            let mut candidate = sources.clone();
             let admin = self.admin_policies.get(&key).copied();
-            let existing = sources.get(&key).copied();
+            let existing = candidate.get(&key).copied();
             let ceiling = match (admin, existing) {
                 (Some(a), _) => {
                     if requested > a.ceiling {
@@ -1708,11 +1739,13 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             };
             let kind = existing.map(|e| e.kind).unwrap_or(declared_kind);
             let entry = SourceEntry { ceiling, kind };
-            sources.put(key, entry);
-            (entry, Self::source_rows(&sources))
+            candidate.put(key, entry);
+            let rows = Self::source_rows(&candidate);
+            (entry, candidate, rows)
         };
         self.persist_source_rows(&source_rows)
             .map_err(|_| Status::internal("source registry persistence failed"))?;
+        *self.sources.lock().unwrap() = candidate;
         Ok(Response::new(RegisterSourceResponse {
             ceiling: effective.ceiling as i32,
         }))
