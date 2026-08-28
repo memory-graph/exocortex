@@ -7,6 +7,17 @@ criteria are `docs/reviews/round-6-review.prd`; accepted work is promoted in
 the Backlog below as R6-S1 through R6-Q1. The prior post-BR-PRD green-gate
 claim is historical, not the current release verdict.
 
+**Status (2026-08-27):** Palantir-expansion PRD drafted
+(`docs/exocortex-palantir-expansion-prd.md`, rev 2) — five post-v1
+capabilities promoted below as PX1-PX6. **None are release-blocking and
+none start while Round 6 is open**; they are recorded here so the plan
+reflects accepted scope rather than living only in a PRD. PX1 closes the
+long-standing v2 deferral D2 ("second-pack demo"). PX3 is the one item
+with a bearing on current work: it found that the existing
+`storage-conformance` gate does not do what its name implies (see PX3's
+note), which is a live weakness in the gate set Round 6 is being verified
+against.
+
 **Status:** BR-PRD shipped. **[2026-08-27]** Memory backup/restore
 landed as `exocortex-client 0.2.2`: `--export`/`--import` one-shot
 modes over a versioned, fingerprint-stamped file in the WAL's own row
@@ -153,7 +164,12 @@ each step (88 tests at completion).
 | BR2 | Backend-mode org backup/restore: storage-side export/import as one-shot node flags (BR-PRD's deferred leg) | BR-PRD §deferred | **Done** — `exocortex-server/src/org_backup.rs` (`--export-org`/`--import-org` + `--graph-name` on `exocortex-node`): versioned fingerprint+org-gated JSON over the kernel row shapes, DR-faithful restore (ids/provenance/content intact; LSNs re-stamped by the target store, §6.2), idempotent re-import; 4 tests in `server/tests/org_backup.rs`. Side fix: the backend-node falkor arm defaulted its graph name to `exocortex-node-<pid>` — every restart served a fresh empty graph; now pinned via `--graph-name` (default `exocortex-org`) |
 | SR-PRD | Standalone read-back (F1-F5): materializer, live write-back, boot seeding, synthetic-seed removal, local D6 parity — the zero-setup mode write→read loop | `docs/bug-prd-standalone-readback.md` | **Done** — shipped as `exocortex-client 0.2.1`; one commit per fix (F3+F4 combined — replacing the boot seed left the synth path dead code); all seven acceptance criteria covered by `client/tests/standalone_readback.rs` (AC5 additionally by `e2e_chain` + the CL5 stdio test) |
 | ML1 | `exocortex-adapter-mintlify`: the reference Ingestion Protocol adapter (Mintlify MDX + `exocortex:` frontmatter → typed memories). First shipped adapter — closes the largest "open-source Palantir" gap (no data-plane integrations today) | `docs/prd/mintlify-docs-integration-prd.md` | **Done** — shipped as its own repo, [memory-graph/exocortex-adapter-mintlify](https://github.com/memory-graph/exocortex-adapter-mintlify) 0.1.0: signed registrations + batches, identity-stable pages (ExternalKey/R-T18a), entities as convergent join points, runbook Precedes chains, deletion closures, durable cursor with no-advance-past-failure discipline, `validate` subcommand for docs CI; 8 golden-batch tests + mock-server integration test (registration, first-run ingest, no-op poll, outage replay). Documented v1 deviations in its README (references→content, deprecates→tags) |
-
+| PX1 | Second pack `exocortex-pack-mortgage-v1`, authored by a non-primary author against `ONTOLOGY_GUIDE.md`; composes with dev-v1 into one byte-stable fingerprint; <3 open `pack-seam` kernel issues at ship | palantir-expansion PRD §3.1 | Accepted — post-v1, not release-blocking. **Supersedes deferred D2** |
+| PX2 | Pack-registered Actions and Functions: `actions!` / `functions!` / `guidance!` sections on the `pack!` macro, macro-generated `inventory::submit!` registration (one registry, R-P1/R-P2 preserved), audit + preflight + visibility-ceiling enforcement, generated Function-SLO bench harness, `--dump-tools`, `--dump-fingerprint` | palantir-expansion PRD §3.2, §4.1-4.3 | Accepted — post-v1, not release-blocking |
+| PX3 | Seam inventory (`cargo xtask seam-inventory`) + six conformance suites. **Note:** the existing `storage-conformance` gate runs `cargo test -p exocortex-storage` plus the Falkor integration suite when `FALKOR_URL` is set — two different test sets against two backends, not one shared corpus run against every `Storage` impl. There are three impls (Falkor, InMemory, `NoBackendStorage` in the client), and the third is where the SR-PRD read-back defects lived. The gate's name currently overstates it | palantir-expansion PRD §3.3 | Accepted — post-v1; the naming finding is worth folding into Round 6 verification |
+| PX4 | Mintlify adapter end-to-end on a real `loanlight-engineering/docs` checkout: >=30 memories + >=50 edges through the live ingest path as `ProducerKind::DocsAdapter`, idempotent rerun, `RejectCode::UnknownType` exercised against real input | palantir-expansion PRD §3.4 | Accepted — post-v1, not release-blocking |
+| PX5 | Read-only object explorer at `/explorer` on the node binary: six views, bearer auth, `VisibilityContext`-filtered at every render, no JS build step | palantir-expansion PRD §3.5 | Accepted — post-v1; depends on PX6 for the provenance view |
+| PX6 | Kernel catalogue <-> operation registry bijection: `GetChain`, `ExplainEdge`, and `RetractEdge` are declared in `exocortex-kernel/src/actions.rs` / `functions.rs` with names and budgets and have no registered operation. `operations.rs:3` already documents `retract_edge` as living in that module; it does not. Implement all three | palantir-expansion PRD §3.3 S6 | Accepted — post-v1. Smallest item; `soft_delete_relationship` already exists under `RetractEdge` |
 
 ## In progress
 
@@ -185,7 +201,7 @@ each step (88 tests at completion).
 | R6-R12 | Strict-review cache repair: clear incident relationship indexes when a memory deletion removes petgraph edges | Codex | Done — deletion retires every incident relationship ID and its byte accounting before StableGraph may reuse an edge index |
 | R6-R13 | Strict-review discovery repair: stamp quality once and expose durable production discoveries through issuance and acceptance | Codex | In progress — verified that production cycles discard candidates after logging and metrics independently hardcode quality |
 | R6-R14 | Strict-review SSE ordering repair: install coherent snapshot frontiers and preserve out-of-order first events without losing real holes | Codex | In progress — verified hydrate/replay and first-event ordering races |
-| R6-R15 | Strict-review cache recovery repair: make failed microbatches atomic and concurrent standalone publications lossless | Codex | In progress — verified later successes can advance past failed fetches and blind local stores can overwrite generations |
+| R6-R15 | Strict-review cache recovery repair: make failed microbatches atomic and concurrent standalone publications lossless | Codex | Done — unresolved fetches abort the entire publication, while standalone writers merge under the generation lock without regressing either rows or frontier |
 | R6-R16 | Strict-review owner-lifecycle repair: renew Dreams leases through all fenced mutation and rollback phases | Codex | In progress — verified a fixed 60-second lease can expire mid-cycle and fence both completion and rollback |
 | R6-R17 | Strict-review change-feed durability repair: reconcile graph commits whose invalidation publication fails | Codex | In progress — verified committed rows can remain indefinitely absent from already-live caches |
 | R6-R18 | Strict-review authorization repair: derive all relationship visibility, enforce promotion ceilings, and restrict audit reads to administrators | Codex | In progress — verified producer-declared within-batch widening, over-ceiling promotion, and org-wide audit enumeration by any bearer |
@@ -266,6 +282,7 @@ each step (88 tests at completion).
 | R6-R05 | **Done** — the cache keeps immutable ArcSwap generations but reuses only uniquely owned retired graph buffers, catches them up through a bounded delta journal, and atomically republishes; a memory replacement now updates its node in place so incident relationships survive | cache `released_snapshot_buffer_makes_isolated_update_delta_only` proves the second isolated update over 2,000 residents performs zero additional full clones; `memory_upsert_preserves_incident_relationships`; full cache suite 18/18 and allocation test; release update gate over 20,000 residents measured 256 invalidations in 3.26 ms with one publication and zero full clones, plus a 10,000-edge point invalidation in 3.16 ms |
 | R6-R11 | **Done** — the 100,000-row search benchmark now supplies the same explicit tenant and project membership required of production rows and callers; before the repair every query correctly returned zero under fail-closed visibility and the mandatory gate aborted | `cargo bench -p exocortex-cache --bench search`: `auth fix` and the complete query rotation return visible hits; p50 32.2 µs, p99 761.8 µs; R-Lat1 PASS |
 | R6-R12 | **Done** — memory deletion removes both incoming and outgoing relationship IDs before petgraph frees their edge slots, preventing a delayed stale-ID delete from removing a new edge that reused the same index | cache `node_delete_clears_incident_ids_before_edge_index_reuse` performs delete → edge-slot reuse → delayed stale delete and proves the new edge survives; full cache suite 19/19, allocation test, and targeted clippy |
+| R6-R15 | **Done** — one failed fetch aborts its complete invalidation microbatch before any later success can advance the frontier; local writers serialize read/merge/publication under the graph generation lock and preserve late lower-LSN rows without frontier regression | cache `failed_fetch_aborts_the_whole_invalidation_microbatch` and `out_of_order_concurrent_local_publications_merge_generations`; full cache suite 21/21 and focused all-target clippy |
 
 ## Done
 
@@ -379,7 +396,7 @@ are recorded in the "Rounds 4-5" section below.
 | ID | Item | PRD |
 |----|------|-----|
 | D1 | Iceberg / Delta / parquet-dir adapter workers (unblocked: B8+B9+A1 closed) | §18.4, §24 |
-| D2 | Second-pack demo | §23.26, §24 |
+| D2 | Second-pack demo — **superseded by PX1**: promoted from deferral to accepted scope as `exocortex-pack-mortgage-v1`, with the non-primary-author rule as its acceptance test | §23.26, §24 |
 | D3 | Federation | §24 |
 | D4 | Embedding fine-tuning | §24 |
 | D5 | Ingest-time SimilarTo seeding (`SimilarityCosine`) | §24 q12 (lean: no) |

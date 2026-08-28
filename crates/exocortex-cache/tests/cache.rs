@@ -190,6 +190,66 @@ async fn relationship_fetch_failure_does_not_advance_backend_lsn() {
 }
 
 #[tokio::test]
+async fn failed_fetch_aborts_the_whole_invalidation_microbatch() {
+    let store = InMemoryStorage::new(ontology());
+    let (cache, rx) = LocalCache::new(64 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let store = store.clone_dyn();
+        async move { cache.run(Arc::new(store), rx).await }
+    });
+    cache.reseed_from_storage(&store, &"org".into()).await;
+    let before = cache.version("org").unwrap().backend_lsn;
+    let later = mem("must-not-pass-failed-prefix", Visibility::Org, None);
+
+    cache
+        .submit(CacheWrite::Apply(
+            exocortex_storage::Invalidation::RelationshipUpserted {
+                id: exocortex_kernel::RelationshipId([0xEF; 16]),
+                from: MemoryId([1; 16]),
+                to: MemoryId([2; 16]),
+                kind: exocortex_kernel::RelKindId(1),
+                lsn: 99,
+            },
+        ))
+        .await;
+    cache
+        .submit(CacheWrite::Apply(
+            exocortex_storage::Invalidation::MemorySnapshotUpserted {
+                memory: Box::new(later.clone()),
+                lsn: 100,
+            },
+        ))
+        .await;
+    cache.flush().await;
+
+    assert_eq!(cache.version("org").unwrap().backend_lsn, before);
+    assert!(cache
+        .get_memory("org", &later.id, &vc(Visibility::Org, "u"))
+        .is_none());
+    writer.abort();
+}
+
+#[test]
+fn out_of_order_concurrent_local_publications_merge_generations() {
+    let (cache, _rx) = LocalCache::new(64 * 1024 * 1024);
+    let later = mem("local-lsn-two", Visibility::Org, None);
+    let earlier = mem("local-lsn-one", Visibility::Org, None);
+
+    // This is the deterministic terminal ordering of two concurrent calls:
+    // LSN 2 wins the publication race before the delayed LSN 1 call enters
+    // the generation lock. Both immutable WAL rows must remain resident.
+    cache.apply_local("org", std::slice::from_ref(&later), &[], 2);
+    cache.apply_local("org", std::slice::from_ref(&earlier), &[], 1);
+
+    let snapshot = cache.graphs_snapshot("org").unwrap();
+    assert!(snapshot.by_id.contains_key(&earlier.id));
+    assert!(snapshot.by_id.contains_key(&later.id));
+    assert_eq!(snapshot.last_local_lsn, 2);
+}
+
+#[tokio::test]
 async fn two_q_resists_scan_pollution() {
     // §8.5 step 5: a long unique scan evicts cold graphs, but a re-referenced
     // warm graph is promoted out of A1in into Am and survives. The budget is

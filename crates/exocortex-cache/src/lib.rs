@@ -458,6 +458,37 @@ impl GraphSlot {
         self.current.store(snapshot);
     }
 
+    fn apply_local(
+        &self,
+        memories: &[Memory],
+        relationships: &[Relationship],
+        local_lsn: u64,
+    ) -> Option<(usize, usize)> {
+        // The read/check/clone/swap is one writer transaction. Offline MCP
+        // requests may run concurrently, so loading before taking this lock
+        // can publish a stale generation and erase a sibling request.
+        let mut state = self.reuse.lock();
+        let current = self.current.load_full();
+        if memories.is_empty() && relationships.is_empty() && local_lsn <= current.last_local_lsn {
+            return None;
+        }
+        let old_bytes = current.est_bytes;
+        let mut next = clone_snapshot(&current);
+        for memory in memories {
+            next.insert_memory(memory.clone());
+        }
+        for relationship in relationships {
+            next.insert_relationship(relationship.clone());
+        }
+        next.last_local_lsn = next.last_local_lsn.max(local_lsn);
+        let new_bytes = next.est_bytes;
+        state.generation = state.generation.saturating_add(1);
+        state.retired.clear();
+        state.journal.clear();
+        self.current.store(Arc::new(next));
+        Some((old_bytes, new_bytes))
+    }
+
     fn publish_delta(&self, delta: Vec<SnapshotDelta>, clone_count: &AtomicU64) -> (usize, usize) {
         const RETIRED_BUFFERS: usize = 4;
         let mut state = self.reuse.lock();
@@ -680,7 +711,7 @@ impl LocalCache {
                         }
                         Err(e) => {
                             tracing::warn!(?e, "invalidation fetch failed");
-                            continue;
+                            return;
                         }
                     }
                     delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
@@ -698,11 +729,11 @@ impl LocalCache {
                             tracing::warn!(
                                 "relationship invalidation row missing; LSN not advanced"
                             );
-                            continue;
+                            return;
                         }
                         Err(error) => {
                             tracing::warn!(?error, "relationship invalidation fetch failed");
-                            continue;
+                            return;
                         }
                     }
                     delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
@@ -739,8 +770,11 @@ impl LocalCache {
         // in the re-reference branches previously skipped the check).
         {
             let mut tq = self.tq.lock();
-            tq.bytes = tq.bytes.saturating_sub(old_bytes);
-            tq.bytes += new_bytes;
+            if new_bytes >= old_bytes {
+                tq.bytes += new_bytes - old_bytes;
+            } else {
+                tq.bytes = tq.bytes.saturating_sub(old_bytes - new_bytes);
+            }
         }
         self.admit(&org);
     }
@@ -1059,11 +1093,7 @@ impl LocalCache {
     /// observe the value the offline ack handed back.
     pub fn advance_local_lsn(&self, org: &str, local_lsn: u64) {
         if let Some(g) = self.graphs.get(org) {
-            let cur = g.load_full();
-            if local_lsn > cur.last_local_lsn {
-                let mut next = clone_snapshot(&cur);
-                next.last_local_lsn = local_lsn;
-                g.store(Arc::new(next));
+            if g.apply_local(&[], &[], local_lsn).is_some() {
                 self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1089,28 +1119,17 @@ impl LocalCache {
             .entry(org.into())
             .or_insert_with(|| Arc::new(GraphSlot::new(Arc::new(GraphSnapshot::empty()))))
             .clone();
-        let cur = g.load_full();
-        if local_lsn <= cur.last_local_lsn {
+        let Some((old_bytes, new_bytes)) = g.apply_local(memories, relationships, local_lsn) else {
             return;
-        }
-        let mut next = clone_snapshot(&cur);
-        for m in memories {
-            next.insert_memory(m.clone());
-        }
-        for r in relationships {
-            next.insert_relationship(r.clone());
-        }
-        next.last_local_lsn = local_lsn;
-        let delta = next.est_bytes.abs_diff(cur.est_bytes);
+        };
         {
             let mut tq = self.tq.lock();
-            if next.est_bytes >= cur.est_bytes {
-                tq.bytes += delta;
+            if new_bytes >= old_bytes {
+                tq.bytes += new_bytes - old_bytes;
             } else {
-                tq.bytes = tq.bytes.saturating_sub(delta);
+                tq.bytes = tq.bytes.saturating_sub(old_bytes - new_bytes);
             }
         }
-        g.store(Arc::new(next));
         self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
         self.admit(&org.into());
     }
