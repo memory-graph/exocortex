@@ -513,3 +513,9 @@ uses a non-null invalidator and verifies both the decoded current memory and
 the current `_MemoryAssertion` scalar fields after rollback. R6-B20's plan
 evidence now points to the canonical bounded-I/O atomic-replace regression.
 Integration-feature storage clippy passes.
+
+The complete workspace run promoted and closed R6-R156. The two
+out-of-process spawned-node fixtures secured principal credentials but not the
+administrator source signing policy, so the hardened runtime correctly failed
+startup. Both fixtures now create both credential files with owner-only Unix
+permissions; the adapter SDK and worker socket-level targets pass.

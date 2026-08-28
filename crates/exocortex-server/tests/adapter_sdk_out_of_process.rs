@@ -46,6 +46,8 @@ fn spawn_node() -> Node {
         r#"[{"org_id":"org","source_uri":"fixture://oop","producer_id":"oop-fixture","ceiling":3,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
     )
     .unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o600)).unwrap();
     let principals = policy_dir.path().join("principals.json");
     std::fs::write(
         &principals,

@@ -95,6 +95,8 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
         r#"[{"org_id":"org","source_uri":"fixture://fixture-e2e","producer_id":"fixture-e2e","ceiling":3,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
     )
     .unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&source_policy, std::fs::Permissions::from_mode(0o600)).unwrap();
     let principal_policy = policy_dir.path().join("principals.json");
     std::fs::write(
         &principal_policy,
