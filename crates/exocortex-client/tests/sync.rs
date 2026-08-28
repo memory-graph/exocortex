@@ -545,18 +545,19 @@ async fn per_client_sse_hmac_verifies_with_derived_key() {
     }
     let seed = test_memory("seed", 1);
     storage.upsert_memory(&seed).await.unwrap();
-    cache.reseed_from_storage(&*storage, &"org".into()).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let token = "client-token-7";
     let derived = derive_client_sse_key(&HMAC_KEY, token);
+    let hydrated = Arc::new(tokio::sync::Notify::new());
     let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
     cfg.backoff = Duration::from_millis(50);
     cfg.bearer = Some(token.into());
     cfg.client_key = Some(derived);
+    cfg.hydration_ready = Some(hydrated.clone());
     let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 0, None));
-    // Head start so the run exercises the live path (see sse_feed test).
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::timeout(Duration::from_secs(2), hydrated.notified())
+        .await
+        .expect("derived-key verified initial image");
 
     let vc = VisibilityContext {
         user_id: "u".into(),
