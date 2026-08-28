@@ -73,6 +73,15 @@ fn sign(mut b: IngestBatch, key: [u8; 32]) -> IngestBatch {
     b
 }
 
+fn hex_id(id: exocortex_kernel::MemoryId) -> String {
+    use std::fmt::Write as _;
+    id.0.iter()
+        .fold(String::with_capacity(32), |mut out, byte| {
+            write!(out, "{byte:02x}").unwrap();
+            out
+        })
+}
+
 async fn registered(srv: &IngestServer<InMemoryStorage>, ceiling: i32) {
     use tonic::Request;
     srv.register_source(Request::new(exocortex_wire::signing::registration(
@@ -106,8 +115,7 @@ async fn e2e_valid_batch_accepted_with_monotonic_lsn() {
         .await
         .unwrap()
         .into_inner();
-    // D6: 3 memories + 3 InSession edges + 3 HasMember companions.
-    if ack.accepted != 9 {
+    if ack.accepted != 3 {
         panic!("rejections: {:#?}", ack.rejections);
     }
     assert!(ack.assigned_lsn > 0);
@@ -701,7 +709,18 @@ async fn unknown_memory_type_rejected() {
 #[tokio::test]
 async fn external_batch_without_key_rejected_and_with_key_deterministic() {
     let srv = server();
-    registered(&srv, 3).await;
+    srv.register_source(tonic::Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://s1",
+        "session-wrapup",
+        3,
+        "iceberg",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::AnalyticsAdapter,
+    )))
+    .await
+    .unwrap();
     let mut d = draft("k", "Fix", 1);
     d.external_key = None;
     let mut b = batch(vec![d]);
@@ -742,8 +761,7 @@ async fn external_batch_without_key_rejected_and_with_key_deterministic() {
         .await
         .unwrap()
         .into_inner();
-    // D6: memory + InSession edge + HasMember companion.
-    assert_eq!(ack2.accepted, 3);
+    assert_eq!(ack2.accepted, 1);
 
     let id_a =
         exocortex_kernel::MemoryId::from_external("org", "session://s1", &[1u8; 16], b"row-1", 3);
@@ -756,6 +774,201 @@ async fn external_batch_without_key_rejected_and_with_key_deterministic() {
 }
 
 #[tokio::test]
+async fn authenticated_temporal_and_external_edge_provenance_survive_exactly() {
+    use futures::StreamExt;
+
+    let srv = server();
+    srv.register_source(tonic::Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "iceberg://catalog/table",
+        "iceberg-adapter",
+        3,
+        "iceberg",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::AnalyticsAdapter,
+    )))
+    .await
+    .unwrap();
+
+    let observed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
+    let recorded = std::time::UNIX_EPOCH + std::time::Duration::from_secs(200);
+    let valid_from = std::time::UNIX_EPOCH + std::time::Duration::from_secs(110);
+    let valid_until = std::time::UNIX_EPOCH + std::time::Duration::from_secs(150);
+    let mut from = draft("fix", "Fix", 3);
+    from.valid_from = Some(valid_from.into());
+    from.valid_until = Some(valid_until.into());
+    from.external_key = Some(ExternalKey {
+        table_uuid: vec![7; 16],
+        logical_pk: "fix-row".into(),
+        mapping_version: 4,
+    });
+    let mut to = draft("problem", "Problem", 3);
+    to.external_key = Some(ExternalKey {
+        table_uuid: vec![7; 16],
+        logical_pk: "problem-row".into(),
+        mapping_version: 4,
+    });
+    let mut b = batch(vec![from, to]);
+    b.source_uri = "iceberg://catalog/table".into();
+    b.producer_id = "iceberg-adapter".into();
+    b.batch_id = "temporal-external".into();
+    b.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    b.observed_at = Some(observed.into());
+    b.recorded_at = Some(recorded.into());
+    b.snapshot = Some(exocortex_wire::ingest::v1::ExternalSnapshotInfo {
+        snapshot_id: "snapshot-9".into(),
+        schema_hash: vec![9; 32],
+        source_flavor: "iceberg".into(),
+    });
+    b.relationships = vec![exocortex_wire::ingest::v1::RelationshipDraft {
+        from_draft_key: "fix".into(),
+        to_draft_key: "problem".into(),
+        kind: "Fixes".into(),
+        strength: 0.9,
+        confidence: 0.8,
+        visibility: 3,
+        ..Default::default()
+    }];
+    let ack = srv
+        .submit(tonic::Request::new(sign(b, [5u8; 32])))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ack.accepted, 3, "only two drafts and one authored edge");
+    assert_eq!(ack.rejected, 0, "{:?}", ack.rejections);
+
+    let expected_observed = chrono::DateTime::from_timestamp(100, 0).unwrap();
+    let expected_recorded = chrono::DateTime::from_timestamp(200, 0).unwrap();
+    let expected_from = chrono::DateTime::from_timestamp(110, 0).unwrap();
+    let expected_until = chrono::DateTime::from_timestamp(150, 0).unwrap();
+    let mut memory_stream = srv.storage.stream_all_memories().await;
+    let mut producer_memories = Vec::new();
+    while let Some(Ok(memory)) = memory_stream.next().await {
+        producer_memories.push(memory);
+    }
+    assert_eq!(
+        producer_memories.len(),
+        2,
+        "iceberg flavor does not session-group"
+    );
+    let fix = producer_memories
+        .iter()
+        .find(|memory| memory.title.as_str() == "title fix")
+        .unwrap();
+    assert_eq!(fix.context.timestamp, expected_observed);
+    assert_eq!(fix.valid_from, expected_from);
+    assert_eq!(fix.valid_until, Some(expected_until));
+    assert_eq!(fix.recorded_at, expected_recorded);
+    let exocortex_kernel::Provenance::ExternalSnapshot(snapshot) = &fix.provenance else {
+        panic!("external memory lost snapshot provenance")
+    };
+    assert_eq!(snapshot.observed_at, expected_observed);
+    assert_eq!(snapshot.snapshot_id.as_str(), "snapshot-9");
+    assert_eq!(snapshot.external_key.logical_pk, b"fix-row");
+
+    let fixes = srv.ontology.kind_id("Fixes").unwrap();
+    let mut relationship_stream = srv.storage.stream_all_relationships().await;
+    let edge = loop {
+        let edge = relationship_stream.next().await.unwrap().unwrap();
+        if edge.kind == fixes {
+            break edge;
+        }
+    };
+    assert_eq!(edge.valid_from, expected_recorded);
+    assert_eq!(edge.recorded_at, expected_recorded);
+    let exocortex_kernel::Provenance::ExternalSnapshot(snapshot) = edge.provenance else {
+        panic!("external relationship lost snapshot provenance")
+    };
+    assert_eq!(snapshot.observed_at, expected_observed);
+    assert_eq!(snapshot.external_key.logical_pk, b"fix-row");
+
+    let mut malformed = batch(vec![draft("bad", "Fix", 3)]);
+    malformed.source_uri = "iceberg://catalog/table".into();
+    malformed.producer_id = "iceberg-adapter".into();
+    malformed.batch_id = "malformed-temporal".into();
+    malformed.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    malformed.snapshot = Some(exocortex_wire::ingest::v1::ExternalSnapshotInfo {
+        snapshot_id: "snapshot-10".into(),
+        schema_hash: vec![10; 32],
+        source_flavor: "iceberg".into(),
+    });
+    malformed.memories[0].external_key = Some(ExternalKey {
+        table_uuid: vec![8; 16],
+        logical_pk: "bad".into(),
+        mapping_version: 1,
+    });
+    malformed.recorded_at = Some(recorded.into());
+    malformed.recorded_at.as_mut().unwrap().nanos = 1_000_000_000;
+    let rejected = srv
+        .submit(tonic::Request::new(sign(malformed, [5u8; 32])))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((rejected.accepted, rejected.rejected), (0, 1));
+    let mut after = srv.storage.stream_all_memories().await;
+    let mut after_count = 0;
+    while let Some(Ok(_)) = after.next().await {
+        after_count += 1;
+    }
+    assert_eq!(after_count, 2, "malformed time mutates nothing");
+}
+
+#[tokio::test]
+async fn grpc_storage_failures_do_not_expose_backend_details() {
+    use futures::StreamExt;
+    use tonic::Code;
+
+    let srv = server();
+    registered(&srv, 3).await;
+    let mut seed = signed_batch(&srv, vec![draft("target", "Problem", 3)]);
+    seed.batch_id = "redaction-seed".into();
+    seed = sign(seed, [5u8; 32]);
+    assert_eq!(
+        srv.submit(tonic::Request::new(seed))
+            .await
+            .unwrap()
+            .into_inner()
+            .accepted,
+        1
+    );
+    let mut memories = srv.storage.stream_all_memories().await;
+    let target = loop {
+        let memory = memories.next().await.unwrap().unwrap();
+        if memory.title.as_str() == "title target" {
+            break memory.id;
+        }
+    };
+
+    srv.storage.fail_next_batch_read();
+    let mut read = signed_batch(&srv, vec![draft("from", "Fix", 3)]);
+    read.batch_id = "redaction-read".into();
+    read.relationships = vec![exocortex_wire::ingest::v1::RelationshipDraft {
+        from_draft_key: "from".into(),
+        to_memory_id: hex_id(target),
+        kind: "Fixes".into(),
+        strength: 0.8,
+        confidence: 0.8,
+        visibility: 3,
+        ..Default::default()
+    }];
+    read = sign(read, [5u8; 32]);
+    let read_error = srv.submit(tonic::Request::new(read)).await.unwrap_err();
+    assert_eq!(read_error.code(), Code::Internal);
+    assert_eq!(read_error.message(), "internal storage error");
+    assert!(!read_error.message().contains("credential"));
+
+    srv.storage.fail_next_ingest_commit();
+    let mut commit = signed_batch(&srv, vec![draft("commit", "Fix", 3)]);
+    commit.batch_id = "redaction-commit".into();
+    commit = sign(commit, [5u8; 32]);
+    let commit_error = srv.submit(tonic::Request::new(commit)).await.unwrap_err();
+    assert_eq!(commit_error.code(), Code::Internal);
+    assert_eq!(commit_error.message(), "internal storage error");
+    assert!(!commit_error.message().contains("credential"));
+}
+
+#[tokio::test]
 async fn duplicate_batch_is_idempotent_replay() {
     let srv = server();
     registered(&srv, 3).await;
@@ -765,8 +978,7 @@ async fn duplicate_batch_is_idempotent_replay() {
         .await
         .unwrap()
         .into_inner();
-    // D6: memory + InSession + companion.
-    assert_eq!(first.accepted, 3);
+    assert_eq!(first.accepted, 1);
     let second = srv
         .submit(tonic::Request::new(b))
         .await
@@ -1066,8 +1278,7 @@ async fn stored_memories_carry_extracted_entities() {
         .await
         .unwrap()
         .into_inner();
-    // D6: memory + InSession + companion.
-    assert_eq!(ack.accepted, 3);
+    assert_eq!(ack.accepted, 1);
 
     let storage = &srv.storage;
     let mut n = 0;
@@ -1107,8 +1318,7 @@ async fn ceiling_visibility_alone_is_not_widening() {
         .await
         .unwrap()
         .into_inner();
-    // D6: memory + InSession + companion.
-    assert_eq!(ack.accepted, 3, "narrower-than-ceiling is allowed");
+    assert_eq!(ack.accepted, 1, "narrower-than-ceiling is allowed");
 }
 
 /// WS1 (audit): RegisterSource requires the producer HMAC — an
@@ -1179,8 +1389,7 @@ async fn legitimate_producer_survives_registration_flood() {
         .await
         .unwrap()
         .into_inner();
-    // D6: memory + InSession + companion.
-    assert_eq!(ack.accepted, 3, "registered producer unaffected by flood");
+    assert_eq!(ack.accepted, 1, "registered producer unaffected by flood");
 }
 
 /// WS1/WS2: re-registration never silently overwrites a different ceiling;
@@ -1544,8 +1753,7 @@ async fn session_source_stamps_session_id() {
         .await
         .unwrap()
         .into_inner();
-    // D6: memory + InSession + companion.
-    assert_eq!(ack.accepted, 3, "batch lands: {ack:?}");
+    assert_eq!(ack.accepted, 1, "batch lands: {ack:?}");
     use futures::StreamExt;
     let mut ms = srv.storage.stream_all_memories().await;
     let mut any = false;
@@ -1578,8 +1786,7 @@ async fn duplicate_replay_dedup_survives_restart() {
         .await
         .unwrap()
         .into_inner();
-    // D6: memory + InSession + companion.
-    assert_eq!(ack.accepted, 3);
+    assert_eq!(ack.accepted, 1);
     use futures::StreamExt;
     let mut before = 0;
     let mut memories = storage.stream_all_memories().await;

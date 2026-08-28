@@ -129,8 +129,7 @@ async fn dreams_cycle_over_ingested_data() {
         ],
     )
     .await;
-    // D6: 5 memories + 5 InSession + 5 companions.
-    assert_eq!(ack.accepted, 15, "{:?}", ack.rejections);
+    assert_eq!(ack.accepted, 5, "{:?}", ack.rejections);
 
     // Embeddings were stored (§7.5 backend-assigned).
     {
@@ -352,8 +351,7 @@ async fn write_counter_trigger_fires_a_cycle() {
             )],
         )
         .await;
-        // D6: memory + InSession + companion.
-        assert_eq!(ack.accepted, 3, "{:?}", ack.rejections);
+        assert_eq!(ack.accepted, 1, "{:?}", ack.rejections);
     }
 
     // The predicate trips on the third commit; the run loop consolidates

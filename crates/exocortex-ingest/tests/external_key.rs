@@ -84,7 +84,7 @@ async fn registered(srv: &IngestServer<InMemoryStorage>) {
         "iceberg://cat/db/orders",
         "external-sync",
         3,
-        "external",
+        "custom",
         "test-node",
         exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
     )))

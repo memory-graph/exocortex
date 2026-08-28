@@ -22,6 +22,7 @@ use exocortex_wire::ingest::v1::IngestBatch;
 
 /// One grouping rule per registered `source_flavor`. Absent flavor ⇒
 /// no grouping (v1 default).
+#[derive(Clone, Copy)]
 pub struct GroupingRule {
     /// Matches `IngestBatch`'s registered source flavor.
     pub flavor: &'static str,
@@ -56,15 +57,15 @@ pub fn parse_session_uri(batch: &IngestBatch) -> Option<String> {
 }
 
 /// Resolve the rule for a batch's source flavor, then its grouping key.
-pub fn grouping_key(batch: &IngestBatch) -> Option<(&'static GroupingRule, String)> {
-    // The batch carries no flavor field; the registered flavor for the
-    // source is what the registration wrote. Batches from the session
-    // wrapup path are identified by their URI scheme — the same signal
-    // `session_id_of` (W3) and the §10.7 enqueue use, so grouping and
-    // session-stamping cannot disagree about what a session is.
-    let rule = grouping_rules()
-        .iter()
-        .find(|r| r.flavor == "session" && parse_session_uri(batch).is_some())?;
+pub fn grouping_key<'a>(
+    batch: &IngestBatch,
+    source_flavor: &str,
+    rules: &'a [GroupingRule],
+) -> Option<(&'a GroupingRule, String)> {
+    // Registration is the authority. URI parsing extracts a key only after
+    // the registered flavor selects the rule, so a custom source cannot gain
+    // session semantics merely by choosing a `session://` URI.
+    let rule = rules.iter().find(|rule| rule.flavor == source_flavor)?;
     let key = (rule.key_of)(batch)?;
     Some((rule, key))
 }

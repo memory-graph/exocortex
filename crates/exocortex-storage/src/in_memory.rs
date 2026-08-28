@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -54,6 +54,8 @@ struct InMemoryInner {
     cycle_journals: Mutex<HashMap<LeaseKey, CycleJournalRecord>>,
     point_reads: AtomicU64,
     batch_reads: AtomicU64,
+    fail_next_batch_read: AtomicBool,
+    fail_next_ingest_commit: AtomicBool,
     #[cfg(test)]
     fence_checkpoint: Mutex<Option<std::sync::Arc<FenceCheckpoint>>>,
     #[cfg(test)]
@@ -151,6 +153,8 @@ impl InMemoryStorage {
                 cycle_journals: Default::default(),
                 point_reads: Default::default(),
                 batch_reads: Default::default(),
+                fail_next_batch_read: AtomicBool::new(false),
+                fail_next_ingest_commit: AtomicBool::new(false),
                 mutation_gate: Default::default(),
                 #[cfg(test)]
                 fence_checkpoint: Default::default(),
@@ -174,6 +178,21 @@ impl InMemoryStorage {
     /// A clone handle sharing the same underlying state (tests and caches).
     pub fn clone_dyn(&self) -> Self {
         self.clone()
+    }
+    /// Inject a sentinel batch-read failure for boundary-redaction tests.
+    #[doc(hidden)]
+    pub fn fail_next_batch_read(&self) {
+        self.inner
+            .fail_next_batch_read
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Inject a sentinel atomic ingest failure for boundary-redaction tests.
+    #[doc(hidden)]
+    pub fn fail_next_ingest_commit(&self) {
+        self.inner
+            .fail_next_ingest_commit
+            .store(true, Ordering::SeqCst);
     }
     /// Fail the next bulk stream after `after` valid rows (Dreams/cache fault tests).
     #[doc(hidden)]
@@ -748,6 +767,15 @@ impl Storage for InMemoryStorage {
         accepted: u32,
         effect: &PostIngestEffect,
     ) -> Result<IngestCommitOutcome, StorageError> {
+        if self
+            .inner
+            .fail_next_ingest_commit
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(StorageError::Backend(
+                "sentinel backend credential=secret".into(),
+            ));
+        }
         let (outcome, invalidations) = {
             let _gate = self.inner.mutation_gate.lock().unwrap();
             self.commit_ingest_locked(key, memories, relationships, accepted, Some(effect))?
@@ -1166,6 +1194,15 @@ impl Storage for InMemoryStorage {
         Ok(Some(m))
     }
     async fn get_memories(&self, ids: &[MemoryId]) -> Result<Vec<Memory>, StorageError> {
+        if self
+            .inner
+            .fail_next_batch_read
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(StorageError::Backend(
+                "sentinel backend credential=secret".into(),
+            ));
+        }
         self.inner.batch_reads.fetch_add(1, Ordering::SeqCst);
         let store = self.inner.memories.lock().unwrap();
         Ok(ids

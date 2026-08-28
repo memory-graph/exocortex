@@ -231,6 +231,108 @@ async fn non_session_source_does_not_group() {
     );
 }
 
+#[tokio::test]
+async fn custom_flavor_cannot_claim_session_semantics_from_its_uri() {
+    let srv = server();
+    srv.register_source(Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://custom-source",
+        "custom-adapter",
+        3,
+        "custom",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::Custom,
+    )))
+    .await
+    .unwrap();
+    let changed = srv
+        .register_source(Request::new(exocortex_wire::signing::registration(
+            &[5u8; 32],
+            "org",
+            "session://custom-source",
+            "custom-adapter",
+            3,
+            "session",
+            "test-node",
+            exocortex_wire::ingest::v1::ProducerKind::Custom,
+        )))
+        .await;
+    assert!(
+        changed.is_err(),
+        "registered flavor is first-registration authority"
+    );
+    let mut b = batch(
+        "custom-source",
+        "custom-flavor",
+        vec![draft("k", "Technology", "Custom row")],
+    );
+    b.producer_id = "custom-adapter".into();
+    let ack = submit(&srv, b).await;
+    assert_eq!((ack.accepted, ack.rejected), (1, 0));
+    let mems = memories(&srv).await;
+    assert_eq!(mems.len(), 1, "custom flavor creates no grouping node");
+    assert!(mems[0].context.session_id.is_none());
+}
+
+#[test]
+fn legacy_source_registry_rows_default_to_no_flavor() {
+    let entry: exocortex_ingest::service::SourceEntry =
+        serde_json::from_str(r#"{"ceiling":"Org","kind":"Custom"}"#).unwrap();
+    assert!(
+        entry.flavor.is_empty(),
+        "old rows cannot infer grouping from URI"
+    );
+}
+
+fn docs_grouping_key(batch: &IngestBatch) -> Option<String> {
+    batch
+        .source_uri
+        .strip_prefix("fixture://docs/")
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+}
+
+#[tokio::test]
+async fn synthetic_second_flavor_groups_without_changing_commit_orchestration() {
+    let mut rules = exocortex_ingest::grouping::grouping_rules().to_vec();
+    rules.push(exocortex_ingest::grouping::GroupingRule {
+        flavor: "docs",
+        key_of: docs_grouping_key,
+        node_type: "Technology",
+        edge_kind: "InSession",
+    });
+    let srv = server().with_grouping_rules(rules);
+    srv.register_source(Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "fixture://docs/rust",
+        "docs-adapter",
+        3,
+        "docs",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::DocsAdapter,
+    )))
+    .await
+    .unwrap();
+    let mut b = batch("unused", "docs-flavor", vec![draft("k", "Fix", "Docs fix")]);
+    b.source_uri = "fixture://docs/rust".into();
+    b.producer_id = "docs-adapter".into();
+    let ack = submit(&srv, b).await;
+    assert_eq!((ack.accepted, ack.rejected), (1, 0));
+    let mems = memories(&srv).await;
+    assert!(mems.iter().any(|memory| matches!(
+        memory.provenance,
+        exocortex_kernel::Provenance::Derived { .. }
+    )));
+    let rels = relationships(&srv).await;
+    let in_session = srv.ontology.kind_id("InSession").unwrap();
+    assert_eq!(
+        rels.iter().filter(|edge| edge.kind == in_session).count(),
+        1
+    );
+}
+
 /// D8 (§3.8): UNSPECIFIED producer kind is rejected at registration —
 /// the closed enum is enforced at the boundary, before any row lands.
 #[tokio::test]

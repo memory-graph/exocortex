@@ -182,9 +182,7 @@ async fn verdicts_agree_row_for_row() {
         exocortex_wire::signing::prepare_batch(&KEY, &mut b);
         let ack = srv.submit(Request::new(b)).await.unwrap().into_inner();
         match row.reject {
-            // D6: an accepted memory rides with its InSession edge +
-            // companion from the session grouping.
-            None => assert_eq!(ack.accepted, 3, "row `{}`: ingest accepted", row.name),
+            None => assert_eq!(ack.accepted, 1, "row `{}`: ingest accepted", row.name),
             Some(code) => assert!(
                 ack.rejections.iter().any(|r| r.code == code as i32),
                 "row `{}`: ingest rejected with {code:?}, got {:?}",

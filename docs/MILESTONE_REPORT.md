@@ -138,6 +138,16 @@ cross-cutting gates (§3). Commits: one per milestone, `M<n>: <what and why>`.
     stamps the full immutable revision. Runtime verification reuses the
     canonical `exocortex_wire::signing` SHA-256 helper; `image` remains
     exact-pinned at the Rust 1.85-compatible 0.25.5 resolver boundary.
+17. **External relationship keys are absent from the v1 wire** (§7.9,
+    §18.1): the PRD requires every external memory and relationship assertion
+    to carry `ExternalSnapshot`, whose kernel shape includes one
+    `ExternalKey`, but `RelationshipDraft` defines no relationship-level key.
+    The v1 ingest boundary therefore stamps an external relationship with the
+    authenticated snapshot provenance of its `from_draft_key` memory. This is
+    lossless for the shipped row-to-edge mapping model and preserves raw-byte
+    source identity, snapshot id, schema hash, observation time, and producer;
+    a future wire revision must add an explicit edge key before adapters may
+    model an edge independently of its source memory row.
 
 ## Post-review round 1 (2026-08-24)
 

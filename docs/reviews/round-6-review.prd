@@ -749,6 +749,22 @@ visibly owned by `Client`, whose timeout and drop paths kill and wait. Client
 all-target Clippy and the bounded silent-child regression pass; the complete
 matrix must still restart from its first command.
 
+### Fresh strict-review ingest contract repairs (R6-R208–R212)
+
+The subsequent nine-lens strict review found that ingest was restamping signed
+temporal coordinates, counting generated inverse/grouping rows in producer
+acks, inferring session semantics from a URI after discarding registered
+`source_flavor`, stamping every relationship as an anonymous `ingest`
+assertion, and reflecting raw storage failures through gRPC. R6-R208 through
+R6-R212 close those defects together at the shared materialization boundary.
+Exact external temporal/provenance readback, malformed-time no-mutation,
+producer-row count/replay, custom-versus-session and synthetic second-flavor,
+legacy registry default, and sentinel error-redaction regressions pass. The
+wire has no relationship-level `ExternalKey`; milestone deviation 17 records
+the authoritative v1 interpretation that an external edge inherits the
+snapshot coordinates of its source draft rather than silently fabricating an
+identity.
+
 ### Historical pre-R176 closure evidence (superseded)
 
 At the earlier closure point, the complete mandatory gate matrix passed:

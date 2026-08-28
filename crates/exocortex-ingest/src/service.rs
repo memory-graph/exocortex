@@ -39,7 +39,7 @@ const REGISTRY_LRU_CAP: usize = 1000;
 /// every provenance row the source asserts — retrofitting producer
 /// identity onto committed rows is guessing, so it lands before the
 /// second producer exists.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SourceEntry {
     /// The effective ceiling (admin value wins, audit WS2).
     pub ceiling: Visibility,
@@ -47,6 +47,11 @@ pub struct SourceEntry {
     /// `Custom` (PRD §3.8: "existing rows read back as custom").
     #[serde(default = "default_producer_kind")]
     pub kind: exocortex_kernel::ProducerKind,
+    /// D6: grouping is selected from the registered flavor, never inferred
+    /// from a producer-controlled URI. Old registry rows intentionally load
+    /// with no flavor and therefore receive no grouping.
+    #[serde(default)]
+    pub flavor: SmolStrLike,
 }
 
 /// Immutable administrator policy for one exact producer identity.
@@ -139,6 +144,8 @@ pub struct IngestServer<S: Storage> {
     pub submit_permits: Arc<tokio::sync::Semaphore>,
     /// Wakes the durable-effect drainer after a newly committed outbox row.
     post_ingest_notify: Arc<tokio::sync::Notify>,
+    /// D6 grouping rules selected by the registered source flavor.
+    grouping_rules: Arc<Vec<crate::grouping::GroupingRule>>,
 }
 
 /// One ring entry.
@@ -195,6 +202,7 @@ impl<S: Storage> Clone for IngestServer<S> {
             recent: self.recent.clone(),
             submit_permits: self.submit_permits.clone(),
             post_ingest_notify: self.post_ingest_notify.clone(),
+            grouping_rules: self.grouping_rules.clone(),
         }
     }
 }
@@ -230,6 +238,7 @@ impl<S: Storage> IngestServer<S> {
             recent: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             submit_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CONCURRENT_SUBMITS)),
             post_ingest_notify: Arc::new(tokio::sync::Notify::new()),
+            grouping_rules: Arc::new(crate::grouping::grouping_rules().to_vec()),
         }
     }
 
@@ -254,6 +263,13 @@ impl<S: Storage> IngestServer<S> {
     /// deterministic `RATE_LIMITED` rejection before ontology or storage work.
     pub fn with_submit_concurrency_limit(mut self, limit: usize) -> Self {
         self.submit_permits = Arc::new(tokio::sync::Semaphore::new(limit));
+        self
+    }
+
+    /// Install a complete grouping-rule table. Production uses the v1 table;
+    /// adapters can extend it without changing commit orchestration.
+    pub fn with_grouping_rules(mut self, rules: Vec<crate::grouping::GroupingRule>) -> Self {
+        self.grouping_rules = Arc::new(rules);
         self
     }
 
@@ -336,7 +352,7 @@ impl<S: Storage> IngestServer<S> {
     fn source_rows(sources: &SourceRegistry) -> Vec<((String, String, String), SourceEntry)> {
         sources
             .iter()
-            .map(|((o, u, p), v)| ((o.clone(), u.clone(), p.clone()), *v))
+            .map(|((o, u, p), v)| ((o.clone(), u.clone(), p.clone()), v.clone()))
             .collect()
     }
 
@@ -412,9 +428,9 @@ impl<S: Storage> IngestServer<S> {
         &self,
         batch: &IngestBatch,
         m: &exocortex_wire::ingest::v1::MemoryDraft,
-        ceiling: Visibility,
         snapshot: bool,
-        producer_kind: exocortex_kernel::ProducerKind,
+        source: &SourceEntry,
+        times: BatchTimes,
         principal: Option<&VisibilityContext>,
     ) -> Result<Memory, RejectCode> {
         let Some(mt) = self
@@ -503,7 +519,7 @@ impl<S: Storage> IngestServer<S> {
             &kernel_draft,
             exocortex_kernel::validator::SourceCeiling {
                 source: "ingest",
-                ceiling,
+                ceiling: source.ceiling,
             },
         ) {
             return Err(kernel_error_to_reject(&e));
@@ -525,7 +541,18 @@ impl<S: Storage> IngestServer<S> {
                 return Err(RejectCode::InvalidExternalKey);
             }
         }
-        let now = chrono::Utc::now();
+        let valid_from = match m.valid_from.as_ref() {
+            Some(value) => checked_timestamp(value.seconds, value.nanos)?,
+            None => times.recorded_at,
+        };
+        let valid_until = m
+            .valid_until
+            .as_ref()
+            .map(|value| checked_timestamp(value.seconds, value.nanos))
+            .transpose()?;
+        if valid_until.is_some_and(|until| until < valid_from) {
+            return Err(RejectCode::Unknown);
+        }
         let mut mem = Memory {
             id: MemoryId::new_v7(),
             memory_type: *mt,
@@ -553,7 +580,7 @@ impl<S: Storage> IngestServer<S> {
                             h
                         })
                         .unwrap_or([0u8; 32]),
-                    observed_at: now,
+                    observed_at: times.observed_at,
                     external_key: exocortex_kernel::ExternalKey {
                         // B8: raw UUID bytes are stored as their hex
                         // rendering — lossless and human-readable — never
@@ -582,16 +609,16 @@ impl<S: Storage> IngestServer<S> {
                 // D8: the registered producer kind rides every assertion.
                 Provenance::Asserted {
                     author: batch.producer_id.clone().into(),
-                    producer_kind: Some(producer_kind),
+                    producer_kind: Some(source.kind),
                 }
             },
             context: MemoryContext {
-                timestamp: now,
+                timestamp: times.observed_at,
                 // W3 (audit): session-scoped sources stamp the session id
                 // (parsed from `session://<id>`); without this the same
                 // conversation was split by transport — offline-written
                 // memories carried context online ones did not.
-                session_id: session_id_of(&batch.source_uri, &batch.producer_id),
+                session_id: session_id_of(&batch.source_uri, &source.flavor),
                 project_id,
                 project_path: None,
                 team_id,
@@ -612,12 +639,9 @@ impl<S: Storage> IngestServer<S> {
             confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
             effectiveness: None,
             usage_count: 0,
-            valid_from: m
-                .valid_from
-                .map(|t| chrono::DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or(now))
-                .unwrap_or(now),
-            valid_until: None,
-            recorded_at: now,
+            valid_from,
+            valid_until,
+            recorded_at: times.recorded_at,
             invalidated_by: None,
             embedding: None,
             lsn: LSN::new_local(0),
@@ -641,9 +665,12 @@ impl<S: Storage> IngestServer<S> {
 
     fn validate_relationship(
         &self,
+        batch: &IngestBatch,
         r: &exocortex_wire::ingest::v1::RelationshipDraft,
         draft_ids: &HashMap<String, Memory>,
         ceiling: Visibility,
+        producer_kind: exocortex_kernel::ProducerKind,
+        times: BatchTimes,
     ) -> Result<Relationship, RejectCode> {
         let Some(from_mem) = draft_ids.get(&r.from_draft_key) else {
             return Err(RejectCode::InvalidTypeTriple);
@@ -709,17 +736,24 @@ impl<S: Storage> IngestServer<S> {
         if !r.confidence.is_finite() || !(0.0..=1.0).contains(&r.confidence) {
             return Err(RejectCode::Unknown);
         }
-        let now = chrono::Utc::now();
+        let provenance = if batch.snapshot.is_some() {
+            // RelationshipDraft has no independent ExternalKey coordinate.
+            // An external edge is an assertion emitted by its source draft,
+            // so it inherits that authenticated row's snapshot coordinates.
+            from_mem.provenance.clone()
+        } else {
+            Provenance::Asserted {
+                author: batch.producer_id.clone().into(),
+                producer_kind: Some(producer_kind),
+            }
+        };
         Ok(Relationship {
             id: RelationshipId::derive(from_mem.id, kind, to_mem.id, None),
             kind,
             from: from_mem.id,
             to: to_mem.id,
             visibility: vis,
-            provenance: Provenance::Asserted {
-                author: "ingest".into(),
-                producer_kind: None,
-            },
+            provenance,
             properties: exocortex_kernel::RelationshipProperties {
                 strength: if r.strength == 0.0 {
                     self.ontology
@@ -744,13 +778,13 @@ impl<S: Storage> IngestServer<S> {
                 success_rate: None,
                 validation_count: 0,
                 counter_evidence_count: 0,
-                last_validated: now,
+                last_validated: times.recorded_at,
             },
             description: None,
             bidirectional: false,
-            valid_from: now,
+            valid_from: times.recorded_at,
             valid_until: None,
-            recorded_at: now,
+            recorded_at: times.recorded_at,
             invalidated_by: None,
             lsn: LSN::new_local(0),
         })
@@ -876,6 +910,48 @@ struct CommitRows {
     relationships: Vec<Relationship>,
     producer_memories: Vec<Memory>,
     grouping_nodes_created: u32,
+    accepted: u32,
+}
+
+#[derive(Clone, Copy)]
+struct BatchTimes {
+    observed_at: chrono::DateTime<chrono::Utc>,
+    recorded_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn checked_timestamp(
+    seconds: i64,
+    nanos: i32,
+) -> Result<chrono::DateTime<chrono::Utc>, RejectCode> {
+    let nanos = u32::try_from(nanos).map_err(|_| RejectCode::Unknown)?;
+    if nanos >= 1_000_000_000 {
+        return Err(RejectCode::Unknown);
+    }
+    chrono::DateTime::from_timestamp(seconds, nanos).ok_or(RejectCode::Unknown)
+}
+
+fn batch_times(batch: &IngestBatch) -> Result<BatchTimes, RejectCode> {
+    let now = chrono::Utc::now();
+    let recorded_at = match batch.recorded_at.as_ref() {
+        Some(value) => checked_timestamp(value.seconds, value.nanos)?,
+        None => now,
+    };
+    let observed_at = match batch.observed_at.as_ref() {
+        Some(value) => checked_timestamp(value.seconds, value.nanos)?,
+        None => recorded_at,
+    };
+    Ok(BatchTimes {
+        observed_at,
+        recorded_at,
+    })
+}
+
+fn internal_storage_status(
+    operation: &'static str,
+    error: exocortex_storage::StorageError,
+) -> Status {
+    tracing::error!(operation, ?error, "ingest storage operation failed");
+    Status::internal("internal storage error")
 }
 
 impl<S: Storage + 'static> IngestServer<S> {
@@ -987,7 +1063,7 @@ impl<S: Storage + 'static> IngestServer<S> {
                 batch.source_uri.clone(),
                 batch.producer_id.clone(),
             ))
-            .copied()
+            .cloned()
             .ok_or_else(|| {
                 ack_reject_all(batch, RejectCode::UnknownSource, "producer not registered")
             })?;
@@ -1003,6 +1079,17 @@ impl<S: Storage + 'static> IngestServer<S> {
                 batch,
                 RejectCode::UnknownSource,
                 "ceiling mismatch (R-I3)",
+            ));
+        }
+        if batch
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.source_flavor.as_str() != source.flavor.as_str())
+        {
+            return Err(ack_reject_all(
+                batch,
+                RejectCode::UnknownSource,
+                "snapshot source_flavor differs from the registered source",
             ));
         }
         Ok(source)
@@ -1083,9 +1170,19 @@ impl<S: Storage + 'static> IngestServer<S> {
     async fn validate_batch(
         &self,
         batch: &IngestBatch,
-        source: SourceEntry,
+        source: &SourceEntry,
         principal: Option<&VisibilityContext>,
     ) -> Result<Result<ValidatedBatch, IngestAck>, Status> {
+        let times = match batch_times(batch) {
+            Ok(times) => times,
+            Err(code) => {
+                return Ok(Err(ack_reject_all(
+                    batch,
+                    code,
+                    "malformed or out-of-range temporal coordinate",
+                )))
+            }
+        };
         let mut memories = Vec::with_capacity(batch.memories.len());
         let mut rejections = Vec::new();
         let mut draft_ids = HashMap::new();
@@ -1093,9 +1190,9 @@ impl<S: Storage + 'static> IngestServer<S> {
             match self.validate_memory(
                 batch,
                 draft,
-                source.ceiling,
                 batch.snapshot.is_some(),
-                source.kind,
+                source,
+                times,
                 principal,
             ) {
                 Ok(memory) => {
@@ -1148,7 +1245,7 @@ impl<S: Storage + 'static> IngestServer<S> {
             .storage
             .get_memories(&unique_external)
             .await
-            .map_err(|error| Status::internal(format!("storage: {error}")))?
+            .map_err(|error| internal_storage_status("load relationship targets", error))?
             .into_iter()
             .map(|memory| (memory.id, memory))
             .collect::<HashMap<_, _>>();
@@ -1183,7 +1280,14 @@ impl<S: Storage + 'static> IngestServer<S> {
 
         let mut relationships = Vec::with_capacity(batch.relationships.len());
         for draft in &batch.relationships {
-            match self.validate_relationship(draft, &draft_ids, source.ceiling) {
+            match self.validate_relationship(
+                batch,
+                draft,
+                &draft_ids,
+                source.ceiling,
+                source.kind,
+                times,
+            ) {
                 Ok(relationship) => relationships.push(relationship),
                 Err(code) => rejections.push(RejectRow {
                     draft_key: if draft.to_memory_id.is_empty() {
@@ -1210,6 +1314,7 @@ impl<S: Storage + 'static> IngestServer<S> {
     fn materialize_commit_rows(
         &self,
         batch: &IngestBatch,
+        source_flavor: &str,
         mut validated: ValidatedBatch,
     ) -> CommitRows {
         let supersession_targets = validated
@@ -1227,6 +1332,7 @@ impl<S: Storage + 'static> IngestServer<S> {
             .collect::<std::collections::HashSet<_>>();
         let confidence_floor = exocortex_kernel::memory::derived_confidence(true, 0, 0);
         let producer_count = validated.memories.len();
+        let accepted = (producer_count + validated.relationships.len()) as u32;
         for memory in &mut validated.memories {
             if supersession_targets.contains(&memory.id)
                 && memory.confidence.partial_cmp_score(&confidence_floor)
@@ -1252,6 +1358,7 @@ impl<S: Storage + 'static> IngestServer<S> {
         let producer_memories = validated.memories[..producer_count].to_vec();
         let grouping_nodes_created = self.materialize_grouping(
             batch,
+            source_flavor,
             &producer_memories,
             &mut validated.memories,
             &mut validated.relationships,
@@ -1262,17 +1369,21 @@ impl<S: Storage + 'static> IngestServer<S> {
             relationships: validated.relationships,
             producer_memories,
             grouping_nodes_created,
+            accepted,
         }
     }
 
     fn materialize_grouping(
         &self,
         batch: &IngestBatch,
+        source_flavor: &str,
         producer_memories: &[Memory],
         memories: &mut Vec<Memory>,
         relationships: &mut Vec<Relationship>,
     ) -> u32 {
-        let Some((rule, key)) = crate::grouping::grouping_key(batch) else {
+        let Some((rule, key)) =
+            crate::grouping::grouping_key(batch, source_flavor, &self.grouping_rules)
+        else {
             return 0;
         };
         let now = chrono::Utc::now();
@@ -1324,7 +1435,7 @@ impl<S: Storage + 'static> IngestServer<S> {
         batch: &IngestBatch,
         rows: &CommitRows,
     ) -> Result<Result<(u64, u32), IngestAck>, Status> {
-        let accepted = (rows.producer_memories.len() + rows.relationships.len()) as u32;
+        let accepted = rows.accepted;
         let key = IngestBatchKey {
             org_id: batch.org_id.clone().into(),
             producer_id: batch.producer_id.clone().into(),
@@ -1341,7 +1452,7 @@ impl<S: Storage + 'static> IngestServer<S> {
                 &effect,
             )
             .await
-            .map_err(|error| Status::internal(format!("storage: {error}")))?;
+            .map_err(|error| internal_storage_status("commit ingest batch", error))?;
         match outcome {
             IngestCommitOutcome::Committed { settled, .. } => {
                 self.post_ingest_notify.notify_one();
@@ -1597,13 +1708,13 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             Err(ack) => return Ok(Response::new(ack)),
         };
         let validated = match self
-            .validate_batch(&batch, source, principal.as_ref())
+            .validate_batch(&batch, &source, principal.as_ref())
             .await?
         {
             Ok(validated) => validated,
             Err(ack) => return Ok(Response::new(ack)),
         };
-        let rows = self.materialize_commit_rows(&batch, validated);
+        let rows = self.materialize_commit_rows(&batch, &source.flavor, validated);
         let (assigned_lsn, accepted) = match self.commit_rows(&batch, &rows).await? {
             Ok(commit) => commit,
             Err(ack) => return Ok(Response::new(self.remember_ack(&batch, ack))),
@@ -1752,6 +1863,7 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                 "producer_kind UNSPECIFIED is rejected: every producer declares what it is (D8)",
             ));
         }
+        let declared_flavor: SmolStrLike = r.source_flavor.as_str().into();
         let key = (r.org_id, r.source_uri, r.producer_id);
         // Audit WS2: an admin-configured ceiling is authoritative — the
         // producer cannot register above it, and the configured value is
@@ -1768,8 +1880,8 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             let sources = self.sources.lock().unwrap();
             let mut candidate = sources.clone();
             let admin = self.admin_policies.get(&key).copied();
-            let existing = candidate.get(&key).copied();
-            let ceiling = match (admin, existing) {
+            let existing = candidate.get(&key).cloned();
+            let ceiling = match (admin, existing.as_ref()) {
                 (Some(a), _) => {
                     if requested > a.ceiling {
                         return Err(Status::permission_denied(
@@ -1789,10 +1901,26 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             };
             let kind = admin
                 .map(|policy| policy.kind)
-                .or_else(|| existing.map(|entry| entry.kind))
+                .or_else(|| existing.as_ref().map(|entry| entry.kind))
                 .unwrap_or(declared_kind);
-            let entry = SourceEntry { ceiling, kind };
-            candidate.put(key, entry);
+            let flavor: SmolStrLike = existing
+                .as_ref()
+                .map(|entry| entry.flavor.clone())
+                .unwrap_or_else(|| declared_flavor.clone());
+            if existing
+                .as_ref()
+                .is_some_and(|entry| entry.flavor != declared_flavor)
+            {
+                return Err(Status::failed_precondition(
+                    "source_flavor differs from the existing registration",
+                ));
+            }
+            let entry = SourceEntry {
+                ceiling,
+                kind,
+                flavor,
+            };
+            candidate.put(key, entry.clone());
             let rows = Self::source_rows(&candidate);
             (entry, candidate, rows)
         };
@@ -1845,8 +1973,8 @@ fn wire_kind_to_kernel(v: i32) -> Option<exocortex_kernel::ProducerKind> {
 }
 
 /// W3: the session id for `session://<id>` sources (None otherwise).
-fn session_id_of(source_uri: &str, producer_id: &str) -> Option<smol_str::SmolStr> {
-    if producer_id != "session-wrapup" {
+fn session_id_of(source_uri: &str, source_flavor: &str) -> Option<smol_str::SmolStr> {
+    if source_flavor != "session" {
         return None;
     }
     source_uri

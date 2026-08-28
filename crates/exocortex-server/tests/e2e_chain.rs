@@ -298,8 +298,7 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
         .await
         .unwrap()
         .into_inner();
-    // D6: memory + InSession + companion.
-    assert_eq!(ack.accepted, 3, "batch accepted over gRPC: {ack:?}");
+    assert_eq!(ack.accepted, 1, "batch accepted over gRPC: {ack:?}");
 
     // The committed id: derive from the storage stream (single memory).
     let committed = {
