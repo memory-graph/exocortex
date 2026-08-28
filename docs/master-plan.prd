@@ -531,6 +531,9 @@ idea:
 | R6-R259 | Strict review advisory: qualify dead-enforcement method reachability by its owning receiver | Codex | Done — the control manifest records whitespace-normalized qualified call patterns; the two-receiver collision fixture and live `dead-enforcement` gate pass (this commit) |
 | R6-R260 | Strict review: make distributed ingest-effect delivery idempotent across interleaved claims and ambiguous retries | Codex | In progress — persist per-region processed effect identities in the atomic Redis counter update and prove A/B/A delivery counts A once |
 | R6-R261 | Strict review advisory: apply cfg and unconditional-exit reachability checks to receiver-qualified dead-control witnesses | Codex | In progress — retain source offsets through whitespace-tolerant qualified matching and add cfg/dead-code negative fixtures |
+| R6-R262 | Strict review advisory: require shell evidence commands and inspecting xtask functions to execute real syntax rather than mention a path as inert text | Codex | In progress — parse supported invocation tokens, inspect executable gate source, and add inert-path fixtures |
+| R6-R263 | Strict review advisory: exclude every heredoc body when one shell command declares multiple heredocs | Codex | In progress — queue all quoted/unquoted delimiters and add a two-body negative fixture |
+| R6-R264 | Strict review advisory: align stale-lease exact settlement replay semantics between in-memory and Falkor | Codex | In progress — choose fail-closed fence validation before tombstone replay and prove shared backend behavior |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence
