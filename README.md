@@ -2,8 +2,16 @@
 
 ![The Exocortex knowledge graph — a typed memory graph rendered as a blueprint schematic](images/hero.jpeg)
 
-**The open-source Palantir: the ontology, in-house.** By
+**An agent memory and knowledge system.** By
 [MemoryGraph](https://github.com/memory-graph).
+
+Your agents and tools write down what they learn. Every fact is typed,
+carries its source, and is stamped with when it was true. Nothing is ever
+deleted, so you can ask what the system knew on any past day. Rules decide
+things, not a model — the same input always produces the same answer. One
+binary, your servers, nothing leaves.
+
+Memory is what agents write. Knowledge is what it becomes.
 
 Every serious agent stack grows a memory layer, and the default answer
 is prose in a vector store — embed the notes, recall by similarity. It
@@ -13,35 +21,49 @@ believed, and the more you store the worse retrieval gets. Memory that
 has to compound for years cannot be a pile of prose. It has to be
 structured.
 
-Exocortex is agent memory backed by an ontology and a typed graph.
-Every captured fact is a typed node; every connection is a typed,
-weighted, provenance-stamped edge; every read is a traversal with a
-microsecond budget. That is the substrate context engineering actually
+Exocortex stores what your agents learn as a typed graph. Every captured
+fact is a node with a type — a `Problem`, a `Fix`, a `Solution` — and every
+connection is a typed, weighted edge that records who asserted it and when.
+The catalogue of types, edges, and rules is called an *ontology*, and in
+Exocortex it is ordinary Rust code: versioned, diffable, reviewed in a pull
+request like anything else. Every read is a traversal with a microsecond
+budget. That is the substrate context engineering actually
 needs: the prompt gets assembled from what your org demonstrably knows
 — the fix, the decision and its reason, the edge that says *this
 solution solves that problem* — not from whatever a similarity search
 surfaced first.
 
+Claude Code, Codex, Cursor — any MCP client writes to it and reads from
+it, so what your org learns in one session is what it knows in the next.
+Documents feed the same graph through
+[`exocortex-adapter-mintlify`](https://github.com/memory-graph/exocortex-adapter-mintlify),
+the reference ingestion adapter: pages tagged with `exocortex:` frontmatter
+land as identity-stable typed memories, deterministically, with no LLM
+anywhere in the loop. Git history, issue trackers, and analytics tables
+follow through the same seam.
+
+## Where this goes
+
 Palantir Foundry's core product is not a data lake or a set of dashboards.
 It is the *Ontology* — a governed, typed, versioned semantic layer over an
 organization's knowledge, with provenance stamped on every fact. That is
-the artifact that compounds: a Foundry deployment is valuable at year
-three because of three years of governed Objects and Links, not any
-single query.
+the artifact that compounds: a Foundry deployment is valuable at year three
+because of three years of governed Objects and Links, not any single query.
 
-Exocortex is that ontology as a single Rust binary, under an OSS license,
-fed by your agents today — your documents and analytics tables next —
-instead of a data team. Claude Code, Codex, Cursor, any MCP client
-writes to it and reads from it — so what your org learns in one session
-is what it knows in the next. Documents feed the same graph through
-[`exocortex-adapter-mintlify`](https://github.com/memory-graph/exocortex-adapter-mintlify),
-the reference Ingestion Protocol adapter: pages tagged with `exocortex:`
-frontmatter land as identity-stable typed memories — deterministically,
-no LLM anywhere in the loop. Analytics tables follow the same seam via
-the planned S3 Tables / Iceberg adapter. The ontology's shape (type-tagged
-memories + a typed edge vocabulary, not per-type payload schemas) was
-validated by our prior memory-graph deployment; Exocortex is that idea
-as one fast, governed binary.
+**Exocortex is built from the same primitives, and that part exists
+today** — typed nodes and edges, provenance on every write, bi-temporal
+validity, an audit ledger, deterministic reasoning, and domain models that
+ship as versioned Rust crates rather than clicks in a console.
+
+What Foundry has that Exocortex does not is breadth: hundreds of data
+connectors, petabyte scale, and a surface for building applications on top.
+That is a roadmap, not a rewrite, and it is written down —
+[the plan](docs/master-plan.prd) sequences it wave by wave, with the
+reasoning for every step and every deferral. Exocortex is the personal-
+through-org tier, not the enterprise one, and the shape of the graph
+(type-tagged memories plus a typed edge vocabulary, rather than per-type
+payload schemas) was validated by our prior memory-graph deployment before
+any of this was written.
 
 | Foundry | Exocortex |
 |---|---|
