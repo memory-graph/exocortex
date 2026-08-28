@@ -92,7 +92,7 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
         .expect_err("unsigned sentinel registration fails");
     assert_redacted("registration status", &registration_error.to_string());
 
-    let submission = IngestBatch {
+    let mut submission = IngestBatch {
         org_id: "org".into(),
         source_uri: "session://safe-source".into(),
         producer_id: "safe-producer".into(),
@@ -121,6 +121,7 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
             client_metadata: None,
         }),
     };
+    submission.checksum = exocortex_wire::signing::canonical_checksum(&submission);
     let submission_ack = ingest
         .submit(tonic::Request::new(submission))
         .await
