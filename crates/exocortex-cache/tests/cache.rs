@@ -797,6 +797,68 @@ async fn queued_invalidations_publish_one_delta_snapshot() {
     writer.abort();
 }
 
+#[tokio::test]
+async fn maximum_invalidation_batch_hydrates_in_two_storage_reads() {
+    let storage = InMemoryStorage::new(ontology());
+    let memories = (0..128)
+        .map(|index| mem(&format!("batch-memory-{index}"), Visibility::Org, None))
+        .collect::<Vec<_>>();
+    let relationships = (0..128)
+        .map(|index| rel(memories[0].id, memories[1].id, index as u8))
+        .collect::<Vec<_>>();
+    storage
+        .upsert_batch(&memories, &relationships)
+        .await
+        .unwrap();
+
+    let (cache, rx) = LocalCache::new(64 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    cache.publish("org", Arc::new(GraphSnapshot::empty()));
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let storage = storage.clone_dyn();
+        async move { cache.run(Arc::new(storage), rx).await }
+    });
+    storage.take_read_counts();
+    let invalidations = memories
+        .iter()
+        .enumerate()
+        .map(
+            |(index, memory)| exocortex_storage::Invalidation::MemoryUpserted {
+                id: memory.id,
+                lsn: index as u64 + 1,
+            },
+        )
+        .chain(
+            relationships
+                .iter()
+                .enumerate()
+                .map(|(index, relationship)| {
+                    exocortex_storage::Invalidation::RelationshipUpserted {
+                        id: relationship.id,
+                        from: relationship.from,
+                        to: relationship.to,
+                        kind: relationship.kind,
+                        lsn: index as u64 + 129,
+                    }
+                }),
+        )
+        .collect();
+    cache.apply_invalidations(invalidations).await.unwrap();
+
+    assert_eq!(
+        storage.take_read_counts(),
+        (0, 2),
+        "a full 256-event burst uses one memory and one relationship batch read"
+    );
+    let snapshot = cache.graphs_snapshot("org").unwrap();
+    assert_eq!(snapshot.by_id.len(), 128);
+    assert!(relationships
+        .iter()
+        .all(|relationship| snapshot.by_rel_id.contains_key(&relationship.id)));
+    writer.abort();
+}
+
 /// CR5 (audit): re-upserting the same RelationshipId replaces the edge —
 /// no parallel duplicates.
 #[tokio::test]

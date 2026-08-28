@@ -780,21 +780,52 @@ impl LocalCache {
                 "cache invalidation target was evicted before publication".into(),
             )
         })?;
+        let mut memory_ids = invalidations
+            .iter()
+            .filter_map(|invalidation| match invalidation {
+                Invalidation::MemoryUpserted { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        memory_ids.sort();
+        memory_ids.dedup();
+        let mut relationship_ids = invalidations
+            .iter()
+            .filter_map(|invalidation| match invalidation {
+                Invalidation::RelationshipUpserted { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        relationship_ids.sort();
+        relationship_ids.dedup();
+        let hydrated_memories = if memory_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            storage
+                .get_memories(&memory_ids)
+                .await?
+                .into_iter()
+                .map(|memory| (memory.id, memory))
+                .collect()
+        };
+        let hydrated_relationships = if relationship_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            storage
+                .get_relationships(&relationship_ids)
+                .await?
+                .into_iter()
+                .map(|relationship| (relationship.id, relationship))
+                .collect()
+        };
         let mut delta = Vec::new();
         for inv in invalidations {
             match inv {
                 Invalidation::MemoryUpserted { id, lsn } => {
-                    match storage.get_memory(&id).await {
-                        Ok(Some(m)) => {
-                            delta.push(SnapshotDelta::UpsertMemory(Box::new(m)));
-                        }
-                        Ok(None) => {
-                            delta.push(SnapshotDelta::DeleteMemory(id));
-                        }
-                        Err(e) => {
-                            tracing::warn!(?e, "invalidation fetch failed");
-                            return Err(e);
-                        }
+                    if let Some(memory) = hydrated_memories.get(&id) {
+                        delta.push(SnapshotDelta::UpsertMemory(Box::new(memory.clone())));
+                    } else {
+                        delta.push(SnapshotDelta::DeleteMemory(id));
                     }
                     delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
                 }
@@ -803,23 +834,15 @@ impl LocalCache {
                     delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
                 }
                 Invalidation::RelationshipUpserted { id, lsn, .. } => {
-                    match storage.get_relationship(&id).await {
-                        Ok(Some(r)) => {
-                            delta.push(SnapshotDelta::UpsertRelationship(Box::new(r)));
-                        }
-                        Ok(None) => {
-                            tracing::warn!(
-                                "relationship invalidation row missing; LSN not advanced"
-                            );
-                            return Err(exocortex_storage::StorageError::Backend(
-                                "relationship invalidation row missing".into(),
-                            ));
-                        }
-                        Err(error) => {
-                            tracing::warn!(?error, "relationship invalidation fetch failed");
-                            return Err(error);
-                        }
-                    }
+                    let relationship = hydrated_relationships.get(&id).ok_or_else(|| {
+                        tracing::warn!("relationship invalidation row missing; LSN not advanced");
+                        exocortex_storage::StorageError::Backend(
+                            "relationship invalidation row missing".into(),
+                        )
+                    })?;
+                    delta.push(SnapshotDelta::UpsertRelationship(Box::new(
+                        relationship.clone(),
+                    )));
                     delta.push(SnapshotDelta::AdvanceBackendLsn(lsn));
                 }
                 Invalidation::RelationshipDeleted { id, lsn } => {

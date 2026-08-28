@@ -64,6 +64,8 @@ pub struct FalkorStorage {
     #[cfg(feature = "integration")]
     migration_peak_rows: AtomicU64,
     #[cfg(feature = "integration")]
+    publish_round_trips: AtomicU64,
+    #[cfg(feature = "integration")]
     fail_next_publish: std::sync::atomic::AtomicBool,
     #[cfg(feature = "integration")]
     pause_next_publish: std::sync::atomic::AtomicBool,
@@ -413,6 +415,8 @@ impl FalkorStorage {
             legacy_repair_queries: AtomicU64::new(0),
             #[cfg(feature = "integration")]
             migration_peak_rows: AtomicU64::new(0),
+            #[cfg(feature = "integration")]
+            publish_round_trips: AtomicU64::new(0),
             #[cfg(feature = "integration")]
             fail_next_publish: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "integration")]
@@ -903,6 +907,20 @@ impl FalkorStorage {
     }
 
     async fn publish_checked(&self, inv: &Invalidation) -> Result<(), StorageError> {
+        self.publish_checked_batch(std::slice::from_ref(inv)).await
+    }
+
+    async fn publish_batch(&self, invalidations: &[Invalidation]) {
+        let _ = self.publish_checked_batch(invalidations).await;
+    }
+
+    async fn publish_checked_batch(
+        &self,
+        invalidations: &[Invalidation],
+    ) -> Result<(), StorageError> {
+        if invalidations.is_empty() {
+            return Ok(());
+        }
         #[cfg(feature = "integration")]
         if self
             .fail_next_publish
@@ -920,11 +938,23 @@ impl FalkorStorage {
             self.publish_paused.notify_one();
             self.publish_release.notified().await;
         }
-        let payload = crate::types::encode_feed_invalidation(inv)
+        let payloads = invalidations
+            .iter()
+            .map(crate::types::encode_feed_invalidation)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|error| StorageError::Backend(error.to_string()))?;
-        self.redis
-            .clone()
-            .publish::<_, _, i64>(&self.channel, payload)
+        let mut pipeline = redis::pipe();
+        for payload in payloads {
+            pipeline
+                .cmd("PUBLISH")
+                .arg(&self.channel)
+                .arg(payload)
+                .ignore();
+        }
+        #[cfg(feature = "integration")]
+        self.publish_round_trips.fetch_add(1, Ordering::Relaxed);
+        pipeline
+            .query_async::<()>(&mut self.redis.clone())
             .await
             .map_err(|error| StorageError::Backend(error.to_string()))?;
         Ok(())
@@ -936,48 +966,46 @@ impl FalkorStorage {
         claim_token: &str,
         invalidations: &[Invalidation],
     ) -> Result<(), StorageError> {
-        for invalidation in invalidations {
-            let renewed = !self
-                .run_template(
-                    "idempotent_batch_publication_renew",
-                    &serde_json::json!({
-                        "operation_key": operation_key,
-                        "claim_token": claim_token,
-                        "lease_ms": 30_000,
-                    }),
-                    false,
-                )
-                .await?
-                .is_empty();
-            if !renewed {
-                return Err(StorageError::Backend(
-                    "idempotent publication claim ownership was lost".into(),
-                ));
-            }
-            let publication_error = match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                self.publish_checked(invalidation),
+        let renewed = !self
+            .run_template(
+                "idempotent_batch_publication_renew",
+                &serde_json::json!({
+                    "operation_key": operation_key,
+                    "claim_token": claim_token,
+                    "lease_ms": 30_000,
+                }),
+                false,
             )
-            .await
-            {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error),
-                Err(_) => Some(StorageError::Backend(
-                    "idempotent publication timed out".into(),
-                )),
-            };
-            if let Some(error) = publication_error {
-                self.run_template(
-                    "idempotent_batch_publication_release",
-                    &serde_json::json!({
-                        "operation_key": operation_key,
-                        "claim_token": claim_token,
-                    }),
-                    false,
-                )
-                .await?;
-                return Err(error);
-            }
+            .await?
+            .is_empty();
+        if !renewed {
+            return Err(StorageError::Backend(
+                "idempotent publication claim ownership was lost".into(),
+            ));
+        }
+        let publication_error = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.publish_checked_batch(invalidations),
+        )
+        .await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some(StorageError::Backend(
+                "idempotent publication timed out".into(),
+            )),
+        };
+        if let Some(error) = publication_error {
+            self.run_template(
+                "idempotent_batch_publication_release",
+                &serde_json::json!({
+                    "operation_key": operation_key,
+                    "claim_token": claim_token,
+                }),
+                false,
+            )
+            .await?;
+            return Err(error);
         }
         let completed = self
             .run_template(
@@ -1523,9 +1551,7 @@ impl FalkorStorage {
             )
             .await?;
         } else {
-            for invalidation in invalidations {
-                self.publish(invalidation).await;
-            }
+            self.publish_batch(&invalidations).await;
         }
         Ok(Some(committed))
     }
@@ -1671,9 +1697,7 @@ impl FalkorStorage {
             })?;
             return Ok(IngestCommitOutcome::Duplicate(decode_settled_ingest(row)?));
         }
-        for invalidation in invalidations {
-            self.publish(invalidation).await;
-        }
+        self.publish_batch(&invalidations).await;
         Ok(IngestCommitOutcome::Committed { records, settled })
     }
 }
@@ -3468,9 +3492,7 @@ impl Storage for FalkorStorage {
                 lease_epoch: lease.epoch,
             });
         }
-        for invalidation in invalidations {
-            self.publish(invalidation).await;
-        }
+        self.publish_batch(&invalidations).await;
         Ok(records)
     }
 
@@ -3583,6 +3605,13 @@ impl FalkorStorage {
     #[cfg(feature = "integration")]
     pub fn migration_peak_rows_for_testing(&self) -> u64 {
         self.migration_peak_rows.load(Ordering::Relaxed)
+    }
+    /// Reset and return Redis publication network requests. One pipelined
+    /// batch counts once regardless of its number of compatible feed frames.
+    #[doc(hidden)]
+    #[cfg(feature = "integration")]
+    pub fn take_publish_round_trips_for_testing(&self) -> u64 {
+        self.publish_round_trips.swap(0, Ordering::Relaxed)
     }
     /// Fail the next Redis publication after its durable graph mutation.
     #[cfg(feature = "integration")]

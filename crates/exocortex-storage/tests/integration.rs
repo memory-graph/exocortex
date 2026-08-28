@@ -2410,6 +2410,66 @@ itest!(invalidation_end_to_end, {
     }
 });
 
+itest!(batch_invalidation_publish_uses_one_redis_round_trip, {
+    let url = falkor_url().unwrap();
+    let org = format!("batch-publish-{}", graph_suffix());
+    let publisher = FalkorStorage::connect(
+        FalkorConfig {
+            falkor_url: url.clone(),
+            redis_url: std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+            graph_name: format!("exocortex_test_{}", graph_suffix()),
+            org_id: org.clone().into(),
+            node_id: "batch-publisher".into(),
+        },
+        ontology(),
+    )
+    .await
+    .unwrap();
+    let region = RegionKey {
+        org: org.into(),
+        project: "*".into(),
+        memory_type: 0,
+    };
+    let mut stream = publisher
+        .subscribe_invalidations(&region)
+        .await
+        .expect("subscribe before batch commit");
+    tokio::time::sleep(StdDuration::from_millis(100)).await;
+    publisher.take_publish_round_trips_for_testing();
+    let memories = (0..64)
+        .map(|index| mem(&format!("publish-batch-{index}"), 3, Visibility::Org))
+        .collect::<Vec<_>>();
+    publisher.upsert_batch(&memories, &[]).await.unwrap();
+    assert_eq!(
+        publisher.take_publish_round_trips_for_testing(),
+        1,
+        "all compatible feed frames must share one Redis pipeline request"
+    );
+
+    let expected = memories
+        .iter()
+        .map(|memory| memory.id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut observed = std::collections::HashSet::new();
+    let receive = async {
+        while observed.len() < expected.len() {
+            match stream.next().await {
+                Some(Ok(Invalidation::MemoryUpserted { id, .. })) => {
+                    observed.insert(id);
+                }
+                Some(Ok(other)) => panic!("unexpected batch invalidation: {other:?}"),
+                Some(Err(error)) => panic!("batch stream error: {error:?}"),
+                None => panic!("batch stream ended early"),
+            }
+        }
+    };
+    tokio::time::timeout(StdDuration::from_secs(5), receive)
+        .await
+        .expect("every pipelined compatibility frame is delivered");
+    assert_eq!(observed, expected);
+});
+
 itest!(stream_memories_roundtrip, {
     let s = connect("node-1").await;
     for i in 0..10 {
