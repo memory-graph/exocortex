@@ -2,24 +2,61 @@
 //! stdio, and serves the local graph (SR-PRD: honestly empty on a fresh
 //! data dir — no synthetic filler — and seeded from the WAL on restart).
 
-use std::io::Write;
+use std::io::{BufRead as _, Write as _};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 struct Client {
     child: Child,
+    stdout: mpsc::Receiver<Result<String, String>>,
+    stderr: mpsc::Receiver<String>,
+    response_timeout: Duration,
 }
 
 impl Client {
     fn spawn_with(configure: impl FnOnce(&mut Command)) -> Self {
+        Self::spawn_with_timeout(configure, Duration::from_secs(5))
+    }
+
+    fn spawn_with_timeout(
+        configure: impl FnOnce(&mut Command),
+        response_timeout: Duration,
+    ) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_exocortex-mcp-client"));
         configure(&mut cmd);
-        let child = cmd
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn exocortex-mcp-client");
-        Self { child }
+        let child_stdout = child.stdout.take().expect("stdout");
+        let (stdout_tx, stdout) = mpsc::sync_channel(16);
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(child_stdout).lines() {
+                let line = line.map_err(|error| error.to_string());
+                if stdout_tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let child_stderr = child.stderr.take().expect("stderr");
+        let (stderr_tx, stderr) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut diagnostic = String::new();
+            let _ = std::io::Read::read_to_string(
+                &mut std::io::BufReader::new(child_stderr),
+                &mut diagnostic,
+            );
+            let _ = stderr_tx.send(diagnostic);
+        });
+        Self {
+            child,
+            stdout,
+            stderr,
+            response_timeout,
+        }
     }
 
     /// Write all requests up front (pipes preserve order; the server handles
@@ -33,34 +70,27 @@ impl Client {
     }
 
     fn read_line(&mut self) -> serde_json::Value {
-        let mut line = String::new();
-        let mut byte = [0u8; 1];
-        loop {
-            use std::io::Read;
-            let read = self
-                .child
-                .stdout
-                .as_mut()
-                .expect("stdout")
-                .read(&mut byte)
-                .unwrap();
-            if read == 0 {
-                let status = self.child.wait().expect("reap closed MCP server");
-                let mut stderr = String::new();
-                self.child
-                    .stderr
-                    .as_mut()
-                    .expect("stderr")
-                    .read_to_string(&mut stderr)
-                    .expect("read MCP server stderr");
-                panic!("server closed stdout with {status}: {stderr}");
+        let line = match self.stdout.recv_timeout(self.response_timeout) {
+            Ok(Ok(line)) => line,
+            Ok(Err(error)) => self.fail_with_diagnostic(&format!("server stdout failed: {error}")),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.fail_with_diagnostic("server response timed out")
             }
-            if byte[0] == b'\n' {
-                break;
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.fail_with_diagnostic("server closed stdout")
             }
-            line.push(byte[0] as char);
-        }
+        };
         serde_json::from_str(&line).expect("valid JSON-RPC line")
+    }
+
+    fn fail_with_diagnostic(&mut self, reason: &str) -> ! {
+        let _ = self.child.kill();
+        let status = self.child.wait().expect("reap MCP server");
+        let stderr = self
+            .stderr
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or_else(|_| "<stderr unavailable>".into());
+        panic!("{reason} with {status}: {stderr}");
     }
 }
 
@@ -224,6 +254,27 @@ fn falls_back_from_sep_2575_discovery_for_crush() {
     assert!(names.contains(&"exocortex.end_session"), "{names:?}");
 }
 
+#[test]
+fn silent_child_response_wait_is_bounded() {
+    let dir = tempdir();
+    let mut client = Client::spawn_with_timeout(
+        |cmd| {
+            cmd.args(["--data-dir", dir.to_str().unwrap()]);
+        },
+        Duration::from_millis(50),
+    );
+    let started = std::time::Instant::now();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.read_line()))
+        .expect_err("silent child must time out");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(message.contains("server response timed out"), "{message}");
+}
+
 /// §13.6.2 / Success Criteria #2 shape: the harness calls
 /// `exocortex.end_session` over stdio with 3 memories + 2 edges; offline
 /// mode buffers the batch into the WAL and answers
@@ -332,18 +383,13 @@ fn uuid_rand_bytes() -> [u8; 16] {
 /// and no stale stubs remain.
 #[test]
 fn mcp_tool_list_matches_registry() {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-mcp-client"));
     let dir = std::env::temp_dir().join(format!("exo-mcp-registry-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    cmd.args(["--org", "registry", "--user", "tester"])
-        .arg("--data-dir")
-        .arg(&dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut client = Client {
-        child: cmd.spawn().expect("spawn"),
-    };
+    let mut client = Client::spawn_with(|cmd| {
+        cmd.args(["--org", "registry", "--user", "tester"])
+            .arg("--data-dir")
+            .arg(&dir);
+    });
     client.send_all(&[
         serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -438,23 +484,15 @@ fn backend_mode_waits_for_authenticated_hydration_before_stdio_readiness() {
         }
     })]);
 
-    let mut stdout = c.child.stdout.take().expect("stdout");
-    let (tx, rx) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut byte = [0u8; 1];
-        let _ = tx.send(stdout.read(&mut byte));
-    });
     assert!(
         matches!(
-            rx.recv_timeout(std::time::Duration::from_millis(300)),
+            c.stdout.recv_timeout(std::time::Duration::from_millis(300)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ),
         "unhydrated backend mode exposed or closed MCP stdout"
     );
     c.child.kill().expect("stop waiting client");
     c.child.wait().expect("reap waiting client");
-    reader.join().expect("stdout reader exits after kill");
 }
 
 /// CL3 (audit): a malformed environment key aborts startup with a diagnostic
