@@ -15,16 +15,27 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let marker = dir.join("supervisor-started");
+    let client_args = dir.join("client-args");
     let fake_node = dir.join("exocortex-node");
+    let fake_client = dir.join("exocortex-mcp-client");
     std::fs::write(
         &fake_node,
         format!(
-            "#!/bin/sh\ntouch '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\nruntime=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --standalone-runtime-file ]; then runtime=$2; shift 2; else shift; fi\ndone\nprintf \"EXOCORTEX_BACKEND='http://127.0.0.1:43119'\\nEXOCORTEX_SSE_KEY='0000000000000000000000000000000000000000000000000000000000000000'\\n\" > \"$runtime\"\ntouch '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
             marker.display()
         ),
     )
     .unwrap();
+    std::fs::write(
+        &fake_client,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nIFS= read -r request\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'\n",
+            client_args.display()
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&fake_client, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_exocortex-mcp-client"))
         .parent()
@@ -43,6 +54,7 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
         ])
         .env("EXOCORTEX_BIN_DIR", bin_dir)
         .env("EXOCORTEX_STANDALONE_NODE_BIN", &fake_node)
+        .env("EXOCORTEX_STANDALONE_CLIENT_BIN", &fake_client)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -69,12 +81,9 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(marker.exists(), "standalone supervisor was not started");
-    assert!(Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .unwrap()
-        .success());
-    child.wait().unwrap();
+    assert!(child.wait().unwrap().success());
+    let args = std::fs::read_to_string(client_args).unwrap();
+    assert!(args.contains("--backend http://127.0.0.1:43119"), "{args}");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -92,7 +101,7 @@ fn installed_wrapper_rule_probe_enters_standalone_topology() {
     std::fs::write(
         &fake_node,
         format!(
-            "#!/bin/sh\ntouch '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\nruntime=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --standalone-runtime-file ]; then runtime=$2; shift 2; else shift; fi\ndone\nprintf \"EXOCORTEX_BACKEND='http://127.0.0.1:43119'\\nEXOCORTEX_SSE_KEY='0000000000000000000000000000000000000000000000000000000000000000'\\n\" > \"$runtime\"\ntouch '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
             marker.display()
         ),
     )

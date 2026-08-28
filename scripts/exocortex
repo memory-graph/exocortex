@@ -27,7 +27,56 @@ case "$mode" in
     ;;
   mcp-standalone)
     node_bin=${EXOCORTEX_STANDALONE_NODE_BIN:-"$bin_dir/exocortex-node"}
-    "$node_bin" --mode mcp-standalone &
+    client_bin=${EXOCORTEX_STANDALONE_CLIENT_BIN:-"$bin_dir/exocortex-mcp-client"}
+    standalone_org=personal
+    standalone_user=dev
+    standalone_data_dir=""
+    expect=""
+    for argument in "$@"; do
+      if [ -n "$expect" ]; then
+        case "$expect" in
+          org) standalone_org=$argument ;;
+          user) standalone_user=$argument ;;
+          data) standalone_data_dir=$argument ;;
+        esac
+        expect=""
+        continue
+      fi
+      case "$argument" in
+        --org) expect=org ;;
+        --org=*) standalone_org=${argument#--org=} ;;
+        --user) expect=user ;;
+        --user=*) standalone_user=${argument#--user=} ;;
+        --data-dir) expect=data ;;
+        --data-dir=*) standalone_data_dir=${argument#--data-dir=} ;;
+        --backend|--backend=*)
+          echo "mcp-standalone owns --backend; use --mode mcp-client for an external node" >&2
+          exit 2
+          ;;
+      esac
+    done
+    [ -z "$expect" ] || { echo "standalone option requires a value" >&2; exit 2; }
+    runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/exocortex-standalone.XXXXXX")
+    runtime_file="$runtime_dir/runtime.env"
+    random_hex() {
+      od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+    }
+    : "${EXOCORTEX_CLUSTER_SECRET:=$(random_hex)}"
+    : "${EXOCORTEX_HMAC_KEY:=$(random_hex)}"
+    : "${EXOCORTEX_AUTH_TOKEN:=$(random_hex)}"
+    export EXOCORTEX_CLUSTER_SECRET EXOCORTEX_HMAC_KEY EXOCORTEX_AUTH_TOKEN
+    if [ -n "$standalone_data_dir" ]; then
+      "$node_bin" --mode mcp-standalone \
+        --org "$standalone_org" \
+        --standalone-user "$standalone_user" \
+        --standalone-data-dir "$standalone_data_dir/falkordb" \
+        --standalone-runtime-file "$runtime_file" &
+    else
+      "$node_bin" --mode mcp-standalone \
+        --org "$standalone_org" \
+        --standalone-user "$standalone_user" \
+        --standalone-runtime-file "$runtime_file" &
+    fi
     supervisor_pid=$!
     client_pid=""
     cleanup() {
@@ -37,12 +86,43 @@ case "$mode" in
       fi
       kill "$supervisor_pid" 2>/dev/null || true
       wait "$supervisor_pid" 2>/dev/null || true
+      rm -f "$runtime_file"
+      rmdir "$runtime_dir" 2>/dev/null || true
     }
     trap cleanup EXIT
     trap 'exit 143' HUP INT TERM
-    # The foreground process is the real cache/WAL/operation-registry MCP
-    # runtime. The sibling node owns and supervises embedded FalkorDB.
-    "$bin_dir/exocortex-mcp-client" "$@" <&0 &
+    attempts=0
+    while [ ! -s "$runtime_file" ]; do
+      if ! kill -0 "$supervisor_pid" 2>/dev/null; then
+        wait "$supervisor_pid" || true
+        echo "standalone node exited before publishing its backend endpoint" >&2
+        exit 1
+      fi
+      attempts=$((attempts + 1))
+      [ "$attempts" -lt 200 ] || {
+        echo "standalone node did not become ready within 10 seconds" >&2
+        exit 1
+      }
+      sleep 0.05
+    done
+    # The node writes only fixed-name, single-quoted values into this private
+    # file; source it after owner-only atomic publication.
+    . "$runtime_file"
+    case "${EXOCORTEX_BACKEND:-}" in
+      http://127.0.0.1:*|http://\[::1\]:*) ;;
+      *) echo "standalone node published a non-loopback backend" >&2; exit 1 ;;
+    esac
+    case "${EXOCORTEX_SSE_KEY:-}" in
+      *[!0-9a-f]*|'') echo "standalone node published an invalid SSE key" >&2; exit 1 ;;
+    esac
+    [ "${#EXOCORTEX_SSE_KEY}" -eq 64 ] || {
+      echo "standalone node published a wrong-width SSE key" >&2
+      exit 1
+    }
+    export EXOCORTEX_SSE_KEY
+    # The foreground MCP runtime uses the supervised Falkor-backed node for
+    # both writes and authenticated cache hydration.
+    "$client_bin" --backend "$EXOCORTEX_BACKEND" "$@" <&0 &
     client_pid=$!
     set +e
     wait "$client_pid"

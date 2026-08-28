@@ -21,7 +21,15 @@ cat >"$tmp/exocortex-node" <<'EOF'
 #!/bin/sh
 printf 'node:%s\n' "$*" >>"$EXOCORTEX_ENTRYPOINT_LOG"
 case " $* " in
-  *" --mode mcp-standalone "*) trap 'exit 0' TERM INT; while :; do sleep 1; done ;;
+  *" --mode mcp-standalone "*)
+    runtime=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --standalone-runtime-file ]; then runtime=$2; shift 2; else shift; fi
+    done
+    printf "EXOCORTEX_BACKEND='http://127.0.0.1:43119'\nEXOCORTEX_SSE_KEY='0000000000000000000000000000000000000000000000000000000000000000'\n" >"$runtime"
+    trap 'exit 0' TERM INT
+    while :; do sleep 1; done
+    ;;
 esac
 EOF
 chmod +x "$tmp/exocortex-mcp-client" "$tmp/exocortex-node"
@@ -34,7 +42,7 @@ scripts/exocortex --mode backend-node --probe backend
 
 grep -F 'client:--probe client' "$log"
 grep -F 'node:--mode mcp-standalone' "$log"
-grep -F 'client:--probe standalone' "$log"
+grep -F 'client:--backend http://127.0.0.1:43119 --probe standalone' "$log"
 grep -F 'node:--mode backend-node --probe backend' "$log"
 
 rm "$tmp/exocortex-node"

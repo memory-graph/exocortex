@@ -43,44 +43,50 @@ pub struct SupervisedServer {
 
 impl Drop for SupervisedServer {
     fn drop(&mut self) {
-        // CS5: never orphan the child.
+        // Preserve the embedded graph across wrapper restarts. Redis performs
+        // a final synchronous snapshot before exit; a bounded hard kill is
+        // only the fallback for a wedged child.
+        request_shutdown(self.port);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
 impl SupervisedServer {
-    /// CS5 (audit): the supervision loop — `try_wait` the child, restart
-    /// within `max_restarts`, and re-wait for PING after each restart.
-    /// Returns the number of restarts performed, or an error once the
-    /// policy is exhausted (the caller exits non-zero).
-    pub fn supervise(&mut self, cfg: &SupervisorConfig) -> anyhow::Result<u32> {
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
-            match self.child.try_wait() {
-                Ok(Some(_status)) => {
-                    if self.restarts >= cfg.max_restarts {
-                        anyhow::bail!(
-                            "supervised server exited; restart budget ({}) exhausted",
-                            cfg.max_restarts
-                        );
-                    }
-                    self.restarts += 1;
-                    metrics::counter!("exocortex_supervisor_restarts_total").increment(1);
-                    tracing::warn!(
-                        restart = self.restarts,
-                        port = self.port,
-                        "supervised server crashed; restarting"
+    /// Check the child once and apply the bounded restart policy. Async
+    /// runtimes use this non-blocking step from their own interval loop.
+    pub fn poll(&mut self, cfg: &SupervisorConfig) -> anyhow::Result<()> {
+        match self.child.try_wait() {
+            Ok(Some(_status)) => {
+                if self.restarts >= cfg.max_restarts {
+                    anyhow::bail!(
+                        "supervised server exited; restart budget ({}) exhausted",
+                        cfg.max_restarts
                     );
-                    self.child = spawn_child(cfg)?;
-                    if !wait_ping(cfg.port, &mut self.child)? {
-                        anyhow::bail!("supervised server restart did not answer PING");
-                    }
                 }
-                Ok(None) => {}
-                Err(e) => anyhow::bail!("supervisor try_wait failed: {e}"),
+                self.restarts += 1;
+                metrics::counter!("exocortex_supervisor_restarts_total").increment(1);
+                tracing::warn!(
+                    restart = self.restarts,
+                    port = self.port,
+                    "supervised server crashed; restarting"
+                );
+                self.child = spawn_child(cfg)?;
+                if !wait_ping(cfg.port, &mut self.child)? {
+                    anyhow::bail!("supervised server restart did not answer PING");
+                }
             }
+            Ok(None) => {}
+            Err(e) => anyhow::bail!("supervisor try_wait failed: {e}"),
         }
+        Ok(())
     }
 }
 
@@ -93,7 +99,9 @@ fn spawn_child(cfg: &SupervisorConfig) -> anyhow::Result<Child> {
             "--save",
             "1 1",
             "--appendonly",
-            "no",
+            "yes",
+            "--appendfsync",
+            "everysec",
             "--dir",
         ])
         .arg(&cfg.data_dir)
@@ -192,6 +200,13 @@ fn ping(port: u16) -> bool {
     buf[..n].windows(4).any(|w| w == b"PONG" || w == b"+PON")
 }
 
+fn request_shutdown(port: u16) {
+    use std::io::Write as _;
+    if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+        let _ = stream.write_all(b"SHUTDOWN SAVE\r\n");
+    }
+}
+
 /// Pick a free localhost port by binding port 0 and reading the assignment.
 pub fn free_port() -> anyhow::Result<u16> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
@@ -231,7 +246,7 @@ mod tests {
         server.child.kill().unwrap();
         let _ = server.child.wait();
 
-        // The budget logic of supervise()'s loop body: a crash consumes a
+        // The budget logic of poll(): a crash consumes a
         // restart until the budget is spent, then gives up.
         let mut restarts = 0;
         loop {

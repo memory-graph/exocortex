@@ -407,6 +407,27 @@ pub async fn run_backend_node<S: Storage + 'static>(
     ontology: Arc<Ontology>,
     args: BackendNodeArgs,
 ) -> anyhow::Result<BackendNode<S>> {
+    run_backend_node_inner(storage, ontology, args, None).await
+}
+
+/// Run the loopback-only personal topology with one explicit producer key.
+/// Shared backend nodes never call this path and remain administrator-policy
+/// only.
+pub async fn run_standalone_backend_node<S: Storage + 'static>(
+    storage: Arc<S>,
+    ontology: Arc<Ontology>,
+    args: BackendNodeArgs,
+    producer_key: [u8; 32],
+) -> anyhow::Result<BackendNode<S>> {
+    run_backend_node_inner(storage, ontology, args, Some(producer_key)).await
+}
+
+async fn run_backend_node_inner<S: Storage + 'static>(
+    storage: Arc<S>,
+    ontology: Arc<Ontology>,
+    args: BackendNodeArgs,
+    standalone_producer_key: Option<[u8; 32]>,
+) -> anyhow::Result<BackendNode<S>> {
     // Parse TLS material and bind before starting any background subsystem.
     // Bad transport configuration is a startup failure, never a node that
     // appears alive while its protected listener is absent.
@@ -689,11 +710,16 @@ pub async fn run_backend_node<S: Storage + 'static>(
     }
 
     // Ingest: gRPC IngestService, embedding-enabled, reasoning-wired.
-    let ingest = IngestServer::new_with_admin_policies(
-        storage.clone(),
-        ontology.clone(),
-        args.admin_source_policies.clone(),
-    )
+    let ingest = match standalone_producer_key {
+        Some(key) => {
+            IngestServer::new(storage.clone(), ontology.clone(), key).allow_personal_scopes()
+        }
+        None => IngestServer::new_with_admin_policies(
+            storage.clone(),
+            ontology.clone(),
+            args.admin_source_policies.clone(),
+        ),
+    }
     .with_reasoning(reasoning.clone())
     .with_dreams(dreams.clone())
     .with_org(&org)

@@ -454,3 +454,13 @@ proto-sync-guarded copy).
   cardinality contract. The implementation reports `reason="capacity"` and
   keeps region identity in protected operational state, so dashboards must
   aggregate overflow rather than group it by raw region.
+
+### Round 6 infrastructure-only validation
+
+- `scripts/test-standalone-live.sh` is the executable installed-wrapper
+  write/read/restart persistence target. On 2026-08-28 it reported
+  **UNEXECUTED** because this macOS host has `/opt/homebrew/bin/redis-server`
+  but no loadable macOS FalkorDB module and neither standalone module
+  environment variable was provisioned. The wrapper topology tests and
+  supervisor tests pass; this entry deliberately does not represent the live
+  persistence target as passed.

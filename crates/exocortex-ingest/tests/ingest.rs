@@ -469,6 +469,47 @@ async fn authenticated_principal_is_required_and_authoritatively_scopes_writes()
 }
 
 #[tokio::test]
+async fn personal_mode_accepts_authenticated_dynamic_project_scope() {
+    let srv = server().allow_personal_scopes().require_request_principal();
+    let principal = exocortex_storage::VisibilityContext {
+        user_id: "personal-user".into(),
+        org_id: "org".into(),
+        project_ids: Default::default(),
+        team_ids: Default::default(),
+        max_visibility: exocortex_kernel::Visibility::Org,
+    };
+    let mut registration = tonic::Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://personal",
+        "session-wrapup",
+        3,
+        "session",
+        "personal-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    ));
+    registration.extensions_mut().insert(principal.clone());
+    srv.register_source(registration).await.unwrap();
+
+    let mut batch = batch(vec![draft("personal", "Fix", 1)]);
+    batch.source_uri = "session://personal".into();
+    batch.batch_id = "personal-project".into();
+    batch.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    batch.producer.as_mut().unwrap().client_metadata =
+        Some(exocortex_wire::ingest::v1::ClientMetadata {
+            playbook_version: String::new(),
+            client_version: String::new(),
+            harness_hint: String::new(),
+            project_id: "project-created-locally".into(),
+            team_id: String::new(),
+        });
+    let mut request = tonic::Request::new(sign(batch, [5u8; 32]));
+    request.extensions_mut().insert(principal);
+    let accepted = srv.submit(request).await.unwrap().into_inner();
+    assert_eq!(accepted.accepted, 1, "{:?}", accepted.rejections);
+}
+
+#[tokio::test]
 async fn authenticated_relationship_target_must_be_in_caller_membership() {
     use futures::StreamExt;
 

@@ -109,6 +109,17 @@ struct Args {
     /// mode, including when the policy is intentionally empty (`[]`).
     #[arg(long)]
     source_policy: Option<std::path::PathBuf>,
+    /// Personal-mode user identity supplied by the installed wrapper.
+    #[arg(long, hide = true, default_value = "dev")]
+    standalone_user: String,
+    /// Owner-only shell fragment used to hand the selected endpoint and SSE
+    /// key to the installed wrapper.
+    #[arg(long, hide = true)]
+    standalone_runtime_file: Option<std::path::PathBuf>,
+    /// Override the embedded Falkor data directory for isolated installs and
+    /// acceptance tests.
+    #[arg(long, hide = true)]
+    standalone_data_dir: Option<std::path::PathBuf>,
     /// redis-server binary for the embedded supervisor.
     #[arg(long)]
     redis_server_bin: Option<std::path::PathBuf>,
@@ -157,46 +168,133 @@ fn main() -> anyhow::Result<()> {
             if args.storage != "falkordb-embedded" {
                 anyhow::bail!("mcp-standalone supports --storage=falkordb-embedded only");
             }
-            let (bin, module) = supervisor::resolve_paths(
-                args.redis_server_bin.clone(),
-                args.falkordb_module.clone(),
-            )?;
-            let port = supervisor::free_port()?;
-            let data_home = data_home()?;
-            let cfg = supervisor::SupervisorConfig {
-                redis_server_bin: bin,
-                falkordb_module: module,
-                port_file: Some(data_home.join("port")),
-                data_dir: data_home,
-                port,
-                max_restarts: 3,
-            };
-            let mut server = supervisor::spawn_supervised(&cfg)?;
-            tracing::info!(port = server.port, "exocortex-node mcp-standalone ready");
-            if args.verify_rules {
-                verify_deployed_rules(&ontology, "mcp-standalone")?;
-                return Ok(());
-            }
-            // CS5 (audit): a REAL supervision loop — try_wait, restart
-            // within the policy, exit non-zero when the budget is spent.
-            // (Drop kills the child, so the parent never orphans it.)
-            let outcome: anyhow::Result<()> = (|| {
-                server.supervise(&cfg)?;
-                Ok(())
-            })();
-            match outcome {
-                Ok(()) => unreachable!("supervise only returns on give-up"),
-                Err(e) => {
-                    tracing::error!(%e, "supervision gave up; exiting");
-                    std::process::exit(1);
-                }
-            }
+            standalone_main(args, ontology)
         }
         Mode::BackendNode => backend_node_main(args),
         Mode::Embedded => {
             anyhow::bail!("--mode embedded is the in-process path used by tests");
         }
     }
+}
+
+fn standalone_main(
+    args: Args,
+    ontology: std::sync::Arc<exocortex_kernel::Ontology>,
+) -> anyhow::Result<()> {
+    let (bin, module) =
+        supervisor::resolve_paths(args.redis_server_bin.clone(), args.falkordb_module.clone())?;
+    let port = supervisor::free_port()?;
+    let data_home = args.standalone_data_dir.clone().unwrap_or(data_home()?);
+    let cfg = supervisor::SupervisorConfig {
+        redis_server_bin: bin,
+        falkordb_module: module,
+        port_file: Some(data_home.join("port")),
+        data_dir: data_home,
+        port,
+        max_restarts: 3,
+    };
+    let mut supervised = supervisor::spawn_supervised(&cfg)?;
+    tracing::info!(port = supervised.port, "embedded FalkorDB ready");
+    if args.verify_rules {
+        return verify_deployed_rules(&ontology, "mcp-standalone");
+    }
+
+    let cluster_secret =
+        resolve_cluster_secret(std::env::var("EXOCORTEX_CLUSTER_SECRET").ok().as_deref())?;
+    let producer_key = exocortex_wire::signing::decode_hex32(
+        &std::env::var("EXOCORTEX_HMAC_KEY")
+            .map_err(|_| anyhow::anyhow!("EXOCORTEX_HMAC_KEY is required for mcp-standalone"))?,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let bearer = std::env::var("EXOCORTEX_AUTH_TOKEN")
+        .map_err(|_| anyhow::anyhow!("EXOCORTEX_AUTH_TOKEN is required for mcp-standalone"))?;
+    let principal = exocortex_server::principal::PrincipalRegistry::single(
+        bearer.clone(),
+        exocortex_storage::VisibilityContext {
+            user_id: args.standalone_user.clone().into(),
+            org_id: args.org.clone().into(),
+            project_ids: Default::default(),
+            team_ids: Default::default(),
+            max_visibility: exocortex_kernel::Visibility::Org,
+        },
+    )?;
+    let bind = if args.bind == "0.0.0.0:8080" {
+        "127.0.0.1:0".to_owned()
+    } else {
+        args.bind.clone()
+    };
+    let address: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|error| anyhow::anyhow!("bad standalone --bind: {error}"))?;
+    anyhow::ensure!(
+        address.ip().is_loopback(),
+        "mcp-standalone backend bind must be loopback"
+    );
+    let falkor_url = format!("falkor://127.0.0.1:{}", supervised.port);
+    let redis_url = format!("redis://127.0.0.1:{}", supervised.port);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let storage = std::sync::Arc::new(
+            exocortex_storage::FalkorStorage::connect(
+                exocortex_storage::FalkorConfig {
+                    falkor_url,
+                    redis_url: redis_url.clone(),
+                    graph_name: args
+                        .graph_name
+                        .clone()
+                        .unwrap_or_else(|| format!("exocortex-{}", args.org)),
+                    org_id: args.org.clone().into(),
+                    node_id: format!("standalone-{}", std::process::id()).into(),
+                },
+                ontology.clone(),
+            )
+            .await?,
+        );
+        let node_args = backend::BackendNodeArgs {
+            org: args.org.clone(),
+            bind,
+            transport: backend::TransportSecurity::PlaintextLoopback,
+            node_id: format!("standalone-{}", std::process::id()),
+            cluster_secret,
+            principals: std::sync::Arc::new(principal),
+            gossip_listen: "127.0.0.1:0".parse().expect("literal socket address"),
+            seed_nodes: Vec::new(),
+            redis_url: Some(redis_url),
+            quiet_hours: Default::default(),
+            admin_source_policies: Vec::new(),
+        };
+        let mut node =
+            backend::run_standalone_backend_node(storage, ontology, node_args, producer_key)
+                .await?;
+        if let Some(path) = args.standalone_runtime_file.as_deref() {
+            let sse_key = exocortex_wire::signing::derive_sse_client_key(&cluster_secret, &bearer);
+            use std::fmt::Write as _;
+            let mut sse_key_hex = String::with_capacity(64);
+            for byte in sse_key {
+                write!(sse_key_hex, "{byte:02x}").expect("writing to a string cannot fail");
+            }
+            let contents = format!(
+                "EXOCORTEX_BACKEND='http://{}'\nEXOCORTEX_SSE_KEY='{sse_key_hex}'\n",
+                node.local_addr
+            );
+            exocortex_storage::bounded_io::atomic_write_private(
+                path,
+                contents.as_bytes(),
+                "standalone runtime",
+            )?;
+        }
+        tracing::info!(addr = %node.local_addr, "exocortex-node mcp-standalone ready");
+        loop {
+            tokio::select! {
+                result = node.wait_for_ingress() => return result,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    supervised.poll(&cfg)?;
+                }
+            }
+        }
+    })
 }
 
 fn verify_production_embedder() -> anyhow::Result<()> {

@@ -133,6 +133,10 @@ pub struct IngestServer<S: Storage> {
     /// Production transport mode: every RPC must carry the authenticated
     /// principal installed by the ingress authorization layer.
     pub require_request_principal: bool,
+    /// Personal single-user mode may name arbitrary project/team scopes: the
+    /// authenticated user owns the entire local graph. Shared nodes never set
+    /// this flag and retain exact membership checks.
+    allow_personal_scopes: bool,
     /// D10c (§4.10b): bounded recent-acceptance ring for near-duplicate
     /// hints — (org, id, type, title, content-hash, embedding) for the
     /// last [`RECENT_RING_LEN`] committed memories. Hints compare each
@@ -199,6 +203,7 @@ impl<S: Storage> Clone for IngestServer<S> {
             admin_policies: self.admin_policies.clone(),
             require_admin_policy: self.require_admin_policy,
             require_request_principal: self.require_request_principal,
+            allow_personal_scopes: self.allow_personal_scopes,
             recent: self.recent.clone(),
             submit_permits: self.submit_permits.clone(),
             post_ingest_notify: self.post_ingest_notify.clone(),
@@ -235,6 +240,7 @@ impl<S: Storage> IngestServer<S> {
             admin_policies: HashMap::new(),
             require_admin_policy: false,
             require_request_principal: false,
+            allow_personal_scopes: false,
             recent: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             submit_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CONCURRENT_SUBMITS)),
             post_ingest_notify: Arc::new(tokio::sync::Notify::new()),
@@ -312,6 +318,13 @@ impl<S: Storage> IngestServer<S> {
     /// Require an ingress-authenticated principal on every gRPC request.
     pub fn require_request_principal(mut self) -> Self {
         self.require_request_principal = true;
+        self
+    }
+
+    /// Permit the one authenticated personal principal to author project and
+    /// team scoped rows without a pre-provisioned membership catalogue.
+    pub fn allow_personal_scopes(mut self) -> Self {
+        self.allow_personal_scopes = true;
         self
     }
 
@@ -457,7 +470,8 @@ impl<S: Storage> IngestServer<S> {
             let requested_team = metadata
                 .map(|metadata| metadata.team_id.as_str())
                 .filter(|id| !id.is_empty());
-            if vis == Visibility::Project
+            if !self.allow_personal_scopes
+                && vis == Visibility::Project
                 && !requested_project.is_some_and(|id| {
                     principal
                         .project_ids
@@ -467,7 +481,8 @@ impl<S: Storage> IngestServer<S> {
             {
                 return Err(RejectCode::VisibilityWidening);
             }
-            if vis == Visibility::Team
+            if !self.allow_personal_scopes
+                && vis == Visibility::Team
                 && !requested_team.is_some_and(|id| {
                     principal
                         .team_ids
