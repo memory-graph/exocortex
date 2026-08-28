@@ -291,9 +291,7 @@ impl<S: Storage> IngestServer<S> {
         self
     }
 
-    fn source_rows(
-        sources: &SourceRegistry,
-    ) -> Vec<((String, String, String), SourceEntry)> {
+    fn source_rows(sources: &SourceRegistry) -> Vec<((String, String, String), SourceEntry)> {
         sources
             .iter()
             .map(|((o, u, p), v)| ((o.clone(), u.clone(), p.clone()), *v))
@@ -1343,18 +1341,31 @@ impl<S: Storage + 'static> IngestServer<S> {
             }
         }
         if let Some(dreams) = &self.dreams {
+            let mut regions = std::collections::HashMap::<RegionKey, u32>::new();
             for memory in &rows.producer_memories {
-                dreams
-                    .on_write(RegionKey {
-                        org: batch.org_id.clone().into(),
-                        project: memory
-                            .context
-                            .project_id
-                            .clone()
-                            .unwrap_or_else(|| "*".into()),
-                        memory_type: memory.memory_type,
-                    })
-                    .await;
+                let region = RegionKey {
+                    org: batch.org_id.clone().into(),
+                    project: memory
+                        .context
+                        .project_id
+                        .clone()
+                        .unwrap_or_else(|| "*".into()),
+                    memory_type: memory.memory_type,
+                };
+                *regions.entry(region).or_default() += 1;
+            }
+            for (region, memories) in regions {
+                let mut delay = std::time::Duration::from_millis(25);
+                loop {
+                    match dreams.on_writes(region.clone(), memories, 0).await {
+                        Ok(()) => break,
+                        Err(error) => {
+                            tracing::warn!(%error, ?region, "Dreams write-counter persistence retrying");
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                        }
+                    }
+                }
             }
         }
         let keyed = batch

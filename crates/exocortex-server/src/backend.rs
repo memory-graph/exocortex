@@ -37,6 +37,8 @@ pub enum TransportSecurity {
 /// Backend-node wiring knobs (§4.2 flags land here).
 #[derive(Clone)]
 pub struct BackendNodeArgs {
+    /// Exact organization served by this one-graph backend node.
+    pub org: String,
     /// Ingress bind (`http + gRPC`).
     pub bind: String,
     /// TLS for shared binds, or explicitly loopback-only plaintext.
@@ -97,6 +99,7 @@ pub struct BackendNode<S: Storage> {
     pub dreams: Arc<exocortex_dreams::DreamsEngine<S>>,
     /// Live gossip handle retained for the backend process lifetime.
     pub gossip: chitchat::ChitchatHandle,
+    cluster_feed: Option<tokio::task::JoinHandle<()>>,
     leader_election: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -105,6 +108,17 @@ impl<S: Storage> BackendNode<S> {
     pub fn stop_leader_election(&mut self) {
         self.leader_gate
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(task) = self.leader_election.take() {
+            task.abort();
+        }
+    }
+}
+
+impl<S: Storage> Drop for BackendNode<S> {
+    fn drop(&mut self) {
+        if let Some(task) = self.cluster_feed.take() {
+            task.abort();
+        }
         if let Some(task) = self.leader_election.take() {
             task.abort();
         }
@@ -358,7 +372,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
     // appears alive while its protected listener is absent.
     let ingress = BoundIngress::bind(&args.bind, &args.transport).await?;
     let local_addr = ingress.local_addr()?;
-    let org: Arc<str> = "org".into();
+    let org: Arc<str> = args.org.clone().into();
 
     // Read path: cache + writer loop over the same storage. The writer
     // consumes first so the reseed flows through it (§8.2).
@@ -452,10 +466,47 @@ pub async fn run_backend_node<S: Storage + 'static>(
         ontology.fingerprint,
         args.cluster_secret,
     ));
-    {
+    let cluster_feed = {
         let runner = cluster.clone();
-        tokio::spawn(async move { runner.run().await });
-    }
+        let health = health.clone();
+        let mut feed_health = cluster.subscribe_feed_health();
+        tokio::spawn(async move {
+            let monitor = async {
+                loop {
+                    let state = *feed_health.borrow_and_update();
+                    health.rcu(|snapshot| {
+                        let mut next = (**snapshot).clone();
+                        next.cluster_feed_ready = state.ready;
+                        next.cluster_feed_epoch = state.epoch;
+                        next.cluster_feed_failures = state.failures;
+                        Arc::new(next)
+                    });
+                    if feed_health.changed().await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let run = runner.run();
+            tokio::pin!(monitor);
+            tokio::pin!(run);
+            tokio::select! {
+                () = &mut monitor => {
+                    tracing::error!("cluster feed health channel ended");
+                }
+                result = &mut run => {
+                    if let Err(error) = result {
+                        tracing::error!(%error, "cluster invalidation supervisor stopped");
+                    }
+                }
+            }
+            health.rcu(|snapshot| {
+                let mut next = (**snapshot).clone();
+                next.cluster_feed_ready = false;
+                next.cluster_feed_failures = next.cluster_feed_failures.saturating_add(1);
+                Arc::new(next)
+            });
+        })
+    };
 
     // Reasoning: post-commit enrichment (§10.7 step 8).
     let reasoning = Arc::new(exocortex_reasoning::ReasoningEngine::new(
@@ -468,55 +519,78 @@ pub async fn run_backend_node<S: Storage + 'static>(
         tokio::spawn(async move { engine.run().await });
     }
 
+    // Shared Dreams transport uses separate Redis connections for blocking
+    // drain and producer/ack traffic. A configured transport is mandatory:
+    // startup fails rather than silently falling back to node-local fires.
+    let (distributed_fire, fire_drainer) = if let Some(redis_url) = &args.redis_url {
+        let client = redis::Client::open(redis_url.as_str())?;
+        let producer = client.get_multiplexed_async_connection().await?;
+        let drainer = client.get_multiplexed_async_connection().await?;
+        (
+            Some(Arc::new(tokio::sync::Mutex::new(
+                exocortex_dreams::fire::RedisFireQueue::new(
+                    producer,
+                    args.quiet_hours,
+                    args.org.clone(),
+                ),
+            ))),
+            Some(exocortex_dreams::fire::RedisFireQueue::new(
+                drainer,
+                args.quiet_hours,
+                args.org.clone(),
+            )),
+        )
+    } else {
+        (None, None)
+    };
+
     // Dreams: the consolidation loop over the fire channel. CS4 (audit):
     // the elected leader gate makes the re-election lease fence something
     // real — consolidation runs only on the node that holds it.
     let leader_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let dreams = Arc::new(
-        exocortex_dreams::DreamsEngine::new(
-            storage.clone(),
-            exocortex_dreams::trigger::DreamsTrigger::default(),
-            0.01,
-            0.05,
-            true,
-            args.node_id.clone().into(),
-        )
-        .with_leader_gate(leader_gate.clone()),
-    );
+    let mut dreams_engine = exocortex_dreams::DreamsEngine::new(
+        storage.clone(),
+        exocortex_dreams::trigger::DreamsTrigger::default(),
+        0.01,
+        0.05,
+        true,
+        args.node_id.clone().into(),
+    )
+    .with_leader_gate(leader_gate.clone());
+    if let Some(queue) = &distributed_fire {
+        dreams_engine = dreams_engine.with_distributed_fire(queue.clone());
+    }
+    let dreams = Arc::new(dreams_engine);
     {
         let engine = dreams.clone();
         tokio::spawn(async move { engine.run().await });
     }
 
-    // Fire transport (§12.2): when a Redis URL is configured, drain the
-    // shared fire queue — reset the region's Redis write counters
-    // atomically (R-Dr13, at consumption) and notify the engine. Quiet
-    // hours reorder a short backlog rather than blocking it (R-Dr14).
-    if let Some(redis_url) = args.redis_url.clone() {
+    // Only the elected owner drains shared fires. Notifications move through
+    // a durable processing list; a successor requeues a dead owner's items
+    // before advertising leadership below.
+    if let Some(mut queue) = fire_drainer {
         let dreams = dreams.clone();
-        let quiet = args.quiet_hours;
+        let elected = leader_gate.clone();
         tokio::spawn(async move {
-            match redis::Client::open(redis_url.as_str()) {
-                Ok(client) => match client.get_multiplexed_async_connection().await {
-                    Ok(conn) => {
-                        let mut queue = exocortex_dreams::fire::RedisFireQueue::new(conn, quiet);
-                        loop {
-                            match queue.drain(Duration::from_secs(5)).await {
-                                Ok(Some(region)) => {
-                                    let _ = queue.reset_counters(&region).await;
-                                    dreams.notify(region);
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    tracing::warn!(%e, "fire drain error; retrying");
-                                    tokio::time::sleep(Duration::from_secs(1)).await;
-                                }
-                            }
-                        }
+            loop {
+                if !elected.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(LEASE_RENEW).await;
+                    continue;
+                }
+                match queue.drain(Duration::from_secs(5)).await {
+                    Ok(exocortex_dreams::fire::DrainResult::Ready(notification)) => {
+                        dreams.notify_distributed(notification);
                     }
-                    Err(e) => tracing::warn!(%e, "fire queue connect failed"),
-                },
-                Err(e) => tracing::warn!(%e, "fire queue client open failed"),
+                    Ok(exocortex_dreams::fire::DrainResult::Deferred) => {
+                        tracing::debug!("Dreams fire durably reordered");
+                    }
+                    Ok(exocortex_dreams::fire::DrainResult::TimedOut) => {}
+                    Err(e) => {
+                        tracing::warn!(%e, "fire drain error; retrying");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
             }
         });
     }
@@ -594,6 +668,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
         let node_id = args.node_id.clone();
         let org = org.to_string();
         let elected = leader_gate.clone();
+        let distributed_fire = distributed_fire.clone();
         tokio::spawn(async move {
             let key = dreams_lease_key(&org);
             // §3 M5 AC: leader election converges within 2s of a
@@ -603,6 +678,14 @@ pub async fn run_backend_node<S: Storage + 'static>(
             loop {
                 match storage.acquire_lease(&key, LEASE_TTL).await {
                     Ok(lease) => {
+                        if let Some(queue) = &distributed_fire {
+                            if let Err(error) = queue.lock().await.recover_inflight().await {
+                                tracing::warn!(%error, "Dreams in-flight recovery failed; refusing leadership");
+                                let _ = storage.release_lease(lease).await;
+                                tokio::time::sleep(LEASE_RENEW).await;
+                                continue;
+                            }
+                        }
                         let mut epoch = lease.epoch;
                         // CS4: the Dreams engine consolidates only while
                         // this node is the elected leader.
@@ -666,6 +749,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
         leader_gate,
         dreams,
         gossip,
+        cluster_feed: Some(cluster_feed),
         leader_election: Some(leader_election),
     })
 }

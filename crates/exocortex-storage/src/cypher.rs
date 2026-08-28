@@ -156,6 +156,62 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         "#,
     });
 
+    reg!(Template {
+        id: "batch_cycle_journal_fragment",
+        read_only: false,
+        required_params: &[
+            "lease_key",
+            "cycle_id",
+            "lease_epoch",
+            "fragment_id",
+            "restore_json"
+        ],
+        cypher: r#"
+            OPTIONAL MATCH (existing:_CycleJournal {lease_key: $lease_key})
+            WITH existing
+            WHERE existing IS NULL OR existing.state = 'Completed'
+                  OR existing.cycle_id = $cycle_id
+            MERGE (journal:_CycleJournal {lease_key: $lease_key})
+            SET journal.cycle_id = $cycle_id,
+                journal.lease_epoch = $lease_epoch,
+                journal.state = 'Active'
+            MERGE (fragment:_CycleJournalFragment {
+                lease_key: $lease_key, cycle_id: $cycle_id,
+                fragment_id: $fragment_id
+            })
+            SET fragment.restore_json = $restore_json
+        "#,
+    });
+
+    reg!(Template {
+        id: "active_cycle_journal",
+        read_only: true,
+        required_params: &["lease_key"],
+        cypher: r#"
+            MATCH (journal:_CycleJournal {lease_key: $lease_key, state: 'Active'})
+            MATCH (fragment:_CycleJournalFragment {
+                lease_key: $lease_key, cycle_id: journal.cycle_id
+            })
+            RETURN journal.cycle_id, journal.lease_epoch, fragment.restore_json
+            ORDER BY fragment.fragment_id ASC
+        "#,
+    });
+
+    reg!(Template {
+        id: "cycle_journal_complete_fenced",
+        read_only: false,
+        required_params: &["lease_key", "cycle_id", "token", "epoch", "now_ms"],
+        cypher: r#"
+            MATCH (lease:_ExocortexLease {lease_key: $lease_key, token: $token})
+            WHERE lease.epoch = $epoch AND lease.expires_at_ms > $now_ms
+            MATCH (journal:_CycleJournal {
+                lease_key: $lease_key, cycle_id: $cycle_id, state: 'Active'
+            })
+            SET journal.state = 'Completed', journal.completed_by_epoch = $epoch
+            RETURN journal.cycle_id
+        "#,
+    });
+
     // Fenced rollback physically removes only rows proven absent from the
     // cycle preimage. OPTIONAL MATCH makes an ambiguous failed write safe to
     // compensate even when the row never reached storage.
@@ -898,18 +954,134 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "mutation_lsn_guard",
+        read_only: false,
+        required_params: &["lsn"],
+        cypher: r#"
+            MERGE (order:_ExocortexMeta {key: 'committed_lsn'})
+            ON CREATE SET order.value = 0
+            WITH order WHERE order.value < $lsn
+            SET order.value = $lsn
+        "#,
+    });
+
+    reg!(Template {
+        id: "read_committed_lsn",
+        read_only: true,
+        required_params: &[],
+        cypher: r#"
+            MATCH (order:_ExocortexMeta {key: 'committed_lsn'})
+            RETURN order.value LIMIT 1
+        "#,
+    });
+
+    reg!(Template {
         id: "migrate_memory_schema_v1",
         read_only: false,
-        required_params: &["id", "entity_ids"],
+        required_params: &[
+            "id",
+            "memory_type_label",
+            "memory_type_id",
+            "props_json",
+            "tags",
+            "entity_ids",
+            "tenant_id",
+            "user_id",
+            "project_id",
+            "team_id",
+            "visibility",
+            "valid_from",
+            "valid_until",
+            "invalidated_by",
+            "recorded_at",
+            "lsn"
+        ],
         cypher: r#"
             MATCH (m:Memory {id: $id})
-            SET m.entity_ids = $entity_ids
+            SET m.memory_type_label = $memory_type_label,
+                m.memory_type_id = $memory_type_id,
+                m.props_json = $props_json,
+                m.tags = $tags,
+                m.entity_ids = $entity_ids,
+                m.tenant_id = $tenant_id,
+                m.user_id = $user_id,
+                m.project_id = $project_id,
+                m.team_id = $team_id,
+                m.visibility = $visibility,
+                m.valid_from = $valid_from,
+                m.valid_until = $valid_until,
+                m.invalidated_by = $invalidated_by,
+                m.recorded_at = $recorded_at,
+                m.lsn = $lsn
             MERGE (h:_MemoryAssertion {id: m.id, lsn: m.lsn})
-            ON CREATE SET h.visibility = m.visibility,
-                          h.valid_from = m.valid_from,
-                          h.valid_until = m.valid_until,
-                          h.recorded_at = m.recorded_at,
-                          h.props_json = m.props_json
+            ON CREATE SET h.memory_type_label = m.memory_type_label,
+                          h.memory_type_id = m.memory_type_id,
+                          h.visibility = m.visibility, h.valid_from = m.valid_from,
+                          h.valid_until = m.valid_until, h.recorded_at = m.recorded_at,
+                          h.invalidated_by = m.invalidated_by, h.props_json = m.props_json,
+                          h.tags = m.tags, h.entity_ids = m.entity_ids,
+                          h.tenant_id = m.tenant_id, h.user_id = m.user_id,
+                          h.project_id = m.project_id, h.team_id = m.team_id
+            RETURN m.id
+        "#,
+    });
+
+    reg!(Template {
+        id: "legacy_memory_candidates",
+        read_only: true,
+        required_params: &["limit"],
+        cypher: r#"
+            MATCH (m:Memory)
+            WHERE m.props_json IS NOT NULL AND m.lsn IS NOT NULL
+            OPTIONAL MATCH (current:_MemoryAssertion {id: m.id, lsn: m.lsn})
+            WITH m, count(current) AS current_count
+            WHERE current_count = 0
+            RETURN m ORDER BY m.lsn ASC LIMIT $limit
+        "#,
+    });
+
+    reg!(Template {
+        id: "repair_legacy_memory_v1",
+        read_only: false,
+        required_params: &[
+            "id",
+            "memory_type_label",
+            "memory_type_id",
+            "props_json",
+            "tags",
+            "entity_ids",
+            "tenant_id",
+            "user_id",
+            "project_id",
+            "team_id",
+            "visibility",
+            "valid_from",
+            "valid_until",
+            "invalidated_by",
+            "recorded_at",
+            "lsn"
+        ],
+        cypher: r#"
+            MATCH (m:Memory {id: $id})
+            WHERE m.lsn = $lsn
+            OPTIONAL MATCH (current:_MemoryAssertion {id: m.id, lsn: m.lsn})
+            WITH m, count(current) AS current_count
+            WHERE current_count = 0
+            SET m.memory_type_label = $memory_type_label,
+                m.memory_type_id = $memory_type_id,
+                m.props_json = $props_json, m.tags = $tags,
+                m.entity_ids = $entity_ids, m.tenant_id = $tenant_id,
+                m.user_id = $user_id, m.project_id = $project_id,
+                m.team_id = $team_id, m.visibility = $visibility,
+                m.valid_from = $valid_from, m.valid_until = $valid_until,
+                m.invalidated_by = $invalidated_by, m.recorded_at = $recorded_at
+            CREATE (h:_MemoryAssertion {id: m.id, lsn: m.lsn,
+                memory_type_label: m.memory_type_label, memory_type_id: m.memory_type_id,
+                visibility: m.visibility, valid_from: m.valid_from,
+                valid_until: m.valid_until, recorded_at: m.recorded_at,
+                invalidated_by: m.invalidated_by, props_json: m.props_json,
+                tags: m.tags, entity_ids: m.entity_ids, tenant_id: m.tenant_id,
+                user_id: m.user_id, project_id: m.project_id, team_id: m.team_id})
             RETURN m.id
         "#,
     });
@@ -1181,7 +1353,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                               d.to = $to,
                               d.discovered_at = $discovered_at,
                               d.props_json = $props_json,
-                              d.lsn = $lsn)
+                              d.lsn = $lsn,
+                              d.published = false)
             WITH proposals
             MATCH (d:_Discovery {discovery_id: $discovery_id})
             WHERE size(proposals) = 0
@@ -1191,7 +1364,57 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
               AND d.from = $from AND d.to = $to
               AND d.discovered_at = $discovered_at
               AND d.props_json = $props_json
-            RETURN d.discovery_id AS discovery_id, d.lsn AS discovery_lsn
+            RETURN d.discovery_id AS discovery_id, d.lsn AS discovery_lsn,
+                   coalesce(d.published, false) AS published
+        "#,
+    });
+
+    reg!(Template {
+        id: "batch_discovery_record_store",
+        read_only: false,
+        required_params: &[
+            "discovery_id",
+            "org_id",
+            "region_project",
+            "region_memory_type",
+            "from",
+            "to",
+            "discovered_at",
+            "props_json",
+            "lsn"
+        ],
+        cypher: r#"
+            OPTIONAL MATCH (p:_DiscoveryProposal {discovery_id: $discovery_id})
+            WITH count(p) AS proposal_count
+            WHERE proposal_count = 0
+            MERGE (d:_Discovery {discovery_id: $discovery_id})
+            ON CREATE SET d.org_id = $org_id, d.region_project = $region_project,
+                d.region_memory_type = $region_memory_type, d.from = $from, d.to = $to,
+                d.discovered_at = $discovered_at, d.props_json = $props_json,
+                d.lsn = $lsn, d.published = false
+        "#,
+    });
+
+    reg!(Template {
+        id: "discovery_outbox_mark_published",
+        read_only: false,
+        required_params: &["discovery_id", "lsn"],
+        cypher: r#"
+            MATCH (d:_Discovery {discovery_id: $discovery_id, lsn: $lsn})
+            SET d.published = true
+            RETURN d.discovery_id
+        "#,
+    });
+
+    reg!(Template {
+        id: "discovery_outbox_pending",
+        read_only: true,
+        required_params: &["limit"],
+        cypher: r#"
+            MATCH (d:_Discovery)
+            WHERE coalesce(d.published, false) = false
+            RETURN d.discovery_id, d.props_json, d.lsn
+            ORDER BY d.lsn ASC LIMIT $limit
         "#,
     });
 
@@ -1202,6 +1425,16 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MATCH (d:_Discovery {discovery_id: $discovery_id})
             RETURN d.props_json AS props_json LIMIT 1
+        "#,
+    });
+
+    reg!(Template {
+        id: "discovery_record_state",
+        read_only: true,
+        required_params: &["discovery_id"],
+        cypher: r#"
+            MATCH (d:_Discovery {discovery_id: $discovery_id})
+            RETURN d.props_json, d.lsn, coalesce(d.published, false) LIMIT 1
         "#,
     });
 

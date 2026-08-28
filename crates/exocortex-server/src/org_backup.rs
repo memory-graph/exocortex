@@ -13,7 +13,10 @@
 //! one-shot against quiesced storage, which is the DR model.
 
 use anyhow::{Context, Result};
-use exocortex_kernel::{Memory, Ontology, Relationship};
+use exocortex_kernel::{
+    relationship_visibility, validator::validate_triple, Memory, MemoryId, Ontology, Provenance,
+    Relationship, RelationshipId, Visibility,
+};
 use exocortex_storage::{
     bounded_io::{atomic_write_private, ensure_size, read_bounded, serialize_json_pretty_bounded},
     Storage,
@@ -142,6 +145,7 @@ pub async fn import_org<S: Storage>(
         "ontology fingerprint mismatch: backup {} vs binary {expected} — the backup was written against a different pack set",
         doc.ontology_fingerprint
     );
+    validate_restore_document(ontology, org_id, &doc)?;
     storage
         .upsert_batch(&doc.memories, &doc.relationships)
         .await
@@ -150,6 +154,120 @@ pub async fn import_org<S: Storage>(
         memories: doc.memories.len(),
         relationships: doc.relationships.len(),
     })
+}
+
+fn validate_restore_document(ontology: &Ontology, org_id: &str, doc: &OrgBackup) -> Result<()> {
+    let mut memories = std::collections::HashMap::<MemoryId, &Memory>::new();
+    for (index, memory) in doc.memories.iter().enumerate() {
+        anyhow::ensure!(
+            memories.insert(memory.id, memory).is_none(),
+            "memory {index}: duplicate id"
+        );
+        anyhow::ensure!(
+            ontology
+                .memory_type_names
+                .get(memory.memory_type as usize)
+                .is_some(),
+            "memory {index}: unknown memory type {}",
+            memory.memory_type
+        );
+        anyhow::ensure!(
+            memory.context.tenant_id.as_deref() == Some(org_id),
+            "memory {index}: tenant does not exactly match restore org"
+        );
+        anyhow::ensure!(
+            !matches!(&memory.provenance, Provenance::Proposed { .. }),
+            "memory {index}: proposed provenance may not persist"
+        );
+        match memory.visibility {
+            Visibility::Private => anyhow::ensure!(
+                memory
+                    .context
+                    .user_id
+                    .as_ref()
+                    .is_some_and(|id| !id.is_empty()),
+                "memory {index}: private visibility requires user scope"
+            ),
+            Visibility::Project => anyhow::ensure!(
+                memory
+                    .context
+                    .project_id
+                    .as_ref()
+                    .is_some_and(|id| !id.is_empty()),
+                "memory {index}: project visibility requires project scope"
+            ),
+            Visibility::Team => anyhow::ensure!(
+                memory
+                    .context
+                    .team_id
+                    .as_ref()
+                    .is_some_and(|id| !id.is_empty()),
+                "memory {index}: team visibility requires team scope"
+            ),
+            Visibility::Org | Visibility::Public => {}
+        }
+    }
+
+    let mut relationships = std::collections::HashSet::<RelationshipId>::new();
+    for (index, relationship) in doc.relationships.iter().enumerate() {
+        anyhow::ensure!(
+            relationships.insert(relationship.id),
+            "relationship {index}: duplicate id"
+        );
+        let from = memories
+            .get(&relationship.from)
+            .copied()
+            .with_context(|| format!("relationship {index}: missing from endpoint"))?;
+        let to = memories
+            .get(&relationship.to)
+            .copied()
+            .with_context(|| format!("relationship {index}: missing to endpoint"))?;
+        let metadata = ontology
+            .kinds_by_id
+            .get(&relationship.kind)
+            .with_context(|| format!("relationship {index}: unknown relationship kind"))?;
+        if ontology.triples_by_kind.contains_key(&relationship.kind) {
+            validate_triple(
+                ontology,
+                from.memory_type,
+                relationship.kind,
+                to.memory_type,
+            )
+            .with_context(|| format!("relationship {index}: invalid ontology triple"))?;
+        } else {
+            // Inverse companions are materialized durable rows but the
+            // catalogue stores type triples on their declared forward kind.
+            let forward_kind = ontology
+                .kinds_by_id
+                .iter()
+                .find_map(|(kind, candidate)| {
+                    (candidate.inverse == Some(relationship.kind)).then_some(*kind)
+                })
+                .with_context(|| {
+                    format!("relationship {index}: kind has no ontology triple or inverse")
+                })?;
+            validate_triple(ontology, to.memory_type, forward_kind, from.memory_type)
+                .with_context(|| {
+                    format!("relationship {index}: invalid inverse ontology triple")
+                })?;
+        }
+        anyhow::ensure!(
+            relationship
+                .visibility
+                .within(relationship_visibility(from.visibility, to.visibility)),
+            "relationship {index}: visibility is wider than an endpoint"
+        );
+        anyhow::ensure!(
+            !matches!(&relationship.provenance, Provenance::Proposed { .. }),
+            "relationship {index}: proposed provenance may not persist"
+        );
+        anyhow::ensure!(
+            !metadata.computed_only
+                || matches!(&relationship.provenance, Provenance::Computed { .. }),
+            "relationship {index}: computed-only kind has non-computed provenance"
+        );
+    }
+    Ok(())
 }
 
 fn hex(b: &[u8]) -> String {

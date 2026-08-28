@@ -9,6 +9,9 @@
 /// Wire-schema version for peer admission (R-W2/R-W3). Additive-only
 /// evolution; peers with mismatched wire versions refuse to peer.
 pub const WIRE_VERSION: u32 = 1;
+/// Client-facing SSE event capability version. Version 2 understands the
+/// additive visibility, reseed, and discovery oneof arms.
+pub const SSE_EVENT_VERSION: u32 = 2;
 
 /// `exocortex.ingest.v1` — the Ingestion Protocol (§18.6).
 pub mod ingest {

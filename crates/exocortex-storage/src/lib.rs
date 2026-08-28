@@ -21,11 +21,11 @@ pub use falkor::{FalkorConfig, FalkorStorage};
 pub use in_memory::InMemoryStorage;
 pub use trait_::{Storage, StorageError};
 pub use types::{
-    memory_visible, relationship_visible, AuditEvent, CommitRecord, CypherQuery, Direction,
-    DiscoveryAcceptance, DiscoveryProposal, DiscoveryRecord, Embedding, FencedBatchCommit,
-    FencedRestore, GraphSnapshot, IngestBatchKey, IngestCommitOutcome, Invalidation, LeaseKey,
-    MemoryFilter, OwnerLease, RegionKey, ResultSet, SettledIngestBatch, StorageBackendId,
-    StorageCapabilities, TraversalSpec, VisibilityContext,
+    memory_visible, relationship_visible, AuditEvent, CommitRecord, CycleJournalRecord,
+    CycleJournalState, CypherQuery, Direction, DiscoveryAcceptance, DiscoveryProposal,
+    DiscoveryRecord, Embedding, FencedBatchCommit, FencedRestore, GraphSnapshot, IngestBatchKey,
+    IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter, OwnerLease, RegionKey, ResultSet,
+    SettledIngestBatch, StorageBackendId, StorageCapabilities, TraversalSpec, VisibilityContext,
 };
 
 /// Result alias for storage operations (§6.1).

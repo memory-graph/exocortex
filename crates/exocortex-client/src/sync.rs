@@ -369,6 +369,16 @@ pub async fn run_sse_sync(
                     continue;
                 }
             };
+            let sse_version = exocortex_wire::SSE_EVENT_VERSION.to_string();
+            builder = match builder.header("x-exocortex-sse-version", &sse_version) {
+                Ok(builder) => builder,
+                Err(error) => {
+                    tracing::warn!(%error, "SSE version header rejected; backing off");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                    continue;
+                }
+            };
             if let Some(bearer) = &cfg.bearer {
                 match builder.header("authorization", &format!("Bearer {bearer}")) {
                     Ok(b) => builder = b,

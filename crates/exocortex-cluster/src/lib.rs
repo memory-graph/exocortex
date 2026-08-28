@@ -9,4 +9,4 @@
 pub mod node;
 pub mod sse;
 
-pub use node::{ClusterError, ClusterNode, Replay};
+pub use node::{ClusterError, ClusterNode, FeedHealth, Replay};

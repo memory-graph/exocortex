@@ -132,12 +132,12 @@ Connection: close
     // run loop), then upsert.
     let t0 = Instant::now();
     storage.upsert_memory(&mem("sse-pushed")).await.unwrap();
-    let _ = cluster
-        .tx
-        .send(cluster.envelope(Invalidation::MemoryUpserted {
+    cluster
+        .admit_and_publish(cluster.envelope(Invalidation::MemoryUpserted {
             id: mem("x").id,
             lsn: 1,
-        }));
+        }))
+        .unwrap();
 
     let deadline = t0 + Duration::from_millis(200);
     let mut buf = vec![0u8; 4096];

@@ -198,6 +198,7 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
         storage,
         ontology,
         exocortex_server::backend::BackendNodeArgs {
+            org: "org".into(),
             bind: "127.0.0.1:0".into(),
             transport: exocortex_server::backend::TransportSecurity::Tls {
                 certificate: "tests/fixtures/localhost-cert.pem".into(),

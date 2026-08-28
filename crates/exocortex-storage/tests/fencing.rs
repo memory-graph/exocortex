@@ -7,7 +7,9 @@ use exocortex_kernel::{
 };
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::types::LeaseKey;
-use exocortex_storage::{FencedRestore, InMemoryStorage, Storage, StorageError};
+use exocortex_storage::{
+    CycleJournalState, FencedRestore, InMemoryStorage, Storage, StorageError, VisibilityContext,
+};
 use std::sync::Arc;
 
 fn store() -> InMemoryStorage {
@@ -153,6 +155,85 @@ async fn fenced_restore_preserves_concurrent_non_cycle_versions() {
             "every Dreams-owned relationship assertion must be removed"
         );
     }
+}
+
+#[tokio::test]
+async fn journaled_fenced_batches_atomically_accumulate_exact_owned_versions() {
+    let s = store();
+    let original = mem(40);
+    s.upsert_memory(&original).await.unwrap();
+    let key = LeaseKey::Dreams {
+        org: "org".into(),
+        region: "journal".into(),
+    };
+    let lease = s
+        .acquire_lease(&key, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let prepared = FencedRestore {
+        memories: vec![original.clone()],
+        ..FencedRestore::default()
+    };
+
+    let mut first = original.clone();
+    first.title = "cycle-one".into();
+    let first_commit = s
+        .upsert_batch_fenced_journaled(&[first], &[], &prepared, "cycle-1", &lease)
+        .await
+        .unwrap();
+    let mut second = original.clone();
+    second.title = "cycle-two".into();
+    let second_commit = s
+        .upsert_batch_fenced_journaled(&[second], &[], &prepared, "cycle-1", &lease)
+        .await
+        .unwrap();
+
+    let journal = s
+        .get_active_cycle_journal(&key)
+        .await
+        .unwrap()
+        .expect("committed mutation has an active durable journal");
+    assert_eq!(journal.state, CycleJournalState::Active);
+    let owned = journal.restore.owned_memory_lsns.get(&original.id).unwrap();
+    assert!(owned.contains(&first_commit.records[0].lsn));
+    assert!(owned.contains(&second_commit.records[0].lsn));
+
+    s.restore_fenced(&journal.restore, &lease).await.unwrap();
+    s.complete_cycle_journal_fenced("cycle-1", &lease)
+        .await
+        .unwrap();
+    assert!(s.get_active_cycle_journal(&key).await.unwrap().is_none());
+    assert_eq!(
+        s.get_memory(&original.id).await.unwrap().unwrap().title,
+        original.title
+    );
+}
+
+#[tokio::test]
+async fn visible_batch_preserves_requested_identity_order() {
+    let s = store();
+    let mut first = mem(50);
+    first.context.tenant_id = Some("org".into());
+    let mut second = mem(51);
+    second.context.tenant_id = Some("org".into());
+    s.upsert_batch(&[first.clone(), second.clone()], &[])
+        .await
+        .unwrap();
+    let rows = s
+        .get_visible_memories(
+            &[second.id, first.id],
+            &VisibilityContext {
+                org_id: "org".into(),
+                max_visibility: Visibility::Org,
+                ..VisibilityContext::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|memory| memory.id).collect::<Vec<_>>(),
+        [second.id, first.id]
+    );
 }
 
 fn mem(seed: u8) -> Memory {

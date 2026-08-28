@@ -13,6 +13,7 @@ use exocortex_storage::Storage;
 
 fn args(bind: &str, gossip: u16, seeds: Vec<String>) -> BackendNodeArgs {
     BackendNodeArgs {
+        org: "org".into(),
         bind: bind.into(),
         transport: exocortex_server::backend::TransportSecurity::PlaintextLoopback,
         node_id: format!("node-{gossip}"),
@@ -407,6 +408,44 @@ async fn backend_nodes_serve_http_grpc_and_gossip_converges() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn backend_node_threads_a_non_default_org_through_its_runtime() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let mut memory = acceptance_memory(88, false);
+    memory.context.tenant_id = Some("acme".into());
+    storage.upsert_memory(&memory).await.unwrap();
+
+    let mut config = args("127.0.0.1:0", 41008, vec![]);
+    config.org = "acme".into();
+    config.principals = Arc::new(
+        exocortex_server::principal::PrincipalRegistry::single(
+            "test-only-acme-bearer-token-00000000".into(),
+            exocortex_ops::operations::ops_vc("acme", "reader", exocortex_kernel::Visibility::Org),
+        )
+        .unwrap(),
+    );
+    let node = run_backend_node(storage, onto, config)
+        .await
+        .expect("a configured non-default organization boots");
+    let acme =
+        exocortex_ops::operations::ops_vc("acme", "reader", exocortex_kernel::Visibility::Org);
+    assert!(node.cache.get_memory("acme", &memory.id, &acme).is_some());
+    assert!(node.cache.get_memory("org", &memory.id, &acme).is_none());
+    let (status, _) = http_get(
+        node.local_addr,
+        "/v1/audit?since_lsn=0",
+        Some("test-only-acme-bearer-token-00000000"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the configured org principal reaches operations"
+    );
+}
+
 fn acceptance_memory(seed: u8, embedding: bool) -> exocortex_kernel::Memory {
     use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
     Memory {
@@ -745,7 +784,7 @@ async fn three_node_owner_runs_full_event_driven_dreams_lifecycle() {
         chrono::Utc::now() - chrono::Duration::hours(7),
     );
     for _ in 0..1000 {
-        nodes[owner].dreams.on_write(region.clone()).await;
+        nodes[owner].dreams.on_write(region.clone()).await.unwrap();
     }
 
     let result = tokio::time::timeout(Duration::from_secs(3), async {
@@ -977,4 +1016,17 @@ async fn health_ready_reflects_maintainer_truth() {
         body.contains("\"not-ready\"") && !body.contains("storage_ok"),
         "public probe is minimal: {body}"
     );
+
+    // A dead/reconnecting invalidation feed is independently not ready even
+    // when storage and the lease maintainer remain healthy.
+    node.health.rcu(|h| {
+        let mut next = h.as_ref().clone();
+        next.storage_ok = true;
+        next.last_lease_tick = Some(chrono::Utc::now());
+        next.cluster_feed_ready = false;
+        std::sync::Arc::new(next)
+    });
+    let (status, body) = http_get(node.local_addr, "/health/ready", None).await;
+    assert_eq!(status, 503, "dead invalidation feed must fail readiness");
+    assert!(body.contains("\"not-ready\""));
 }

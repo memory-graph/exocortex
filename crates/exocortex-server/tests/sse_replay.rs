@@ -74,7 +74,7 @@ async fn get_status_and_body(addr: std::net::SocketAddr, path: &str) -> (String,
     let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     sock.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n")
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\nX-Exocortex-SSE-Version: 2\r\nConnection: close\r\n\r\n")
             .as_bytes(),
     )
     .await

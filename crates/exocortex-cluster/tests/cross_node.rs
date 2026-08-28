@@ -13,7 +13,6 @@ use exocortex_cluster::ClusterNode;
 use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{FalkorConfig, FalkorStorage, Storage};
-use futures::StreamExt;
 
 fn falkor_url() -> Option<String> {
     std::env::var("FALKOR_URL").ok().filter(|u| !u.is_empty())
@@ -28,7 +27,10 @@ async fn node(node_id: &str, graph: &str) -> FalkorStorage {
             falkor_url: url,
             redis_url: redis,
             graph_name: graph.into(),
-            org_id: "crossnode".into(),
+            // Pub-sub channels are org-scoped. Use the per-test graph suffix
+            // as the org as well so concurrently executing live tests cannot
+            // consume one another's invalidations.
+            org_id: graph.into(),
             node_id: node_id.into(),
         },
         onto,
@@ -82,12 +84,48 @@ fn mem(title: &str, n: u8) -> Memory {
     }
 }
 
+async fn wait_feed_ready(node: &ClusterNode<FalkorStorage>) {
+    let mut health = node.subscribe_feed_health();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if health.borrow().ready {
+                break;
+            }
+            health.changed().await.expect("feed health sender alive");
+        }
+    })
+    .await
+    .expect("storage invalidation feed became ready");
+}
+
+async fn wait_for_frontier(
+    subscriber: &mut tokio::sync::broadcast::Receiver<
+        exocortex_wire::cluster::v1::InvalidationEnvelope,
+    >,
+    frontier: u64,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let envelope = subscriber.recv().await.expect("peer invalidation");
+            if envelope
+                .inv
+                .as_ref()
+                .is_some_and(|invalidation| invalidation.backend_lsn >= frontier)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("peer observed committed frontier");
+}
+
 /// Node A commits; node B's local hub carries it (Redis pub-sub, §9.1);
 /// an SSE subscriber on B observes the envelope within a bounded wait.
 #[tokio::test(flavor = "multi_thread")]
 async fn cross_node_commit_reaches_peer_hub() {
     if falkor_url().is_none() {
-        eprintln!("skipping cross_node_commit_reaches_peer_hub: FALKOR_URL not set");
+        eprintln!("UNEXECUTED cross_node_commit_reaches_peer_hub: FALKOR_URL not set");
         return;
     }
     let graph = format!("crossnode_a_{}", std::process::id());
@@ -106,6 +144,7 @@ async fn cross_node_commit_reaches_peer_hub() {
         tokio::spawn(async move { runner.run().await });
     }
     let mut subscriber = cluster_b.subscribe_local();
+    wait_feed_ready(&cluster_b).await;
 
     // Node A commits two rows; B never touches storage itself.
     let c1 = storage_a.upsert_memory(&mem("via-a-1", 1)).await.unwrap();
@@ -140,7 +179,7 @@ async fn cross_node_commit_reaches_peer_hub() {
 async fn cross_node_replay_window_serves_reconnects() {
     use exocortex_server::sse::sse_router;
     if falkor_url().is_none() {
-        eprintln!("skipping cross_node_replay_window_serves_reconnects: FALKOR_URL not set");
+        eprintln!("UNEXECUTED cross_node_replay_window_serves_reconnects: FALKOR_URL not set");
         return;
     }
     let graph = format!("crossnode_b_{}", std::process::id());
@@ -158,14 +197,15 @@ async fn cross_node_replay_window_serves_reconnects() {
         let runner = cluster_b.clone();
         tokio::spawn(async move { runner.run().await });
     }
-    // Wait for B's subscription to be live before committing (pub-sub has
-    // no replay; early commits would only hit the ring via the hub).
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut subscriber = cluster_b.subscribe_local();
+    // Pub-sub has no replay, so readiness must be observed before committing.
+    wait_feed_ready(&cluster_b).await;
 
     let c1 = storage_a.upsert_memory(&mem("replay-1", 1)).await.unwrap();
     let c2 = storage_a.upsert_memory(&mem("replay-2", 2)).await.unwrap();
-    // Let B's loop ingest both into hub + replay ring.
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // The local hub and replay ring are updated by the same publish operation;
+    // observing c2's frontier makes replay assertions deterministic.
+    wait_for_frontier(&mut subscriber, c2.lsn).await;
 
     // Reconnect from before both: the ring replays 2 events, in LSN order.
     let replay = match cluster_b.replay_since(c1.lsn - 1) {
@@ -189,7 +229,7 @@ async fn cross_node_replay_window_serves_reconnects() {
     // And the router serves the same window over SSE.
     let app = sse_router(cluster_b.clone()).layer(axum::Extension(
         exocortex_storage::VisibilityContext {
-            org_id: "org".into(),
+            org_id: graph.clone().into(),
             user_id: "test-reader".into(),
             max_visibility: exocortex_kernel::Visibility::Org,
             ..Default::default()

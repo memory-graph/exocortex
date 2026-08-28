@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use exocortex_kernel::OntologyFingerprint;
 use exocortex_storage::{Invalidation, LeaseKey, OwnerLease, Storage};
@@ -41,7 +41,7 @@ pub struct ClusterNode<S: Storage> {
     /// Cluster-shared HMAC key (R-Sec4).
     pub hmac_key: [u8; 32],
     /// Local fan-out hub backing the SSE router.
-    pub tx: broadcast::Sender<InvalidationEnvelope>,
+    tx: broadcast::Sender<InvalidationEnvelope>,
     /// Bounded replay buffer for `?since_lsn` reconnects (R-C6): the last
     /// `replay_cap` envelopes in backend-LSN order. When a reconnect's
     /// `since_lsn` is older than the buffer floor the server answers
@@ -54,6 +54,18 @@ pub struct ClusterNode<S: Storage> {
     max_observed_lsn: std::sync::atomic::AtomicU64,
     /// Ring capacity (default [`REPLAY_CAPACITY_DEFAULT`]).
     replay_cap: usize,
+    feed_health: watch::Sender<FeedHealth>,
+}
+
+/// Observable lifecycle state for the storage invalidation subscription.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FeedHealth {
+    /// Increments after each successful subscription.
+    pub epoch: u64,
+    /// True only while the current subscription is live.
+    pub ready: bool,
+    /// Decode, subscription, and clean-termination failures observed.
+    pub failures: u64,
 }
 
 /// Default replay-buffer depth (envelopes). The PRD's "last 15 minutes"
@@ -79,6 +91,7 @@ impl<S: Storage + 'static> ClusterNode<S> {
         hmac_key: [u8; 32],
     ) -> Self {
         let (tx, _) = broadcast::channel(4096);
+        let (feed_health, _) = watch::channel(FeedHealth::default());
         Self {
             storage,
             node_id,
@@ -89,6 +102,7 @@ impl<S: Storage + 'static> ClusterNode<S> {
             replay_cap: REPLAY_CAPACITY_DEFAULT,
             observed_anything: std::sync::atomic::AtomicBool::new(false),
             max_observed_lsn: std::sync::atomic::AtomicU64::new(0),
+            feed_health,
         }
     }
 
@@ -194,33 +208,71 @@ impl<S: Storage + 'static> ClusterNode<S> {
             project: "*".into(),
             memory_type: 0,
         };
-        let mut sub = self.storage.subscribe_invalidations(&region).await?;
-        use futures::StreamExt;
-        while let Some(inv) = sub.next().await {
-            // CS7 (audit): a decode failure means the LSN sequence on this
-            // node is known-incomplete — count it, log it, and re-anchor
-            // (subscribers will gap-detect and reseed), never swallow it.
-            let inv = match inv {
-                Ok(inv) => inv,
-                Err(e) => {
-                    metrics::counter!("exocortex_cluster_invalidation_decode_errors_total")
-                        .increment(1);
-                    tracing::warn!(%e, "storage invalidation decode failed; change lost");
+        let mut delay = std::time::Duration::from_millis(100);
+        loop {
+            let mut sub = match self.storage.subscribe_invalidations(&region).await {
+                Ok(sub) => sub,
+                Err(error) => {
+                    self.mark_feed_failed();
+                    tracing::warn!(%error, "storage invalidation subscribe failed; retrying");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(5));
                     continue;
                 }
             };
-            let env = self.envelope(inv);
-            // Keep local storage events on the same admission path as peer
-            // envelopes. This makes the public security control a live
-            // production boundary and prevents a future caller from adding a
-            // second, unchecked fan-out path.
-            self.admit_and_publish(env)?;
-            // Peer fan-out over Redis pub-sub is wired at M5 server start
-            // (same instance as FalkorDB, §9.1); the storage subscribe
-            // already crosses nodes through FalkorDB replication in the
-            // docker-compose topology.
+            self.mark_feed_ready();
+            delay = std::time::Duration::from_millis(100);
+            self.consume_feed_epoch(&mut sub).await?;
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(5));
         }
+    }
+
+    async fn consume_feed_epoch(
+        &self,
+        sub: &mut futures::stream::BoxStream<'_, exocortex_storage::Result<Invalidation>>,
+    ) -> Result<(), ClusterError> {
+        use futures::StreamExt as _;
+        while let Some(inv) = sub.next().await {
+            let inv = match inv {
+                Ok(inv) => inv,
+                Err(error) => {
+                    metrics::counter!("exocortex_cluster_invalidation_decode_errors_total")
+                        .increment(1);
+                    self.mark_feed_failed();
+                    tracing::warn!(%error, "storage invalidation decode failed; reconnecting");
+                    return Ok(());
+                }
+            };
+            self.admit_and_publish(self.envelope(inv))?;
+        }
+        self.mark_feed_failed();
+        tracing::warn!("storage invalidation stream ended; reconnecting");
         Ok(())
+    }
+
+    fn mark_feed_ready(&self) {
+        let mut state = *self.feed_health.borrow();
+        state.epoch = state.epoch.saturating_add(1);
+        state.ready = true;
+        self.feed_health.send_replace(state);
+    }
+
+    fn mark_feed_failed(&self) {
+        let mut state = *self.feed_health.borrow();
+        state.ready = false;
+        state.failures = state.failures.saturating_add(1);
+        self.feed_health.send_replace(state);
+    }
+
+    /// Snapshot the feed state for readiness and supervision.
+    pub fn feed_health(&self) -> FeedHealth {
+        *self.feed_health.borrow()
+    }
+
+    /// Subscribe to feed epoch/readiness changes without timing sleeps.
+    pub fn subscribe_feed_health(&self) -> watch::Receiver<FeedHealth> {
+        self.feed_health.subscribe()
     }
 
     /// Sign an invalidation into a wire envelope (R-W4: HMAC-SHA256 over
@@ -280,4 +332,71 @@ impl<S: Storage + 'static> ClusterNode<S> {
 /// The backend LSN an envelope carries (0 when malformed).
 fn envelope_lsn(env: &InvalidationEnvelope) -> u64 {
     env.inv.as_ref().map(|i| i.backend_lsn).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exocortex_kernel::MemoryId;
+    use exocortex_pack_dev_v1::pack_def;
+    use exocortex_storage::{InMemoryStorage, StorageError};
+    use futures::StreamExt as _;
+
+    fn node() -> ClusterNode<InMemoryStorage> {
+        let ontology =
+            Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).expect("ontology"));
+        ClusterNode::new(
+            Arc::new(InMemoryStorage::new(ontology.clone())),
+            "feed-test".into(),
+            ontology.fingerprint,
+            [5; 32],
+        )
+    }
+
+    #[tokio::test]
+    async fn decode_failure_and_eof_end_the_epoch_and_are_observable() {
+        let node = node();
+        let mut receiver = node.subscribe_local();
+        node.mark_feed_ready();
+        let mut first = futures::stream::iter(vec![
+            Ok(Invalidation::MemoryDeleted {
+                id: MemoryId::new_v7(),
+                lsn: 11,
+            }),
+            Err(StorageError::Backend("corrupt stream row".into())),
+        ])
+        .boxed();
+
+        node.consume_feed_epoch(&mut first).await.expect("epoch");
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .expect("published")
+                .inv
+                .unwrap()
+                .backend_lsn,
+            11
+        );
+        assert_eq!(
+            node.feed_health(),
+            FeedHealth {
+                epoch: 1,
+                ready: false,
+                failures: 1,
+            }
+        );
+
+        node.mark_feed_ready();
+        let mut second = futures::stream::empty().boxed();
+        node.consume_feed_epoch(&mut second).await.expect("epoch");
+        assert_eq!(
+            node.feed_health(),
+            FeedHealth {
+                epoch: 2,
+                ready: false,
+                failures: 2,
+            }
+        );
+    }
 }

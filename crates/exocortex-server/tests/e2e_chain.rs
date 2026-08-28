@@ -99,6 +99,7 @@ async fn boot() -> (
         storage.clone(),
         onto.clone(),
         exocortex_server::backend::BackendNodeArgs {
+            org: "org".into(),
             bind: "127.0.0.1:0".into(),
             transport: exocortex_server::backend::TransportSecurity::PlaintextLoopback,
             node_id: "e2e-node".into(),

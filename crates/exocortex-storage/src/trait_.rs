@@ -6,10 +6,10 @@ use futures::stream::BoxStream;
 use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId};
 
 use crate::types::{
-    AuditEvent, CommitRecord, CypherQuery, DiscoveryAcceptance, DiscoveryProposal, DiscoveryRecord,
-    Embedding, FencedBatchCommit, FencedRestore, GraphSnapshot, IngestBatchKey,
-    IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter, OwnerLease, RegionKey, ResultSet,
-    StorageBackendId, StorageCapabilities, TraversalSpec,
+    AuditEvent, CommitRecord, CycleJournalRecord, CypherQuery, DiscoveryAcceptance,
+    DiscoveryProposal, DiscoveryRecord, Embedding, FencedBatchCommit, FencedRestore, GraphSnapshot,
+    IngestBatchKey, IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter, OwnerLease,
+    RegionKey, ResultSet, StorageBackendId, StorageCapabilities, TraversalSpec,
 };
 
 /// Errors surfaced by every `Storage` implementation.
@@ -193,11 +193,14 @@ pub trait Storage: Send + Sync + 'static {
         ids: &[MemoryId],
         vc: &crate::VisibilityContext,
     ) -> crate::Result<Vec<Memory>> {
-        Ok(self
-            .get_memories(ids)
-            .await?
-            .into_iter()
+        let rows = self.get_memories(ids).await?;
+        let by_id: std::collections::HashMap<_, _> =
+            rows.into_iter().map(|memory| (memory.id, memory)).collect();
+        Ok(ids
+            .iter()
+            .filter_map(|id| by_id.get(id))
             .filter(|memory| crate::memory_visible(memory, vc))
+            .cloned()
             .collect())
     }
     /// Indexed point read of one current relationship row.
@@ -381,6 +384,43 @@ pub trait Storage: Send + Sync + 'static {
         rs: &[Relationship],
         lease: &OwnerLease,
     ) -> crate::Result<FencedBatchCommit>;
+    /// Atomically commit a fenced owner batch and merge its exact backend LSNs
+    /// into the durable active cycle journal. Implementations must not expose
+    /// the graph mutation without the matching journal ownership record.
+    async fn upsert_batch_fenced_journaled(
+        &self,
+        ms: &[Memory],
+        rs: &[Relationship],
+        prepared_restore: &FencedRestore,
+        cycle_id: &str,
+        lease: &OwnerLease,
+    ) -> crate::Result<FencedBatchCommit> {
+        let _ = (ms, rs, prepared_restore, cycle_id, lease);
+        Err(StorageError::Backend(
+            "durable fenced cycle journals unsupported".into(),
+        ))
+    }
+    /// Return the active cycle journal for a lease scope, if recovery is due.
+    async fn get_active_cycle_journal(
+        &self,
+        key: &LeaseKey,
+    ) -> crate::Result<Option<CycleJournalRecord>> {
+        let _ = key;
+        Err(StorageError::Backend(
+            "durable fenced cycle journals unsupported".into(),
+        ))
+    }
+    /// Atomically tombstone a recovered/completed cycle under the current fence.
+    async fn complete_cycle_journal_fenced(
+        &self,
+        cycle_id: &str,
+        lease: &OwnerLease,
+    ) -> crate::Result<()> {
+        let _ = (cycle_id, lease);
+        Err(StorageError::Backend(
+            "durable fenced cycle journals unsupported".into(),
+        ))
+    }
     /// [`Storage::delete_memory`](Self::delete_memory) under the same
     /// fencing check (a rollback must not delete a newer owner's rows).
     async fn delete_memory_fenced(

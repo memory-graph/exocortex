@@ -90,6 +90,30 @@ fn wrong_cluster_key_rejects() {
     assert!(matches!(b.admit(&env), Err(ClusterError::HmacFailed)));
 }
 
+#[test]
+fn unauthenticated_envelope_never_reaches_fanout_or_replay() {
+    let storage = InMemoryStorage::new(Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap(),
+    ));
+    let n = node(&storage, "node-1", [7u8; 32]);
+    let mut receiver = n.subscribe_local();
+    let mut unsigned = n.envelope(Invalidation::MemoryUpserted {
+        id: MemoryId::new_v7(),
+        lsn: 9,
+    });
+    unsigned.hmac.clear();
+
+    assert!(matches!(
+        n.admit_and_publish(unsigned),
+        Err(ClusterError::HmacFailed)
+    ));
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(n.replay_since(0), exocortex_cluster::Replay::Fresh(rows) if rows.is_empty()));
+}
+
 #[tokio::test]
 async fn lease_race_and_epoch_fencing_against_live_falkordb() {
     // The live lease race runs when the docker harness is up; against the
@@ -189,7 +213,7 @@ async fn sse_hub_fans_out_signed_envelopes() {
         id: MemoryId::new_v7(),
         lsn: 5,
     });
-    let _ = n.tx.send(env.clone());
+    n.admit_and_publish(env.clone()).unwrap();
     let got = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("envelope within 2s")

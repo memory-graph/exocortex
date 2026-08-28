@@ -283,8 +283,10 @@ itest!(
         let graph = first.graph_name_clone();
         let entity = EntityId([11; 16]);
         let mut from = mem("legacy-from", 3, Visibility::Org);
+        from.context.tenant_id = None;
         from.context.entities.push(entity);
-        let to = mem("legacy-to", 3, Visibility::Org);
+        let mut to = mem("legacy-to", 3, Visibility::Org);
+        to.context.tenant_id = None;
         let relationship = rel(from.id, to.id, exocortex_kernel::kinds::FIXES.0);
         first
             .upsert_batch(&[from.clone(), to.clone()], &[relationship])
@@ -329,6 +331,11 @@ itest!(
             .await
             .expect("legacy entity ids are denormalized at startup");
         assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), [from.id]);
+        assert_eq!(
+            rows[0].context.tenant_id.as_deref(),
+            Some("test-org"),
+            "genuine pre-tenant canonical JSON is adopted by the configured graph org"
+        );
         let state = restarted
             .get_state_at(Utc::now() + Duration::seconds(1))
             .await
@@ -539,6 +546,42 @@ itest!(fingerprint_mismatch_aborts_startup, {
         "expected FingerprintMismatch, got {err:?}"
     );
 });
+
+itest!(
+    post_migration_legacy_write_is_repaired_without_widening_current_null_tenant,
+    {
+        let s = connect("legacy-after-migration").await;
+        let mut legacy = mem("legacy-after-v1", 3, Visibility::Org);
+        legacy.context.tenant_id = None;
+        s.upsert_memory(&legacy).await.unwrap();
+        let vc = VisibilityContext {
+            user_id: "user-1".into(),
+            org_id: "test-org".into(),
+            project_ids: ["proj".into()].into_iter().collect(),
+            max_visibility: Visibility::Org,
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.get_memory_for(&legacy.id, &vc).await,
+            Err(exocortex_storage::StorageError::PermissionDenied)
+        ));
+
+        s.query_cypher(&CypherQuery {
+            template_id: "integration_remove_current_memory_assertion",
+            params: serde_json::json!({ "id": id_hex(&legacy.id.0) }),
+            read_only: false,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+        let repaired = s
+            .get_memory_for(&legacy.id, &vc)
+            .await
+            .unwrap()
+            .expect("legacy-shaped row is repaired before exposure");
+        assert_eq!(repaired.context.tenant_id.as_deref(), Some("test-org"));
+    }
+);
 
 itest!(malformed_fingerprint_fails_closed_without_rewrite, {
     let s = connect("corrupt-fingerprint").await;
@@ -1268,7 +1311,7 @@ itest!(discovery_publish_is_durable_ordered_and_idempotent_live, {
     tokio::time::sleep(StdDuration::from_millis(150)).await;
     let record = DiscoveryRecord {
         discovery_id: format!("discovery-event-{}", graph_suffix()).into(),
-        region,
+        region: region.clone(),
         from: MemoryId::new_v7(),
         to: MemoryId::new_v7(),
         discovery_type: "transitive".into(),
@@ -1333,6 +1376,75 @@ itest!(discovery_publish_is_durable_ordered_and_idempotent_live, {
         .is_err(),
         "an immutable exact retry must not publish a duplicate event"
     );
+});
+
+itest!(discovery_outbox_retries_after_live_publication_failure, {
+    let storage = connect("discovery-outbox-retry").await;
+    let region = RegionKey {
+        org: "test-org".into(),
+        project: "proj".into(),
+        memory_type: 3,
+    };
+    let graph = storage.graph_name_clone();
+    let record = DiscoveryRecord {
+        discovery_id: format!("discovery-retry-{}", graph_suffix()).into(),
+        region: region.clone(),
+        from: MemoryId::new_v7(),
+        to: MemoryId::new_v7(),
+        discovery_type: "transitive".into(),
+        quality: 0.7,
+        via_types: [1, 2],
+        discovery_cycle_id: "retry-cycle".into(),
+        discovered_at: Utc::now(),
+    };
+    storage.fail_next_publish_for_testing();
+    assert!(storage.store_discovery(&record).await.is_err());
+    assert_eq!(
+        storage.get_discovery(&record.discovery_id).await.unwrap(),
+        Some(record.clone()),
+        "publication failure does not roll back the durable outbox record"
+    );
+
+    let url = falkor_url().unwrap();
+    let recovery = FalkorStorage::connect(
+        FalkorConfig {
+            falkor_url: url.clone(),
+            redis_url: std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+            graph_name: graph,
+            org_id: "test-org".into(),
+            node_id: "discovery-recovery".into(),
+        },
+        ontology(),
+    )
+    .await
+    .unwrap();
+    let mut feed = recovery.subscribe_invalidations(&region).await.unwrap();
+    let published = tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            if let Some(Ok(Invalidation::DiscoveryAvailable {
+                record: observed,
+                lsn,
+            })) = feed.next().await
+            {
+                if observed.discovery_id == record.discovery_id {
+                    break lsn;
+                }
+            }
+        }
+    })
+    .await
+    .expect("durable pending event is retried");
+    let persisted = storage
+        .query_cypher(&CypherQuery {
+            template_id: "integration_get_discovery_lsn",
+            params: serde_json::json!({ "discovery_id": record.discovery_id }),
+            read_only: true,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+    assert_eq!(persisted.rows, vec![serde_json::json!([published])]);
 });
 
 itest!(
@@ -1501,6 +1613,47 @@ itest!(lease_race_single_winner, {
         .expect("B wins after release");
     assert!(second.epoch > 0, "epoch fencing increments");
 });
+
+itest!(
+    cross_node_durable_mutations_cannot_commit_below_graph_frontier,
+    {
+        let a = Arc::new(connect("ordered-node-a").await);
+        let url = falkor_url().unwrap();
+        let b = FalkorStorage::connect(
+            FalkorConfig {
+                falkor_url: url.clone(),
+                redis_url: std::env::var("REDIS_URL")
+                    .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+                graph_name: a.graph_name_clone(),
+                org_id: "test-org".into(),
+                node_id: "ordered-node-b".into(),
+            },
+            ontology(),
+        )
+        .await
+        .unwrap();
+        let lower = mem("lower-lsn", 3, Visibility::Org);
+        let mut higher = lower.clone();
+        higher.title = "higher-lsn".into();
+
+        a.pause_next_lsn_for_testing();
+        let delayed = {
+            let a = a.clone();
+            tokio::spawn(async move { a.upsert_memory(&lower).await })
+        };
+        a.wait_for_paused_lsn_for_testing().await;
+        let high_commit = b.upsert_memory(&higher).await.unwrap();
+        a.release_paused_lsn_for_testing();
+        let low_result = delayed.await.unwrap();
+        assert!(
+            low_result.is_err(),
+            "a lower allocated LSN cannot commit late"
+        );
+        let current = b.get_memory(&higher.id).await.unwrap().unwrap();
+        assert_eq!(current.title, higher.title);
+        assert_eq!(current.lsn.value, high_commit.lsn);
+    }
+);
 
 itest!(invalidation_end_to_end, {
     let sub = connect("sub-node").await;

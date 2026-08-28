@@ -16,7 +16,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use exocortex_cluster::{ClusterNode, Replay};
+use exocortex_cluster::{ClusterError, ClusterNode, Replay};
 use exocortex_kernel::{Memory, MemoryId, Relationship, RelationshipId};
 use exocortex_storage::{
     memory_visible, relationship_visible, Invalidation, Storage, StorageError, VisibilityContext,
@@ -105,6 +105,11 @@ async fn handler<S: Storage + 'static>(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .filter(|value| !value.is_empty());
+    let supports_additive_events = headers
+        .get("x-exocortex-sse-version")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some_and(|version| version >= exocortex_wire::SSE_EVENT_VERSION);
     if principal.is_none() {
         return (http::StatusCode::UNAUTHORIZED, "missing SSE credentials").into_response();
     }
@@ -166,17 +171,32 @@ async fn handler<S: Storage + 'static>(
         let mut rx = tokio_stream::wrappers::BroadcastStream::new(rx);
         // Initial comment anchors the connection before the first delta.
         yield Ok::<Event, Infallible>(Event::default().comment(format!("exocortex {node_id}")));
-        if let Some(mut env) = initial_snapshot {
-            if let Some(key) = &client_key {
-                resign(key, &mut env);
+        if let Some(env) = initial_snapshot {
+            let envelopes = match finalize_for_subscriber(
+                &cluster,
+                env,
+                client_key.as_ref(),
+                supports_additive_events,
+            ) {
+                Ok(envelopes) => envelopes,
+                Err(error) => {
+                    tracing::warn!(?error, "closing SSE stream after invalid initial envelope");
+                    return;
+                }
+            };
+            for env in envelopes {
+                let payload = B64::encode(&prost_encode(&env));
+                yield Ok(Event::default().event("inv").data(payload));
             }
-            let payload = B64::encode(&prost_encode(&env));
-            yield Ok(Event::default().event("inv").data(payload));
         }
         // R-C6 replay first (LSN order); the client's LSN gate dedups any
         // overlap with the live stream that follows.
         for env in replay {
-            let mut env = match prepare_for_subscriber(
+            if let Err(error) = cluster.verify_hmac(&env) {
+                tracing::warn!(?error, "closing SSE stream after invalid replay envelope");
+                return;
+            }
+            let env = match prepare_for_subscriber(
                 &cluster,
                 &state.hydration,
                 env,
@@ -188,13 +208,22 @@ async fn handler<S: Storage + 'static>(
                     return;
                 }
             };
-            if let Some(key) = &client_key {
-                if env.hmac.is_empty() || cluster.verify_hmac(&env).is_ok() {
-                    resign(key, &mut env);
+            let envelopes = match finalize_for_subscriber(
+                &cluster,
+                env,
+                client_key.as_ref(),
+                supports_additive_events,
+            ) {
+                Ok(envelopes) => envelopes,
+                Err(error) => {
+                    tracing::warn!(?error, "closing SSE stream after invalid prepared envelope");
+                    return;
                 }
+            };
+            for env in envelopes {
+                let payload = B64::encode(&prost_encode(&env));
+                yield Ok(Event::default().event("inv").data(payload));
             }
-            let payload = B64::encode(&prost_encode(&env));
-            yield Ok(Event::default().event("inv").data(payload));
         }
         while let Some(item) = rx.next().await {
             let env = match item {
@@ -204,7 +233,11 @@ async fn handler<S: Storage + 'static>(
                     return;
                 }
             };
-            let mut env = match prepare_for_subscriber(
+            if let Err(error) = cluster.verify_hmac(&env) {
+                tracing::warn!(?error, "closing SSE stream after invalid live envelope");
+                return;
+            }
+            let env = match prepare_for_subscriber(
                 &cluster,
                 &state.hydration,
                 env,
@@ -216,18 +249,67 @@ async fn handler<S: Storage + 'static>(
                     return;
                 }
             };
-            if let Some(key) = &client_key {
-                if env.hmac.is_empty() || cluster.verify_hmac(&env).is_ok() {
-                    resign(key, &mut env);
+            let envelopes = match finalize_for_subscriber(
+                &cluster,
+                env,
+                client_key.as_ref(),
+                supports_additive_events,
+            ) {
+                Ok(envelopes) => envelopes,
+                Err(error) => {
+                    tracing::warn!(?error, "closing SSE stream after invalid prepared envelope");
+                    return;
                 }
+            };
+            for env in envelopes {
+                let payload = B64::encode(&prost_encode(&env));
+                yield Ok(Event::default().event("inv").data(payload));
             }
-            let payload = B64::encode(&prost_encode(&env));
-            yield Ok(Event::default().event("inv").data(payload));
         }
     };
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(5)))
         .into_response()
+}
+
+fn finalize_for_subscriber<S: Storage + 'static>(
+    cluster: &ClusterNode<S>,
+    mut env: InvalidationEnvelope,
+    client_key: Option<&[u8; 32]>,
+    supports_additive_events: bool,
+) -> Result<Vec<InvalidationEnvelope>, ClusterError> {
+    // Never authenticate an envelope that did not arrive authenticated.
+    cluster.verify_hmac(&env)?;
+    let needs_progress_companion = env.inv.as_ref().is_some_and(|invalidation| {
+        matches!(
+            invalidation.kind.as_ref(),
+            Some(Kind::VisibilityAdvance(_))
+                | Some(Kind::GraphReseed(_))
+                | Some(Kind::DiscoveryAvailable(_))
+        )
+    });
+    if needs_progress_companion && !supports_additive_events {
+        let lsn = env
+            .inv
+            .as_ref()
+            .map(|invalidation| invalidation.backend_lsn)
+            .unwrap_or(0);
+        // UUIDv7 cannot be all zero, so this known pre-R6 deletion is a
+        // harmless progress carrier. Pre-R6 clients never receive an unknown
+        // oneof arm that would force a permanent reseed loop.
+        let mut companion = cluster.envelope(Invalidation::MemoryDeleted {
+            id: MemoryId([0; 16]),
+            lsn,
+        });
+        if let Some(key) = client_key {
+            resign(key, &mut companion);
+        }
+        return Ok(vec![companion]);
+    }
+    if let Some(key) = client_key {
+        resign(key, &mut env);
+    }
+    Ok(vec![env])
 }
 
 /// Replace an invisible row event with a signed, identifier-free LSN advance.
@@ -605,9 +687,25 @@ async fn graph_reseed_envelope_at<S: Storage + 'static>(
 }
 
 fn encoded_json_len<T: serde::Serialize>(value: &T) -> Result<usize, StorageError> {
-    serde_json::to_vec(value)
-        .map(|encoded| encoded.len())
-        .map_err(|error| StorageError::Backend(error.to_string()))
+    struct CountingWriter(usize);
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::FileTooLarge, "JSON length overflow")
+            })?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|error| StorageError::Backend(error.to_string()))?;
+    Ok(counter.0)
 }
 
 fn ensure_reseed_budget(rows: usize, bytes: usize) -> Result<(), StorageError> {
@@ -694,7 +792,8 @@ fn prost_encode(env: &exocortex_wire::cluster::v1::InvalidationEnvelope) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_reseed_budget, graph_reseed_envelope_at, MAX_RESEED_BYTES, MAX_RESEED_ROWS,
+        encoded_json_len, ensure_reseed_budget, finalize_for_subscriber, graph_reseed_envelope_at,
+        prost_encode, MAX_RESEED_BYTES, MAX_RESEED_ROWS,
     };
     use exocortex_cluster::ClusterNode;
     use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
@@ -703,11 +802,158 @@ mod tests {
     };
     use std::sync::Arc;
 
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct FrozenEnvelope {
+        #[prost(message, optional, tag = "4")]
+        inv: Option<FrozenInvalidation>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct FrozenInvalidation {
+        #[prost(oneof = "frozen_invalidation::Kind", tags = "1, 2, 3, 4")]
+        kind: Option<frozen_invalidation::Kind>,
+        #[prost(uint64, tag = "10")]
+        backend_lsn: u64,
+    }
+
+    mod frozen_invalidation {
+        #[derive(Clone, PartialEq, prost::Oneof)]
+        pub enum Kind {
+            #[prost(message, tag = "1")]
+            MemoryUpserted(super::FrozenMemoryUpserted),
+            #[prost(message, tag = "2")]
+            MemoryDeleted(super::FrozenMemoryDeleted),
+            #[prost(message, tag = "3")]
+            RelationshipUpserted(super::FrozenEmpty),
+            #[prost(message, tag = "4")]
+            RelationshipDeleted(super::FrozenEmpty),
+        }
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct FrozenMemoryUpserted {
+        #[prost(bytes = "vec", tag = "1")]
+        id: Vec<u8>,
+        #[prost(bytes = "vec", tag = "2")]
+        snapshot_json: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct FrozenMemoryDeleted {
+        #[prost(bytes = "vec", tag = "1")]
+        id: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct FrozenEmpty {}
+
     #[test]
     fn hydration_budget_is_inclusive_and_fail_closed() {
         assert!(ensure_reseed_budget(MAX_RESEED_ROWS, MAX_RESEED_BYTES).is_ok());
         assert!(ensure_reseed_budget(MAX_RESEED_ROWS + 1, 0).is_err());
         assert!(ensure_reseed_budget(0, MAX_RESEED_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn additive_events_preserve_progress_for_a_frozen_pre_r6_decoder() {
+        use prost::Message as _;
+
+        let ontology = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let cluster = ClusterNode::new(
+            Arc::new(InMemoryStorage::new(ontology.clone())),
+            "compat".into(),
+            ontology.fingerprint,
+            [8; 32],
+        );
+        let now = chrono::Utc::now();
+        let record = DiscoveryRecord {
+            discovery_id: "compat-discovery".into(),
+            region: RegionKey {
+                org: "org".into(),
+                project: "project".into(),
+                memory_type: 3,
+            },
+            from: MemoryId::new_v7(),
+            to: MemoryId::new_v7(),
+            discovery_type: "transitive".into(),
+            quality: 0.8,
+            via_types: [1, 2],
+            discovery_cycle_id: "cycle".into(),
+            discovered_at: now,
+        };
+        let events = [
+            Invalidation::VisibilityAdvance { lsn: 31 },
+            Invalidation::GraphReseed {
+                snapshot_json: br#"{"memories":[],"relationships":[]}"#.to_vec(),
+                lsn: 32,
+            },
+            Invalidation::DiscoveryAvailable { record, lsn: 33 },
+        ];
+
+        for (index, event) in events.into_iter().enumerate() {
+            let expected_lsn = 31 + index as u64;
+            let typed_envelope = cluster.envelope(event);
+            let typed = finalize_for_subscriber(&cluster, typed_envelope.clone(), None, true)
+                .expect("current-client envelope");
+            assert_eq!(typed.len(), 1);
+            assert!(matches!(
+                typed[0]
+                    .inv
+                    .as_ref()
+                    .and_then(|invalidation| invalidation.kind.as_ref()),
+                Some(
+                    exocortex_wire::sse::v1::invalidation::Kind::VisibilityAdvance(_)
+                        | exocortex_wire::sse::v1::invalidation::Kind::GraphReseed(_)
+                        | exocortex_wire::sse::v1::invalidation::Kind::DiscoveryAvailable(_)
+                )
+            ));
+
+            let envelopes = finalize_for_subscriber(&cluster, typed_envelope, None, false)
+                .expect("authenticated compatibility envelope");
+            assert_eq!(envelopes.len(), 1);
+            for envelope in &envelopes {
+                cluster.verify_hmac(envelope).expect("bridge HMAC");
+            }
+            let companion = FrozenEnvelope::decode(prost_encode(&envelopes[0]).as_slice())
+                .expect("pre-R6 decoder");
+            let companion = companion.inv.expect("progress invalidation");
+            assert_eq!(companion.backend_lsn, expected_lsn);
+            let frozen_invalidation::Kind::MemoryDeleted(carrier) =
+                companion.kind.expect("known progress arm")
+            else {
+                panic!("new event lacked a frozen-schema progress companion");
+            };
+            assert_eq!(carrier.id, b"00000000000000000000000000000000");
+        }
+    }
+
+    #[test]
+    fn unsigned_envelopes_are_not_resigned_for_subscribers() {
+        let ontology = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let cluster = ClusterNode::new(
+            Arc::new(InMemoryStorage::new(ontology.clone())),
+            "auth".into(),
+            ontology.fingerprint,
+            [8; 32],
+        );
+        let mut envelope = cluster.envelope(Invalidation::VisibilityAdvance { lsn: 41 });
+        envelope.hmac.clear();
+        assert!(finalize_for_subscriber(&cluster, envelope, Some(&[9; 32]), true).is_err());
+    }
+
+    #[test]
+    fn reseed_byte_counter_matches_serialized_output_without_retaining_it() {
+        let value = serde_json::json!({"memories": ["a", "b"], "relationships": []});
+        assert_eq!(
+            encoded_json_len(&value).unwrap(),
+            serde_json::to_vec(&value).unwrap().len()
+        );
     }
 
     #[tokio::test]

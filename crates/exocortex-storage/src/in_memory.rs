@@ -43,6 +43,7 @@ struct InMemoryInner {
     frontier_relationship_calls: AtomicU64,
     attribute_memory_calls: AtomicU64,
     settled_ingest: Mutex<HashMap<IngestBatchKey, SettledIngestBatch>>,
+    cycle_journals: Mutex<HashMap<LeaseKey, CycleJournalRecord>>,
     point_reads: AtomicU64,
     batch_reads: AtomicU64,
     #[cfg(test)]
@@ -109,6 +110,7 @@ impl InMemoryStorage {
                 frontier_relationship_calls: AtomicU64::new(0),
                 attribute_memory_calls: AtomicU64::new(0),
                 settled_ingest: Default::default(),
+                cycle_journals: Default::default(),
                 point_reads: Default::default(),
                 batch_reads: Default::default(),
                 mutation_gate: Default::default(),
@@ -1255,6 +1257,115 @@ impl Storage for InMemoryStorage {
             let _ = self.feed.send(inv);
         }
         Ok(committed)
+    }
+    async fn upsert_batch_fenced_journaled(
+        &self,
+        ms: &[Memory],
+        rs: &[Relationship],
+        prepared_restore: &FencedRestore,
+        cycle_id: &str,
+        lease: &OwnerLease,
+    ) -> Result<FencedBatchCommit, StorageError> {
+        let (mut committed, invalidations) = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            self.check_lease_current(lease)?;
+            let mut journals = self.inner.cycle_journals.lock().unwrap();
+            if let Some(active) = journals.get(&lease.key) {
+                if active.state == CycleJournalState::Active && active.cycle_id != cycle_id {
+                    return Err(StorageError::Backend(format!(
+                        "active cycle {} requires recovery before {cycle_id}",
+                        active.cycle_id
+                    )));
+                }
+            }
+            let (records, invalidations) = self.upsert_batch_locked(ms, rs)?;
+            let mut committed = FencedBatchCommit {
+                records,
+                ..FencedBatchCommit::default()
+            };
+            for invalidation in &invalidations {
+                match invalidation {
+                    Invalidation::MemoryUpserted { id, lsn } => {
+                        committed.memory_lsns.entry(*id).or_default().insert(*lsn);
+                    }
+                    Invalidation::RelationshipUpserted { id, lsn, .. } => {
+                        committed
+                            .relationship_lsns
+                            .entry(*id)
+                            .or_default()
+                            .insert(*lsn);
+                    }
+                    _ => {}
+                }
+            }
+            let journal = journals
+                .entry(lease.key.clone())
+                .or_insert_with(|| CycleJournalRecord {
+                    cycle_id: cycle_id.into(),
+                    lease_key: lease.key.clone(),
+                    lease_epoch: lease.epoch,
+                    restore: FencedRestore::default(),
+                    state: CycleJournalState::Active,
+                });
+            journal.cycle_id = cycle_id.into();
+            journal.lease_epoch = lease.epoch;
+            journal.state = CycleJournalState::Active;
+            journal.restore.merge(prepared_restore);
+            for (id, lsns) in &committed.memory_lsns {
+                journal
+                    .restore
+                    .owned_memory_lsns
+                    .entry(*id)
+                    .or_default()
+                    .extend(lsns);
+            }
+            for (id, lsns) in &committed.relationship_lsns {
+                journal
+                    .restore
+                    .owned_relationship_lsns
+                    .entry(*id)
+                    .or_default()
+                    .extend(lsns);
+            }
+            (committed, invalidations)
+        };
+        for invalidation in invalidations {
+            self.index_invalidation(&invalidation);
+            let _ = self.feed.send(invalidation);
+        }
+        Ok(std::mem::take(&mut committed))
+    }
+    async fn get_active_cycle_journal(
+        &self,
+        key: &LeaseKey,
+    ) -> Result<Option<CycleJournalRecord>, StorageError> {
+        Ok(self
+            .inner
+            .cycle_journals
+            .lock()
+            .unwrap()
+            .get(key)
+            .filter(|journal| journal.state == CycleJournalState::Active)
+            .cloned())
+    }
+    async fn complete_cycle_journal_fenced(
+        &self,
+        cycle_id: &str,
+        lease: &OwnerLease,
+    ) -> Result<(), StorageError> {
+        let _gate = self.inner.mutation_gate.lock().unwrap();
+        self.check_lease_current(lease)?;
+        let mut journals = self.inner.cycle_journals.lock().unwrap();
+        let journal = journals
+            .get_mut(&lease.key)
+            .ok_or_else(|| StorageError::Backend("cycle journal not found".into()))?;
+        if journal.cycle_id != cycle_id {
+            return Err(StorageError::Backend(
+                "cycle journal identity mismatch".into(),
+            ));
+        }
+        journal.state = CycleJournalState::Completed;
+        Ok(())
     }
     async fn delete_memory_fenced(
         &self,

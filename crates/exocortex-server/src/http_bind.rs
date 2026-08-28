@@ -48,6 +48,12 @@ pub struct HealthSnapshot {
     pub last_lease_tick: Option<chrono::DateTime<chrono::Utc>>,
     /// True while the reasoning worker loop is consuming (R-O4).
     pub reasoning_alive: bool,
+    /// True only while the cluster invalidation subscription is live.
+    pub cluster_feed_ready: bool,
+    /// Monotonic subscription epoch, incremented after each reconnect.
+    pub cluster_feed_epoch: u64,
+    /// Total observed cluster-feed failures and clean terminations.
+    pub cluster_feed_failures: u64,
 }
 
 /// The HTTP binding: operation routes + auth + observability.
@@ -81,6 +87,7 @@ impl HttpBind {
                 hydrated: true,
                 storage_ok: true,
                 reasoning_alive: true,
+                cluster_feed_ready: true,
                 last_lease_tick: Some(chrono::Utc::now()),
                 ..Default::default()
             }))),
@@ -145,6 +152,9 @@ impl HttpBind {
                             "leader_node_id": h.leader_node_id,
                             "lease_epoch": h.lease_epoch,
                             "backend_lsn": h.backend_lsn,
+                            "feed_ready": h.cluster_feed_ready,
+                            "feed_epoch": h.cluster_feed_epoch,
+                            "feed_failures": h.cluster_feed_failures,
                         }))
                     }
                 }),
@@ -195,7 +205,11 @@ impl HttpBind {
                     let lease_fresh = h
                         .last_lease_tick
                         .is_some_and(|t| (chrono::Utc::now() - t).num_seconds() < 15);
-                    let ready = h.hydrated && h.storage_ok && h.reasoning_alive && lease_fresh;
+                    let ready = h.hydrated
+                        && h.storage_ok
+                        && h.reasoning_alive
+                        && h.cluster_feed_ready
+                        && lease_fresh;
                     let status = if ready {
                         StatusCode::OK
                     } else {
@@ -288,13 +302,18 @@ fn op_route(
                     OpError::DeadlineExceeded => {
                         err_response(StatusCode::REQUEST_TIMEOUT, "deadline exceeded")
                     }
-                    OpError::Storage(m) | OpError::Other(m) => {
-                        err_response(StatusCode::INTERNAL_SERVER_ERROR, &m)
-                    }
+                    OpError::Storage(m) | OpError::Other(m) => internal_error_response(&m),
                 },
             }
         })
     }
+}
+
+fn internal_error_response(detail: &str) -> Response<Body> {
+    // Preserve diagnostics in server-controlled telemetry, but never reflect
+    // backend URLs, query text, credentials, or dependency messages to HTTP.
+    tracing::error!(error = %detail, "HTTP operation failed");
+    err_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
 }
 
 fn err_response(status: StatusCode, msg: &str) -> Response<Body> {
@@ -371,6 +390,20 @@ fn install_prometheus() -> metrics_exporter_prometheus::PrometheusHandle {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn internal_http_error_never_reflects_dependency_detail() {
+        const SENTINEL: &str = "redis://credential-sentinel@example.invalid/private";
+        let response = internal_error_response(SENTINEL);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"error":"internal error"}"#);
+        assert!(!body
+            .windows(SENTINEL.len())
+            .any(|window| window == SENTINEL.as_bytes()));
+    }
 
     #[tokio::test]
     async fn bearer_auth_injects_credential_specific_principal() {

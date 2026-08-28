@@ -122,6 +122,43 @@ fn rel(from: MemoryId, to: MemoryId) -> Relationship {
     }
 }
 
+#[tokio::test]
+async fn live_cycle_journal_survives_reconnect_and_accumulates_owned_lsns() {
+    let s = falkor("cycle_journal").await;
+    let original = mem(41);
+    s.upsert_memory(&original).await.unwrap();
+    let key = LeaseKey::Dreams {
+        org: "org".into(),
+        region: "journal".into(),
+    };
+    let lease = s
+        .acquire_lease(&key, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let prepared = FencedRestore {
+        memories: vec![original.clone()],
+        ..FencedRestore::default()
+    };
+    let mut changed = original.clone();
+    changed.title = "journaled".into();
+    let committed = s
+        .upsert_batch_fenced_journaled(&[changed], &[], &prepared, "cycle-live", &lease)
+        .await
+        .unwrap();
+
+    let recovered = s
+        .get_active_cycle_journal(&key)
+        .await
+        .unwrap()
+        .expect("active journal is durable in Falkor");
+    assert!(recovered.restore.owned_memory_lsns[&original.id].contains(&committed.records[0].lsn));
+    s.restore_fenced(&recovered.restore, &lease).await.unwrap();
+    s.complete_cycle_journal_fenced("cycle-live", &lease)
+        .await
+        .unwrap();
+    assert!(s.get_active_cycle_journal(&key).await.unwrap().is_none());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_lease_write_is_fenced_live() {
     if falkor_url().is_none() {

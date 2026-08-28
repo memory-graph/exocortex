@@ -62,7 +62,7 @@ fn serde_memory_context_defaults() -> MemoryContext {
         project_id: None,
         project_path: None,
         team_id: None,
-        tenant_id: None,
+        tenant_id: Some("org".into()),
         session_id: None,
         user_id: None,
         created_by: None,
@@ -75,6 +75,22 @@ fn serde_memory_context_defaults() -> MemoryContext {
         working_directory: None,
         entities: Default::default(),
         additional_metadata: serde_json::Value::Null,
+    }
+}
+
+fn backup_document(
+    ontology: &exocortex_kernel::Ontology,
+    memories: Vec<Memory>,
+    relationships: Vec<Relationship>,
+) -> org_backup::OrgBackup {
+    org_backup::OrgBackup {
+        format: org_backup::FORMAT.into(),
+        version: org_backup::VERSION,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        org_id: "org".into(),
+        ontology_fingerprint: fingerprint_hex(ontology),
+        memories,
+        relationships,
     }
 }
 
@@ -109,16 +125,41 @@ fn test_rel(from: MemoryId, to: MemoryId, kind: exocortex_kernel::RelKindId) -> 
     }
 }
 
+fn valid_noncomputed_triple(
+    ontology: &exocortex_kernel::Ontology,
+) -> (u8, u8, exocortex_kernel::RelKindId) {
+    ontology
+        .triples_by_kind
+        .keys()
+        .filter(|kind| {
+            ontology
+                .kinds_by_id
+                .get(kind)
+                .is_some_and(|metadata| !metadata.computed_only)
+        })
+        .find_map(|kind| {
+            (0..ontology.memory_type_names.len() as u8).find_map(|from| {
+                (0..ontology.memory_type_names.len() as u8)
+                    .find(|to| {
+                        exocortex_kernel::validator::validate_triple(ontology, from, *kind, *to)
+                            .is_ok()
+                    })
+                    .map(|to| (from, to, *kind))
+            })
+        })
+        .expect("dev ontology has a non-computed valid triple")
+}
+
 async fn rows<S: Storage>(s: &S) -> (Vec<Memory>, Vec<Relationship>) {
     let mut ms = s.stream_all_memories().await;
     let mut memories = Vec::new();
-    while let Some(Ok(m)) = ms.next().await {
-        memories.push(m);
+    while let Some(memory) = ms.next().await {
+        memories.push(memory.expect("memory stream must remain readable"));
     }
     let mut rs = s.stream_all_relationships().await;
     let mut rels = Vec::new();
-    while let Some(Ok(r)) = rs.next().await {
-        rels.push(r);
+    while let Some(relationship) = rs.next().await {
+        rels.push(relationship.expect("relationship stream must remain readable"));
     }
     (memories, rels)
 }
@@ -128,9 +169,12 @@ async fn org_round_trip_is_byte_faithful_across_storage_instances() {
     let onto = ontology();
     let fp = fingerprint_hex(&onto);
     let a = InMemoryStorage::new(onto.clone());
-    let m1 = test_mem("auth-bridge", 1);
-    let m2 = test_mem("policy-engine", 2);
-    let rel = test_rel(m1.id, m2.id, onto.kind_id("Fixes").unwrap());
+    let (from_type, to_type, kind) = valid_noncomputed_triple(&onto);
+    let mut m1 = test_mem("auth-bridge", 1);
+    m1.memory_type = from_type;
+    let mut m2 = test_mem("policy-engine", 2);
+    m2.memory_type = to_type;
+    let rel = test_rel(m1.id, m2.id, kind);
     a.upsert_memory(&m1).await.unwrap();
     a.upsert_memory(&m2).await.unwrap();
     a.upsert_relationship(&rel).await.unwrap();
@@ -311,5 +355,169 @@ async fn invalid_late_relationship_rolls_back_the_entire_org_import() {
         memories.is_empty(),
         "a late relationship failure must roll back earlier memory rows"
     );
+    assert!(relationships.is_empty());
+}
+
+#[tokio::test]
+async fn governance_violations_fail_before_atomic_restore() {
+    let onto = ontology();
+    let (from_type, to_type, kind) = valid_noncomputed_triple(&onto);
+    let mut from = test_mem("from", 61);
+    from.memory_type = from_type;
+    let mut to = test_mem("to", 62);
+    to.memory_type = to_type;
+    let valid_relationship = test_rel(from.id, to.id, kind);
+    let valid = backup_document(
+        &onto,
+        vec![from.clone(), to.clone()],
+        vec![valid_relationship.clone()],
+    );
+
+    let mut wrong_tenant = serde_json::to_value(&valid).unwrap();
+    wrong_tenant["memories"][0]["context"]["tenant_id"] = serde_json::json!("foreign-org");
+
+    let mut unknown_type = serde_json::to_value(&valid).unwrap();
+    unknown_type["memories"][0]["memory_type"] = serde_json::json!(255);
+
+    let mut widened = valid_relationship.clone();
+    let mut private_from = from.clone();
+    private_from.visibility = Visibility::Private;
+    private_from.context.user_id = Some("owner".into());
+    widened.visibility = Visibility::Org;
+    let widened = serde_json::to_value(backup_document(
+        &onto,
+        vec![private_from, to.clone()],
+        vec![widened],
+    ))
+    .unwrap();
+
+    let mut proposed = serde_json::to_value(backup_document(
+        &onto,
+        vec![from.clone(), to.clone()],
+        vec![valid_relationship.clone()],
+    ))
+    .unwrap();
+    proposed["relationships"][0]["provenance"] = serde_json::json!({
+        "Proposed": {
+            "discovery_id": "00000000-0000-0000-0000-000000000001",
+            "score": 0.8
+        }
+    });
+
+    let similar_to = onto.kind_id("SimilarTo").unwrap();
+    let computed_only = serde_json::to_value(backup_document(
+        &onto,
+        vec![from.clone(), to.clone()],
+        vec![test_rel(from.id, to.id, similar_to)],
+    ))
+    .unwrap();
+
+    let (bad_from, bad_to, bad_kind) = onto
+        .triples_by_kind
+        .keys()
+        .find_map(|kind| {
+            (0..onto.memory_type_names.len() as u8).find_map(|from_type| {
+                (0..onto.memory_type_names.len() as u8)
+                    .find(|to_type| {
+                        exocortex_kernel::validator::validate_triple(
+                            &onto, from_type, *kind, *to_type,
+                        )
+                        .is_err()
+                    })
+                    .map(|to_type| (from_type, to_type, *kind))
+            })
+        })
+        .expect("dev ontology has a constrained triple");
+    let mut invalid_from = from.clone();
+    invalid_from.memory_type = bad_from;
+    let mut invalid_to = to.clone();
+    invalid_to.memory_type = bad_to;
+    let invalid_triple = serde_json::to_value(backup_document(
+        &onto,
+        vec![invalid_from, invalid_to],
+        vec![test_rel(from.id, to.id, bad_kind)],
+    ))
+    .unwrap();
+
+    for (name, document) in [
+        ("wrong tenant", wrong_tenant),
+        ("unknown type", unknown_type),
+        ("widened visibility", widened),
+        ("proposed provenance", proposed),
+        ("computed-only provenance", computed_only),
+        ("invalid triple", invalid_triple),
+    ] {
+        let target = InMemoryStorage::new(onto.clone());
+        let sentinel = test_mem("preexisting", 70);
+        target.upsert_memory(&sentinel).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("invalid.json");
+        std::fs::write(&file, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let error = org_backup::import_org(&target, &onto, "org", &file)
+            .await
+            .expect_err(name);
+        assert!(!error.to_string().is_empty(), "{name}");
+        let (memories, relationships) = rows(&target).await;
+        assert_eq!(memories.len(), 1, "{name}: partial memory restore");
+        assert_eq!(memories[0].id, sentinel.id, "{name}: sentinel changed");
+        assert!(relationships.is_empty(), "{name}: partial edge restore");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_falkor_governance_failure_leaves_existing_graph_unchanged() {
+    let Ok(url) = std::env::var("FALKOR_URL") else {
+        eprintln!(
+            "UNEXECUTED live_falkor_governance_failure_leaves_existing_graph_unchanged: FALKOR_URL not set"
+        );
+        return;
+    };
+    if url.is_empty() {
+        eprintln!(
+            "UNEXECUTED live_falkor_governance_failure_leaves_existing_graph_unchanged: FALKOR_URL empty"
+        );
+        return;
+    }
+    let onto = ontology();
+    let storage = exocortex_storage::FalkorStorage::connect(
+        exocortex_storage::FalkorConfig {
+            redis_url: url.replacen("falkor://", "redis://", 1),
+            falkor_url: url,
+            graph_name: format!(
+                "org_restore_governance_{}_{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ),
+            org_id: "org".into(),
+            node_id: "restore-test".into(),
+        },
+        onto.clone(),
+    )
+    .await
+    .unwrap();
+    let sentinel = test_mem("live-preexisting", 81);
+    storage.upsert_memory(&sentinel).await.unwrap();
+    let (before_memories, before_relationships) = rows(&storage).await;
+    assert_eq!(before_memories.len(), 1);
+    assert!(before_relationships.is_empty());
+    let mut foreign = test_mem("foreign", 82);
+    foreign.context.tenant_id = Some("foreign-org".into());
+    let (from_type, to_type, kind) = valid_noncomputed_triple(&onto);
+    foreign.memory_type = from_type;
+    let mut valid_peer = test_mem("valid-peer", 83);
+    valid_peer.memory_type = to_type;
+    let relationship = test_rel(foreign.id, valid_peer.id, kind);
+    let document = backup_document(&onto, vec![foreign, valid_peer], vec![relationship]);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("invalid-live.json");
+    std::fs::write(&file, serde_json::to_vec(&document).unwrap()).unwrap();
+
+    org_backup::import_org(&storage, &onto, "org", &file)
+        .await
+        .unwrap_err();
+    let (memories, relationships) = rows(&storage).await;
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].id, sentinel.id);
     assert!(relationships.is_empty());
 }

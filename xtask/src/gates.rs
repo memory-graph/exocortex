@@ -799,8 +799,7 @@ fn validate_executable_evidence(
     };
     let prefix = &source[..function_offset];
     let attribute_window = &prefix[prefix.len().saturating_sub(512)..];
-    let is_test = attribute_window.contains("#[test")
-        || attribute_window.contains("#[tokio::test");
+    let is_test = attribute_window.contains("#[test") || attribute_window.contains("#[tokio::test");
     anyhow::ensure!(
         !(relative.starts_with("tests/") || relative.contains("/tests/")) || is_test,
         "criterion {criterion} evidence `{relative}::{needle}` is not an executable test"

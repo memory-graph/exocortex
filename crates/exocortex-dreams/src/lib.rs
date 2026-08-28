@@ -116,8 +116,8 @@ pub enum PruneReason {
     LowValue,
 }
 
-#[derive(Default)]
 struct CycleJournal {
+    cycle_id: SmolStr,
     memories: std::collections::BTreeMap<MemoryId, Memory>,
     relationships: std::collections::BTreeMap<RelationshipId, Relationship>,
     created_memories: std::collections::BTreeMap<MemoryId, Memory>,
@@ -128,6 +128,18 @@ struct CycleJournal {
 }
 
 impl CycleJournal {
+    fn new() -> Self {
+        Self {
+            cycle_id: format!("dream:{}", uuid::Uuid::new_v4()).into(),
+            memories: Default::default(),
+            relationships: Default::default(),
+            created_memories: Default::default(),
+            created_relationships: Default::default(),
+            owned_memory_lsns: Default::default(),
+            owned_relationship_lsns: Default::default(),
+        }
+    }
+
     fn record_memory(&mut self, memory: &Memory) {
         if !self.created_memories.contains_key(&memory.id) {
             self.memories
@@ -229,6 +241,15 @@ pub struct DreamsEngine<S: Storage> {
     pub leader_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Per-region write counters.
     pub counters: DashMap<RegionKey, RegionWriteCounters>,
+    /// Regions already queued or executing. A region occupies at most one
+    /// channel slot; writes that land meanwhile remain in `counters` and are
+    /// considered again after the current cycle completes.
+    pending_regions: DashMap<RegionKey, ()>,
+    /// Optional shared Redis transport used by every node to record committed
+    /// writes and by the elected owner to acknowledge completed cycles.
+    distributed_fire: Option<Arc<tokio::sync::Mutex<fire::RedisFireQueue>>>,
+    /// Distributed notification metadata retained until owner completion.
+    distributed_notifications: DashMap<RegionKey, fire::FireMessage>,
     /// IN4 (audit): per-region last-cycle timestamp — the source
     /// `seconds_since_last_cycle` is stamped from. Without it the field
     /// stayed 0 forever and the trigger predicate was unconditionally
@@ -259,6 +280,8 @@ pub struct DreamsEngine<S: Storage> {
     #[cfg(feature = "testing")]
     cycle_fault_after: Option<usize>,
     #[cfg(feature = "testing")]
+    cycle_crash_after: Option<usize>,
+    #[cfg(feature = "testing")]
     cycle_pause_after: Option<(usize, Duration)>,
     #[cfg(feature = "testing")]
     rollback_pause: Option<Duration>,
@@ -285,11 +308,14 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         rollback_on_regression: bool,
         node_id: SmolStr,
     ) -> Self {
-        let (tx_fire, rx_fire) = mpsc::channel(1024);
+        let (tx_fire, rx_fire) = mpsc::channel(1000);
         Self {
             leader_gate: None,
             storage,
             counters: DashMap::new(),
+            pending_regions: DashMap::new(),
+            distributed_fire: None,
+            distributed_notifications: DashMap::new(),
             last_cycle_at: DashMap::new(),
             dreams_trigger,
             tolerance,
@@ -304,6 +330,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             #[cfg(feature = "testing")]
             cycle_fault_after: None,
             #[cfg(feature = "testing")]
+            cycle_crash_after: None,
+            #[cfg(feature = "testing")]
             cycle_pause_after: None,
             #[cfg(feature = "testing")]
             rollback_pause: None,
@@ -314,6 +342,16 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         }
     }
 
+    /// Attach the production shared fire transport. Followers record shared
+    /// counters through this queue but never execute consolidation locally.
+    pub fn with_distributed_fire(
+        mut self,
+        queue: Arc<tokio::sync::Mutex<fire::RedisFireQueue>>,
+    ) -> Self {
+        self.distributed_fire = Some(queue);
+        self
+    }
+
     /// Inject a failure after the specified owner mutation. This exercises
     /// crash compensation against both the double and live backend.
     #[doc(hidden)]
@@ -321,6 +359,34 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     pub fn with_cycle_fault_after(mut self, mutation: usize) -> Self {
         self.cycle_fault_after = Some(mutation);
         self
+    }
+
+    /// Simulate process loss after a durable owner mutation, intentionally
+    /// bypassing in-process compensation so a successor must recover it.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn with_cycle_crash_after(mut self, mutation: usize) -> Self {
+        self.cycle_crash_after = Some(mutation);
+        self
+    }
+
+    /// Acquire the region as a successor and recover only its active journal.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub async fn recover_active_cycle_for_test(&self, region: &RegionKey) -> anyhow::Result<()> {
+        let lease_key = LeaseKey::Dreams {
+            org: region.org.clone(),
+            region: format!("{}:{}", region.project, region.memory_type).into(),
+        };
+        let lease = self
+            .storage
+            .acquire_lease(&lease_key, self.lease_ttl)
+            .await
+            .map_err(|error| anyhow::anyhow!("lease: {error}"))?;
+        let recovery = self.recover_active_cycle(&lease_key, &lease).await;
+        let release = self.storage.release_lease(lease).await;
+        recovery?;
+        release.map_err(|error| anyhow::anyhow!("release recovery lease: {error}"))
     }
 
     /// Use a short owner lease in deterministic renewal regressions.
@@ -369,7 +435,32 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     /// Redis in production; the in-process channel is the same shape).
     /// R-Dr13: counters are NOT reset here — completion resets them, so a
     /// failed cycle never loses its write counts.
-    pub async fn on_write(&self, region: RegionKey) {
+    pub async fn on_write(&self, region: RegionKey) -> anyhow::Result<()> {
+        self.on_writes(region, 1, 0).await
+    }
+
+    /// Record committed memory/relationship deltas. With a distributed fire
+    /// transport this is an atomic shared counter update on every node.
+    pub async fn on_writes(
+        &self,
+        region: RegionKey,
+        memories: u32,
+        edges: u32,
+    ) -> anyhow::Result<()> {
+        if let Some(queue) = &self.distributed_fire {
+            queue
+                .lock()
+                .await
+                .record_write(
+                    &region,
+                    memories,
+                    edges,
+                    self.dreams_trigger,
+                    self.node_id.as_str(),
+                )
+                .await?;
+            return Ok(());
+        }
         let now = chrono::Utc::now();
         // IN4: anchor the region's clock at first observation; cycles
         // re-stamp it on completion.
@@ -379,51 +470,136 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             .or_insert(now)
             .value();
         let mut e = self.counters.entry(region.clone()).or_default();
-        e.memories_since_last_cycle += 1;
+        e.memories_since_last_cycle = e.memories_since_last_cycle.saturating_add(memories);
+        e.edges_since_last_cycle = e.edges_since_last_cycle.saturating_add(edges);
         e.seconds_since_last_cycle = (now - anchor).num_seconds().max(0) as u64;
-        if self.dreams_trigger.should_fire(&e) {
+        if self.is_leader() && self.dreams_trigger.should_fire(&e) {
             let snap = *e;
             drop(e);
-            let _ = self.tx_fire.try_send((region, snap));
+            self.schedule_region(region, snap);
         }
+        Ok(())
     }
 
     /// Fire a region explicitly (Redis fire-queue drainer side).
     pub fn notify(&self, region: RegionKey) {
+        if !self.is_leader() {
+            return;
+        }
         let snap = self.counters.get(&region).map(|e| *e).unwrap_or_default();
-        let _ = self.tx_fire.try_send((region, snap));
+        self.schedule_region(region, snap);
+    }
+
+    /// Deliver a shared notification to this elected owner. Its exact fired
+    /// snapshot is acknowledged by [`Self::run`] only after the whole cycle.
+    pub fn notify_distributed(&self, notification: fire::FireMessage) {
+        if !self.is_leader() {
+            return;
+        }
+        let fired_at = notification.fired_at.unwrap_or_default();
+        let region = notification.region.clone();
+        self.distributed_notifications
+            .insert(region.clone(), notification);
+        self.schedule_region(region, fired_at);
+    }
+
+    fn is_leader(&self) -> bool {
+        self.leader_gate
+            .as_ref()
+            .is_none_or(|gate| gate.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn schedule_region(&self, region: RegionKey, snapshot: RegionWriteCounters) {
+        use dashmap::mapref::entry::Entry;
+        match self.pending_regions.entry(region.clone()) {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(entry) => {
+                entry.insert(());
+                if self.tx_fire.try_send((region.clone(), snapshot)).is_err() {
+                    self.pending_regions.remove(&region);
+                    metrics::counter!("exocortex_dreams_queue_dropped_total").increment(1);
+                }
+            }
+        }
+    }
+
+    fn complete_region(&self, region: &RegionKey, fired_at: RegionWriteCounters, success: bool) {
+        if success {
+            if let Some(mut current) = self.counters.get_mut(region) {
+                current.memories_since_last_cycle = current
+                    .memories_since_last_cycle
+                    .saturating_sub(fired_at.memories_since_last_cycle);
+                current.edges_since_last_cycle = current
+                    .edges_since_last_cycle
+                    .saturating_sub(fired_at.edges_since_last_cycle);
+                current.seconds_since_last_cycle = 0;
+            }
+            self.last_cycle_at
+                .insert(region.clone(), chrono::Utc::now());
+        }
+        self.pending_regions.remove(region);
+
+        if success && self.is_leader() {
+            if let Some(current) = self.counters.get(region).map(|entry| *entry) {
+                if self.dreams_trigger.should_fire(&current) {
+                    self.schedule_region(region.clone(), current);
+                }
+            }
+        }
     }
 
     /// The production Dreams loop: consolidation followed by discovery.
     pub async fn run(self: Arc<Self>) {
         while let Some((region, fired_at)) = { self.rx_fire.lock().await.recv().await } {
-            match self.try_consolidate(&region).await {
+            let consolidation_ok = match self.try_consolidate(&region).await {
                 Ok(res) => {
                     *self.last_result.write().await = Some(res.clone());
                     info!(?res, "consolidation ok");
+                    true
                 }
                 Err(e) => {
                     warn!(?e, "consolidation failed");
-                    continue;
+                    false
                 }
-            }
-            match self.run_discovery(&region).await {
-                Ok(proposals) => info!(count = proposals.len(), "discovery ok"),
-                Err(e) => {
-                    warn!(?e, "discovery failed");
-                    continue;
+            };
+            let success = if consolidation_ok {
+                match self.run_discovery(&region).await {
+                    Ok(proposals) => {
+                        info!(count = proposals.len(), "discovery ok");
+                        true
+                    }
+                    Err(e) => {
+                        warn!(?e, "discovery failed");
+                        false
+                    }
                 }
-            }
-            // R-Dr13: reset only when nothing new landed during the cycle;
-            // otherwise the surviving counts roll into the next fire.
-            if let Some(mut c) = self.counters.get_mut(&region) {
-                if *c == fired_at {
-                    *c = RegionWriteCounters::default();
-                    // IN4: the region's clock restarts on completion.
-                    self.last_cycle_at
-                        .entry(region.clone())
-                        .and_modify(|t| *t = chrono::Utc::now())
-                        .or_insert_with(chrono::Utc::now);
+            } else {
+                false
+            };
+            self.complete_region(&region, fired_at, success);
+            if let Some((_, notification)) = self.distributed_notifications.remove(&region) {
+                if let Some(queue) = &self.distributed_fire {
+                    let mut delay = Duration::from_millis(50);
+                    loop {
+                        match queue
+                            .lock()
+                            .await
+                            .acknowledge(
+                                &notification,
+                                success,
+                                self.dreams_trigger,
+                                self.node_id.as_str(),
+                            )
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(error) => {
+                                warn!(?error, "Dreams distributed acknowledgement retrying");
+                                tokio::time::sleep(delay).await;
+                                delay = (delay * 2).min(Duration::from_secs(5));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -434,7 +610,6 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     /// ride the fenced paths so a stale owner can never commit (R-C3).
     #[instrument(skip(self))]
     pub async fn try_consolidate(&self, region: &RegionKey) -> anyhow::Result<ConsolidationResult> {
-        self.validate_region(region).await?;
         // CS4: a follower (lost re-election) performs no consolidation,
         // even before contending on the region lease.
         if let Some(gate) = &self.leader_gate {
@@ -452,12 +627,20 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             .acquire_lease(&lease_key, self.lease_ttl)
             .await
             .map_err(|e| anyhow::anyhow!("lease: {e}"))?;
+        if let Err(error) = self.recover_active_cycle(&lease_key, &lease).await {
+            let _ = self.storage.release_lease(lease).await;
+            return Err(error);
+        }
+        if let Err(error) = self.validate_region(region).await {
+            let _ = self.storage.release_lease(lease).await;
+            return Err(error);
+        }
         // A cycle contains multiple scans and separately fenced mutations.
         // Keep the same token/epoch alive until compensation has finished;
         // otherwise an expiry after an early write makes rollback itself fail
         // its fence and strands a partial cycle.
         let mut renewal = self.spawn_lease_renewal(lease.clone());
-        let mut journal = CycleJournal::default();
+        let mut journal = CycleJournal::new();
         let mut renewal_stopped = false;
         let outcome = {
             let consolidation = self.consolidate_under_tracked(&lease, region, &mut journal);
@@ -471,7 +654,13 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 outcome = &mut consolidation => outcome,
             }
         };
-        let outcome = if renewal_stopped {
+        #[cfg(feature = "testing")]
+        let crashed = self.cycle_crash_after.is_some() && outcome.is_err();
+        #[cfg(not(feature = "testing"))]
+        let crashed = false;
+        let outcome = if crashed {
+            outcome
+        } else if renewal_stopped {
             self.finish_cycle(outcome, &journal, &lease).await
         } else {
             let finishing = self.finish_cycle(outcome, &journal, &lease);
@@ -503,6 +692,30 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 "cycle failed ({error}); lease release also failed ({release})"
             )),
         }
+    }
+
+    async fn recover_active_cycle(
+        &self,
+        lease_key: &LeaseKey,
+        lease: &exocortex_storage::OwnerLease,
+    ) -> anyhow::Result<()> {
+        let Some(active) = self
+            .storage
+            .get_active_cycle_journal(lease_key)
+            .await
+            .map_err(|error| anyhow::anyhow!("load active Dreams journal: {error}"))?
+        else {
+            return Ok(());
+        };
+        self.storage
+            .restore_fenced(&active.restore, lease)
+            .await
+            .map_err(|error| anyhow::anyhow!("recover active Dreams cycle: {error}"))?;
+        self.storage
+            .complete_cycle_journal_fenced(active.cycle_id.as_str(), lease)
+            .await
+            .map_err(|error| anyhow::anyhow!("complete recovered Dreams journal: {error}"))?;
+        Ok(())
     }
 
     fn renewal_task_error(
@@ -578,7 +791,15 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         lease: &exocortex_storage::OwnerLease,
     ) -> anyhow::Result<ConsolidationResult> {
         match outcome {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                if !journal.is_empty() {
+                    self.storage
+                        .complete_cycle_journal_fenced(journal.cycle_id.as_str(), lease)
+                        .await
+                        .map_err(|error| anyhow::anyhow!("complete Dreams journal: {error}"))?;
+                }
+                Ok(result)
+            }
             Err(error) => {
                 if !journal.is_empty() {
                     self.rollback(journal, lease).await.map_err(|rollback| {
@@ -586,6 +807,14 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                             "cycle failed ({error}); atomic restore failed ({rollback})"
                         )
                     })?;
+                    self.storage
+                        .complete_cycle_journal_fenced(journal.cycle_id.as_str(), lease)
+                        .await
+                        .map_err(|complete| {
+                            anyhow::anyhow!(
+                                "cycle failed ({error}); rollback succeeded but journal completion failed ({complete})"
+                            )
+                        })?;
                 }
                 Err(error)
             }
@@ -621,7 +850,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let sparsity_before = self.sparsity(&working_set);
 
         let mut res = ConsolidationResult {
-            session_id: format!("dream:{}", uuid::Uuid::new_v4()).into(),
+            session_id: journal.cycle_id.clone(),
             user_id: None,
             started_at: chrono::Utc::now(),
             completed_at: chrono::Utc::now(),
@@ -756,7 +985,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             tokio::time::sleep(pause).await;
         }
         #[cfg(feature = "testing")]
-        if self.cycle_fault_after == Some(*mutations) {
+        if self.cycle_fault_after == Some(*mutations) || self.cycle_crash_after == Some(*mutations)
+        {
             anyhow::bail!("injected cycle failure after mutation {mutations}");
         }
         Ok(())
@@ -936,7 +1166,13 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                     .prepare_relationship_writes(&relationship_updates, &working_set.relationships);
                 let commit = self
                     .storage
-                    .upsert_batch_fenced(&[m.clone()], &relationship_updates, lease)
+                    .upsert_batch_fenced_journaled(
+                        &[m.clone()],
+                        &relationship_updates,
+                        &journal.restore(),
+                        journal.cycle_id.as_str(),
+                        lease,
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 journal.record_commit(&commit);
@@ -1005,7 +1241,13 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         if !updates.is_empty() {
             let commit = self
                 .storage
-                .upsert_batch_fenced(&[], &updates, lease)
+                .upsert_batch_fenced_journaled(
+                    &[],
+                    &updates,
+                    &journal.restore(),
+                    journal.cycle_id.as_str(),
+                    lease,
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             journal.record_commit(&commit);
@@ -1087,7 +1329,13 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             journal.prepare_relationship_writes(&fresh, &working_set.relationships);
             let commit = self
                 .storage
-                .upsert_batch_fenced(&[], &fresh, lease)
+                .upsert_batch_fenced_journaled(
+                    &[],
+                    &fresh,
+                    &journal.restore(),
+                    journal.cycle_id.as_str(),
+                    lease,
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             journal.record_commit(&commit);
@@ -1291,6 +1539,132 @@ fn transitive_candidates(
         }
     }
     (out, inspected)
+}
+
+#[cfg(test)]
+mod cycle_scheduling_tests {
+    use super::*;
+    use exocortex_storage::InMemoryStorage;
+
+    fn region() -> RegionKey {
+        RegionKey {
+            org: "org".into(),
+            project: "project".into(),
+            memory_type: 3,
+        }
+    }
+
+    fn engine(storage: &InMemoryStorage) -> DreamsEngine<InMemoryStorage> {
+        DreamsEngine::new(
+            Arc::new(storage.clone_dyn()),
+            DreamsTrigger {
+                memory_threshold: 1,
+                edge_threshold: u32::MAX,
+                age_floor_days: u32::MAX,
+                min_interval_hours: 0,
+            },
+            0.01,
+            0.05,
+            false,
+            "cycle-test".into(),
+        )
+    }
+
+    fn storage() -> InMemoryStorage {
+        InMemoryStorage::new(Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .expect("development ontology"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn region_has_one_pending_cycle_and_retains_post_fire_writes() {
+        let storage = storage();
+        let engine = engine(&storage);
+        let region = region();
+
+        engine.on_write(region.clone()).await.unwrap();
+        engine.on_write(region.clone()).await.unwrap();
+        engine.notify(region.clone());
+        assert_eq!(engine.pending_regions.len(), 1);
+        let fired_at = {
+            let mut receiver = engine.rx_fire.lock().await;
+            let (_, fired_at) = receiver.try_recv().expect("one scheduled cycle");
+            assert!(receiver.try_recv().is_err(), "the region must be coalesced");
+            fired_at
+        };
+        assert_eq!(fired_at.memories_since_last_cycle, 1);
+
+        engine.complete_region(&region, fired_at, true);
+        assert_eq!(
+            engine
+                .counters
+                .get(&region)
+                .unwrap()
+                .memories_since_last_cycle,
+            1,
+            "the write after fire remains pending"
+        );
+        assert_eq!(engine.pending_regions.len(), 1);
+        let second = {
+            let mut receiver = engine.rx_fire.lock().await;
+            receiver
+                .try_recv()
+                .expect("retained write schedules next cycle")
+        };
+        assert_eq!(second.1.memories_since_last_cycle, 1);
+        engine.complete_region(&region, second.1, true);
+        assert_eq!(
+            engine
+                .counters
+                .get(&region)
+                .unwrap()
+                .memories_since_last_cycle,
+            0
+        );
+        assert!(engine.pending_regions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_cycle_keeps_counters_for_a_later_retry() {
+        let storage = storage();
+        let engine = engine(&storage);
+        let region = region();
+        engine.on_write(region.clone()).await.unwrap();
+        let fired_at = {
+            let mut receiver = engine.rx_fire.lock().await;
+            receiver.try_recv().expect("scheduled cycle").1
+        };
+
+        engine.complete_region(&region, fired_at, false);
+        assert_eq!(
+            engine
+                .counters
+                .get(&region)
+                .unwrap()
+                .memories_since_last_cycle,
+            1
+        );
+        assert!(engine.pending_regions.is_empty());
+        engine.notify(region.clone());
+        let retry = engine.rx_fire.lock().await.try_recv().expect("retry cycle");
+        assert_eq!(retry.1.memories_since_last_cycle, 1);
+    }
+
+    #[tokio::test]
+    async fn follower_rejects_cycle_before_any_region_scan() {
+        let storage = storage();
+        let leader = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let engine = engine(&storage).with_leader_gate(leader);
+
+        let error = engine.try_consolidate(&region()).await.unwrap_err();
+        assert!(error.to_string().contains("not the elected leader"));
+        assert_eq!(
+            storage.reasoning_query_counts(),
+            (0, 0, 0, 0),
+            "a follower must not bulk-scan storage"
+        );
+    }
 }
 
 #[cfg(test)]

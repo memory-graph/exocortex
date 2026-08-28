@@ -75,7 +75,7 @@ pub struct FencedBatchCommit {
 /// Exact semantic preimage and cycle-created rows for one fenced rollback.
 /// Restored rows receive fresh backend LSNs; every other field is restored
 /// verbatim. Created ids are physically removed rather than soft-closed.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FencedRestore {
     /// Pre-existing memories changed by the failed owner cycle.
     pub memories: Vec<Memory>,
@@ -86,10 +86,136 @@ pub struct FencedRestore {
     /// Relationship rows absent before, but created by, this cycle.
     pub created_relationships: Vec<Relationship>,
     /// Exact cycle-written memory version that may be compensated.
+    #[serde(with = "memory_lsn_map")]
     pub owned_memory_lsns: std::collections::BTreeMap<MemoryId, std::collections::BTreeSet<u64>>,
     /// Exact cycle-written relationship version that may be compensated.
+    #[serde(with = "relationship_lsn_map")]
     pub owned_relationship_lsns:
         std::collections::BTreeMap<RelationshipId, std::collections::BTreeSet<u64>>,
+}
+
+mod memory_lsn_map {
+    use super::*;
+
+    pub fn serialize<S>(
+        value: &std::collections::BTreeMap<MemoryId, std::collections::BTreeSet<u64>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        value.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<std::collections::BTreeMap<MemoryId, std::collections::BTreeSet<u64>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let rows = Vec::<(MemoryId, std::collections::BTreeSet<u64>)>::deserialize(deserializer)?;
+        Ok(rows.into_iter().collect())
+    }
+}
+
+mod relationship_lsn_map {
+    use super::*;
+
+    pub fn serialize<S>(
+        value: &std::collections::BTreeMap<RelationshipId, std::collections::BTreeSet<u64>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        value.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<std::collections::BTreeMap<RelationshipId, std::collections::BTreeSet<u64>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let rows =
+            Vec::<(RelationshipId, std::collections::BTreeSet<u64>)>::deserialize(deserializer)?;
+        Ok(rows.into_iter().collect())
+    }
+}
+
+impl FencedRestore {
+    /// Merge another prepared/committed cycle fragment into this journal.
+    pub fn merge(&mut self, other: &Self) {
+        for memory in &other.memories {
+            if !self
+                .memories
+                .iter()
+                .any(|existing| existing.id == memory.id)
+            {
+                self.memories.push(memory.clone());
+            }
+        }
+        for relationship in &other.relationships {
+            if !self
+                .relationships
+                .iter()
+                .any(|existing| existing.id == relationship.id)
+            {
+                self.relationships.push(relationship.clone());
+            }
+        }
+        for memory in &other.created_memories {
+            if !self
+                .created_memories
+                .iter()
+                .any(|existing| existing.id == memory.id)
+            {
+                self.created_memories.push(memory.clone());
+            }
+        }
+        for relationship in &other.created_relationships {
+            if !self
+                .created_relationships
+                .iter()
+                .any(|existing| existing.id == relationship.id)
+            {
+                self.created_relationships.push(relationship.clone());
+            }
+        }
+        for (id, lsns) in &other.owned_memory_lsns {
+            self.owned_memory_lsns.entry(*id).or_default().extend(lsns);
+        }
+        for (id, lsns) in &other.owned_relationship_lsns {
+            self.owned_relationship_lsns
+                .entry(*id)
+                .or_default()
+                .extend(lsns);
+        }
+    }
+}
+
+/// Durable state of a fenced owner cycle journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CycleJournalState {
+    /// The cycle may require successor recovery.
+    Active,
+    /// Recovery or the normal cycle completed; retained as an idempotent tombstone.
+    Completed,
+}
+
+/// Durable rollback material for one fenced owner cycle.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CycleJournalRecord {
+    /// Stable cycle identity supplied by the owner.
+    pub cycle_id: SmolStr,
+    /// Lease scope whose successor is allowed to recover this cycle.
+    pub lease_key: LeaseKey,
+    /// Epoch that originally created the journal.
+    pub lease_epoch: u64,
+    /// Exact preimages, created identities, and cycle-owned backend LSNs.
+    pub restore: FencedRestore,
+    /// Recovery state.
+    pub state: CycleJournalState,
 }
 
 /// Bounded traversal descriptor. Every field carries a hard cap enforced

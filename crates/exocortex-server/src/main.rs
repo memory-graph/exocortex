@@ -52,6 +52,9 @@ struct Args {
     /// backend for tests and throwaway dev topologies.
     #[arg(long, default_value = "falkordb-embedded")]
     storage: String,
+    /// Exact organization served by this backend node and graph.
+    #[arg(long, default_value = "org")]
+    org: String,
     /// Bind address for networked modes. Non-loopback/shared binds require
     /// `--tls-cert` and `--tls-key`.
     #[arg(long, default_value = "0.0.0.0:8080")]
@@ -81,9 +84,13 @@ struct Args {
     /// it the node runs Dreams on the in-process fire channel only.
     #[arg(long)]
     redis_url: Option<String>,
-    /// Quiet hours for Dreams firing (backend-node; R-Dr14, e.g. 23-7).
-    #[arg(long)]
-    quiet_hours: Option<u8>,
+    /// Preferred Dreams consolidation window in the org's canonical timezone
+    /// (backend-node; R-Dr14, two-digit START-END).
+    #[arg(long, default_value = "02-06")]
+    quiet_hours: exocortex_dreams::fire::QuietHours,
+    /// Fixed UTC offset, in minutes, for the org's canonical timezone.
+    #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+    quiet_hours_utc_offset_minutes: i16,
     /// Chitchat gossip listen address (backend-node).
     #[arg(long, default_value = "0.0.0.0:8100")]
     gossip_addr: String,
@@ -104,8 +111,8 @@ struct Args {
     /// FalkorDB graph name (backend-node and one-shot modes). Durable
     /// deployments MUST pin one: the default is stable per org, so a
     /// restart serves the same graph.
-    #[arg(long, default_value = "exocortex-org")]
-    graph_name: String,
+    #[arg(long)]
+    graph_name: Option<String>,
     /// BR2 one-shot: export the org's graph to a JSON file, exit.
     #[arg(long)]
     export_org: Option<std::path::PathBuf>,
@@ -201,14 +208,18 @@ async fn org_backup_main(args: Args) -> anyhow::Result<()> {
         }
         s
     };
-    let org = "org";
+    let org = args.org.as_str();
+    let graph_name = args
+        .graph_name
+        .clone()
+        .unwrap_or_else(|| format!("exocortex-{org}"));
     if let Some(path) = &args.export_org {
         if let Some(url) = args.storage.strip_prefix("falkor://") {
             let storage = exocortex_storage::FalkorStorage::connect(
                 exocortex_storage::FalkorConfig {
                     falkor_url: format!("falkor://{url}"),
                     redis_url: format!("redis://{url}"),
-                    graph_name: args.graph_name.clone(),
+                    graph_name: graph_name.clone(),
                     org_id: org.into(),
                     node_id: format!("node-{}", std::process::id()).into(),
                 },
@@ -230,7 +241,7 @@ async fn org_backup_main(args: Args) -> anyhow::Result<()> {
                 exocortex_storage::FalkorConfig {
                     falkor_url: format!("falkor://{url}"),
                     redis_url: format!("redis://{url}"),
-                    graph_name: args.graph_name.clone(),
+                    graph_name,
                     org_id: org.into(),
                     node_id: format!("node-{}", std::process::id()).into(),
                 },
@@ -273,9 +284,9 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
         let principals = std::sync::Arc::new(
             exocortex_server::principal::PrincipalRegistry::load(principal_policy)?,
         );
-        principals.ensure_org("org")?;
+        principals.ensure_org(&args.org)?;
         let admin_source_policies = load_source_policy(args.source_policy.as_deref())?;
-        ensure_source_policy_org(&admin_source_policies, "org")?;
+        ensure_source_policy_org(&admin_source_policies, &args.org)?;
         let transport = resolve_transport(
             &args.bind,
             args.tls_cert.as_deref(),
@@ -286,7 +297,12 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
             .node_id
             .clone()
             .unwrap_or_else(|| format!("node-{}", std::process::id()));
+        let graph_name = args
+            .graph_name
+            .clone()
+            .unwrap_or_else(|| format!("exocortex-{}", args.org));
         let node_args = backend::BackendNodeArgs {
+            org: args.org.clone(),
             bind: args.bind.clone(),
             transport,
             node_id,
@@ -299,10 +315,9 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
                 .map(|eps| eps.split(',').map(str::to_string).collect())
                 .unwrap_or_default(),
             redis_url: args.redis_url.clone(),
-            quiet_hours: match args.quiet_hours {
-                Some(_) => exocortex_dreams::fire::QuietHours::nightly(),
-                None => exocortex_dreams::fire::QuietHours::none(),
-            },
+            quiet_hours: args
+                .quiet_hours
+                .with_utc_offset_minutes(args.quiet_hours_utc_offset_minutes)?,
             admin_source_policies,
         };
         if let Some(url) = args.storage.strip_prefix("falkor://") {
@@ -311,8 +326,8 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
                     exocortex_storage::FalkorConfig {
                         falkor_url: format!("falkor://{url}"),
                         redis_url: format!("redis://{url}"),
-                        graph_name: args.graph_name.clone(),
-                        org_id: "org".into(),
+                        graph_name,
+                        org_id: args.org.clone().into(),
                         node_id: format!("node-{}", std::process::id()).into(),
                     },
                     ontology.clone(),
@@ -342,9 +357,7 @@ async fn serve_forever<S: exocortex_storage::Storage + 'static>(
 ) -> anyhow::Result<()> {
     let node = backend::run_backend_node(storage, ontology, node_args).await?;
     tracing::info!(addr = %node.local_addr, "backend-node up; serving until interrupted");
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
+    std::future::pending::<anyhow::Result<()>>().await
 }
 
 /// Shared/backend mode never derives authentication material from a public
@@ -479,7 +492,35 @@ fn data_home() -> anyhow::Result<std::path::PathBuf> {
 mod tests {
     use super::{
         ensure_source_policy_org, load_source_policy, resolve_cluster_secret, resolve_transport,
+        Args,
     };
+    use clap::Parser;
+
+    #[test]
+    fn quiet_hours_cli_preserves_window_default_and_canonical_timezone() {
+        let defaults = Args::try_parse_from(["exocortex-node"]).unwrap();
+        assert_eq!(defaults.quiet_hours.start_hour, 2);
+        assert_eq!(defaults.quiet_hours.end_hour, 6);
+        assert_eq!(defaults.quiet_hours_utc_offset_minutes, 0);
+
+        let configured = Args::try_parse_from([
+            "exocortex-node",
+            "--quiet-hours",
+            "23-07",
+            "--quiet-hours-utc-offset-minutes",
+            "-360",
+        ])
+        .unwrap();
+        let configured = configured
+            .quiet_hours
+            .with_utc_offset_minutes(configured.quiet_hours_utc_offset_minutes)
+            .unwrap();
+        assert_eq!(configured.start_hour, 23);
+        assert_eq!(configured.end_hour, 7);
+        assert_eq!(configured.utc_offset_minutes, -360);
+
+        assert!(Args::try_parse_from(["exocortex-node", "--quiet-hours", "2-6",]).is_err());
+    }
 
     #[test]
     fn backend_credentials_fail_closed_when_missing_empty_or_malformed() {

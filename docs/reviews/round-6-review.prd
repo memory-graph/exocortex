@@ -382,3 +382,20 @@ advisories cover reseed allocation, default storage ordering, quiet-hours
 configuration, obsolete fire DTOs, registry lock scope, idle wakeups, and live
 test synchronization. Duplicate reports of the dead cluster task and Redis
 queue defects remain owned by R6-R90 and R6-R98/R6-R109 respectively.
+
+Integrated remediation exposed one additional behavioral mismatch: the shared
+Dreams API accepts batched memory and relationship deltas, but its local
+fallback recorded every call as exactly one memory and zero relationships.
+R6-R113 promotes the defect so the in-process and Redis transports retain the
+same trigger accounting contract with executable regression evidence.
+
+The live integration run then reproduced cross-test invalidation consumption:
+unique graph names did not isolate the org-scoped Redis channel, so parallel
+cross-node cases could count sibling commits. R6-R114 scopes both graph and org
+per harness while retaining two peers inside each test.
+
+Live governed-backup validation also exposed invalid harness evidence: the
+Falkor driver rejects graph-entity decoding on a single-thread Tokio runtime,
+and the test's row collector silently discarded that error as an empty graph.
+R6-R115 runs the live test on the driver's required multithread runtime and
+makes every stream error fail the regression.

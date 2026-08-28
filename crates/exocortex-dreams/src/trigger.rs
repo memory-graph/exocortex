@@ -1,7 +1,7 @@
 //! The write-counter trigger model (§12.2): event-driven, never scheduled.
 
 /// Per-region write counters.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RegionWriteCounters {
     /// Commits since the last cycle.
     pub memories_since_last_cycle: u32,

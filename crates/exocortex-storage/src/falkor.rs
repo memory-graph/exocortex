@@ -48,11 +48,20 @@ pub struct FalkorStorage {
     redis_client: redis::Client,
     redis: redis::aio::MultiplexedConnection,
     node_id: SmolStr,
+    org_id: SmolStr,
     ontology: Arc<Ontology>,
     lsn_key: String,
     channel: String,
     stream_memory_pages: AtomicU64,
     stream_relationship_pages: AtomicU64,
+    #[cfg(feature = "integration")]
+    fail_next_publish: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "integration")]
+    pause_next_lsn: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "integration")]
+    lsn_paused: tokio::sync::Notify,
+    #[cfg(feature = "integration")]
+    lsn_release: tokio::sync::Notify,
 }
 
 /// Encode a param value as a Cypher literal for the `CYPHER k=v` prefix the
@@ -376,11 +385,20 @@ impl FalkorStorage {
             redis_client,
             redis,
             node_id: cfg.node_id,
+            org_id: cfg.org_id.clone(),
             ontology,
             lsn_key: format!("exocortex:{}:lsn", cfg.org_id),
             channel: format!("exocortex:{}:inv", cfg.org_id),
             stream_memory_pages: AtomicU64::new(0),
             stream_relationship_pages: AtomicU64::new(0),
+            #[cfg(feature = "integration")]
+            fail_next_publish: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "integration")]
+            pause_next_lsn: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "integration")]
+            lsn_paused: tokio::sync::Notify::new(),
+            #[cfg(feature = "integration")]
+            lsn_release: tokio::sync::Notify::new(),
         };
         let graphs = this
             .client
@@ -463,15 +481,20 @@ impl FalkorStorage {
             current_memories.push(memory?);
         }
         drop(memories);
-        for memory in current_memories {
+        for mut memory in current_memories {
+            if memory.context.tenant_id.is_none() {
+                memory.context.tenant_id = Some(self.org_id.clone());
+            }
+            let memory_type_label = self
+                .ontology
+                .memory_type_names
+                .get(memory.memory_type as usize)
+                .ok_or_else(|| {
+                    StorageError::Backend(format!("bad memory_type {}", memory.memory_type))
+                })?;
             self.run_template(
                 "migrate_memory_schema_v1",
-                &serde_json::json!({
-                    "id": hex(&memory.id.0),
-                    "entity_ids": memory.context.entities.iter()
-                        .map(|entity| hex(&entity.0))
-                        .collect::<Vec<_>>(),
-                }),
+                &self.memory_params(&memory, memory.lsn.value, memory_type_label),
                 false,
             )
             .await?;
@@ -499,6 +522,56 @@ impl FalkorStorage {
         )
         .await?;
         Ok(())
+    }
+
+    /// Adopt only the unambiguous pre-v1 shape: a current row whose exact LSN
+    /// has no canonical assertion. Current-shaped tenantless rows retain their
+    /// assertion and remain fail-closed.
+    async fn repair_legacy_memories(&self) -> Result<(), StorageError> {
+        loop {
+            let rows = self
+                .run_template(
+                    "legacy_memory_candidates",
+                    &serde_json::json!({ "limit": 256 }),
+                    true,
+                )
+                .await?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            let mut repaired = 0usize;
+            for row in rows {
+                let Some(value) = row.first() else {
+                    return Err(StorageError::CorruptMetadata {
+                        key: "legacy_memory",
+                        detail: "candidate row was empty".into(),
+                    });
+                };
+                let mut memory = memory_from_value(value)?;
+                if memory.context.tenant_id.is_some() {
+                    continue;
+                }
+                memory.context.tenant_id = Some(self.org_id.clone());
+                let label = self
+                    .ontology
+                    .memory_type_names
+                    .get(memory.memory_type as usize)
+                    .ok_or_else(|| {
+                        StorageError::Backend(format!("bad memory_type {}", memory.memory_type))
+                    })?;
+                let changed = self
+                    .run_template(
+                        "repair_legacy_memory_v1",
+                        &self.memory_params(&memory, memory.lsn.value, label),
+                        false,
+                    )
+                    .await?;
+                repaired += usize::from(!changed.is_empty());
+            }
+            if repaired == 0 {
+                return Ok(());
+            }
+        }
     }
 
     /// Integration-only downgrade fixture for proving startup migration from
@@ -539,6 +612,14 @@ impl FalkorStorage {
             .incr(&self.lsn_key, 1_u64)
             .await
             .map_err(|e| StorageError::Backend(e.to_string()))?;
+        #[cfg(feature = "integration")]
+        if self
+            .pause_next_lsn
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.lsn_paused.notify_one();
+            self.lsn_release.notified().await;
+        }
         Ok(n)
     }
 
@@ -575,7 +656,7 @@ impl FalkorStorage {
         // so the verbatim §6.4 traverse template gets its depth baked in as a
         // validated integer literal. This is the only non-parameterized
         // substitution in the adapter; the value is a CR-6-capped u8.
-        let cypher_text: String = match (
+        let mut cypher_text: String = match (
             q.params.get("max_depth").and_then(|v| v.as_u64()),
             q.params.get("kind_labels"),
             q.params.get("kind_label"),
@@ -636,6 +717,27 @@ impl FalkorStorage {
             }
         };
         let mut graph = self.client.select_graph(self.graph.clone());
+        let ordered_lsn = if t.read_only
+            || template_id.starts_with("integration_")
+            || matches!(
+                template_id,
+                "migrate_memory_schema_v1"
+                    | "repair_legacy_memory_v1"
+                    | "discovery_outbox_mark_published"
+            ) {
+            None
+        } else {
+            params.get("lsn").and_then(serde_json::Value::as_u64)
+        };
+        if ordered_lsn.is_some() {
+            cypher_text = format!(
+                "MERGE (order:_ExocortexMeta {{key: 'committed_lsn'}}) \
+                 ON CREATE SET order.value = 0 \
+                 WITH order WHERE order.value < $lsn \
+                 SET order.value = $lsn \
+                 WITH 1 AS __ordered_step\n{cypher_text}"
+            );
+        }
         let mut builder = if t.read_only {
             graph.ro_query(cypher_text.as_str())
         } else {
@@ -648,13 +750,102 @@ impl FalkorStorage {
             .execute()
             .await
             .map_err(|e| StorageError::Backend(format!("{}: {e}", t.id)))?;
-        Ok(result.data.collect::<Vec<_>>())
+        let rows = result.data.collect::<Vec<_>>();
+        if let Some(lsn) = ordered_lsn.filter(|_| rows.is_empty()) {
+            return Err(StorageError::Backend(format!(
+                "mutation LSN {lsn} lost graph commit ordering"
+            )));
+        }
+        Ok(rows)
     }
 
     /// Publish an invalidation to the org change-feed channel (§9.1).
     async fn publish(&self, inv: Invalidation) {
-        if let Ok(payload) = crate::types::encode_feed_invalidation(&inv) {
-            let _: Result<i64, _> = self.redis.clone().publish(&self.channel, payload).await;
+        let _ = self.publish_checked(&inv).await;
+    }
+
+    async fn publish_checked(&self, inv: &Invalidation) -> Result<(), StorageError> {
+        #[cfg(feature = "integration")]
+        if self
+            .fail_next_publish
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::Backend(
+                "injected discovery publication failure".into(),
+            ));
+        }
+        let payload = crate::types::encode_feed_invalidation(inv)
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        self.redis
+            .clone()
+            .publish::<_, _, i64>(&self.channel, payload)
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn drain_discovery_outbox(&self) -> Result<(), StorageError> {
+        loop {
+            let rows = self
+                .run_template(
+                    "discovery_outbox_pending",
+                    &serde_json::json!({ "limit": 256 }),
+                    true,
+                )
+                .await?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            for row in rows {
+                let discovery_id = match row.first() {
+                    Some(FalkorValue::String(value)) => value,
+                    other => {
+                        return Err(StorageError::CorruptMetadata {
+                            key: "discovery_outbox_id",
+                            detail: format!("expected string, found {other:?}"),
+                        })
+                    }
+                };
+                let record = match row.get(1) {
+                    Some(FalkorValue::String(value)) => {
+                        serde_json::from_str(value).map_err(|error| {
+                            StorageError::CorruptMetadata {
+                                key: "discovery_outbox_record",
+                                detail: error.to_string(),
+                            }
+                        })?
+                    }
+                    other => {
+                        return Err(StorageError::CorruptMetadata {
+                            key: "discovery_outbox_record",
+                            detail: format!("expected string, found {other:?}"),
+                        })
+                    }
+                };
+                let lsn = match row.get(2) {
+                    Some(FalkorValue::I64(value)) if *value >= 0 => *value as u64,
+                    other => {
+                        return Err(StorageError::CorruptMetadata {
+                            key: "discovery_outbox_lsn",
+                            detail: format!("expected non-negative integer, found {other:?}"),
+                        })
+                    }
+                };
+                self.publish_checked(&Invalidation::DiscoveryAvailable { record, lsn })
+                    .await?;
+                let marked = self
+                    .run_template(
+                        "discovery_outbox_mark_published",
+                        &serde_json::json!({ "discovery_id": discovery_id, "lsn": lsn }),
+                        false,
+                    )
+                    .await?;
+                if marked.is_empty() {
+                    return Err(StorageError::Backend(
+                        "discovery outbox acknowledgement lost durable row".into(),
+                    ));
+                }
+            }
         }
     }
 
@@ -821,9 +1012,18 @@ impl FalkorStorage {
         &self,
         parts: &[(&str, serde_json::Value)],
     ) -> Result<bool, StorageError> {
+        let max_lsn = parts
+            .iter()
+            .filter_map(|(_, values)| values.get("lsn").and_then(serde_json::Value::as_u64))
+            .max();
+        let mut ordered_parts = Vec::with_capacity(parts.len() + usize::from(max_lsn.is_some()));
+        if let Some(lsn) = max_lsn {
+            ordered_parts.push(("mutation_lsn_guard", serde_json::json!({ "lsn": lsn })));
+        }
+        ordered_parts.extend(parts.iter().cloned());
         let mut params = Vec::new();
-        let mut bodies = Vec::with_capacity(parts.len());
-        for (index, (template, values)) in parts.iter().enumerate() {
+        let mut bodies = Vec::with_capacity(ordered_parts.len());
+        for (index, (template, values)) in ordered_parts.iter().enumerate() {
             let (body, mut bound) =
                 self.namespaced_template(template, values, &format!("a{index}"))?;
             bodies.push(body);
@@ -861,7 +1061,16 @@ impl FalkorStorage {
             .await
             .map_err(|e| StorageError::Backend(e.to_string()))?;
         let start = end + 1 - n as u64;
-        Ok(start..start + n as u64)
+        let block = start..start + n as u64;
+        #[cfg(feature = "integration")]
+        if self
+            .pause_next_lsn
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.lsn_paused.notify_one();
+            self.lsn_release.notified().await;
+        }
+        Ok(block)
     }
 
     /// Every row, inverse companion, endpoint guard, and optional lease
@@ -873,7 +1082,8 @@ impl FalkorStorage {
         ms: &[Memory],
         rs: &[Relationship],
         lease: Option<&OwnerLease>,
-    ) -> Result<Vec<CommitRecord>, StorageError> {
+        journal: Option<(&FencedRestore, &str)>,
+    ) -> Result<FencedBatchCommit, StorageError> {
         // R-T4 inverse companions join the same transaction.
         let all_rels = self.expand_relationships(rs);
 
@@ -885,6 +1095,10 @@ impl FalkorStorage {
         let mut records = Vec::with_capacity(total);
         let mut invalidations = Vec::with_capacity(total);
         let mut next = block.start;
+
+        if let Some(last_lsn) = block.end.checked_sub(1) {
+            parts.push(("mutation_lsn_guard", serde_json::json!({ "lsn": last_lsn })));
+        }
 
         if let Some(lease) = lease {
             parts.push((
@@ -969,6 +1183,57 @@ impl FalkorStorage {
             next += 1;
         }
 
+        let mut committed = FencedBatchCommit {
+            records,
+            ..FencedBatchCommit::default()
+        };
+        for (memory, record) in ms.iter().zip(&committed.records) {
+            committed
+                .memory_lsns
+                .entry(memory.id)
+                .or_default()
+                .insert(record.lsn);
+        }
+        for (relationship, record) in all_rels.iter().zip(committed.records.iter().skip(ms.len())) {
+            committed
+                .relationship_lsns
+                .entry(relationship.id)
+                .or_default()
+                .insert(record.lsn);
+        }
+        if let Some((prepared_restore, cycle_id)) = journal {
+            let lease = lease.ok_or_else(|| {
+                StorageError::Backend("journaled batch requires an owner lease".into())
+            })?;
+            let mut restore = prepared_restore.clone();
+            for (id, lsns) in &committed.memory_lsns {
+                restore
+                    .owned_memory_lsns
+                    .entry(*id)
+                    .or_default()
+                    .extend(lsns);
+            }
+            for (id, lsns) in &committed.relationship_lsns {
+                restore
+                    .owned_relationship_lsns
+                    .entry(*id)
+                    .or_default()
+                    .extend(lsns);
+            }
+            parts.push((
+                "batch_cycle_journal_fragment",
+                serde_json::json!({
+                    "lease_key": serde_json::to_string(&lease.key)
+                        .map_err(|error| StorageError::Backend(error.to_string()))?,
+                    "cycle_id": cycle_id,
+                    "lease_epoch": lease.epoch,
+                    "fragment_id": block.start,
+                    "restore_json": serde_json::to_string(&restore)
+                        .map_err(|error| StorageError::Backend(error.to_string()))?,
+                }),
+            ));
+        }
+
         let mut query_params = Vec::new();
         let mut bodies = Vec::with_capacity(parts.len());
         for (index, (template, params)) in parts.iter().enumerate() {
@@ -991,8 +1256,8 @@ impl FalkorStorage {
             .execute()
             .await
             .map_err(|e| StorageError::Backend(format!("atomic batch failed: {e}")))?;
-        let committed = result.data.count() > 0;
-        if !committed {
+        let query_committed = result.data.count() > 0;
+        if !query_committed {
             return match lease {
                 Some(lease) => Err(StorageError::FencedWriteRejected {
                     lease_epoch: lease.epoch,
@@ -1006,7 +1271,7 @@ impl FalkorStorage {
         for inv in invalidations {
             self.publish(inv).await;
         }
-        Ok(records)
+        Ok(committed)
     }
 }
 
@@ -1045,7 +1310,7 @@ impl Storage for FalkorStorage {
         ms: &[Memory],
         rs: &[Relationship],
     ) -> Result<Vec<CommitRecord>, StorageError> {
-        self.upsert_batch_inner(ms, rs, None).await
+        Ok(self.upsert_batch_inner(ms, rs, None, None).await?.records)
     }
 
     async fn commit_ingest_batch(
@@ -1389,39 +1654,136 @@ impl Storage for FalkorStorage {
     }
 
     async fn store_discovery(&self, discovery: &DiscoveryRecord) -> Result<(), StorageError> {
+        let existing = self
+            .run_template(
+                "discovery_record_state",
+                &serde_json::json!({ "discovery_id": discovery.discovery_id }),
+                true,
+            )
+            .await?;
+        if let Some(row) = existing.first() {
+            let stored: DiscoveryRecord = match row.first() {
+                Some(FalkorValue::String(value)) => {
+                    serde_json::from_str(value).map_err(|error| StorageError::CorruptMetadata {
+                        key: "discovery_record",
+                        detail: error.to_string(),
+                    })?
+                }
+                other => {
+                    return Err(StorageError::CorruptMetadata {
+                        key: "discovery_record",
+                        detail: format!("expected string, found {other:?}"),
+                    })
+                }
+            };
+            if stored != *discovery {
+                return Err(StorageError::ProposalMismatch);
+            }
+            let stored_lsn = match row.get(1) {
+                Some(FalkorValue::I64(value)) if *value >= 0 => *value as u64,
+                other => {
+                    return Err(StorageError::CorruptMetadata {
+                        key: "discovery_outbox_lsn",
+                        detail: format!("expected non-negative integer, found {other:?}"),
+                    })
+                }
+            };
+            if !matches!(row.get(2), Some(FalkorValue::Bool(true))) {
+                self.publish_checked(&Invalidation::DiscoveryAvailable {
+                    record: discovery.clone(),
+                    lsn: stored_lsn,
+                })
+                .await?;
+                self.run_template(
+                    "discovery_outbox_mark_published",
+                    &serde_json::json!({
+                        "discovery_id": discovery.discovery_id,
+                        "lsn": stored_lsn,
+                    }),
+                    false,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
         let lsn = self.next_lsn().await?;
         let props_json = serde_json::to_string(discovery)
             .map_err(|error| StorageError::Backend(error.to_string()))?;
-        let rows = self
-            .run_template(
-                "discovery_record_store",
-                &serde_json::json!({
-                    "discovery_id": discovery.discovery_id,
-                    "org_id": discovery.region.org,
-                    "region_project": discovery.region.project,
-                    "region_memory_type": discovery.region.memory_type,
-                    "from": hex(&discovery.from.0),
-                    "to": hex(&discovery.to.0),
-                    "discovered_at": discovery.discovered_at.to_rfc3339(),
-                    "props_json": props_json,
-                    "lsn": lsn,
-                }),
-                false,
-            )
-            .await?;
-        if rows.is_empty() {
+        let create_params = serde_json::json!({
+            "discovery_id": discovery.discovery_id,
+            "org_id": discovery.region.org,
+            "region_project": discovery.region.project,
+            "region_memory_type": discovery.region.memory_type,
+            "from": hex(&discovery.from.0),
+            "to": hex(&discovery.to.0),
+            "discovered_at": discovery.discovered_at.to_rfc3339(),
+            "props_json": props_json,
+            "lsn": lsn,
+        });
+        if !self
+            .run_atomic_parts(&[("batch_discovery_record_store", create_params)])
+            .await?
+        {
             return Err(StorageError::ProposalMismatch);
         }
-        let created = matches!(
-            rows.first().and_then(|row| row.get(1)),
-            Some(FalkorValue::I64(stored_lsn)) if *stored_lsn as u64 == lsn
+        let rows = self
+            .run_template(
+                "discovery_record_state",
+                &serde_json::json!({ "discovery_id": discovery.discovery_id }),
+                true,
+            )
+            .await?;
+        let stored: DiscoveryRecord = match rows.first().and_then(|row| row.first()) {
+            Some(FalkorValue::String(value)) => {
+                serde_json::from_str(value).map_err(|error| StorageError::CorruptMetadata {
+                    key: "discovery_record",
+                    detail: error.to_string(),
+                })?
+            }
+            other => {
+                return Err(StorageError::CorruptMetadata {
+                    key: "discovery_record",
+                    detail: format!("expected string, found {other:?}"),
+                })
+            }
+        };
+        if stored != *discovery {
+            return Err(StorageError::ProposalMismatch);
+        }
+        let stored_lsn = match rows.first().and_then(|row| row.get(1)) {
+            Some(FalkorValue::I64(stored_lsn)) if *stored_lsn >= 0 => *stored_lsn as u64,
+            other => {
+                return Err(StorageError::CorruptMetadata {
+                    key: "discovery_outbox_lsn",
+                    detail: format!("expected non-negative integer, found {other:?}"),
+                })
+            }
+        };
+        let published = matches!(
+            rows.first().and_then(|row| row.get(2)),
+            Some(FalkorValue::Bool(true))
         );
-        if created {
-            self.publish(Invalidation::DiscoveryAvailable {
+        if !published {
+            self.publish_checked(&Invalidation::DiscoveryAvailable {
                 record: discovery.clone(),
-                lsn,
+                lsn: stored_lsn,
             })
-            .await;
+            .await?;
+            let marked = self
+                .run_template(
+                    "discovery_outbox_mark_published",
+                    &serde_json::json!({
+                        "discovery_id": discovery.discovery_id,
+                        "lsn": stored_lsn,
+                    }),
+                    false,
+                )
+                .await?;
+            if marked.is_empty() {
+                return Err(StorageError::Backend(
+                    "discovery outbox acknowledgement lost durable row".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1628,6 +1990,7 @@ impl Storage for FalkorStorage {
     }
 
     async fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>, StorageError> {
+        self.repair_legacy_memories().await?;
         // R-T11 (audit ST3): `Public` is treated as `Org` on v1 read paths —
         // fetch at the widest internal ceiling so a Public row is readable
         // instead of invisible.
@@ -1646,6 +2009,7 @@ impl Storage for FalkorStorage {
         id: &MemoryId,
         vc: &crate::VisibilityContext,
     ) -> Result<Option<Memory>, StorageError> {
+        self.repair_legacy_memories().await?;
         // ST4 (audit): fetch at the widest internal ceiling and apply the
         // visibility decision in Rust — an existing-but-forbidden row is
         // PermissionDenied (R-MT4), never a silent None.
@@ -1667,6 +2031,7 @@ impl Storage for FalkorStorage {
     }
 
     async fn get_memories(&self, ids: &[MemoryId]) -> Result<Vec<Memory>, StorageError> {
+        self.repair_legacy_memories().await?;
         let rows = self
             .run_template(
                 "get_memories_by_ids",
@@ -1686,6 +2051,7 @@ impl Storage for FalkorStorage {
         ids: &[MemoryId],
         vc: &crate::VisibilityContext,
     ) -> Result<Vec<Memory>, StorageError> {
+        self.repair_legacy_memories().await?;
         let rows = self
             .run_template(
                 "get_visible_memories_by_ids",
@@ -1792,6 +2158,7 @@ impl Storage for FalkorStorage {
         entities: &[EntityId],
         limit: u32,
     ) -> Result<Vec<Memory>, StorageError> {
+        self.repair_legacy_memories().await?;
         let rows = self
             .run_template(
                 "memories_sharing_attributes",
@@ -1991,6 +2358,9 @@ impl Storage for FalkorStorage {
     }
 
     async fn stream_all_memories(&self) -> BoxStream<'_, Result<Memory, StorageError>> {
+        if let Err(error) = self.repair_legacy_memories().await {
+            return Box::pin(futures::stream::once(async move { Err(error) }));
+        }
         let stream = futures::stream::unfold(
             (self, 0_u64, true, std::collections::VecDeque::new(), false),
             |(storage, mut cursor, mut first_page, mut buffered, mut done)| async move {
@@ -2228,27 +2598,100 @@ impl Storage for FalkorStorage {
         rs: &[Relationship],
         lease: &OwnerLease,
     ) -> Result<FencedBatchCommit, StorageError> {
-        let relationships = self.expand_relationships(rs);
-        let records = self.upsert_batch_inner(ms, rs, Some(lease)).await?;
-        let mut memory_lsns = std::collections::BTreeMap::new();
-        for (memory, record) in ms.iter().zip(&records) {
-            memory_lsns
-                .entry(memory.id)
-                .or_insert_with(std::collections::BTreeSet::new)
-                .insert(record.lsn);
+        self.upsert_batch_inner(ms, rs, Some(lease), None).await
+    }
+
+    async fn upsert_batch_fenced_journaled(
+        &self,
+        ms: &[Memory],
+        rs: &[Relationship],
+        prepared_restore: &FencedRestore,
+        cycle_id: &str,
+        lease: &OwnerLease,
+    ) -> Result<FencedBatchCommit, StorageError> {
+        self.upsert_batch_inner(ms, rs, Some(lease), Some((prepared_restore, cycle_id)))
+            .await
+    }
+
+    async fn get_active_cycle_journal(
+        &self,
+        key: &LeaseKey,
+    ) -> Result<Option<CycleJournalRecord>, StorageError> {
+        let lease_key =
+            serde_json::to_string(key).map_err(|error| StorageError::Backend(error.to_string()))?;
+        let rows = self
+            .run_template(
+                "active_cycle_journal",
+                &serde_json::json!({ "lease_key": lease_key }),
+                true,
+            )
+            .await?;
+        if rows.is_empty() {
+            return Ok(None);
         }
-        let mut relationship_lsns = std::collections::BTreeMap::new();
-        for (relationship, record) in relationships.iter().zip(records.iter().skip(ms.len())) {
-            relationship_lsns
-                .entry(relationship.id)
-                .or_insert_with(std::collections::BTreeSet::new)
-                .insert(record.lsn);
+        let cycle_id = match rows[0].first() {
+            Some(FalkorValue::String(value)) => value.clone(),
+            other => {
+                return Err(StorageError::Backend(format!(
+                    "corrupt cycle journal id: {other:?}"
+                )))
+            }
+        };
+        let lease_epoch = match rows[0].get(1) {
+            Some(FalkorValue::I64(value)) if *value >= 0 => *value as u64,
+            other => {
+                return Err(StorageError::Backend(format!(
+                    "corrupt cycle journal epoch: {other:?}"
+                )))
+            }
+        };
+        let mut restore = FencedRestore::default();
+        for row in rows {
+            let fragment = match row.get(2) {
+                Some(FalkorValue::String(value)) => serde_json::from_str(value)
+                    .map_err(|error| StorageError::Backend(error.to_string()))?,
+                other => {
+                    return Err(StorageError::Backend(format!(
+                        "corrupt cycle journal fragment: {other:?}"
+                    )))
+                }
+            };
+            restore.merge(&fragment);
         }
-        Ok(FencedBatchCommit {
-            records,
-            memory_lsns,
-            relationship_lsns,
-        })
+        Ok(Some(CycleJournalRecord {
+            cycle_id: cycle_id.into(),
+            lease_key: key.clone(),
+            lease_epoch,
+            restore,
+            state: CycleJournalState::Active,
+        }))
+    }
+
+    async fn complete_cycle_journal_fenced(
+        &self,
+        cycle_id: &str,
+        lease: &OwnerLease,
+    ) -> Result<(), StorageError> {
+        let rows = self
+            .run_template(
+                "cycle_journal_complete_fenced",
+                &serde_json::json!({
+                    "lease_key": serde_json::to_string(&lease.key)
+                        .map_err(|error| StorageError::Backend(error.to_string()))?,
+                    "cycle_id": cycle_id,
+                    "token": lease.fencing_token.as_str(),
+                    "epoch": lease.epoch,
+                    "now_ms": Utc::now().timestamp_millis(),
+                }),
+                false,
+            )
+            .await?;
+        if rows.is_empty() {
+            return Err(StorageError::FencedWriteRejected {
+                lease_epoch: lease.epoch,
+            });
+        }
+        Ok(())
     }
 
     async fn delete_memory_fenced(
@@ -2266,6 +2709,7 @@ impl Storage for FalkorStorage {
             None => String::new(),
         };
         let parts = [
+            ("mutation_lsn_guard", serde_json::json!({ "lsn": lsn })),
             (
                 "lease_fence_guard",
                 serde_json::json!({
@@ -2514,6 +2958,7 @@ impl Storage for FalkorStorage {
             .subscribe(&self.channel)
             .await
             .map_err(|e| StorageError::Backend(e.to_string()))?;
+        self.drain_discovery_outbox().await?;
         let msgs = futures::stream::unfold(pubsub, |mut ps| async move {
             use futures::StreamExt;
             let outcome = {
@@ -2583,6 +3028,32 @@ impl FalkorStorage {
             self.stream_memory_pages.swap(0, Ordering::Relaxed),
             self.stream_relationship_pages.swap(0, Ordering::Relaxed),
         )
+    }
+    /// Fail the next Redis publication after its durable graph mutation.
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    pub fn fail_next_publish_for_testing(&self) {
+        self.fail_next_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Pause the next mutation after Redis allocates its LSN but before Falkor commits it.
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    pub fn pause_next_lsn_for_testing(&self) {
+        self.pause_next_lsn
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Wait until the armed mutation has allocated its LSN.
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    pub async fn wait_for_paused_lsn_for_testing(&self) {
+        self.lsn_paused.notified().await;
+    }
+    /// Release a mutation paused after LSN allocation.
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    pub fn release_paused_lsn_for_testing(&self) {
+        self.lsn_release.notify_one();
     }
     /// Current backend LSN frontier (Redis GET).
     async fn last_backend_lsn(&self) -> u64 {

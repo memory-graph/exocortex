@@ -14,7 +14,7 @@ use exocortex_kernel::{
     Embedding, EmbeddingModel, Memory, MemoryContext, MemoryId, Provenance, RelKindId,
     Relationship, RelationshipId, RelationshipProperties, Visibility, LSN,
 };
-use exocortex_storage::{InMemoryStorage, RegionKey, Storage, VisibilityContext};
+use exocortex_storage::{InMemoryStorage, LeaseKey, RegionKey, Storage, VisibilityContext};
 use futures::StreamExt;
 
 fn ontology() -> Arc<exocortex_kernel::Ontology> {
@@ -692,6 +692,30 @@ fn trigger_model_is_write_counter_driven_only() {
     }));
 }
 
+#[tokio::test]
+async fn batched_local_writes_preserve_exact_memory_and_edge_counts() {
+    let storage = InMemoryStorage::new(ontology());
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        false,
+        "dreams-batch-counter".into(),
+    );
+    let region = RegionKey {
+        org: "org".into(),
+        project: "project".into(),
+        memory_type: 3,
+    };
+
+    engine.on_writes(region.clone(), 7, 5).await.unwrap();
+
+    let counters = *engine.counters.get(&region).unwrap();
+    assert_eq!(counters.memories_since_last_cycle, 7);
+    assert_eq!(counters.edges_since_last_cycle, 5);
+}
+
 #[test]
 fn discovery_is_a_proposal_not_an_edge() {
     let d = Discovery {
@@ -1242,5 +1266,86 @@ async fn rollback_preserves_a_concurrent_non_cycle_memory_version() {
             .unwrap()
             .title,
         "concurrent-b"
+    );
+}
+
+#[tokio::test]
+async fn successor_recovers_durable_cycle_journal_without_overwriting_concurrent_version() {
+    let storage = InMemoryStorage::new(ontology());
+    let target = mem_with_embedding(96_000, None, unit(20));
+    let mut duplicate_a = mem_with_embedding(96_001, Some(1), unit(1));
+    let mut duplicate_b = mem_with_embedding(96_002, Some(1), unit(1));
+    duplicate_a.embedding.as_mut().unwrap().vector[2] = 0.01;
+    duplicate_b.embedding.as_mut().unwrap().vector[3] = 0.01;
+    storage
+        .upsert_batch(&[target, duplicate_a, duplicate_b], &[])
+        .await
+        .unwrap();
+    let region = RegionKey {
+        org: "o".into(),
+        project: "p".into(),
+        memory_type: 3,
+    };
+    let lease_key = LeaseKey::Dreams {
+        org: region.org.clone(),
+        region: "p:3".into(),
+    };
+    let crashed = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        true,
+        "crashed-owner".into(),
+    )
+    .with_cycle_crash_after(1);
+    assert!(crashed.try_consolidate(&region).await.is_err());
+
+    let journal = storage
+        .get_active_cycle_journal(&lease_key)
+        .await
+        .unwrap()
+        .expect("crashed mutation leaves an active durable journal");
+    let concurrently_written_id = *journal
+        .restore
+        .owned_memory_lsns
+        .keys()
+        .next()
+        .expect("the first merge wrote a memory");
+    let mut concurrent = storage
+        .get_memory(&concurrently_written_id)
+        .await
+        .unwrap()
+        .unwrap();
+    concurrent.title = "successor-concurrent-version".into();
+    concurrent.valid_until = None;
+    storage.upsert_memory(&concurrent).await.unwrap();
+
+    let successor = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        true,
+        "successor".into(),
+    );
+    successor
+        .recover_active_cycle_for_test(&region)
+        .await
+        .unwrap();
+    assert!(storage
+        .get_active_cycle_journal(&lease_key)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        storage
+            .get_memory(&concurrently_written_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .title,
+        "successor-concurrent-version",
+        "recovery compensates only the crashed cycle's owned LSN"
     );
 }
