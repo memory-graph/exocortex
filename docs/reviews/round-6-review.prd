@@ -555,3 +555,7 @@ The subsequent strict pass promoted R6-R168–R6-R171: durable reasoning now
 settles successful zero-output work, uses canonical versioned seed keys,
 records publication-pending state with the atomic graph marker, repairs failed
 feed publication on replay, and keeps acknowledgement semantics backend-equal.
+The next convergence pass token-fenced publication through completion:
+per-event renewal and a ten-second I/O bound keep the claim live, forced
+takeover makes the stale publisher fail, completion reclaims its serialized
+payload, and live Falkor covers empty successful settlement.

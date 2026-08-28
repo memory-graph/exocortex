@@ -574,19 +574,21 @@ itest!(
         drop(first);
 
         let url = falkor_url().unwrap();
-        let restarted = FalkorStorage::connect(
-            FalkorConfig {
-                falkor_url: url.clone(),
-                redis_url: std::env::var("REDIS_URL")
-                    .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
-                graph_name: graph,
-                org_id: "test-org".into(),
-                node_id: "ingest-outbox-b".into(),
-            },
-            ontology(),
-        )
-        .await
-        .unwrap();
+        let restarted = Arc::new(
+            FalkorStorage::connect(
+                FalkorConfig {
+                    falkor_url: url.clone(),
+                    redis_url: std::env::var("REDIS_URL")
+                        .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+                    graph_name: graph,
+                    org_id: "test-org".into(),
+                    node_id: "ingest-outbox-b".into(),
+                },
+                ontology(),
+            )
+            .await
+            .unwrap(),
+        );
         let contender = FalkorStorage::connect(
             FalkorConfig {
                 falkor_url: url.clone(),
@@ -649,6 +651,14 @@ itest!(
             .await
             .unwrap();
         assert_eq!(assertion_count.rows, vec![serde_json::json!([1])]);
+        assert!(restarted
+            .upsert_batch_once("reasoning:live-no-output", &[], &[])
+            .await
+            .unwrap());
+        assert!(!contender
+            .upsert_batch_once("reasoning:live-no-output", &[], &[])
+            .await
+            .unwrap());
         let repair_peer = mem("outbox-repair-peer", 3, Visibility::Org);
         let repair_edge = rel(memory.id, repair_peer.id, 1);
         let region = RegionKey {
@@ -679,6 +689,49 @@ itest!(
         })
         .await
         .expect("marker replay republishes the committed relationship invalidation");
+        let retained_payloads = restarted
+            .query_cypher(&CypherQuery {
+                template_id: "integration_idempotent_publication_payload_count",
+                params: serde_json::json!({ "operation_key": "reasoning:publish-repair" }),
+                read_only: true,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            retained_payloads.rows,
+            vec![serde_json::json!([0])],
+            "completed marker releases its no-longer-needed publication payload"
+        );
+        let lease_peer = mem("outbox-lease-peer", 3, Visibility::Org);
+        let lease_edge = rel(memory.id, lease_peer.id, 1);
+        restarted.pause_next_publish_for_testing();
+        let owner_storage = restarted.clone();
+        let owner_edge = lease_edge.clone();
+        let owner = tokio::spawn(async move {
+            owner_storage
+                .upsert_batch_once("reasoning:lease-loss", &[lease_peer], &[owner_edge])
+                .await
+        });
+        restarted.wait_for_paused_publish_for_testing().await;
+        contender
+            .query_cypher(&CypherQuery {
+                template_id: "integration_expire_idempotent_publication_claim",
+                params: serde_json::json!({ "operation_key": "reasoning:lease-loss" }),
+                read_only: false,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        assert!(!contender
+            .upsert_batch_once("reasoning:lease-loss", &[], &[])
+            .await
+            .unwrap());
+        restarted.release_paused_publish_for_testing();
+        assert!(
+            owner.await.unwrap().is_err(),
+            "expired owner cannot report publication success"
+        );
         let (claim_a, claim_b) = tokio::join!(
             restarted.claim_ingest_effect("worker-a", 2_000),
             contender.claim_ingest_effect("worker-b", 2_000),

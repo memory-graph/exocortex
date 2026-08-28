@@ -64,6 +64,12 @@ pub struct FalkorStorage {
     #[cfg(feature = "integration")]
     fail_next_publish: std::sync::atomic::AtomicBool,
     #[cfg(feature = "integration")]
+    pause_next_publish: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "integration")]
+    publish_paused: tokio::sync::Notify,
+    #[cfg(feature = "integration")]
+    publish_release: tokio::sync::Notify,
+    #[cfg(feature = "integration")]
     pause_next_lsn: std::sync::atomic::AtomicBool,
     #[cfg(feature = "integration")]
     lsn_paused: tokio::sync::Notify,
@@ -405,6 +411,12 @@ impl FalkorStorage {
             legacy_repair_queries: AtomicU64::new(0),
             #[cfg(feature = "integration")]
             fail_next_publish: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "integration")]
+            pause_next_publish: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "integration")]
+            publish_paused: tokio::sync::Notify::new(),
+            #[cfg(feature = "integration")]
+            publish_release: tokio::sync::Notify::new(),
             #[cfg(feature = "integration")]
             pause_next_lsn: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "integration")]
@@ -809,6 +821,14 @@ impl FalkorStorage {
                 "injected discovery publication failure".into(),
             ));
         }
+        #[cfg(feature = "integration")]
+        if self
+            .pause_next_publish
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.publish_paused.notify_one();
+            self.publish_release.notified().await;
+        }
         let payload = crate::types::encode_feed_invalidation(inv)
             .map_err(|error| StorageError::Backend(error.to_string()))?;
         self.redis
@@ -816,6 +836,73 @@ impl FalkorStorage {
             .publish::<_, _, i64>(&self.channel, payload)
             .await
             .map_err(|error| StorageError::Backend(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn publish_idempotent_batch(
+        &self,
+        operation_key: &str,
+        claim_token: &str,
+        invalidations: &[Invalidation],
+    ) -> Result<(), StorageError> {
+        for invalidation in invalidations {
+            let renewed = !self
+                .run_template(
+                    "idempotent_batch_publication_renew",
+                    &serde_json::json!({
+                        "operation_key": operation_key,
+                        "claim_token": claim_token,
+                        "lease_ms": 30_000,
+                    }),
+                    false,
+                )
+                .await?
+                .is_empty();
+            if !renewed {
+                return Err(StorageError::Backend(
+                    "idempotent publication claim ownership was lost".into(),
+                ));
+            }
+            let publication_error = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.publish_checked(invalidation),
+            )
+            .await
+            {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(_) => Some(StorageError::Backend(
+                    "idempotent publication timed out".into(),
+                )),
+            };
+            if let Some(error) = publication_error {
+                self.run_template(
+                    "idempotent_batch_publication_release",
+                    &serde_json::json!({
+                        "operation_key": operation_key,
+                        "claim_token": claim_token,
+                    }),
+                    false,
+                )
+                .await?;
+                return Err(error);
+            }
+        }
+        let completed = self
+            .run_template(
+                "idempotent_batch_publication_complete",
+                &serde_json::json!({
+                    "operation_key": operation_key,
+                    "claim_token": claim_token,
+                }),
+                false,
+            )
+            .await?;
+        if completed.is_empty() {
+            return Err(StorageError::Backend(
+                "idempotent publication completion lost claim ownership".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1325,36 +1412,17 @@ impl FalkorStorage {
             };
         }
 
-        for inv in invalidations {
-            if import_key.is_some() {
-                // The durable operation marker makes a replay a no-op, so a
-                // publication failure must remain observable and replayable.
-                if let Err(error) = self.publish_checked(&inv).await {
-                    self.run_template(
-                        "idempotent_batch_publication_release",
-                        &serde_json::json!({
-                            "operation_key": import_key.expect("checked"),
-                            "claim_token": publication_claim_token.expect("checked"),
-                        }),
-                        false,
-                    )
-                    .await?;
-                    return Err(error);
-                }
-            } else {
-                self.publish(inv).await;
-            }
-        }
         if let Some(operation_key) = import_key {
-            self.run_template(
-                "idempotent_batch_publication_complete",
-                &serde_json::json!({
-                    "operation_key": operation_key,
-                    "claim_token": publication_claim_token.expect("checked"),
-                }),
-                false,
+            self.publish_idempotent_batch(
+                operation_key,
+                publication_claim_token.expect("checked"),
+                &invalidations,
             )
             .await?;
+        } else {
+            for invalidation in invalidations {
+                self.publish(invalidation).await;
+            }
         }
         Ok(Some(committed))
     }
@@ -1605,29 +1673,8 @@ impl Storage for FalkorStorage {
                         detail: error.to_string(),
                     }
                 })?;
-            for invalidation in invalidations {
-                if let Err(error) = self.publish_checked(&invalidation).await {
-                    self.run_template(
-                        "idempotent_batch_publication_release",
-                        &serde_json::json!({
-                            "operation_key": operation_key,
-                            "claim_token": claim_token,
-                        }),
-                        false,
-                    )
-                    .await?;
-                    return Err(error);
-                }
-            }
-            self.run_template(
-                "idempotent_batch_publication_complete",
-                &serde_json::json!({
-                    "operation_key": operation_key,
-                    "claim_token": claim_token,
-                }),
-                false,
-            )
-            .await?;
+            self.publish_idempotent_batch(operation_key, &claim_token, &invalidations)
+                .await?;
         } else if !committed
             && !self
                 .run_template(
@@ -3394,6 +3441,25 @@ impl FalkorStorage {
     pub fn fail_next_publish_for_testing(&self) {
         self.fail_next_publish
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Pause one Redis publication after its claim renewal.
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    pub fn pause_next_publish_for_testing(&self) {
+        self.pause_next_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Wait until the injected publication pause is reached.
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    pub async fn wait_for_paused_publish_for_testing(&self) {
+        self.publish_paused.notified().await;
+    }
+    /// Release the injected publication pause.
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    pub fn release_paused_publish_for_testing(&self) {
+        self.publish_release.notify_one();
     }
     /// Pause the next mutation after Redis allocates its LSN but before Falkor commits it.
     #[cfg(feature = "integration")]

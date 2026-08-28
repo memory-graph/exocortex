@@ -554,7 +554,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (i:_GovernedImport {key: $operation_key})
             WHERE i.applied = true AND i.publication_claim_token = $claim_token
             SET i.publication_pending = false
-            REMOVE i.publication_claim_token, i.publication_claim_until_ms
+            REMOVE i.publication_claim_token, i.publication_claim_until_ms,
+                   i.publication_json
             RETURN i.key
         "#,
     });
@@ -579,6 +580,20 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             WHERE i.applied = true AND i.publication_pending = true
               AND i.publication_claim_token = $claim_token
             REMOVE i.publication_claim_token, i.publication_claim_until_ms
+            RETURN i.key
+        "#,
+    });
+
+    reg!(Template {
+        id: "idempotent_batch_publication_renew",
+        read_only: false,
+        required_params: &["operation_key", "claim_token", "lease_ms"],
+        cypher: r#"
+            MATCH (i:_GovernedImport {key: $operation_key})
+            WHERE i.applied = true AND i.publication_pending = true
+              AND i.publication_claim_token = $claim_token
+              AND i.publication_claim_until_ms > timestamp()
+            SET i.publication_claim_until_ms = timestamp() + $lease_ms
             RETURN i.key
         "#,
     });
@@ -1711,6 +1726,31 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MATCH (h:_RelationshipAssertion {id: $id})
             RETURN count(h)
+        "#,
+    });
+
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_idempotent_publication_payload_count",
+        read_only: true,
+        required_params: &["operation_key"],
+        cypher: r#"
+            MATCH (i:_GovernedImport {key: $operation_key})
+            WHERE i.publication_json IS NOT NULL
+            RETURN count(i)
+        "#,
+    });
+
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_expire_idempotent_publication_claim",
+        read_only: false,
+        required_params: &["operation_key"],
+        cypher: r#"
+            MATCH (i:_GovernedImport {key: $operation_key})
+            WHERE i.publication_pending = true
+            SET i.publication_claim_until_ms = 0
+            RETURN i.key
         "#,
     });
 
