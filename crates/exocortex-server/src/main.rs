@@ -274,8 +274,8 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
             exocortex_server::principal::PrincipalRegistry::load(principal_policy)?,
         );
         principals.ensure_org("org")?;
-        let admin_ceilings = load_source_policy(args.source_policy.as_deref())?;
-        ensure_source_policy_org(&admin_ceilings, "org")?;
+        let admin_source_policies = load_source_policy(args.source_policy.as_deref())?;
+        ensure_source_policy_org(&admin_source_policies, "org")?;
         let transport = resolve_transport(
             &args.bind,
             args.tls_cert.as_deref(),
@@ -303,7 +303,7 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
                 Some(_) => exocortex_dreams::fire::QuietHours::nightly(),
                 None => exocortex_dreams::fire::QuietHours::none(),
             },
-            admin_ceilings,
+            admin_source_policies,
         };
         if let Some(url) = args.storage.strip_prefix("falkor://") {
             let storage = std::sync::Arc::new(
@@ -399,10 +399,14 @@ struct SourcePolicyRow {
     source_uri: String,
     producer_id: String,
     ceiling: u8,
+    hmac_key: String,
 }
 
 type SourcePolicyKey = (String, String, String);
-type SourcePolicyEntry = (SourcePolicyKey, exocortex_kernel::Visibility);
+type SourcePolicyEntry = (
+    SourcePolicyKey,
+    exocortex_ingest::service::AdminSourcePolicy,
+);
 
 fn load_source_policy(path: Option<&std::path::Path>) -> anyhow::Result<Vec<SourcePolicyEntry>> {
     let path = path.ok_or_else(|| {
@@ -432,7 +436,15 @@ fn load_source_policy(path: Option<&std::path::Path>) -> anyhow::Result<Vec<Sour
                 seen.insert(key.clone()),
                 "duplicate source policy entry: {key:?}"
             );
-            Ok((key, visibility))
+            let signing_key = exocortex_wire::signing::decode_hex32(&row.hmac_key)
+                .map_err(|error| anyhow::anyhow!("source policy hmac_key: {error}"))?;
+            Ok((
+                key,
+                exocortex_ingest::service::AdminSourcePolicy {
+                    ceiling: visibility,
+                    signing_key,
+                },
+            ))
         })
         .collect()
 }
@@ -487,16 +499,23 @@ mod tests {
         let path = dir.path().join("policy.json");
         std::fs::write(
             &path,
-            r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":3}]"#,
+            r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":3,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
         )
         .unwrap();
         let rows = load_source_policy(Some(&path)).unwrap();
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.signing_key, [0x42; 32]);
         assert!(ensure_source_policy_org(&rows, "org").is_ok());
         assert!(ensure_source_policy_org(&rows, "foreign").is_err());
         std::fs::write(
             &path,
-            r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":9}]"#,
+            r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":3}]"#,
+        )
+        .unwrap();
+        assert!(load_source_policy(Some(&path)).is_err());
+        std::fs::write(
+            &path,
+            r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":9,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
         )
         .unwrap();
         assert!(load_source_policy(Some(&path)).is_err());

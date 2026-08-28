@@ -346,6 +346,115 @@ itest!(ingest_settlement_survives_backend_reconnect, {
         .is_none());
 });
 
+itest!(corrupt_ingest_settlement_fails_closed_on_retry, {
+    for (case, accepted, rejected, assigned_lsn) in [
+        (
+            "wrong-type",
+            serde_json::json!("1"),
+            serde_json::json!(0),
+            serde_json::json!(1),
+        ),
+        (
+            "negative",
+            serde_json::json!(1),
+            serde_json::json!(-1),
+            serde_json::json!(1),
+        ),
+        (
+            "overflow",
+            serde_json::json!(u64::from(u32::MAX) + 1),
+            serde_json::json!(0),
+            serde_json::json!(1),
+        ),
+    ] {
+        let storage = connect(&format!("ingest-corrupt-{case}")).await;
+        let key = IngestBatchKey {
+            org_id: "test-org".into(),
+            producer_id: "producer".into(),
+            batch_id: format!("corrupt-{case}-{}", graph_suffix()).into(),
+        };
+        let committed = mem(&format!("committed-{case}"), 3, Visibility::Org);
+        storage
+            .commit_ingest_batch(&key, &[committed.clone()], &[], 1)
+            .await
+            .unwrap();
+        storage
+            .query_cypher(&CypherQuery {
+                template_id: "integration_corrupt_ingest_settlement",
+                params: serde_json::json!({
+                    "org_id": key.org_id,
+                    "producer_id": key.producer_id,
+                    "batch_id": key.batch_id,
+                    "accepted": accepted,
+                    "rejected": rejected,
+                    "assigned_lsn": assigned_lsn,
+                }),
+                read_only: false,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+
+        let must_not_commit = mem(&format!("must-not-commit-{case}"), 3, Visibility::Org);
+        assert!(matches!(
+            storage
+                .commit_ingest_batch(&key, &[must_not_commit.clone()], &[], 1)
+                .await,
+            Err(StorageError::CorruptMetadata {
+                key: "ingest_settlement",
+                ..
+            })
+        ));
+        assert!(storage.get_memory(&committed.id).await.unwrap().is_some());
+        assert!(storage
+            .get_memory(&must_not_commit.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+});
+
+itest!(credential_bearing_backend_url_errors_are_redacted, {
+    const SENTINEL: &str = "R6_Q3_URL_CREDENTIAL_SENTINEL_8d92e4";
+    let live_falkor = falkor_url().unwrap();
+    let cases = [
+        (
+            format!("falkor://sentinel:{SENTINEL}@["),
+            "redis://127.0.0.1:1".to_string(),
+        ),
+        (
+            live_falkor.clone(),
+            format!("redis://sentinel:{SENTINEL}@["),
+        ),
+        (
+            live_falkor,
+            format!("redis://sentinel:{SENTINEL}@127.0.0.1:1"),
+        ),
+    ];
+    for (index, (falkor_url, redis_url)) in cases.into_iter().enumerate() {
+        let error = match FalkorStorage::connect(
+            FalkorConfig {
+                falkor_url,
+                redis_url,
+                graph_name: format!("credential_redaction_{}_{}", graph_suffix(), index),
+                org_id: "test-org".into(),
+                node_id: "credential-redaction".into(),
+            },
+            ontology(),
+        )
+        .await
+        {
+            Ok(_) => panic!("malformed or unreachable credential-bearing URL must fail"),
+            Err(error) => error,
+        };
+        let diagnostic = format!("{error}\n{error:?}");
+        assert!(
+            !diagnostic.contains(SENTINEL),
+            "backend diagnostic reproduced URL credential: {diagnostic}"
+        );
+    }
+});
+
 itest!(fingerprint_mismatch_aborts_startup, {
     // First process pins the fingerprint.
     let s = connect("node-1").await;
@@ -679,6 +788,84 @@ itest!(
         ));
     }
 );
+
+itest!(discovery_publish_is_durable_ordered_and_idempotent_live, {
+    let storage = connect("discovery-publication").await;
+    let region = RegionKey {
+        org: "test-org".into(),
+        project: "proj".into(),
+        memory_type: 3,
+    };
+    let mut feed = storage.subscribe_invalidations(&region).await.unwrap();
+    tokio::time::sleep(StdDuration::from_millis(150)).await;
+    let record = DiscoveryRecord {
+        discovery_id: format!("discovery-event-{}", graph_suffix()).into(),
+        region,
+        from: MemoryId::new_v7(),
+        to: MemoryId::new_v7(),
+        discovery_type: "transitive".into(),
+        quality: 0.7,
+        via_types: [1, 2],
+        discovery_cycle_id: "publication-cycle".into(),
+        discovered_at: Utc::now(),
+    };
+
+    storage.store_discovery(&record).await.unwrap();
+    let event_lsn = tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            match feed
+                .next()
+                .await
+                .expect("publication stream remains open")
+                .expect("publication decodes")
+            {
+                Invalidation::DiscoveryAvailable {
+                    record: published,
+                    lsn,
+                } if published.discovery_id == record.discovery_id => {
+                    assert_eq!(published, record);
+                    break lsn;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("new discovery publishes");
+    assert_eq!(
+        storage.get_discovery(&record.discovery_id).await.unwrap(),
+        Some(record.clone()),
+        "the durable record is readable when publication is observed"
+    );
+    let persisted_lsn = storage
+        .query_cypher(&CypherQuery {
+            template_id: "integration_get_discovery_lsn",
+            params: serde_json::json!({ "discovery_id": record.discovery_id }),
+            read_only: true,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+    assert_eq!(persisted_lsn.rows, vec![serde_json::json!([event_lsn])]);
+
+    storage.store_discovery(&record).await.unwrap();
+    assert!(
+        tokio::time::timeout(StdDuration::from_millis(100), async {
+            loop {
+                if matches!(
+                    feed.next().await,
+                    Some(Ok(Invalidation::DiscoveryAvailable { record: published, .. }))
+                        if published.discovery_id == record.discovery_id
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_err(),
+        "an immutable exact retry must not publish a duplicate event"
+    );
+});
 
 itest!(
     relationships_in_region_is_exact_ordered_and_budgeted_live,

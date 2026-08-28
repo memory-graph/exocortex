@@ -1026,15 +1026,17 @@ async fn re_registration_does_not_overwrite_ceiling() {
 #[tokio::test]
 async fn admin_ceiling_caps_self_registration() {
     let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
-    let srv = IngestServer::new(
+    let srv = IngestServer::new_with_admin_policies(
         Arc::new(InMemoryStorage::new(onto.clone())),
         onto,
-        [5u8; 32],
-    )
-    .with_admin_ceilings([(
-        ("org".into(), "session://s1".into(), "session-wrapup".into()),
-        exocortex_kernel::Visibility::Project,
-    )]);
+        [(
+            ("org".into(), "session://s1".into(), "session-wrapup".into()),
+            exocortex_ingest::service::AdminSourcePolicy {
+                ceiling: exocortex_kernel::Visibility::Project,
+                signing_key: [5u8; 32],
+            },
+        )],
+    );
 
     // Over the admin ceiling: rejected.
     let err = srv
@@ -1075,15 +1077,98 @@ async fn admin_ceiling_caps_self_registration() {
 }
 
 #[tokio::test]
-async fn production_policy_rejects_unknown_source_without_registration() {
+async fn production_policy_selects_signing_key_by_exact_producer_identity() {
+    use exocortex_ingest::service::AdminSourcePolicy;
+
+    const ALPHA_KEY: [u8; 32] = [0xA1; 32];
+    const BETA_KEY: [u8; 32] = [0xB2; 32];
     let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
-    let srv = IngestServer::new(
+    let srv = IngestServer::new_with_admin_policies(
         Arc::new(InMemoryStorage::new(onto.clone())),
         onto,
-        [5u8; 32],
-    )
-    .with_admin_ceilings(std::iter::empty())
-    .require_admin_ceilings();
+        [
+            (
+                ("org".into(), "session://alpha".into(), "producer".into()),
+                AdminSourcePolicy {
+                    ceiling: exocortex_kernel::Visibility::Org,
+                    signing_key: ALPHA_KEY,
+                },
+            ),
+            (
+                ("org".into(), "session://beta".into(), "producer".into()),
+                AdminSourcePolicy {
+                    ceiling: exocortex_kernel::Visibility::Org,
+                    signing_key: BETA_KEY,
+                },
+            ),
+        ],
+    );
+
+    let forged = exocortex_wire::signing::registration(
+        &ALPHA_KEY,
+        "org",
+        "session://beta",
+        "producer",
+        3,
+        "session",
+        "node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    );
+    let error = srv
+        .register_source(tonic::Request::new(forged))
+        .await
+        .expect_err("another source's key must not impersonate beta");
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+
+    let exact = exocortex_wire::signing::registration(
+        &BETA_KEY,
+        "org",
+        "session://beta",
+        "producer",
+        3,
+        "session",
+        "node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    );
+    srv.register_source(tonic::Request::new(exact))
+        .await
+        .expect("the exact beta key is admitted");
+
+    let mut wrong_batch = batch(vec![draft("wrong-key", "Fix", 1)]);
+    wrong_batch.source_uri = "session://beta".into();
+    wrong_batch.producer_id = "producer".into();
+    wrong_batch.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    let ack = srv
+        .submit(tonic::Request::new(sign(wrong_batch, ALPHA_KEY)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(ack
+        .rejections
+        .iter()
+        .all(|row| row.code == RejectCode::Unauthorized as i32));
+
+    let mut exact_batch = batch(vec![draft("exact-key", "Fix", 1)]);
+    exact_batch.source_uri = "session://beta".into();
+    exact_batch.producer_id = "producer".into();
+    exact_batch.batch_id = "exact-policy-key".into();
+    exact_batch.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    let ack = srv
+        .submit(tonic::Request::new(sign(exact_batch, BETA_KEY)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(ack.rejections.is_empty(), "{:?}", ack.rejections);
+}
+
+#[tokio::test]
+async fn production_policy_rejects_unknown_source_without_registration() {
+    let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
+    let srv = IngestServer::new_with_admin_policies(
+        Arc::new(InMemoryStorage::new(onto.clone())),
+        onto,
+        std::iter::empty(),
+    );
     let request = exocortex_wire::signing::registration(
         &[5u8; 32],
         "org",

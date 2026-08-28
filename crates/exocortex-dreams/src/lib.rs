@@ -186,6 +186,8 @@ pub struct DreamsEngine<S: Storage> {
     cycle_fault_after: Option<usize>,
     #[cfg(feature = "testing")]
     cycle_pause_after: Option<(usize, Duration)>,
+    #[cfg(feature = "testing")]
+    renewal_failure_after: Option<usize>,
 }
 
 impl<S: Storage + 'static> DreamsEngine<S> {
@@ -225,6 +227,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             cycle_fault_after: None,
             #[cfg(feature = "testing")]
             cycle_pause_after: None,
+            #[cfg(feature = "testing")]
+            renewal_failure_after: None,
         }
     }
 
@@ -251,6 +255,14 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     #[cfg(feature = "testing")]
     pub fn with_cycle_pause_after(mut self, mutation: usize, pause: Duration) -> Self {
         self.cycle_pause_after = Some((mutation, pause));
+        self
+    }
+
+    /// Inject persistent lease-renewal failures beginning with `attempt`.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn with_renewal_failure_after(mut self, attempt: usize) -> Self {
+        self.renewal_failure_after = Some(attempt);
         self
     }
 
@@ -345,9 +357,23 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         // Keep the same token/epoch alive until compensation has finished;
         // otherwise an expiry after an early write makes rollback itself fail
         // its fence and strands a partial cycle.
-        let renewal = self.spawn_lease_renewal(lease.clone());
-        let outcome = self.consolidate_under(&lease, region).await;
+        let mut renewal = self.spawn_lease_renewal(lease.clone());
+        let mut journal = CycleJournal::default();
+        let outcome = {
+            let consolidation = self.consolidate_under_tracked(&lease, region, &mut journal);
+            tokio::pin!(consolidation);
+            tokio::select! {
+                biased;
+                renewal_outcome = &mut renewal => match renewal_outcome {
+                    Ok(Err(error)) => Err(error),
+                    Ok(Ok(())) => Err(anyhow::anyhow!("Dreams lease renewal stopped unexpectedly")),
+                    Err(error) => Err(anyhow::anyhow!("Dreams lease renewal task failed: {error}")),
+                },
+                outcome = &mut consolidation => outcome,
+            }
+        };
         renewal.abort();
+        let outcome = self.finish_cycle(outcome, &journal, &lease).await;
         let _ = self.storage.release_lease(lease).await;
         outcome
     }
@@ -355,41 +381,70 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     fn spawn_lease_renewal(
         &self,
         lease: exocortex_storage::OwnerLease,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
         let storage = self.storage.clone();
         let ttl = (lease.expires_at - lease.acquired_at)
             .to_std()
             .unwrap_or(self.lease_ttl);
         let interval = (ttl / 3).max(Duration::from_millis(1));
+        let retry = (ttl / 12).max(Duration::from_millis(1));
+        let reserve = interval;
+        #[cfg(feature = "testing")]
+        let renewal_failure_after = self.renewal_failure_after;
         tokio::spawn(async move {
             let mut current = lease;
+            let mut delay = interval;
+            #[cfg(feature = "testing")]
+            let mut attempt = 0usize;
             loop {
-                tokio::time::sleep(interval).await;
-                match storage.renew_lease(&current).await {
-                    Ok(renewed) => current = renewed,
+                tokio::time::sleep(delay).await;
+                #[cfg(feature = "testing")]
+                {
+                    attempt += 1;
+                }
+                #[cfg(feature = "testing")]
+                let renewed = if renewal_failure_after.is_some_and(|start| attempt >= start) {
+                    Err(exocortex_storage::StorageError::Backend(
+                        "injected lease renewal failure".into(),
+                    ))
+                } else {
+                    storage.renew_lease(&current).await
+                };
+                #[cfg(not(feature = "testing"))]
+                let renewed = storage.renew_lease(&current).await;
+                match renewed {
+                    Ok(renewed) => {
+                        current = renewed;
+                        delay = interval;
+                    }
                     Err(error) => {
-                        warn!(?error, "Dreams owner lease renewal failed");
-                        return;
+                        let remaining = (current.expires_at - chrono::Utc::now())
+                            .to_std()
+                            .unwrap_or_default();
+                        if remaining <= reserve {
+                            anyhow::bail!(
+                                "Dreams owner lease renewal could not be confirmed with rollback reserve: {error}"
+                            );
+                        }
+                        warn!(?error, ?remaining, "Dreams owner lease renewal retrying");
+                        delay = retry.min(remaining.saturating_sub(reserve));
                     }
                 }
             }
         })
     }
 
-    async fn consolidate_under(
+    async fn finish_cycle(
         &self,
+        outcome: anyhow::Result<ConsolidationResult>,
+        journal: &CycleJournal,
         lease: &exocortex_storage::OwnerLease,
-        region: &RegionKey,
     ) -> anyhow::Result<ConsolidationResult> {
-        let mut journal = CycleJournal::default();
-        let outcome = self
-            .consolidate_under_tracked(lease, region, &mut journal)
-            .await;
         match outcome {
             Ok(result) => Ok(result),
             Err(error) => {
                 if !journal.is_empty() {
-                    self.rollback(&journal, lease).await.map_err(|rollback| {
+                    self.rollback(journal, lease).await.map_err(|rollback| {
                         anyhow::anyhow!(
                             "cycle failed ({error}); atomic restore failed ({rollback})"
                         )
@@ -571,7 +626,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         use futures::StreamExt;
         let mut rows: Vec<(chrono::DateTime<chrono::Utc>, MemoryWithEmbedding)> = Vec::new();
         let mut ms = self.storage.stream_all_memories().await;
-        while let Some(Ok(m)) = ms.next().await {
+        while let Some(row) = ms.next().await {
+            let m = row?;
             // IN1 (audit): the write set must be a subset of what the held
             // lease covers — scope by the region's org and project too,
             // not just memory_type.
@@ -584,6 +640,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                     MemoryWithEmbedding {
                         id: m.id,
                         class: m.memory_type,
+                        visibility: m.visibility,
                         embedding: emb.clone(),
                     },
                 ));
@@ -607,7 +664,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
         let mut ms = self.storage.stream_all_memories().await;
-        while let Some(Ok(m)) = ms.next().await {
+        while let Some(row) = ms.next().await {
+            let m = row?;
             if !in_region(&m, region) || m.valid_until.is_some() {
                 continue; // IN1: sparsity measures the region, not the graph
             }
@@ -617,7 +675,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let members: std::collections::HashSet<exocortex_kernel::MemoryId> =
             nodes.iter().map(|(id, _)| *id).collect();
         let mut rs = self.storage.stream_all_relationships().await;
-        while let Some(Ok(r)) = rs.next().await {
+        while let Some(row) = rs.next().await {
+            let r = row?;
             if r.valid_until.is_none() && members.contains(&r.from) && members.contains(&r.to) {
                 edges.push((r.from, r.to, r.kind.0, 0u64, r.properties.confidence));
             }
@@ -641,7 +700,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let mut newer = None;
         let mut survivor_live = false;
         let mut ms = self.storage.stream_all_memories().await;
-        while let Some(Ok(m)) = ms.next().await {
+        while let Some(row) = ms.next().await {
+            let m = row?;
             if m.id == c.a && m.valid_until.is_none() {
                 survivor_live = true;
             }
@@ -743,14 +803,16 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             std::collections::HashSet::new();
         {
             let mut ms = self.storage.stream_all_memories().await;
-            while let Some(Ok(m)) = ms.next().await {
+            while let Some(row) = ms.next().await {
+                let m = row?;
                 if in_region(&m, region) && m.valid_until.is_none() {
                     member_ids.insert(m.id);
                 }
             }
         }
         let mut rs = self.storage.stream_all_relationships().await;
-        while let Some(Ok(mut r)) = rs.next().await {
+        while let Some(row) = rs.next().await {
+            let mut r = row?;
             if !member_ids.contains(&r.from) || !member_ids.contains(&r.to) {
                 continue;
             }
@@ -816,13 +878,15 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 if sim < SIMILAR_TO_THRESHOLD {
                     continue;
                 }
-                use exocortex_kernel::{Relationship, RelationshipProperties, Visibility, LSN};
+                use exocortex_kernel::{
+                    relationship_visibility, Relationship, RelationshipProperties, LSN,
+                };
                 edges.push(Relationship {
                     id: exocortex_kernel::RelationshipId::derive(a.id, similar_kind, b.id, None),
                     kind: similar_kind,
                     from: a.id,
                     to: b.id,
-                    visibility: Visibility::Org,
+                    visibility: relationship_visibility(a.visibility, b.visibility),
                     provenance: Provenance::Computed {
                         producer: exocortex_kernel::provenance::ComputedProducer::SimilarityHnsw,
                         threshold: SIMILAR_TO_THRESHOLD,
@@ -852,7 +916,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let existing: std::collections::HashMap<exocortex_kernel::RelationshipId, Relationship> = {
             let mut rows = std::collections::HashMap::new();
             let mut rs = self.storage.stream_all_relationships().await;
-            while let Some(Ok(r)) = rs.next().await {
+            while let Some(row) = rs.next().await {
+                let r = row?;
                 rows.insert(r.id, r);
             }
             rows

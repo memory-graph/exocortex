@@ -214,6 +214,44 @@ fn decode_persisted_fingerprint(
     Ok(Some(fingerprint))
 }
 
+fn decode_settled_ingest(row: &[FalkorValue]) -> Result<SettledIngestBatch, StorageError> {
+    fn integer(row: &[FalkorValue], index: usize, field: &str) -> Result<i64, StorageError> {
+        match row.get(index) {
+            Some(FalkorValue::I64(value)) => Ok(*value),
+            Some(_) => Err(StorageError::CorruptMetadata {
+                key: "ingest_settlement",
+                detail: format!("{field} must be an integer"),
+            }),
+            None => Err(StorageError::CorruptMetadata {
+                key: "ingest_settlement",
+                detail: format!("missing {field}"),
+            }),
+        }
+    }
+
+    let accepted =
+        u32::try_from(integer(row, 0, "accepted")?).map_err(|_| StorageError::CorruptMetadata {
+            key: "ingest_settlement",
+            detail: "accepted must be between 0 and 4294967295".into(),
+        })?;
+    let rejected =
+        u32::try_from(integer(row, 1, "rejected")?).map_err(|_| StorageError::CorruptMetadata {
+            key: "ingest_settlement",
+            detail: "rejected must be between 0 and 4294967295".into(),
+        })?;
+    let assigned_lsn = u64::try_from(integer(row, 2, "assigned_lsn")?).map_err(|_| {
+        StorageError::CorruptMetadata {
+            key: "ingest_settlement",
+            detail: "assigned_lsn must be non-negative".into(),
+        }
+    })?;
+    Ok(SettledIngestBatch {
+        accepted,
+        rejected,
+        assigned_lsn,
+    })
+}
+
 const STORAGE_SCHEMA_VERSION: i64 = 1;
 
 fn schema_needs_migration(rows: &[Vec<FalkorValue>]) -> Result<bool, StorageError> {
@@ -1086,19 +1124,7 @@ impl Storage for FalkorStorage {
             let row = rows.first().ok_or_else(|| {
                 StorageError::Backend("ingest claim did not settle atomically".into())
             })?;
-            let number = |index: usize| match row.get(index) {
-                Some(FalkorValue::I64(value)) => u64::try_from(*value).ok(),
-                _ => None,
-            };
-            return Ok(IngestCommitOutcome::Duplicate(SettledIngestBatch {
-                accepted: number(0)
-                    .and_then(|value| u32::try_from(value).ok())
-                    .unwrap_or(0),
-                rejected: number(1)
-                    .and_then(|value| u32::try_from(value).ok())
-                    .unwrap_or(0),
-                assigned_lsn: number(2).unwrap_or(0),
-            }));
+            return Ok(IngestCommitOutcome::Duplicate(decode_settled_ingest(row)?));
         }
         for invalidation in invalidations {
             self.publish(invalidation).await;
@@ -2402,5 +2428,53 @@ mod row_decode_tests {
     fn batched_memory_decode_propagates_corrupt_rows() {
         let rows = vec![vec![FalkorValue::String("not-a-node".into())]];
         assert!(memories_by_id(&rows).is_err());
+    }
+
+    #[test]
+    fn persisted_ingest_settlement_rejects_wrong_types_negative_and_overflow() {
+        let valid = vec![
+            FalkorValue::I64(1),
+            FalkorValue::I64(0),
+            FalkorValue::I64(9),
+        ];
+        assert_eq!(
+            decode_settled_ingest(&valid).unwrap(),
+            SettledIngestBatch {
+                accepted: 1,
+                rejected: 0,
+                assigned_lsn: 9,
+            }
+        );
+
+        for corrupt in [
+            vec![
+                FalkorValue::String("1".into()),
+                FalkorValue::I64(0),
+                FalkorValue::I64(9),
+            ],
+            vec![
+                FalkorValue::I64(1),
+                FalkorValue::I64(-1),
+                FalkorValue::I64(9),
+            ],
+            vec![
+                FalkorValue::I64(i64::from(u32::MAX) + 1),
+                FalkorValue::I64(0),
+                FalkorValue::I64(9),
+            ],
+            vec![
+                FalkorValue::I64(1),
+                FalkorValue::I64(0),
+                FalkorValue::I64(-1),
+            ],
+        ] {
+            assert!(matches!(
+                decode_settled_ingest(&corrupt),
+                Err(StorageError::CorruptMetadata {
+                    key: "ingest_settlement",
+                    ..
+                })
+            ));
+        }
     }
 }

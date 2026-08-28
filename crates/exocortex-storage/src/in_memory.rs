@@ -49,6 +49,10 @@ struct InMemoryInner {
     fence_checkpoint: Mutex<Option<std::sync::Arc<FenceCheckpoint>>>,
     #[cfg(test)]
     atomic_fault: Mutex<Option<AtomicFault>>,
+    #[cfg(feature = "testing")]
+    stream_memory_fault_after: Mutex<Option<usize>>,
+    #[cfg(feature = "testing")]
+    stream_relationship_fault_after: Mutex<Option<usize>>,
 }
 
 #[derive(Clone)]
@@ -112,6 +116,10 @@ impl InMemoryStorage {
                 fence_checkpoint: Default::default(),
                 #[cfg(test)]
                 atomic_fault: Default::default(),
+                #[cfg(feature = "testing")]
+                stream_memory_fault_after: Default::default(),
+                #[cfg(feature = "testing")]
+                stream_relationship_fault_after: Default::default(),
             }),
             lsn: std::sync::Arc::new(AtomicU64::new(0)),
             feed: tokio::sync::broadcast::channel(4096).0,
@@ -120,6 +128,13 @@ impl InMemoryStorage {
     /// A clone handle sharing the same underlying state (tests and caches).
     pub fn clone_dyn(&self) -> Self {
         self.clone()
+    }
+    /// Fail the next bulk stream after `after` valid rows (Dreams/cache fault tests).
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn fail_next_stream_after(&self, memories: Option<usize>, relationships: Option<usize>) {
+        *self.inner.stream_memory_fault_after.lock().unwrap() = memories;
+        *self.inner.stream_relationship_fault_after.lock().unwrap() = relationships;
     }
     /// Reset and return backend-read counters for scaling/conformance tests.
     /// The first element is point reads; the second is batched reads.
@@ -1082,6 +1097,17 @@ impl Storage for InMemoryStorage {
             .values()
             .filter_map(|h| h.last().cloned().map(Ok))
             .collect();
+        #[cfg(feature = "testing")]
+        let all = {
+            let mut all = all;
+            if let Some(after) = self.inner.stream_memory_fault_after.lock().unwrap().take() {
+                all.truncate(after);
+                all.push(Err(StorageError::Backend(
+                    "injected memory stream failure".into(),
+                )));
+            }
+            all
+        };
         Box::pin(futures::stream::iter(all))
     }
     async fn stream_all_relationships(&self) -> BoxStream<'_, Result<Relationship, StorageError>> {
@@ -1096,6 +1122,23 @@ impl Storage for InMemoryStorage {
             .values()
             .filter_map(|h| h.last().cloned().map(Ok))
             .collect();
+        #[cfg(feature = "testing")]
+        let all = {
+            let mut all = all;
+            if let Some(after) = self
+                .inner
+                .stream_relationship_fault_after
+                .lock()
+                .unwrap()
+                .take()
+            {
+                all.truncate(after);
+                all.push(Err(StorageError::Backend(
+                    "injected relationship stream failure".into(),
+                )));
+            }
+            all
+        };
         Box::pin(futures::stream::iter(all))
     }
     async fn find_similar_offline(

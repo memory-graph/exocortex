@@ -167,9 +167,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --title "Exocortex $TAG" --generate-notes || true
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" dist/*tar.gz dist/*sha256 dist/install.sh --clobber
+          bash scripts/publish-release-assets.sh "$TAG" "$GITHUB_REPOSITORY" dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: installers

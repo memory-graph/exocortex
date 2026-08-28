@@ -44,6 +44,8 @@ fn main() -> anyhow::Result<()> {
             .with_writer(std::io::stderr)
             .init();
         let args = Args::parse();
+        exocortex_wire::transport::validate_backend_url(&args.backend)
+            .map_err(|error| anyhow::anyhow!("--backend: {error}"))?;
         match args.adapter.as_str() {
             "noop" => {
                 // Deliberately no exocortex-kernel usage here (R-I1). The

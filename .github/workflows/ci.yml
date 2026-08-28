@@ -34,3 +34,5 @@ jobs:
           SLO_MULTIPLIER: "2"
       - name: Publish-script disposable fixture
         run: bash scripts/tests/publish.sh
+      - name: Release-asset immutability fixture
+        run: bash scripts/tests/release-assets.sh

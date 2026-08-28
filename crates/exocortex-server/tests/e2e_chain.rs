@@ -72,7 +72,8 @@ use exocortex_wire::ingest::v1::{
 use exocortex_cache::LocalCache;
 use exocortex_client::sync::{run_sse_sync, SseSyncConfig};
 
-const HMAC_KEY: [u8; 32] = [7u8; 32];
+const CLUSTER_KEY: [u8; 32] = [7u8; 32];
+const PRODUCER_KEY: [u8; 32] = [8u8; 32];
 
 fn authed<T>(message: T) -> tonic::Request<T> {
     let mut request = tonic::Request::new(message);
@@ -97,7 +98,7 @@ async fn boot() -> (
             bind: "127.0.0.1:0".into(),
             transport: exocortex_server::backend::TransportSecurity::PlaintextLoopback,
             node_id: "e2e-node".into(),
-            cluster_secret: HMAC_KEY,
+            cluster_secret: CLUSTER_KEY,
             principals: Arc::new(
                 exocortex_server::principal::PrincipalRegistry::single(
                     "e2e-bearer".into(),
@@ -113,14 +114,17 @@ async fn boot() -> (
             seed_nodes: vec![],
             redis_url: None,
             quiet_hours: exocortex_dreams::fire::QuietHours::none(),
-            admin_ceilings: vec![
+            admin_source_policies: vec![
                 (
                     (
                         "org".into(),
                         "iceberg://warehouse/orders".into(),
                         "external-sync".into(),
                     ),
-                    exocortex_kernel::Visibility::Org,
+                    exocortex_ingest::service::AdminSourcePolicy {
+                        ceiling: exocortex_kernel::Visibility::Org,
+                        signing_key: PRODUCER_KEY,
+                    },
                 ),
                 (
                     (
@@ -128,7 +132,10 @@ async fn boot() -> (
                         "session://e2e".into(),
                         "session-wrapup".into(),
                     ),
-                    exocortex_kernel::Visibility::Org,
+                    exocortex_ingest::service::AdminSourcePolicy {
+                        ceiling: exocortex_kernel::Visibility::Org,
+                        signing_key: PRODUCER_KEY,
+                    },
                 ),
             ],
         },
@@ -140,7 +147,7 @@ async fn boot() -> (
 }
 
 fn signed(mut b: IngestBatch) -> IngestBatch {
-    exocortex_wire::signing::prepare_batch(&HMAC_KEY, &mut b);
+    exocortex_wire::signing::prepare_batch(&PRODUCER_KEY, &mut b);
     b
 }
 
@@ -205,15 +212,18 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
     }
     let seed = test_mem("seed", 1);
     storage.upsert_memory(&seed).await.unwrap();
-    cache.reseed_from_storage(&*storage, &"org".into()).await;
+    cache
+        .reseed_from_storage(&*storage, &"org".into())
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+    let mut cfg = SseSyncConfig::new(format!("http://{addr}"), CLUSTER_KEY, onto.fingerprint.0);
     cfg.backoff = std::time::Duration::from_millis(50);
     // CS1: /v1/changes sits behind the same bearer layer as the op surface.
     cfg.bearer = Some("e2e-bearer".into());
     cfg.client_key = Some(exocortex_server::sse::derive_client_sse_key(
-        &HMAC_KEY,
+        &CLUSTER_KEY,
         "e2e-bearer",
     ));
     let connection_ready = Arc::new(tokio::sync::Notify::new());
@@ -232,7 +242,7 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
         .unwrap();
     client
         .register_source(authed(exocortex_wire::signing::registration(
-            &HMAC_KEY,
+            &PRODUCER_KEY,
             "org",
             "session://e2e",
             "session-wrapup",
@@ -353,13 +363,17 @@ async fn mcp_wal_sync_backend_sse_sibling_is_one_chain_under_500ms() {
         let storage = storage.clone();
         tokio::spawn(async move { cache.run(storage, writer).await });
     }
-    sibling.reseed_from_storage(&*storage, &"org".into()).await;
+    sibling
+        .reseed_from_storage(&*storage, &"org".into())
+        .await
+        .unwrap();
     sibling.flush().await;
 
-    let mut sync_cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+    let mut sync_cfg =
+        SseSyncConfig::new(format!("http://{addr}"), CLUSTER_KEY, onto.fingerprint.0);
     sync_cfg.bearer = Some("e2e-bearer".into());
     sync_cfg.client_key = Some(exocortex_server::sse::derive_client_sse_key(
-        &HMAC_KEY,
+        &CLUSTER_KEY,
         "e2e-bearer",
     ));
     let live = Arc::new(tokio::sync::Notify::new());
@@ -425,7 +439,7 @@ async fn mcp_wal_sync_backend_sse_sibling_is_one_chain_under_500ms() {
     let report = exocortex_client::drain::drain_once(
         &wal,
         &mut ingest,
-        &HMAC_KEY,
+        &PRODUCER_KEY,
         onto.fingerprint.0,
         "org",
         Some("e2e-bearer"),
@@ -482,7 +496,7 @@ async fn two_sync_snapshot_bump_upserts_same_row_new_pk_appends() {
         .unwrap();
     client
         .register_source(authed(exocortex_wire::signing::registration(
-            &HMAC_KEY,
+            &PRODUCER_KEY,
             "org",
             "iceberg://warehouse/orders",
             "external-sync",

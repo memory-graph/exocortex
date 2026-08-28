@@ -48,6 +48,18 @@ pub struct SourceEntry {
     pub kind: exocortex_kernel::ProducerKind,
 }
 
+/// Immutable administrator policy for one exact producer identity.
+#[derive(Clone, Copy, Debug)]
+pub struct AdminSourcePolicy {
+    /// Maximum visibility the producer may assert.
+    pub ceiling: Visibility,
+    /// Producer-specific HMAC key (R-I8); never the cluster peer key.
+    pub signing_key: [u8; 32],
+}
+
+/// Exact producer identity used by administrator policy.
+pub type SourcePolicyKey = (String, String, String);
+
 fn default_producer_kind() -> exocortex_kernel::ProducerKind {
     exocortex_kernel::ProducerKind::Custom
 }
@@ -65,7 +77,7 @@ pub struct IngestServer<S: Storage> {
     /// The effective ontology (fingerprint gate + triple validation).
     pub ontology: Arc<Ontology>,
     /// Producer authentication key (R-I8).
-    pub hmac_key: [u8; 32],
+    default_producer_key: Option<[u8; 32]>,
     /// This server's owning org (round-3 C4): a backend node serves ONE
     /// org; batches or source registrations naming any other org are
     /// rejected before validation. `None` disables the guard (tests,
@@ -94,9 +106,9 @@ pub struct IngestServer<S: Storage> {
     pub dreams: Option<Arc<exocortex_dreams::DreamsEngine<S>>>,
     /// Admin-configured ceilings (§18.2 / audit WS2): out-of-band, immutable
     /// through the RPC surface. Empty = self-registration stands (dev/tests).
-    pub admin_ceilings: HashMap<(String, String, String), Visibility>,
+    admin_policies: HashMap<SourcePolicyKey, AdminSourcePolicy>,
     /// Production policy mode: an unknown source cannot self-register.
-    pub require_admin_ceiling: bool,
+    require_admin_policy: bool,
     /// Production transport mode: every RPC must carry the authenticated
     /// principal installed by the ingress authorization layer.
     pub require_request_principal: bool,
@@ -146,7 +158,7 @@ impl<S: Storage> Clone for IngestServer<S> {
             org_guard: self.org_guard.clone(),
             storage: self.storage.clone(),
             ontology: self.ontology.clone(),
-            hmac_key: self.hmac_key,
+            default_producer_key: self.default_producer_key,
             sources: self.sources.clone(),
             sources_file: self.sources_file.clone(),
             seen_batches: self.seen_batches.clone(),
@@ -154,8 +166,8 @@ impl<S: Storage> Clone for IngestServer<S> {
             extractor: self.extractor.clone(),
             reasoning: self.reasoning.clone(),
             dreams: self.dreams.clone(),
-            admin_ceilings: self.admin_ceilings.clone(),
-            require_admin_ceiling: self.require_admin_ceiling,
+            admin_policies: self.admin_policies.clone(),
+            require_admin_policy: self.require_admin_policy,
             require_request_principal: self.require_request_principal,
             recent: self.recent.clone(),
             submit_permits: self.submit_permits.clone(),
@@ -171,7 +183,7 @@ impl<S: Storage> IngestServer<S> {
             org_guard: None,
             storage,
             ontology,
-            hmac_key,
+            default_producer_key: Some(hmac_key),
             sources: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(REGISTRY_LRU_CAP).unwrap(),
             ))),
@@ -183,12 +195,26 @@ impl<S: Storage> IngestServer<S> {
             extractor: EntityExtractor::new(&org),
             reasoning: None,
             dreams: None,
-            admin_ceilings: HashMap::new(),
-            require_admin_ceiling: false,
+            admin_policies: HashMap::new(),
+            require_admin_policy: false,
             require_request_principal: false,
             recent: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             submit_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CONCURRENT_SUBMITS)),
         }
+    }
+
+    /// Build a production server whose producer authentication is sourced
+    /// exclusively from exact administrator policy. There is no fallback key.
+    pub fn new_with_admin_policies(
+        storage: Arc<S>,
+        ontology: Arc<Ontology>,
+        policies: impl IntoIterator<Item = (SourcePolicyKey, AdminSourcePolicy)>,
+    ) -> Self {
+        let mut server = Self::new(storage, ontology, [0; 32]);
+        server.default_producer_key = None;
+        server.admin_policies = policies.into_iter().collect();
+        server.require_admin_policy = true;
+        server
     }
 
     /// Bound concurrent batch work. A saturated server returns the protocol's
@@ -231,27 +257,6 @@ impl<S: Storage> IngestServer<S> {
         self
     }
 
-    /// Admin-side ceiling provisioning (§18.2 / audit WS2): ceilings keyed
-    /// by `(org, source_uri, producer_id)` that the producer cannot write.
-    /// A registration for a provisioned key may not EXCEED the configured
-    /// ceiling, and the configured value is authoritative — it is what
-    /// RegisterSource returns and what R-I3 compares batches against, so a
-    /// producer configured narrower than it believes still fails the SDK's
-    /// `CeilingMismatch` check instead of widening itself.
-    pub fn with_admin_ceilings(
-        mut self,
-        ceilings: impl IntoIterator<Item = ((String, String, String), Visibility)>,
-    ) -> Self {
-        self.admin_ceilings = ceilings.into_iter().collect();
-        self
-    }
-
-    /// Fail closed for registrations not provisioned by an administrator.
-    pub fn require_admin_ceilings(mut self) -> Self {
-        self.require_admin_ceiling = true;
-        self
-    }
-
     /// Require an ingress-authenticated principal on every gRPC request.
     pub fn require_request_principal(mut self) -> Self {
         self.require_request_principal = true;
@@ -291,6 +296,16 @@ impl<S: Storage> IngestServer<S> {
         }
     }
 
+    fn producer_key(&self, org: &str, source: &str, producer: &str) -> Result<[u8; 32], Status> {
+        self.admin_policies
+            .get(&(org.to_owned(), source.to_owned(), producer.to_owned()))
+            .map(|policy| policy.signing_key)
+            .or(self.default_producer_key)
+            .ok_or_else(|| {
+                Status::permission_denied("producer has no administrator signing policy")
+            })
+    }
+
     fn verify_hmac(&self, b: &IngestBatch) -> Result<(), Status> {
         let Some(producer) = &b.producer else {
             return Err(Status::unauthenticated("no producer"));
@@ -298,7 +313,8 @@ impl<S: Storage> IngestServer<S> {
         if producer.hmac_signature.is_empty() {
             return Err(Status::unauthenticated("missing hmac"));
         }
-        if !exocortex_wire::signing::verify_signature(&self.hmac_key, b) {
+        let key = self.producer_key(&b.org_id, &b.source_uri, &b.producer_id)?;
+        if !exocortex_wire::signing::verify_signature(&key, b) {
             return Err(Status::unauthenticated("hmac verification failed"));
         }
         Ok(())
@@ -1422,7 +1438,8 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         // against, so it carries the same producer identity + HMAC (R-I8).
         // An unauthenticated RPC must not be able to overwrite or LRU-evict
         // a registered producer.
-        if !exocortex_wire::signing::verify_registration(&self.hmac_key, &r) {
+        let producer_key = self.producer_key(&r.org_id, &r.source_uri, &r.producer_id)?;
+        if !exocortex_wire::signing::verify_registration(&producer_key, &r) {
             return Err(Status::unauthenticated(
                 "registration requires a valid producer HMAC (R-I8)",
             ));
@@ -1472,19 +1489,19 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         // same first-registration-wins rule for the same reason.
         let effective = {
             let mut sources = self.sources.lock().unwrap();
-            let admin = self.admin_ceilings.get(&key).copied();
+            let admin = self.admin_policies.get(&key).copied();
             let existing = sources.get(&key).copied();
             let ceiling = match (admin, existing) {
                 (Some(a), _) => {
-                    if requested > a {
+                    if requested > a.ceiling {
                         return Err(Status::permission_denied(
                             "requested ceiling exceeds the admin-configured value (R-I3)",
                         ));
                     }
-                    a
+                    a.ceiling
                 }
                 (None, existing) => {
-                    if self.require_admin_ceiling {
+                    if self.require_admin_policy {
                         return Err(Status::permission_denied(
                             "source has no administrator-provisioned ceiling (R-I3)",
                         ));

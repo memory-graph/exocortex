@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 
 use exocortex_ingest::IngestServer;
-use exocortex_storage::InMemoryStorage;
+use exocortex_storage::{FalkorConfig, FalkorStorage, InMemoryStorage};
 use exocortex_wire::ingest::v1::{
     ingest_service_server::IngestService, IngestBatch, MemoryDraft, ProducerIdentity,
     RegisterSourceRequest,
@@ -71,6 +71,27 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
     );
     let storage = Arc::new(InMemoryStorage::new(ontology.clone()));
     let ingest = IngestServer::new(storage.clone(), ontology.clone(), [5; 32]);
+
+    let backend_error = match FalkorStorage::connect(
+        FalkorConfig {
+            falkor_url: format!("falkor://sentinel:{SENTINEL}@["),
+            redis_url: format!("redis://sentinel:{SENTINEL}@["),
+            graph_name: "credential-redaction".into(),
+            org_id: "org".into(),
+            node_id: "redaction-node".into(),
+        },
+        ontology.clone(),
+    )
+    .await
+    {
+        Ok(_) => panic!("malformed credential-bearing backend URL must fail"),
+        Err(error) => error,
+    };
+    assert_redacted(
+        "malformed Falkor/Redis returned error",
+        &format!("{backend_error:?}"),
+    );
+    tracing::error!(error = %backend_error, "expected malformed backend URL probe");
 
     let registration_error = ingest
         .register_source(tonic::Request::new(RegisterSourceRequest {
@@ -196,7 +217,7 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
             seed_nodes: Vec::new(),
             redis_url: None,
             quiet_hours: exocortex_dreams::fire::QuietHours::none(),
-            admin_ceilings: Vec::new(),
+            admin_source_policies: Vec::new(),
         },
     )
     .await
@@ -216,6 +237,48 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
     assert_redacted(
         "backend startup stderr",
         &String::from_utf8_lossy(&startup.stderr),
+    );
+
+    let policy_dir = tempfile::tempdir().unwrap();
+    let principal_policy = policy_dir.path().join("principals.json");
+    let source_policy = policy_dir.path().join("sources.json");
+    std::fs::write(
+        &principal_policy,
+        r#"[{"bearer_token":"valid-bearer","org_id":"org","user_id":"user","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &source_policy,
+        r#"[{"org_id":"org","source_uri":"session://redaction","producer_id":"redaction","ceiling":3}]"#,
+    )
+    .unwrap();
+    let backend_url = format!("falkor://sentinel:{SENTINEL}@127.0.0.1:1");
+    let connection_failure = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-node"))
+        .args([
+            "--mode",
+            "backend-node",
+            "--storage",
+            &backend_url,
+            "--bind",
+            "127.0.0.1:0",
+            "--allow-plaintext-loopback",
+            "--gossip-addr",
+            "127.0.0.1:0",
+            "--principal-policy",
+            principal_policy.to_str().unwrap(),
+            "--source-policy",
+            source_policy.to_str().unwrap(),
+        ])
+        .env(
+            "EXOCORTEX_CLUSTER_SECRET",
+            "4242424242424242424242424242424242424242424242424242424242424242",
+        )
+        .output()
+        .expect("execute credential-bearing backend connection failure");
+    assert!(!connection_failure.status.success());
+    assert_redacted(
+        "Falkor connection-failure stderr",
+        &String::from_utf8_lossy(&connection_failure.stderr),
     );
 
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();

@@ -331,22 +331,34 @@ impl GraphSnapshot {
     /// live only while `valid_until` is unset (or in the future) and it has
     /// no `invalidated_by`, so a restart cannot resurrect deleted memories
     /// or Dreams-merged duplicates.
-    pub async fn from_storage<S: Storage>(storage: &S) -> Self {
+    pub async fn from_storage<S: Storage>(storage: &S) -> exocortex_storage::Result<Self> {
+        Self::from_streams(
+            storage.stream_all_memories().await,
+            storage.stream_all_relationships().await,
+        )
+        .await
+    }
+
+    async fn from_streams<M, R>(mut ms: M, mut rs: R) -> exocortex_storage::Result<Self>
+    where
+        M: futures::Stream<Item = exocortex_storage::Result<Memory>> + Unpin,
+        R: futures::Stream<Item = exocortex_storage::Result<Relationship>> + Unpin,
+    {
         use futures::StreamExt;
         let now = chrono::Utc::now();
         let live = |valid_until: &Option<chrono::DateTime<chrono::Utc>>| {
             valid_until.is_none_or(|v| v > now)
         };
         let mut snap = Self::empty();
-        let mut ms = storage.stream_all_memories().await;
-        while let Some(Ok(m)) = ms.next().await {
+        while let Some(row) = ms.next().await {
+            let m = row?;
             if m.invalidated_by.is_none() && live(&m.valid_until) {
                 snap.insert_memory(m);
             }
         }
         let mut frontier = 0u64;
-        let mut rs = storage.stream_all_relationships().await;
-        while let Some(Ok(r)) = rs.next().await {
+        while let Some(row) = rs.next().await {
+            let r = row?;
             frontier = frontier.max(r.lsn.value);
             if r.invalidated_by.is_none() && live(&r.valid_until) {
                 snap.insert_relationship(r);
@@ -356,7 +368,7 @@ impl GraphSnapshot {
             frontier = frontier.max(m.lsn.value);
         }
         snap.last_backend_lsn = frontier;
-        snap
+        Ok(snap)
     }
 }
 
@@ -1247,9 +1259,32 @@ impl LocalCache {
 
     /// Stream all memories + relationships from storage and rebuild the
     /// snapshot for one org (§8.4 `reseed_from_storage`).
-    pub async fn reseed_from_storage<S: Storage>(&self, storage: &S, org: &SmolStr) {
-        let snap = GraphSnapshot::from_storage(storage).await;
+    pub async fn reseed_from_storage<S: Storage>(
+        &self,
+        storage: &S,
+        org: &SmolStr,
+    ) -> exocortex_storage::Result<()> {
+        self.reseed_from_streams(
+            org,
+            storage.stream_all_memories().await,
+            storage.stream_all_relationships().await,
+        )
+        .await
+    }
+
+    async fn reseed_from_streams<M, R>(
+        &self,
+        org: &SmolStr,
+        memories: M,
+        relationships: R,
+    ) -> exocortex_storage::Result<()>
+    where
+        M: futures::Stream<Item = exocortex_storage::Result<Memory>> + Unpin,
+        R: futures::Stream<Item = exocortex_storage::Result<Relationship>> + Unpin,
+    {
+        let snap = GraphSnapshot::from_streams(memories, relationships).await?;
         self.reseed_snapshot(org.clone(), snap).await;
+        Ok(())
     }
 
     /// Atomically publish a complete backend image and wait until the writer
@@ -1308,5 +1343,44 @@ fn clone_snapshot(src: &GraphSnapshot) -> GraphSnapshot {
         last_backend_lsn: src.last_backend_lsn,
         built_at: chrono::Utc::now(),
         est_bytes: src.est_bytes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reseed_stream_errors_preserve_the_prior_generation() {
+        for fail_memories in [true, false] {
+            let (cache, _rx) = LocalCache::new(1024 * 1024);
+            let mut prior = GraphSnapshot::empty();
+            prior.last_backend_lsn = 77;
+            cache.publish("org", Arc::new(prior));
+            let before = cache.graphs_snapshot("org").unwrap();
+            let memories = futures::stream::iter(if fail_memories {
+                vec![Err(exocortex_storage::StorageError::Backend(
+                    "memory page failed".into(),
+                ))]
+            } else {
+                Vec::new()
+            });
+            let relationships = futures::stream::iter(if fail_memories {
+                Vec::new()
+            } else {
+                vec![Err(exocortex_storage::StorageError::Backend(
+                    "relationship page failed".into(),
+                ))]
+            });
+
+            let result = cache
+                .reseed_from_streams(&"org".into(), memories, relationships)
+                .await;
+
+            assert!(result.is_err());
+            let after = cache.graphs_snapshot("org").unwrap();
+            assert!(Arc::ptr_eq(&before, &after));
+            assert_eq!(after.last_backend_lsn, 77);
+        }
     }
 }

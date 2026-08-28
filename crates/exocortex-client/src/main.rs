@@ -91,6 +91,11 @@ fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
+    if let Some(backend) = &args.backend {
+        exocortex_wire::transport::validate_backend_url(backend)
+            .map_err(|error| anyhow::anyhow!("--backend: {error}"))?;
+    }
+
     // D5 one-shot modes (no server, no cache, exit immediately).
     if args.dump_playbook {
         print!("{}", exocortex_client::playbook::PLAYBOOK);
@@ -110,6 +115,14 @@ fn main() -> anyhow::Result<()> {
     let auth_token = std::env::var("EXOCORTEX_AUTH_TOKEN")
         .ok()
         .filter(|value| !value.is_empty());
+    let sse_key = std::env::var("EXOCORTEX_SSE_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|hex| {
+            exocortex_wire::signing::decode_hex32(&hex)
+                .map_err(|error| anyhow::anyhow!("EXOCORTEX_SSE_KEY: {error}"))
+        })
+        .transpose()?;
     let hmac_key = match hmac_key_hex.as_deref() {
         Some(hex) => Some(
             exocortex_wire::signing::decode_hex32(hex)
@@ -122,6 +135,9 @@ fn main() -> anyhow::Result<()> {
     }
     if args.backend.is_some() && auth_token.is_none() {
         anyhow::bail!("EXOCORTEX_AUTH_TOKEN is required when --backend is configured");
+    }
+    if args.backend.is_some() && sse_key.is_none() {
+        anyhow::bail!("EXOCORTEX_SSE_KEY is required when --backend is configured");
     }
 
     // Ontology: fail fast if the linked pack set does not assemble. The
@@ -246,6 +262,7 @@ fn main() -> anyhow::Result<()> {
     let org = args.org.clone();
     let user = args.user.clone();
     let auth_token = auth_token.clone();
+    let sse_key = sse_key.unwrap_or([0; 32]);
     let fingerprint = ontology.fingerprint.0;
     let ontology_for_drain = ontology.clone();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -262,11 +279,9 @@ fn main() -> anyhow::Result<()> {
                 .clone()
                 .expect("backend authentication validated before runtime startup");
             let mut sync_config =
-                exocortex_client::sync::SseSyncConfig::new(backend.clone(), hmac_key, fingerprint);
+                exocortex_client::sync::SseSyncConfig::new(backend.clone(), sse_key, fingerprint);
             sync_config.bearer = Some(bearer.clone());
-            sync_config.client_key = Some(exocortex_wire::signing::derive_sse_client_key(
-                &hmac_key, &bearer,
-            ));
+            sync_config.client_key = Some(sse_key);
             sync_config.org = org.clone().into();
             let _sync = exocortex_client::sync::hydrate_and_start_backend_sync(
                 sync_config,

@@ -398,3 +398,10 @@ proto-sync-guarded copy).
   `EXOCORTEX_AUTH_TOKEN` and `EXOCORTEX_HMAC_KEY`; backend nodes require
   `EXOCORTEX_CLUSTER_SECRET`. The deployment behavior is unchanged, but the
   credential transport deliberately differs from the older example.
+- **Producer-key separation is a fail-closed source-policy migration.**
+  Backend source-policy rows now require a 64-hex `hmac_key` for each exact
+  `(org_id, source_uri, producer_id)` identity. Older ceiling-only rows are
+  rejected at startup and must be provisioned with producer-specific keys;
+  the cluster peer secret is no longer accepted as an ingest fallback. MCP
+  clients also receive a separately provisioned `EXOCORTEX_SSE_KEY`, so their
+  producer signing key is never reused as cluster/SSE verification material.

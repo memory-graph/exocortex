@@ -76,12 +76,17 @@ fn reviewed_outbound_dependency(manifest: &str, package: &str) -> bool {
     )
 }
 
+pub(crate) const STORAGE_LIVE_CANARIES: &[(&str, &str)] = &[
+    ("integration", "roundtrip_memory"),
+    ("fencing_live", "stale_lease_write_is_fenced_live"),
+];
+
 pub(crate) fn validate_storage_targets(root: &Path) -> Result<()> {
     let base = root.join("crates/exocortex-storage");
-    for target in ["integration.rs", "fencing_live.rs"] {
+    for (target, _) in STORAGE_LIVE_CANARIES {
         anyhow::ensure!(
-            base.join("tests").join(target).is_file(),
-            "storage-conformance: live target tests/{target} is missing"
+            base.join("tests").join(format!("{target}.rs")).is_file(),
+            "storage-conformance: live target tests/{target}.rs is missing"
         );
     }
     let manifest = std::fs::read_to_string(base.join("Cargo.toml"))?;
@@ -90,6 +95,21 @@ pub(crate) fn validate_storage_targets(root: &Path) -> Result<()> {
             .lines()
             .any(|line| line.trim() == "integration = []"),
         "storage-conformance: exocortex-storage must declare the integration feature"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_storage_target_listing(
+    target: &str,
+    canary: &str,
+    listing: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        listing.lines().any(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, kind)| name == canary && kind.trim() == "test")
+        }),
+        "storage-conformance: live target {target} did not list required canary `{canary}`; the target is empty or configured out"
     );
     Ok(())
 }
@@ -920,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_conformance_rejects_missing_live_target_fixture() {
+    fn storage_conformance_rejects_missing_empty_and_configured_out_live_targets() {
         let root = fixture("storage");
         write(
             &root,
@@ -929,6 +949,22 @@ mod tests {
         );
         write(&root, "crates/exocortex-storage/tests/integration.rs", "");
         assert!(validate_storage_targets(&root).is_err());
+
+        write(&root, "crates/exocortex-storage/tests/fencing_live.rs", "");
+        assert!(validate_storage_targets(&root).is_ok());
+        assert!(validate_storage_target_listing("integration", "roundtrip_memory", "").is_err());
+        assert!(validate_storage_target_listing(
+            "integration",
+            "roundtrip_memory",
+            "configured_out_helper: test\n"
+        )
+        .is_err());
+        assert!(validate_storage_target_listing(
+            "integration",
+            "roundtrip_memory",
+            "roundtrip_memory: test\n"
+        )
+        .is_ok());
     }
 
     #[test]

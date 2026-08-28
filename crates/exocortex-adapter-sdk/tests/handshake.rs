@@ -8,6 +8,23 @@ mod common;
 use exocortex_adapter_sdk::{AdapterSession, SdkError};
 
 #[tokio::test]
+async fn remote_plaintext_backend_fails_before_network_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::config(
+        "http://backend.example:50051",
+        dir.path().join("never-created.cursor"),
+    );
+    let error = match AdapterSession::connect(cfg).await {
+        Err(error) => error,
+        Ok(_) => panic!("remote plaintext must fail admission"),
+    };
+    assert!(
+        matches!(error, SdkError::InvalidUnit { ref detail } if detail.contains("loopback")),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn empty_auth_token_fails_before_network_access() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = common::config(

@@ -29,6 +29,8 @@ pub mod limits;
 /// Canonical batch-integrity helpers (§18.1): checksum + HMAC, the single
 /// workspace implementation shared by every producer and the server.
 pub mod signing;
+/// Backend URL admission shared by every credential-bearing producer.
+pub mod transport;
 
 /// The one reject-guidance table (agent-instructions PRD §4.2): triage
 /// disposition + deterministic correction text for every `RejectCode`.

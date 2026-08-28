@@ -26,6 +26,7 @@ redis = { workspace = true }
 
 [features]
 integration = []
+testing = []
 
 [dev-dependencies]
 exocortex-kernel = { workspace = true }

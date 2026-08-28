@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use exocortex_kernel::{Embedding, EmbeddingModel, MemoryId};
+use exocortex_kernel::{Embedding, EmbeddingModel, MemoryId, Visibility};
 
 /// Embedding model identity for version stamping (R-Mcr1/R-Dr5).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -44,6 +44,8 @@ pub struct MemoryWithEmbedding {
     pub id: MemoryId,
     /// Partition class (memory type id).
     pub class: u8,
+    /// Endpoint visibility retained for derived-relationship authorization.
+    pub visibility: Visibility,
     /// The model-stamped embedding vector.
     pub embedding: Embedding,
 }

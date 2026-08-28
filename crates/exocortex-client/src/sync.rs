@@ -415,9 +415,12 @@ pub async fn run_sse_sync(
                             let verify_key = cfg.client_key.unwrap_or(cfg.hmac_key);
                             match decode_event(&verify_key, &cfg.fingerprint, &ev.data) {
                                 Ok(DecodedEvent::Change(inv, lsn)) => {
-                                    let visibility_changed =
-                                        matches!(&inv, Invalidation::VisibilityAdvance { .. });
+                                    let mut visibility_changed = false;
                                     for released in gate.push(lsn, inv) {
+                                        visibility_changed |= matches!(
+                                            &released,
+                                            Invalidation::VisibilityAdvance { .. }
+                                        );
                                         next_lsn = next_lsn.max(lsn + 1);
                                         metrics::counter!("exocortex_sync_envelopes_applied_total")
                                             .increment(1);

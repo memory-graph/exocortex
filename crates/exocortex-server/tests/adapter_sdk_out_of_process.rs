@@ -41,7 +41,7 @@ fn spawn_node() -> Node {
     let policy = policy_dir.path().join("sources.json");
     std::fs::write(
         &policy,
-        r#"[{"org_id":"org","source_uri":"fixture://oop","producer_id":"oop-fixture","ceiling":3}]"#,
+        r#"[{"org_id":"org","source_uri":"fixture://oop","producer_id":"oop-fixture","ceiling":3,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
     )
     .unwrap();
     let principals = policy_dir.path().join("principals.json");
@@ -162,6 +162,35 @@ async fn fixture_adapter_completes_the_protocol_out_of_process() {
         body.matches("out-of-process").count(),
         3,
         "read-back finds all three committed rows exactly once (replay duplicated nothing): {body}"
+    );
+
+    // R6-R47: these tag shapes collided under the delimiter-based checksum.
+    // Reuse the adapter batch-id seed so content identity is the only
+    // differentiator, then cross the real SDK -> gRPC -> ingest dedupe path.
+    let mut one_tag = draft("tag-boundary");
+    one_tag.tags = vec!["a,b".into()];
+    let mut two_tags = one_tag.clone();
+    two_tags.tags = vec!["a".into(), "b".into()];
+    let tagged_unit = |memories| BatchUnit {
+        batch_id_seed: "tag-boundary".into(),
+        memories,
+        relationships: vec![],
+        snapshot: None,
+        observed_at: std::time::SystemTime::UNIX_EPOCH,
+    };
+    let first = session
+        .submit_window(vec![tagged_unit(vec![one_tag])], "tag-boundary-one")
+        .await
+        .expect("single-tag batch commits");
+    let second = session
+        .submit_window(vec![tagged_unit(vec![two_tags])], "tag-boundary-two")
+        .await
+        .expect("split-tag batch commits");
+    assert_eq!((first.accepted, first.duplicates), (1, 0));
+    assert_eq!(
+        (second.accepted, second.duplicates),
+        (1, 0),
+        "distinct canonical tag encodings must not enter DuplicateBatch replay"
     );
 }
 

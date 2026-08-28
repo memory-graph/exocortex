@@ -18,6 +18,21 @@ fn noop_adapter_boots_without_backend() {
     child.wait().expect("reaped");
 }
 
+#[test]
+fn remote_plaintext_backend_is_rejected_before_worker_startup() {
+    let out = Command::new(env!("CARGO_BIN_EXE_exocortex-worker"))
+        .args([
+            "--adapter",
+            "noop",
+            "--backend",
+            "http://backend.example:50051",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("loopback"));
+}
+
 /// Round-3 C2 + PRD R16's second verify clause: the worker BINARY runs
 /// `--adapter fixture` end-to-end against a real backend-node process
 /// and its batches authenticate (default dev key matches the server's).

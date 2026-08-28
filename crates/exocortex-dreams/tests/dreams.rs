@@ -15,6 +15,7 @@ use exocortex_kernel::{
     Relationship, RelationshipId, RelationshipProperties, Visibility, LSN,
 };
 use exocortex_storage::{InMemoryStorage, RegionKey, Storage, VisibilityContext};
+use futures::StreamExt;
 
 fn ontology() -> Arc<exocortex_kernel::Ontology> {
     Arc::new(
@@ -346,6 +347,159 @@ async fn injected_mid_cycle_failure_restores_exact_mixed_preimage() {
         after_relationships[&preclosed_edge.id].valid_until,
         preclosed_edge.valid_until
     );
+
+    let renewal_engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        true,
+        "renewal-failure".into(),
+    )
+    .with_lease_ttl(std::time::Duration::from_millis(60))
+    .with_cycle_pause_after(1, std::time::Duration::from_millis(180))
+    .with_renewal_failure_after(1);
+    let error = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        renewal_engine.try_consolidate(&region),
+    )
+    .await
+    .expect("renewal loss aborts before the original lease expires")
+    .expect_err("unconfirmed owner renewal aborts the cycle");
+    assert!(error.to_string().contains("renewal"));
+
+    let mut restored_memories = std::collections::HashMap::new();
+    let mut memories = storage.stream_all_memories().await;
+    while let Some(row) = memories.next().await {
+        let mut memory = row.unwrap();
+        memory.lsn = LSN::new_local(0);
+        restored_memories.insert(memory.id, memory);
+    }
+    let mut restored_relationships = std::collections::HashMap::new();
+    let mut relationships = storage.stream_all_relationships().await;
+    while let Some(row) = relationships.next().await {
+        let mut relationship = row.unwrap();
+        relationship.lsn = LSN::new_local(0);
+        restored_relationships.insert(relationship.id, relationship);
+    }
+    assert_eq!(restored_memories.len(), before_memories.len());
+    for (id, before) in &before_memories {
+        assert_eq!(
+            serde_json::to_value(&restored_memories[id]).unwrap(),
+            serde_json::to_value(before).unwrap(),
+            "memory {id:?} differs after renewal loss"
+        );
+    }
+    assert_eq!(restored_relationships.len(), before_relationships.len());
+    for (id, before) in &before_relationships {
+        assert_eq!(
+            serde_json::to_value(&restored_relationships[id]).unwrap(),
+            serde_json::to_value(before).unwrap(),
+            "relationship {id:?} differs after renewal loss"
+        );
+    }
+}
+
+#[tokio::test]
+async fn similar_edges_derive_the_narrowest_endpoint_visibility() {
+    let storage = InMemoryStorage::new(ontology());
+    let cases = [
+        (Visibility::Org, Visibility::Project, Visibility::Project),
+        (Visibility::Team, Visibility::Org, Visibility::Team),
+        (Visibility::Private, Visibility::Org, Visibility::Private),
+        (Visibility::Team, Visibility::Project, Visibility::Project),
+    ];
+    let mut memories = Vec::new();
+    let mut expected = Vec::new();
+    let similar = kind_named("SimilarTo");
+    for (case, (from_visibility, to_visibility, expected_visibility)) in
+        cases.into_iter().enumerate()
+    {
+        let axis = case * 2;
+        let mut from = mem_with_embedding(90_000 + case * 2, None, unit(axis));
+        let mut to_vector = unit(axis);
+        to_vector[axis] = 0.9;
+        to_vector[axis + 1] = (1.0f32 - 0.9f32.powi(2)).sqrt();
+        let mut to = mem_with_embedding(90_001 + case * 2, None, to_vector);
+        from.visibility = from_visibility;
+        to.visibility = to_visibility;
+        expected.push((from.id, to.id, expected_visibility));
+        memories.extend([from, to]);
+    }
+    storage.upsert_batch(&memories, &[]).await.unwrap();
+    DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        true,
+        "visibility".into(),
+    )
+    .try_consolidate(&RegionKey {
+        org: "o".into(),
+        project: "p".into(),
+        memory_type: 3,
+    })
+    .await
+    .unwrap();
+    let mut rows = storage.stream_all_relationships().await;
+    let mut relationships = Vec::new();
+    while let Some(row) = rows.next().await {
+        relationships.push(row.unwrap());
+    }
+    for (from, to, visibility) in expected {
+        let relationship = relationships
+            .iter()
+            .find(|relationship| {
+                relationship.kind == similar
+                    && ((relationship.from == from && relationship.to == to)
+                        || (relationship.from == to && relationship.to == from))
+            })
+            .expect("expected SimilarTo edge");
+        assert_eq!(
+            relationship.visibility, visibility,
+            "SimilarTo visibility must be the narrower endpoint"
+        );
+    }
+}
+
+#[tokio::test]
+async fn storage_stream_failures_abort_before_any_dreams_mutation() {
+    for (memory_fault, relationship_fault) in [(Some(1), None), (None, Some(0))] {
+        let storage = InMemoryStorage::new(ontology());
+        let from = mem_with_embedding(95_000, None, unit(0));
+        let mut vector = unit(0);
+        vector[0] = 0.9;
+        vector[1] = (1.0f32 - 0.9f32.powi(2)).sqrt();
+        let to = mem_with_embedding(95_001, None, vector);
+        storage.upsert_batch(&[from, to], &[]).await.unwrap();
+        storage.fail_next_stream_after(memory_fault, relationship_fault);
+
+        let engine = DreamsEngine::new(
+            Arc::new(storage.clone_dyn()),
+            DreamsTrigger::default(),
+            0.01,
+            0.05,
+            true,
+            "stream-failure".into(),
+        );
+        assert!(
+            engine
+                .try_consolidate(&RegionKey {
+                    org: "*".into(),
+                    project: "*".into(),
+                    memory_type: 3,
+                })
+                .await
+                .is_err(),
+            "an authoritative stream error must abort the cycle"
+        );
+        let mut relationships = storage.stream_all_relationships().await;
+        assert!(
+            relationships.next().await.is_none(),
+            "a truncated scan must not create SimilarTo edges"
+        );
+    }
 }
 
 #[tokio::test]
@@ -507,11 +661,13 @@ fn mcr2_cross_model_comparison_is_prohibited() {
         MemoryWithEmbedding {
             id: MemoryId::new_v7(),
             class: 1,
+            visibility: Visibility::Org,
             embedding: stamped(unit(1)),
         },
         MemoryWithEmbedding {
             id: MemoryId::new_v7(),
             class: 2,
+            visibility: Visibility::Org,
             embedding: stamped(unit(2)),
         },
     ];
@@ -586,11 +742,13 @@ fn mcr2_log_det_matches_closed_form() {
         MemoryWithEmbedding {
             id: MemoryId::new_v7(),
             class: 1,
+            visibility: Visibility::Org,
             embedding: stamped(vec![1.0, 0.0]),
         },
         MemoryWithEmbedding {
             id: MemoryId::new_v7(),
             class: 2,
+            visibility: Visibility::Org,
             embedding: stamped(vec![0.0, 1.0]),
         },
     ];

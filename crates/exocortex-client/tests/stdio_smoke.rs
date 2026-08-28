@@ -403,6 +403,10 @@ fn backend_mode_waits_for_authenticated_hydration_before_stdio_readiness() {
             "EXOCORTEX_HMAC_KEY",
             "1111111111111111111111111111111111111111111111111111111111111111",
         )
+        .env(
+            "EXOCORTEX_SSE_KEY",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        )
         .env("EXOCORTEX_AUTH_TOKEN", "smoke-token");
     });
     c.send_all(&[serde_json::json!({
@@ -441,6 +445,10 @@ fn malformed_hmac_key_fails_startup() {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-mcp-client"))
             .args(["--org", "x", "--backend", "http://127.0.0.1:1"])
             .env("EXOCORTEX_HMAC_KEY", bad)
+            .env(
+                "EXOCORTEX_SSE_KEY",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+            )
             .env("EXOCORTEX_AUTH_TOKEN", "test")
             .output()
             .expect("run client");
@@ -464,35 +472,47 @@ fn malformed_hmac_key_fails_startup() {
 #[test]
 fn backend_mode_requires_nonempty_authentication_material() {
     let bin = env!("CARGO_BIN_EXE_exocortex-mcp-client");
-    for (hmac, token, expected) in [
-        (None, Some("token"), "EXOCORTEX_HMAC_KEY"),
-        (
-            Some("4242424242424242424242424242424242424242424242424242424242424242"),
-            None,
-            "EXOCORTEX_AUTH_TOKEN",
-        ),
-        (
-            Some("4242424242424242424242424242424242424242424242424242424242424242"),
-            Some(""),
-            "EXOCORTEX_AUTH_TOKEN",
-        ),
+    const KEY: &str = "4242424242424242424242424242424242424242424242424242424242424242";
+    for (hmac, token, sse, expected) in [
+        (None, Some("token"), Some(KEY), "EXOCORTEX_HMAC_KEY"),
+        (Some(KEY), None, Some(KEY), "EXOCORTEX_AUTH_TOKEN"),
+        (Some(KEY), Some(""), Some(KEY), "EXOCORTEX_AUTH_TOKEN"),
+        (Some(KEY), Some("token"), None, "EXOCORTEX_SSE_KEY"),
     ] {
         let mut command = std::process::Command::new(bin);
         command
             .args(["--backend", "http://127.0.0.1:1"])
             .env_remove("EXOCORTEX_HMAC_KEY")
-            .env_remove("EXOCORTEX_AUTH_TOKEN");
+            .env_remove("EXOCORTEX_AUTH_TOKEN")
+            .env_remove("EXOCORTEX_SSE_KEY");
         if let Some(value) = hmac {
             command.env("EXOCORTEX_HMAC_KEY", value);
         }
         if let Some(value) = token {
             command.env("EXOCORTEX_AUTH_TOKEN", value);
         }
+        if let Some(value) = sse {
+            command.env("EXOCORTEX_SSE_KEY", value);
+        }
         let out = command.output().expect("run client");
         assert!(!out.status.success(), "backend mode must fail closed");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains(expected), "{expected} diagnostic: {stderr}");
     }
+}
+
+#[test]
+fn remote_plaintext_backend_is_rejected_before_credentials_are_loaded() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-mcp-client"))
+        .args(["--backend", "http://backend.example:50051"])
+        .env_remove("EXOCORTEX_HMAC_KEY")
+        .env_remove("EXOCORTEX_AUTH_TOKEN")
+        .output()
+        .expect("run client");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("loopback"), "{stderr}");
+    assert!(!stderr.contains("EXOCORTEX_HMAC_KEY"), "{stderr}");
 }
 
 /// IN10 (audit): the MCP read tools and the HTTP surface serve the SAME

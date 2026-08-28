@@ -256,6 +256,11 @@ impl AdapterSession {
 
     /// `connect` with an injected sleep function (tests; R14).
     pub async fn connect_with(config: AdapterConfig, sleep: SleepFn) -> Result<Self, SdkError> {
+        exocortex_wire::transport::validate_backend_url(&config.backend_url).map_err(|detail| {
+            SdkError::InvalidUnit {
+                detail: format!("backend_url: {detail}"),
+            }
+        })?;
         if config.auth_token.is_empty() {
             return Err(SdkError::InvalidUnit {
                 detail: "adapter auth_token must be non-empty".into(),

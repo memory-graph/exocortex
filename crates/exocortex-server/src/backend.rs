@@ -56,8 +56,11 @@ pub struct BackendNodeArgs {
     pub redis_url: Option<String>,
     /// Quiet-hours window for the fire drainer (R-Dr14; default: none).
     pub quiet_hours: exocortex_dreams::fire::QuietHours,
-    /// Immutable administrator source ceilings loaded before startup.
-    pub admin_ceilings: Vec<((String, String, String), exocortex_kernel::Visibility)>,
+    /// Immutable exact producer signing/visibility policies loaded before startup.
+    pub admin_source_policies: Vec<(
+        exocortex_ingest::service::SourcePolicyKey,
+        exocortex_ingest::service::AdminSourcePolicy,
+    )>,
 }
 
 /// Dreams-lease TTL for the backend re-election loop. 1.2s + a 250ms
@@ -127,7 +130,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
     }
     cache
         .reseed_from_storage(&*storage, &org.to_string().into())
-        .await;
+        .await?;
     // R-O4: hydration completes when the org graph is actually resident
     // (the reseed flowed through the writer), not at spawn time.
     let mut hydrated = false;
@@ -300,13 +303,15 @@ pub async fn run_backend_node<S: Storage + 'static>(
     }
 
     // Ingest: gRPC IngestService, embedding-enabled, reasoning-wired.
-    let ingest = IngestServer::new(storage.clone(), ontology.clone(), args.cluster_secret)
-        .with_reasoning(reasoning.clone())
-        .with_dreams(dreams.clone())
-        .with_org(&org)
-        .with_admin_ceilings(args.admin_ceilings.clone())
-        .require_admin_ceilings()
-        .require_request_principal();
+    let ingest = IngestServer::new_with_admin_policies(
+        storage.clone(),
+        ontology.clone(),
+        args.admin_source_policies.clone(),
+    )
+    .with_reasoning(reasoning.clone())
+    .with_dreams(dreams.clone())
+    .with_org(&org)
+    .require_request_principal();
     #[cfg(feature = "fastembed")]
     let ingest = ingest.with_embedder(Arc::new(
         exocortex_ingest::embedding::FastEmbedder::bge_small()?,

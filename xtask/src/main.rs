@@ -224,6 +224,14 @@ fn validate_release_hardening(
                 release_job.contains("    permissions:\n      contents: write\n"),
                 "only the release job may receive contents: write"
             );
+            anyhow::ensure!(
+                release_job.contains("scripts/publish-release-assets.sh"),
+                "release job must use the immutable draft-first asset publisher"
+            );
+            anyhow::ensure!(
+                !release_job.contains("--clobber") && !release_job.contains("|| true"),
+                "release job must not suppress conflicts or overwrite repeated-tag assets"
+            );
         }
         for line in workflow.lines() {
             let directive = line.trim().trim_start_matches("- ");
@@ -307,10 +315,38 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> Result<()> {
     Ok(())
 }
 
+fn storage_test_listing(target: &str) -> Result<String> {
+    let output = std::process::Command::new(cargo())
+        .args([
+            "test",
+            "-p",
+            "exocortex-storage",
+            "--features",
+            "integration",
+            "--test",
+            target,
+            "--",
+            "--list",
+        ])
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "storage-conformance: failed to list live target {target}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .map_err(|error| anyhow::anyhow!("storage-conformance: non-UTF-8 test listing: {error}"))
+}
+
 /// §2.1: the storage suite against the double, plus the live Falkor
 /// integration suite when FALKOR_URL is present.
 fn storage_conformance() -> Result<()> {
     gates::validate_storage_targets(std::path::Path::new("."))?;
+    for (target, canary) in gates::STORAGE_LIVE_CANARIES {
+        let listing = storage_test_listing(target)?;
+        gates::validate_storage_target_listing(target, canary, &listing)?;
+    }
+    println!("storage-conformance: live target canaries LISTED (backend suite not yet executed)");
     run(&["test", "-p", "exocortex-storage"], &[])?;
     println!("storage-conformance: in-memory suite PASS");
     if std::env::var("FALKOR_URL").is_ok_and(|url| !url.is_empty()) {
@@ -1196,7 +1232,7 @@ mod release_hardening_tests {
     #[test]
     fn rejects_mutable_actions_root_runtime_and_public_test_ports() {
         let good_release = format!(
-            "permissions:\n  contents: read\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@{SHA}\n  release:\n    permissions:\n      contents: write\n"
+            "permissions:\n  contents: read\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@{SHA}\n  release:\n    permissions:\n      contents: write\n    steps:\n      - run: bash scripts/publish-release-assets.sh \"$TAG\" \"$GITHUB_REPOSITORY\" dist\n"
         );
         let good_ci = format!(
             "permissions:\n  contents: read\njobs:\n  gates:\n    steps:\n      - uses: actions/checkout@{SHA}\n"
@@ -1238,5 +1274,24 @@ mod release_hardening_tests {
             &["ports:\n  - \"8080:8080\"\n"]
         )
         .is_err());
+        for unsafe_release in [
+            good_release.replace(
+                "scripts/publish-release-assets.sh",
+                "scripts/unsafe-release.sh",
+            ),
+            good_release.replace(" dist\n", " dist --clobber\n"),
+            good_release.replace(" dist\n", " dist || true\n"),
+        ] {
+            let unsafe_workflows = [
+                (".github/workflows/release.yml", unsafe_release.as_str()),
+                (".github/workflows/ci.yml", good_ci.as_str()),
+            ];
+            assert!(validate_release_hardening(
+                &unsafe_workflows,
+                good_dockerfile,
+                &[good_compose]
+            )
+            .is_err());
+        }
     }
 }

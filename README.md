@@ -361,7 +361,8 @@ Run the node:
 exocortex-node --mode backend-node --storage falkor://falkordb:6379 \
   --bind 0.0.0.0:8080 --tls-cert /run/secrets/exocortex/tls.crt \
   --tls-key /run/secrets/exocortex/tls.key \
-  --principal-policy /run/secrets/exocortex/principals.json
+  --principal-policy /run/secrets/exocortex/principals.json \
+  --source-policy /run/secrets/exocortex/sources.json
 ```
 
 Shared/LAN binds require an operator-provided TLS certificate and key.
@@ -375,6 +376,11 @@ non-empty `bearer_token` to `org_id`, `user_id`, explicit `project_ids` and
 principal protects HTTP operations, SSE, metrics, and every gRPC method; a
 caller-supplied org or project/team scope never overrides this policy.
 
+`sources.json` is also administrator-owned. Each row contains `org_id`,
+`source_uri`, `producer_id`, `ceiling`, and a 64-hex `hmac_key`. The key is
+unique producer authentication material for that exact identity; it is not
+the cluster secret and cannot authenticate a different source or producer.
+
 Back up and restore the org's durable graph (disaster recovery —
 byte-faithful rows modulo storage-assigned LSNs, fingerprint-gated):
 
@@ -383,10 +389,13 @@ exocortex-node --mode backend-node --storage falkor://falkordb:6379   --graph-na
 exocortex-node --mode backend-node --storage falkor://falkordb:6379   --graph-name my-org --import-org org-backup.json
 ```
 
-Set `EXOCORTEX_AUTH_TOKEN` and `EXOCORTEX_HMAC_KEY` in the client process
+Set `EXOCORTEX_AUTH_TOKEN`, the exact source's `EXOCORTEX_HMAC_KEY`, and its
+pre-provisioned per-client `EXOCORTEX_SSE_KEY` in the client process
 environment, then run clients with `--backend https://host:8080`. Backend
 nodes similarly read `EXOCORTEX_CLUSTER_SECRET`; credentials are never CLI
 arguments visible in process listings.
+Remote plaintext backend URLs are rejected before credentials are read or
+attached; `http` is reserved for literal loopback addresses and `localhost`.
 Every operation is also available over authenticated HTTP; the SSE
 change feed keeps each client's local cache current. See the
 [PRD](docs/prd/exocortex-core-prd.md) (§4 deployment, §17 tenancy) and

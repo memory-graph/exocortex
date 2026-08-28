@@ -1,8 +1,8 @@
 //! The canonical batch-integrity helpers (§18.1 / §13.6 step 3).
 //!
 //! One implementation, shared by every producer and by the ingest server:
-//! - [`canonical_checksum`]: BLAKE3 hex over an order-independent
-//!   canonical projection of the batch's covered fields. Two batches with
+//! - [`canonical_checksum`]: BLAKE3 hex over an order-independent,
+//!   versioned binary encoding of the batch's covered fields. Two batches with
 //!   the same rows in different orders checksum identically; any change
 //!   to a covered field changes the checksum.
 //! - [`sign_batch`] / [`verify_signature`]: HMAC-SHA256 over the full
@@ -63,36 +63,65 @@ pub fn verify_invalidation_envelope(key: &[u8; 32], envelope: &InvalidationEnvel
         ))
 }
 
-/// Version tag baked into the checksum preimage so a deliberate format
-/// change is visible: old and new checksums differ even for identical rows.
-const CHECKSUM_VERSION: &str = "exocortex-checksum-v1";
+/// Domain and format version baked into the checksum preimage so a deliberate
+/// encoding change is visible: old and new checksums differ even for identical
+/// rows. The version describes this canonical preimage, not the protobuf wire
+/// schema version.
+const CHECKSUM_DOMAIN: &[u8] = b"exocortex-ingest-checksum";
+const CHECKSUM_FORMAT_VERSION: u32 = 2;
 
 /// Canonical BLAKE3-hex checksum over the batch's covered fields (§18.1):
 /// `memories` (all fields incl. tags, external_key, valid_from/until),
 /// `relationships`, and `snapshot`. Order-independent within each
 /// collection — producers may buffer rows in any order.
 pub fn canonical_checksum(b: &IngestBatch) -> String {
-    let mut memories: Vec<String> = b.memories.iter().map(canonical_memory).collect();
+    let mut memories: Vec<Vec<u8>> = b
+        .memories
+        .iter()
+        .map(|memory| {
+            let mut canonical = memory.clone();
+            canonical.tags.sort();
+            canonical.encode_to_vec()
+        })
+        .collect();
     memories.sort();
-    let mut relationships: Vec<String> =
-        b.relationships.iter().map(canonical_relationship).collect();
+    let mut relationships: Vec<Vec<u8>> =
+        b.relationships.iter().map(Message::encode_to_vec).collect();
     relationships.sort();
-    let snapshot = b
-        .snapshot
-        .as_ref()
-        .map(canonical_snapshot)
-        .unwrap_or_else(|| "none".to_string());
 
-    let mut preimage = String::with_capacity(64 + memories.len() * 128);
-    preimage.push_str(CHECKSUM_VERSION);
-    preimage.push('\x1e');
-    preimage.push_str(&memories.join("\x1e"));
-    preimage.push('\x1e');
-    preimage.push_str(&relationships.join("\x1e"));
-    preimage.push('\x1e');
-    preimage.push_str(&snapshot);
+    let mut preimage = Vec::with_capacity(64 + memories.len() * 128);
+    push_len_prefixed(&mut preimage, CHECKSUM_DOMAIN);
+    preimage.extend_from_slice(&CHECKSUM_FORMAT_VERSION.to_be_bytes());
+    push_collection(&mut preimage, b"memories", &memories);
+    push_collection(&mut preimage, b"relationships", &relationships);
+    push_len_prefixed(&mut preimage, b"snapshot");
+    match &b.snapshot {
+        Some(snapshot) => {
+            preimage.push(1);
+            push_len_prefixed(&mut preimage, &snapshot.encode_to_vec());
+        }
+        None => preimage.push(0),
+    }
 
-    blake3::hash(preimage.as_bytes()).to_hex().to_string()
+    blake3::hash(&preimage).to_hex().to_string()
+}
+
+fn push_collection(preimage: &mut Vec<u8>, name: &[u8], rows: &[Vec<u8>]) {
+    push_len_prefixed(preimage, name);
+    push_len(preimage, rows.len());
+    for row in rows {
+        push_len_prefixed(preimage, row);
+    }
+}
+
+fn push_len_prefixed(preimage: &mut Vec<u8>, value: &[u8]) {
+    push_len(preimage, value.len());
+    preimage.extend_from_slice(value);
+}
+
+fn push_len(preimage: &mut Vec<u8>, len: usize) {
+    let len = u64::try_from(len).expect("canonical checksum input length fits u64");
+    preimage.extend_from_slice(&len.to_be_bytes());
 }
 
 /// Producer-side ordering: set the checksum, then sign the full batch
@@ -234,58 +263,6 @@ pub fn decode_hex32(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-fn canonical_memory(m: &crate::ingest::v1::MemoryDraft) -> String {
-    let mut tags: Vec<&str> = m.tags.iter().map(|t| t.as_str()).collect();
-    tags.sort_unstable();
-    let external_key = match &m.external_key {
-        Some(k) => format!(
-            "{{table_uuid:{},logical_pk:{},mapping_version:{}}}",
-            hex(&k.table_uuid),
-            hex(k.logical_pk.as_bytes()),
-            k.mapping_version
-        ),
-        None => "none".to_string(),
-    };
-    format!(
-        "{{draft_key:{},id:{},memory_type:{},title:{},content:{},tags:{},visibility:{},valid_from:{:?},valid_until:{:?},external_key:{}}}",
-        m.draft_key,
-        m.id,
-        m.memory_type,
-        m.title,
-        m.content,
-        tags.join(","),
-        m.visibility,
-        m.valid_from.map(|t| (t.seconds, t.nanos)),
-        m.valid_until.map(|t| (t.seconds, t.nanos)),
-        external_key,
-    )
-}
-
-fn canonical_relationship(r: &crate::ingest::v1::RelationshipDraft) -> String {
-    format!(
-        "{{from:{},to:{},kind:{},strength:{},confidence:{},context:{},visibility:{}}}",
-        r.from_draft_key, r.to_draft_key, r.kind, r.strength, r.confidence, r.context, r.visibility
-    )
-}
-
-fn canonical_snapshot(s: &crate::ingest::v1::ExternalSnapshotInfo) -> String {
-    format!(
-        "{{snapshot_id:{},schema_hash:{},source_flavor:{}}}",
-        s.snapshot_id,
-        hex(&s.schema_hash),
-        s.source_flavor
-    )
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,8 +331,32 @@ mod tests {
     #[test]
     fn checksum_is_order_independent() {
         let a = batch(vec![draft("k1", "one"), draft("k2", "two")]);
-        let b = batch(vec![draft("k2", "two"), draft("k1", "one")]);
+        let mut b = batch(vec![draft("k2", "two"), draft("k1", "one")]);
+        b.memories[0].tags.reverse();
+        b.memories[1].tags.reverse();
         assert_eq!(canonical_checksum(&a), canonical_checksum(&b));
+    }
+
+    #[test]
+    fn checksum_distinguishes_tag_boundaries() {
+        let mut one_tag = batch(vec![draft("k1", "one")]);
+        one_tag.memories[0].tags = vec!["a,b".into()];
+        let mut two_tags = one_tag.clone();
+        two_tags.memories[0].tags = vec!["a".into(), "b".into()];
+
+        assert_ne!(
+            canonical_checksum(&one_tag),
+            canonical_checksum(&two_tags),
+            "length-prefixed tag elements must not collide with embedded delimiters"
+        );
+    }
+
+    #[test]
+    fn checksum_v2_encoding_is_stable() {
+        assert_eq!(
+            canonical_checksum(&batch(vec![draft("k1", "one")])),
+            "849d28aa1ee0a8ea1ff4b0ef2bc0587bae0e4bea32d43de6b46be38afe91af1e"
+        );
     }
 
     #[test]

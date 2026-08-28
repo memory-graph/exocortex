@@ -242,6 +242,136 @@ fn visibility_advance_decodes_and_keeps_the_lsn_gate_gap_free() {
     assert_eq!(gate.next_lsn(), 9, "hidden LSN never creates a gap loop");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn held_visibility_advance_forces_authenticated_reseed_when_gap_fills() {
+    use axum::extract::RawQuery;
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::get;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let node = ClusterNode::new(
+        storage.clone(),
+        "held-revocation".into(),
+        onto.fingerprint,
+        HMAC_KEY,
+    );
+    let bearer = "held-revocation-bearer";
+    let client_key = exocortex_wire::signing::derive_sse_client_key(&HMAC_KEY, bearer);
+    let signed_payload = |invalidation| {
+        let mut envelope = node.envelope(invalidation);
+        exocortex_wire::signing::sign_invalidation_envelope(&client_key, &mut envelope);
+        b64_encode(&envelope.encode_to_vec())
+    };
+    // LSN 5 arrives first and must be held. LSN 4 then fills the gap and
+    // releases both events; revocation is a property of the released batch,
+    // not merely the last network arrival.
+    let hidden = signed_payload(Invalidation::VisibilityAdvance { lsn: 5 });
+    let gap_fill = signed_payload(Invalidation::MemorySnapshotUpserted {
+        memory: Box::new(test_memory("gap-fill", 4)),
+        lsn: 4,
+    });
+    let reseed = signed_payload(Invalidation::GraphReseed {
+        snapshot_json: serde_json::to_vec(&serde_json::json!({
+            "memories": [],
+            "relationships": []
+        }))
+        .unwrap(),
+        lsn: 5,
+    });
+    let authenticated = Arc::new(AtomicBool::new(false));
+    let reseed_requested = Arc::new(AtomicBool::new(false));
+    let app = axum::Router::new().route(
+        "/v1/changes",
+        get({
+            let authenticated = authenticated.clone();
+            let reseed_requested = reseed_requested.clone();
+            move |headers: http::HeaderMap, RawQuery(query): RawQuery| {
+                let hidden = hidden.clone();
+                let gap_fill = gap_fill.clone();
+                let reseed = reseed.clone();
+                let authenticated = authenticated.clone();
+                let reseed_requested = reseed_requested.clone();
+                async move {
+                    authenticated.store(
+                        headers
+                            .get(http::header::AUTHORIZATION)
+                            .is_some_and(|value| value == "Bearer held-revocation-bearer"),
+                        Ordering::SeqCst,
+                    );
+                    let seed = query.as_deref().is_some_and(|query| query.contains("seed=true"));
+                    reseed_requested.fetch_or(seed, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        if seed {
+                            yield Ok::<Event, Infallible>(Event::default().event("inv").data(reseed));
+                        } else {
+                            yield Ok::<Event, Infallible>(Event::default().event("inv").data(hidden));
+                            yield Ok::<Event, Infallible>(Event::default().event("inv").data(gap_fill));
+                        }
+                        futures::future::pending::<()>().await;
+                    };
+                    Sse::new(stream)
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let stale = test_memory("must-be-revoked", 9);
+    let (cache, rx) = LocalCache::new(1024 * 1024);
+    cache.seed_local("org", std::slice::from_ref(&stale), &[], 0);
+    let cache = Arc::new(cache);
+    let writer = {
+        let cache = cache.clone();
+        let storage = storage.clone();
+        tokio::spawn(async move { cache.run(storage, rx).await })
+    };
+    let hydrated = Arc::new(tokio::sync::Notify::new());
+    let connected = Arc::new(tokio::sync::Notify::new());
+    let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+    cfg.org = "org".into();
+    cfg.bearer = Some(bearer.into());
+    cfg.client_key = Some(client_key);
+    cfg.hydration_ready = Some(hydrated.clone());
+    cfg.connection_ready = Some(connected.clone());
+    cfg.backoff = Duration::from_millis(1);
+    cfg.reconcile_interval = Duration::from_secs(10);
+    let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 4, None));
+
+    tokio::time::timeout(Duration::from_secs(3), connected.notified())
+        .await
+        .expect("authenticated SSE connection becomes ready");
+    tokio::time::timeout(Duration::from_millis(500), hydrated.notified())
+        .await
+        .expect("released hidden event immediately requests an authenticated reseed");
+    assert!(authenticated.load(Ordering::SeqCst));
+    assert!(reseed_requested.load(Ordering::SeqCst));
+    assert!(cache
+        .get_memory(
+            "org",
+            &stale.id,
+            &VisibilityContext {
+                user_id: "reader".into(),
+                org_id: "org".into(),
+                project_ids: Default::default(),
+                team_ids: Default::default(),
+                max_visibility: exocortex_kernel::Visibility::Org,
+            }
+        )
+        .is_none());
+    assert_eq!(cache.version("org").unwrap().backend_lsn, 5);
+    sync.abort();
+    writer.abort();
+}
+
 #[tokio::test]
 async fn discovery_available_decodes_advances_cache_frontier_and_rejects_malformed_record() {
     let onto = Arc::new(
@@ -822,7 +952,10 @@ async fn deterministic_replay_probe() {
 
     // The client's org graph must be resident before deltas can apply
     // (§8.2: the reseed establishes the org, then Apply flows in).
-    cache.reseed_from_storage(&*storage, &"org".into()).await;
+    cache
+        .reseed_from_storage(&*storage, &"org".into())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);

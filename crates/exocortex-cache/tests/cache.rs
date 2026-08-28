@@ -115,7 +115,10 @@ async fn reseed_matches_storage_after_every_write() {
             .upsert_memory(&mem(&format!("m{i}"), Visibility::Org, None))
             .await
             .unwrap();
-        cache.reseed_from_storage(&store, &"org".into()).await;
+        cache
+            .reseed_from_storage(&store, &"org".into())
+            .await
+            .unwrap();
         let ctx = vc(Visibility::Org, "u");
         let hits = cache.search("org", "m", 100, &ctx);
         assert_eq!(hits.len(), i + 1, "reseed reflects write {}", i);
@@ -136,7 +139,10 @@ async fn apply_invalidations_cow() {
 
     let m0 = mem("seed-a", Visibility::Org, None);
     store.upsert_memory(&m0).await.unwrap();
-    cache.reseed_from_storage(&store, &"org".into()).await;
+    cache
+        .reseed_from_storage(&store, &"org".into())
+        .await
+        .unwrap();
 
     // Apply an upsert through the change feed.
     let m1 = mem("seed-b", Visibility::Org, None);
@@ -167,7 +173,10 @@ async fn relationship_fetch_failure_does_not_advance_backend_lsn() {
         let store = store.clone_dyn();
         async move { cache.run(Arc::new(store), rx).await }
     });
-    cache.reseed_from_storage(&store, &"org".into()).await;
+    cache
+        .reseed_from_storage(&store, &"org".into())
+        .await
+        .unwrap();
     let before = cache.version("org").unwrap().backend_lsn;
     cache
         .submit(CacheWrite::Apply(
@@ -199,7 +208,10 @@ async fn failed_fetch_aborts_the_whole_invalidation_microbatch() {
         let store = store.clone_dyn();
         async move { cache.run(Arc::new(store), rx).await }
     });
-    cache.reseed_from_storage(&store, &"org".into()).await;
+    cache
+        .reseed_from_storage(&store, &"org".into())
+        .await
+        .unwrap();
     let before = cache.version("org").unwrap().backend_lsn;
     let later = mem("must-not-pass-failed-prefix", Visibility::Org, None);
 
@@ -614,7 +626,10 @@ async fn upsert_replaces_stale_version() {
     });
     let a = mem("alpha-wide", Visibility::Org, None);
     storage.upsert_memory(&a).await.unwrap();
-    cache.reseed_from_storage(&storage, &"org".into()).await;
+    cache
+        .reseed_from_storage(&storage, &"org".into())
+        .await
+        .unwrap();
 
     // Re-upsert the SAME id with a new title (and a narrowed visibility,
     // which search must respect).
@@ -668,7 +683,7 @@ async fn reseed_skips_deleted_rows() {
     storage.upsert_memory(&b).await.unwrap();
     storage.delete_memory(&a.id).await.unwrap();
 
-    let snap = GraphSnapshot::from_storage(&storage).await;
+    let snap = GraphSnapshot::from_storage(&storage).await.unwrap();
     assert!(
         snap.by_id.get(&a.id).is_none(),
         "deleted row not resurrected"
@@ -695,7 +710,10 @@ async fn search_resolves_correct_node_after_index_reuse() {
         ids.push(m.id);
         storage.upsert_memory(&m).await.unwrap();
     }
-    cache.reseed_from_storage(&storage, &"org".into()).await;
+    cache
+        .reseed_from_storage(&storage, &"org".into())
+        .await
+        .unwrap();
 
     // Delete the last, then insert two fresh rows (node indices get reused).
     storage.delete_memory(&ids[3]).await.unwrap();
@@ -824,7 +842,10 @@ async fn relationship_reupsert_does_not_duplicate() {
         lsn: LSN::new_backend(1),
     };
     storage.upsert_relationship(&rel).await.unwrap();
-    cache.reseed_from_storage(&storage, &"org".into()).await;
+    cache
+        .reseed_from_storage(&storage, &"org".into())
+        .await
+        .unwrap();
     let relationship_streams_before = storage.reasoning_query_counts().1;
 
     let inv = exocortex_storage::Invalidation::RelationshipUpserted {

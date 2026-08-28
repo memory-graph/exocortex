@@ -945,6 +945,36 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "integration_corrupt_ingest_settlement",
+        read_only: false,
+        required_params: &[
+            "org_id",
+            "producer_id",
+            "batch_id",
+            "accepted",
+            "rejected",
+            "assigned_lsn"
+        ],
+        cypher: r#"
+            MATCH (d:_IngestBatch {
+                org_id: $org_id, producer_id: $producer_id, batch_id: $batch_id})
+            SET d.accepted = $accepted, d.rejected = $rejected,
+                d.assigned_lsn = $assigned_lsn
+            RETURN d.batch_id
+        "#,
+    });
+
+    reg!(Template {
+        id: "integration_get_discovery_lsn",
+        read_only: true,
+        required_params: &["discovery_id"],
+        cypher: r#"
+            MATCH (d:_Discovery {discovery_id: $discovery_id})
+            RETURN d.lsn LIMIT 1
+        "#,
+    });
+
+    reg!(Template {
         id: "discovery_proposal_get",
         read_only: true,
         required_params: &["discovery_id"],
