@@ -587,6 +587,15 @@ self-sufficient builder, an executable gate that rejects loss of the required
 native build tools, a clean current-image compose build, and a passing failover
 run against that image.
 
+### R6-R177 — The chaos harness mounts credential policies with unsafe modes
+
+After R6-R176 produced a fresh image, every node failed closed before joining:
+the checked-in principal and source policies are mode 0644 bind mounts, while
+the production loader requires owner-only credentials. Closure requires the
+harness to stage those dev-only policies at mode 0600 without embedding them in
+the release image, executable deployment-gate coverage that rejects the direct
+bind-mount regression, and a passing current-image failover run.
+
 The complete mandatory gate matrix passed: formatting, workspace clippy,
 workspace tests with adapter SDK testing and `--no-fail-fast`, dependency
 policy, kernel purity, fingerprint (`e1f7d17b...ddc9b2`), schema/playbook
