@@ -79,6 +79,30 @@
     "name": "exocortex.get_memory"
   },
   {
+    "description": "issue_discovery",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `issue_discovery`.",
+      "properties": {
+        "discovery_id": {
+          "description": "Durable discovery id.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Relationship kind the caller proposes to assert.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "discovery_id",
+        "kind"
+      ],
+      "title": "IssueDiscoveryInput",
+      "type": "object"
+    },
+    "name": "exocortex.issue_discovery"
+  },
+  {
     "description": "list_audit_records",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -96,6 +120,25 @@
       "type": "object"
     },
     "name": "exocortex.list_audit_records"
+  },
+  {
+    "description": "list_discoveries",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `list_discoveries`.",
+      "properties": {
+        "limit": {
+          "default": 20,
+          "description": "Maximum rows to return (hard-capped at 100).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "title": "ListDiscoveriesInput",
+      "type": "object"
+    },
+    "name": "exocortex.list_discoveries"
   },
   {
     "description": "preflight_wrapup",
