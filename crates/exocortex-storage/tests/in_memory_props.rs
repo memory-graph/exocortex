@@ -116,12 +116,20 @@ async fn stable_operation_key_appends_derived_batch_once() {
         .await
         .unwrap();
     let relationship = base_relationship(left.id, right.id);
+    let first_rows = [relationship.clone()];
+    let second_rows = [relationship.clone()];
+    let (first, second) = tokio::join!(
+        storage.upsert_batch_once("reasoning:effect-1", &[], &first_rows),
+        storage.upsert_batch_once("reasoning:effect-1", &[], &second_rows),
+    );
+    assert_ne!(first.unwrap(), second.unwrap(), "exactly one racer commits");
+    assert_eq!(storage.relationship_history(&relationship.id).len(), 1);
     assert!(storage
-        .upsert_batch_once("reasoning:effect-1", &[], &[relationship.clone()])
+        .upsert_batch_once("reasoning:no-output", &[], &[])
         .await
         .unwrap());
     assert!(!storage
-        .upsert_batch_once("reasoning:effect-1", &[], &[relationship.clone()])
+        .upsert_batch_once("reasoning:no-output", &[], &[relationship.clone()])
         .await
         .unwrap());
     assert_eq!(storage.relationship_history(&relationship.id).len(), 1);
@@ -901,7 +909,7 @@ async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
         .await
         .unwrap());
     assert!(store.pending_ingest_effects(10).await.unwrap().is_empty());
-    assert!(store
+    assert!(!store
         .acknowledge_ingest_effect(effect.effect_id.as_str(), loser)
         .await
         .unwrap());

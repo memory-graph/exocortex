@@ -841,11 +841,13 @@ impl Storage for InMemoryStorage {
         let Some(row) = effects.get_mut(effect_id) else {
             return Ok(false);
         };
-        if !matches!(&row.claim, Some((token, until)) if token.as_str() == claim_token && *until > std::time::Instant::now())
+        if row.acknowledged
+            || !matches!(&row.claim, Some((token, until)) if token.as_str() == claim_token && *until > std::time::Instant::now())
         {
             return Ok(false);
         }
         row.acknowledged = true;
+        row.claim = None;
         Ok(true)
     }
     async fn upsert_memory_audited(

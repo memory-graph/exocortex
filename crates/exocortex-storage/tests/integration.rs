@@ -617,14 +617,27 @@ itest!(
         );
         let peer = mem("outbox-peer", 3, Visibility::Org);
         let derived = rel(memory.id, peer.id, 1);
-        assert!(restarted
-            .upsert_batch_once("reasoning:live-effect", &[peer.clone()], &[derived.clone()])
-            .await
-            .unwrap());
-        assert!(!contender
-            .upsert_batch_once("reasoning:live-effect", &[peer], &[derived.clone()])
-            .await
-            .unwrap());
+        let first_memories = [peer.clone()];
+        let second_memories = [peer.clone()];
+        let first_relationships = [derived.clone()];
+        let second_relationships = [derived.clone()];
+        let (first_once, second_once) = tokio::join!(
+            restarted.upsert_batch_once(
+                "reasoning:live-effect",
+                &first_memories,
+                &first_relationships,
+            ),
+            contender.upsert_batch_once(
+                "reasoning:live-effect",
+                &second_memories,
+                &second_relationships,
+            ),
+        );
+        assert_ne!(
+            first_once.unwrap(),
+            second_once.unwrap(),
+            "exactly one independent live client commits"
+        );
         let assertion_count = restarted
             .query_cypher(&CypherQuery {
                 template_id: "integration_relationship_assertion_count",
@@ -635,6 +648,40 @@ itest!(
             .await
             .unwrap();
         assert_eq!(assertion_count.rows, vec![serde_json::json!([1])]);
+        let repair_peer = mem("outbox-repair-peer", 3, Visibility::Org);
+        let repair_edge = rel(memory.id, repair_peer.id, 1);
+        let region = RegionKey {
+            org: "test-org".into(),
+            project: "proj".into(),
+            memory_type: 3,
+        };
+        let mut feed = contender.subscribe_invalidations(&region).await.unwrap();
+        restarted.fail_next_publish_for_testing();
+        assert!(restarted
+            .upsert_batch_once(
+                "reasoning:publish-repair",
+                &[repair_peer.clone()],
+                &[repair_edge.clone()],
+            )
+            .await
+            .is_err());
+        assert!(!contender
+            .upsert_batch_once(
+                "reasoning:publish-repair",
+                &[repair_peer],
+                &[repair_edge.clone()],
+            )
+            .await
+            .unwrap());
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                if matches!(feed.next().await, Some(Ok(Invalidation::RelationshipUpserted { id, .. })) if id == repair_edge.id) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("marker replay republishes the committed relationship invalidation");
         let (claim_a, claim_b) = tokio::join!(
             restarted.claim_ingest_effect("worker-a", 2_000),
             contender.claim_ingest_effect("worker-b", 2_000),

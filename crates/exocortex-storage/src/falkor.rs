@@ -1312,7 +1312,21 @@ impl FalkorStorage {
         }
 
         for inv in invalidations {
-            self.publish(inv).await;
+            if import_key.is_some() {
+                // The durable operation marker makes a replay a no-op, so a
+                // publication failure must remain observable and replayable.
+                self.publish_checked(&inv).await?;
+            } else {
+                self.publish(inv).await;
+            }
+        }
+        if let Some(operation_key) = import_key {
+            self.run_template(
+                "idempotent_batch_publication_complete",
+                &serde_json::json!({ "operation_key": operation_key }),
+                false,
+            )
+            .await?;
         }
         Ok(Some(committed))
     }
@@ -1522,10 +1536,51 @@ impl Storage for FalkorStorage {
         ms: &[Memory],
         rs: &[Relationship],
     ) -> Result<bool, StorageError> {
-        Ok(self
+        let committed = self
             .upsert_batch_inner(ms, rs, None, None, Some(operation_key))
             .await?
-            .is_some())
+            .is_some();
+        let publication_pending = !self
+            .run_template(
+                "idempotent_batch_publication_pending",
+                &serde_json::json!({ "operation_key": operation_key }),
+                true,
+            )
+            .await?
+            .is_empty();
+        if !committed && publication_pending {
+            // A prior attempt may have committed the marker and graph rows but
+            // failed publication. Reconstruct authoritative invalidations on
+            // replay so the durable no-op repairs the change feed.
+            for memory in ms {
+                if let Some(current) = self.get_memory(&memory.id).await? {
+                    self.publish_checked(&Invalidation::MemoryUpserted {
+                        id: current.id,
+                        lsn: current.lsn.value,
+                    })
+                    .await?;
+                }
+            }
+            for relationship in self.expand_relationships(rs) {
+                if let Some(current) = self.get_relationship(&relationship.id).await? {
+                    self.publish_checked(&Invalidation::RelationshipUpserted {
+                        id: current.id,
+                        from: current.from,
+                        to: current.to,
+                        kind: current.kind,
+                        lsn: current.lsn.value,
+                    })
+                    .await?;
+                }
+            }
+            self.run_template(
+                "idempotent_batch_publication_complete",
+                &serde_json::json!({ "operation_key": operation_key }),
+                false,
+            )
+            .await?;
+        }
+        Ok(committed)
     }
 
     async fn commit_ingest_batch(

@@ -523,9 +523,32 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         required_params: &["import_key"],
         cypher: r#"
             MERGE (i:_GovernedImport {key: $import_key})
-            ON CREATE SET i.applied = false
+            ON CREATE SET i.applied = false, i.publication_pending = false
             WITH i WHERE i.applied = false
-            SET i.applied = true
+            SET i.applied = true, i.publication_pending = true
+        "#,
+    });
+
+    reg!(Template {
+        id: "idempotent_batch_publication_pending",
+        read_only: true,
+        required_params: &["operation_key"],
+        cypher: r#"
+            MATCH (i:_GovernedImport {key: $operation_key})
+            WHERE i.applied = true AND i.publication_pending = true
+            RETURN i.key
+        "#,
+    });
+
+    reg!(Template {
+        id: "idempotent_batch_publication_complete",
+        read_only: false,
+        required_params: &["operation_key"],
+        cypher: r#"
+            MATCH (i:_GovernedImport {key: $operation_key})
+            WHERE i.applied = true
+            SET i.publication_pending = false
+            RETURN i.key
         "#,
     });
 

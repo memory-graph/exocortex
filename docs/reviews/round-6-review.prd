@@ -551,3 +551,7 @@ storage-clock lease renewal plus atomic effect-keyed derived write settlement,
 expired-owner acknowledgement rejection, direct
 immutable-policy selection, a cancellation-safe supervised reasoning receiver,
 simultaneous cross-client claim regressions, and a fail-closed migration note.
+The subsequent strict pass promoted R6-R168–R6-R171: durable reasoning now
+settles successful zero-output work, uses canonical versioned seed keys,
+records publication-pending state with the atomic graph marker, repairs failed
+feed publication on replay, and keeps acknowledgement semantics backend-equal.

@@ -37,6 +37,7 @@ pub enum ReasoningWork {
     },
     /// Test/supervision probe: terminate this consumer without closing the
     /// engine-owned queue so its supervisor can restart it.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     StopWorker,
 }
@@ -96,6 +97,7 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
                             .await,
                     );
                 }
+                #[cfg(debug_assertions)]
                 ReasoningWork::StopWorker => return,
             }
         }
@@ -124,6 +126,7 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
     }
 
     /// Request a clean consumer exit while retaining the queue for restart.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub async fn stop_worker_for_testing(&self) {
         let _ = self.tx_work.send(ReasoningWork::StopWorker).await;
@@ -322,7 +325,7 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         operation_key: Option<&str>,
     ) -> Result<(), StorageError> {
         for m in ms {
-            let seed_key = operation_key.map(|key| format!("{key}:{m:?}"));
+            let seed_key = operation_key.map(|key| durable_seed_key(key, *m));
             self.try_k_hop_reason(*m, 3, seed_key.as_deref()).await?;
         }
         Ok(())
@@ -521,7 +524,7 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
             }
         }
 
-        if new_rels.is_empty() {
+        if new_rels.is_empty() && operation_key.is_none() {
             return Ok(());
         }
         // Idempotency uses indexed point reads over only the bounded derived
@@ -533,14 +536,17 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
                 None => fresh.push(relationship),
             }
         }
-        if !fresh.is_empty() {
-            if let Some(operation_key) = operation_key {
-                self.storage
-                    .upsert_batch_once(operation_key, &[], &fresh)
-                    .await?;
-            } else {
-                self.storage.upsert_batch(&[], &fresh).await?;
+        if let Some(operation_key) = operation_key {
+            let committed = self
+                .storage
+                .upsert_batch_once(operation_key, &[], &fresh)
+                .await?;
+            if committed && !fresh.is_empty() {
+                metrics::counter!("exocortex_rules_executed_total", "engine" => "crepe")
+                    .increment(fresh.len() as u64);
             }
+        } else if !fresh.is_empty() {
+            self.storage.upsert_batch(&[], &fresh).await?;
             metrics::counter!("exocortex_rules_executed_total", "engine" => "crepe")
                 .increment(fresh.len() as u64);
         }
@@ -575,6 +581,15 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
     fn storage_ontology(&self) -> exocortex_kernel::Ontology {
         storage_ontology(&self.storage)
     }
+}
+
+fn durable_seed_key(effect_key: &str, memory_id: MemoryId) -> String {
+    use std::fmt::Write as _;
+    let mut key = format!("reasoning:v1:{}:{effect_key}:", effect_key.len());
+    for byte in memory_id.0 {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
 }
 
 fn storage_ontology<S: Storage>(_: &Arc<S>) -> exocortex_kernel::Ontology {
@@ -622,4 +637,20 @@ fn fxhash_tag(tag: &str) -> u32 {
         h = h.wrapping_mul(0x0100_0193);
     }
     h
+}
+
+#[cfg(test)]
+mod durable_key_tests {
+    use super::*;
+
+    #[test]
+    fn durable_seed_identity_is_versioned_length_framed_raw_hex() {
+        let id = MemoryId([
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        assert_eq!(
+            durable_seed_key("effect", id),
+            "reasoning:v1:6:effect:0123456789abcdef0000000000000000"
+        );
+    }
 }
