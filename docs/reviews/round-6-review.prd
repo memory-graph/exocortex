@@ -433,3 +433,11 @@ not a substitute for first-party SSE admission and are owned by R6-R142.
 Principal policy files contain plaintext bearer credentials and the loader did
 not validate their mode, so that question is promoted as R6-R143 rather than
 closed by deployment assumption.
+
+The first complete workspace run after remediation promoted R6-R144. Five
+targets still encoded the replaced contracts: Round-1 ingest tests did not run
+the durable post-effect drainer; backend fixtures granted ordinary principals
+implicit audit access; out-of-process fixtures wrote principal secrets with
+ambient permissions; and the installed standalone test used a timing-sensitive
+supervisor observation. These are harness defects, not permission to weaken the
+new runtime controls.
