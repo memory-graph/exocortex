@@ -2585,6 +2585,76 @@ itest!(lease_race_single_winner, {
     assert!(second.epoch > 0, "epoch fencing increments");
 });
 
+itest!(demoted_owner_cannot_persist_a_discovery, {
+    let storage = connect("discovery-fence").await;
+    let key = LeaseKey::Dreams {
+        org: format!("discovery-fence-{}", graph_suffix()).into(),
+        region: "project:3".into(),
+    };
+    let stale = storage
+        .acquire_lease(&key, StdDuration::from_secs(30))
+        .await
+        .unwrap();
+    storage.release_lease(stale.clone()).await.unwrap();
+    let current = storage
+        .acquire_lease(&key, StdDuration::from_secs(30))
+        .await
+        .unwrap();
+    assert!(current.epoch > stale.epoch);
+    let current_record = DiscoveryRecord {
+        discovery_id: format!("current-discovery-{}", graph_suffix()).into(),
+        region: RegionKey {
+            org: "test-org".into(),
+            project: "project".into(),
+            memory_type: 3,
+        },
+        from: MemoryId([0x21; 16]),
+        to: MemoryId([0x22; 16]),
+        discovery_type: "transitive".into(),
+        quality: 0.6,
+        via_types: [1, 2],
+        discovery_cycle_id: "current-cycle".into(),
+        discovered_at: Utc::now(),
+    };
+    storage
+        .store_discovery_fenced(&current_record, &current)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage
+            .get_discovery(current_record.discovery_id.as_str())
+            .await
+            .unwrap(),
+        Some(current_record)
+    );
+    let record = DiscoveryRecord {
+        discovery_id: format!("stale-discovery-{}", graph_suffix()).into(),
+        region: RegionKey {
+            org: "test-org".into(),
+            project: "project".into(),
+            memory_type: 3,
+        },
+        from: MemoryId([0x31; 16]),
+        to: MemoryId([0x32; 16]),
+        discovery_type: "transitive".into(),
+        quality: 0.6,
+        via_types: [1, 2],
+        discovery_cycle_id: "stale-cycle".into(),
+        discovered_at: Utc::now(),
+    };
+
+    let stale_write = storage.store_discovery_fenced(&record, &stale).await;
+    assert!(
+        matches!(stale_write, Err(StorageError::FencedWriteRejected { .. })),
+        "stale discovery write result: {stale_write:?}"
+    );
+    assert!(storage
+        .get_discovery(record.discovery_id.as_str())
+        .await
+        .unwrap()
+        .is_none());
+});
+
 itest!(
     cross_node_durable_mutations_cannot_commit_below_graph_frontier,
     {

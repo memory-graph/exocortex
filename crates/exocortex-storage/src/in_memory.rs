@@ -1003,6 +1003,42 @@ impl Storage for InMemoryStorage {
         Ok(())
     }
 
+    async fn store_discovery_fenced(
+        &self,
+        discovery: &DiscoveryRecord,
+        lease: &OwnerLease,
+    ) -> Result<(), StorageError> {
+        let lsn = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            self.check_lease_current(lease)?;
+            if self
+                .inner
+                .proposals
+                .lock()
+                .unwrap()
+                .contains_key(&discovery.discovery_id)
+            {
+                return Err(StorageError::ProposalMismatch);
+            }
+            let mut discoveries = self.inner.discoveries.lock().unwrap();
+            match discoveries.get(&discovery.discovery_id) {
+                Some(stored) if stored == discovery => return Ok(()),
+                Some(_) => return Err(StorageError::ProposalMismatch),
+                None => {
+                    let lsn = self.lsn.load(Ordering::SeqCst) + 1;
+                    discoveries.insert(discovery.discovery_id.clone(), discovery.clone());
+                    self.lsn.store(lsn, Ordering::SeqCst);
+                    lsn
+                }
+            }
+        };
+        let _ = self.feed.send(Invalidation::DiscoveryAvailable {
+            record: discovery.clone(),
+            lsn,
+        });
+        Ok(())
+    }
+
     async fn get_discovery(
         &self,
         discovery_id: &str,
@@ -2050,6 +2086,58 @@ mod atomic_fence_tests {
             embedding: None,
             lsn: LSN::new_local(0),
         }
+    }
+
+    fn discovery(id: &str) -> DiscoveryRecord {
+        DiscoveryRecord {
+            discovery_id: id.into(),
+            region: RegionKey {
+                org: "org".into(),
+                project: "project".into(),
+                memory_type: 0,
+            },
+            from: MemoryId([1; 16]),
+            to: MemoryId([2; 16]),
+            discovery_type: "transitive".into(),
+            quality: 0.6,
+            via_types: [1, 2],
+            discovery_cycle_id: "cycle".into(),
+            discovered_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn demoted_owner_cannot_persist_a_discovery() {
+        let ontology = std::sync::Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = InMemoryStorage::new(ontology);
+        let key = LeaseKey::Dreams {
+            org: "org".into(),
+            region: "project:0".into(),
+        };
+        let stale = storage
+            .acquire_lease(&key, std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        storage.release_lease(stale.clone()).await.unwrap();
+        let current = storage
+            .acquire_lease(&key, std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(current.epoch > stale.epoch);
+
+        let record = discovery("stale-discovery");
+        assert!(matches!(
+            storage.store_discovery_fenced(&record, &stale).await,
+            Err(StorageError::FencedWriteRejected { .. })
+        ));
+        assert!(storage
+            .get_discovery(record.discovery_id.as_str())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

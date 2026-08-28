@@ -1716,6 +1716,51 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "fenced_discovery_record_store",
+        read_only: false,
+        required_params: &[
+            "lease_key",
+            "token",
+            "epoch",
+            "now_ms",
+            "discovery_id",
+            "org_id",
+            "region_project",
+            "region_memory_type",
+            "from",
+            "to",
+            "discovered_at",
+            "props_json",
+            "lsn"
+        ],
+        cypher: r#"
+            MATCH (l:_ExocortexLease {lease_key: $lease_key})
+            WHERE l.token = $token AND l.epoch = $epoch
+              AND l.expires_at_ms > $now_ms
+            MERGE (order:_ExocortexMeta {key: 'committed_lsn'})
+            ON CREATE SET order.value = 0
+            WITH l, order
+            WHERE order.value < $lsn
+            SET order.value = $lsn
+            WITH l
+            OPTIONAL MATCH (p:_DiscoveryProposal {discovery_id: $discovery_id})
+            WITH l, count(p) AS proposal_count
+            FOREACH (_ IN CASE WHEN proposal_count = 0 THEN [1] ELSE [] END |
+                MERGE (d:_Discovery {discovery_id: $discovery_id})
+                ON CREATE SET d.org_id = $org_id,
+                              d.region_project = $region_project,
+                              d.region_memory_type = $region_memory_type,
+                              d.from = $from,
+                              d.to = $to,
+                              d.discovered_at = $discovered_at,
+                              d.props_json = $props_json,
+                              d.lsn = $lsn,
+                              d.published = false)
+            RETURN l.epoch AS epoch
+        "#,
+    });
+
+    reg!(Template {
         id: "discovery_outbox_mark_published",
         read_only: false,
         required_params: &["discovery_id", "lsn"],

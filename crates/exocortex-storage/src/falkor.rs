@@ -995,6 +995,7 @@ impl FalkorStorage {
                 "migrate_memory_schema_v1"
                     | "repair_legacy_memory_v1"
                     | "discovery_outbox_mark_published"
+                    | "fenced_discovery_record_store"
             ) {
             None
         } else {
@@ -1281,6 +1282,24 @@ impl FalkorStorage {
             "issued_at": proposal.issued_at.to_rfc3339(),
             "props_json": serde_json::to_string(proposal)
                 .map_err(|e| StorageError::Backend(e.to_string()))?,
+        }))
+    }
+
+    fn discovery_create_params(
+        discovery: &DiscoveryRecord,
+        lsn: u64,
+    ) -> Result<serde_json::Value, StorageError> {
+        Ok(serde_json::json!({
+            "discovery_id": discovery.discovery_id,
+            "org_id": discovery.region.org,
+            "region_project": discovery.region.project,
+            "region_memory_type": discovery.region.memory_type,
+            "from": hex(&discovery.from.0),
+            "to": hex(&discovery.to.0),
+            "discovered_at": discovery.discovered_at.to_rfc3339(),
+            "props_json": serde_json::to_string(discovery)
+                .map_err(|error| StorageError::Backend(error.to_string()))?,
+            "lsn": lsn,
         }))
     }
 
@@ -2412,19 +2431,7 @@ impl Storage for FalkorStorage {
             return Ok(());
         }
         let lsn = self.next_lsn().await?;
-        let props_json = serde_json::to_string(discovery)
-            .map_err(|error| StorageError::Backend(error.to_string()))?;
-        let create_params = serde_json::json!({
-            "discovery_id": discovery.discovery_id,
-            "org_id": discovery.region.org,
-            "region_project": discovery.region.project,
-            "region_memory_type": discovery.region.memory_type,
-            "from": hex(&discovery.from.0),
-            "to": hex(&discovery.to.0),
-            "discovered_at": discovery.discovered_at.to_rfc3339(),
-            "props_json": props_json,
-            "lsn": lsn,
-        });
+        let create_params = Self::discovery_create_params(discovery, lsn)?;
         if !self
             .run_atomic_parts(&[("batch_discovery_record_store", create_params)])
             .await?
@@ -2491,6 +2498,36 @@ impl Storage for FalkorStorage {
             }
         }
         Ok(())
+    }
+
+    async fn store_discovery_fenced(
+        &self,
+        discovery: &DiscoveryRecord,
+        lease: &OwnerLease,
+    ) -> Result<(), StorageError> {
+        let lsn = self.next_lsn().await?;
+        let mut params = Self::discovery_create_params(discovery, lsn)?;
+        let serde_json::Value::Object(ref mut values) = params else {
+            unreachable!("discovery params are an object")
+        };
+        values.insert(
+            "lease_key".into(),
+            serde_json::to_string(&lease.key)
+                .map_err(|error| StorageError::Backend(error.to_string()))?
+                .into(),
+        );
+        values.insert("token".into(), lease.fencing_token.as_str().into());
+        values.insert("epoch".into(), lease.epoch.into());
+        values.insert("now_ms".into(), Utc::now().timestamp_millis().into());
+        let rows = self
+            .run_template("fenced_discovery_record_store", &params, false)
+            .await?;
+        if rows.is_empty() {
+            return Err(StorageError::FencedWriteRejected {
+                lease_epoch: lease.epoch,
+            });
+        }
+        self.store_discovery(discovery).await
     }
 
     async fn get_discovery(

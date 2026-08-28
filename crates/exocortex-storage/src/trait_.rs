@@ -203,6 +203,18 @@ pub trait Storage: Send + Sync + 'static {
             "discovery records unsupported".into(),
         ))
     }
+    /// Persist one Dreams discovery only while `lease` is the current owner.
+    /// The fence check and durable creation are one atomic operation.
+    async fn store_discovery_fenced(
+        &self,
+        discovery: &DiscoveryRecord,
+        lease: &OwnerLease,
+    ) -> crate::Result<()> {
+        let _ = (discovery, lease);
+        Err(StorageError::Backend(
+            "fenced discovery records unsupported".into(),
+        ))
+    }
     /// Load one durable unasserted discovery by id.
     async fn get_discovery(&self, discovery_id: &str) -> crate::Result<Option<DiscoveryRecord>> {
         let _ = discovery_id;

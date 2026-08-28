@@ -593,33 +593,20 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         }
     }
 
-    /// The production Dreams loop: consolidation followed by discovery.
+    /// The production Dreams loop: consolidation and discovery under one
+    /// region-owner lease.
     pub async fn run(self: Arc<Self>) {
         while let Some((region, fired_at)) = { self.rx_fire.lock().await.recv().await } {
-            let consolidation_ok = match self.try_consolidate(&region).await {
+            let success = match self.try_consolidate(&region).await {
                 Ok(res) => {
                     *self.last_result.write().await = Some(res.clone());
-                    info!(?res, "consolidation ok");
+                    info!(?res, "Dreams cycle ok");
                     true
                 }
                 Err(e) => {
-                    warn!(?e, "consolidation failed");
+                    warn!(?e, "Dreams cycle failed");
                     false
                 }
-            };
-            let success = if consolidation_ok {
-                match self.run_discovery(&region).await {
-                    Ok(proposals) => {
-                        info!(count = proposals.len(), "discovery ok");
-                        true
-                    }
-                    Err(e) => {
-                        warn!(?e, "discovery failed");
-                        false
-                    }
-                }
-            } else {
-                false
             };
             self.complete_region(&region, fired_at, success);
             if let Some((_, notification)) = self.distributed_notifications.remove(&region) {
@@ -731,6 +718,24 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 }
                 outcome = &mut finishing => outcome,
             }
+        };
+        let outcome = match outcome {
+            Ok(result) if !renewal_stopped && !crashed => {
+                let discovery = self.run_discovery_fenced(region, &lease);
+                tokio::pin!(discovery);
+                tokio::select! {
+                    biased;
+                    renewal_outcome = &mut renewal => {
+                        renewal_stopped = true;
+                        Err(Self::renewal_task_error(renewal_outcome))
+                    }
+                    outcome = &mut discovery => outcome.map(|proposals| {
+                        info!(count = proposals.len(), "discovery ok");
+                        result
+                    }),
+                }
+            }
+            other => other,
         };
         if !renewal_stopped {
             renewal.abort();
@@ -1474,7 +1479,46 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     /// the graph (R-Dr1/R-T16) — they wait in `pending_discoveries` for
     /// `accept_discovery`.
     pub async fn run_discovery(&self, region: &RegionKey) -> anyhow::Result<Vec<Discovery>> {
-        self.validate_region(region).await?;
+        let lease_key = LeaseKey::Dreams {
+            org: region.org.clone(),
+            region: format!("{}:{}", region.project, region.memory_type).into(),
+        };
+        let lease = self
+            .storage
+            .acquire_lease(&lease_key, self.lease_ttl)
+            .await
+            .map_err(|error| anyhow::anyhow!("lease: {error}"))?;
+        let mut renewal = self.spawn_lease_renewal(lease.clone());
+        let outcome = {
+            let discovery = async {
+                self.validate_region(region).await?;
+                self.run_discovery_fenced(region, &lease).await
+            };
+            tokio::pin!(discovery);
+            tokio::select! {
+                biased;
+                renewal_outcome = &mut renewal => Err(Self::renewal_task_error(renewal_outcome)),
+                outcome = &mut discovery => outcome,
+            }
+        };
+        renewal.abort();
+        let _ = renewal.await;
+        let release = self.storage.release_lease(lease).await;
+        match (outcome, release) {
+            (Ok(discoveries), Ok(())) => Ok(discoveries),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(release)) => Err(anyhow::anyhow!("release Dreams lease: {release}")),
+            (Err(error), Err(release)) => Err(anyhow::anyhow!(
+                "discovery failed ({error}); lease release also failed ({release})"
+            )),
+        }
+    }
+
+    async fn run_discovery_fenced(
+        &self,
+        region: &RegionKey,
+        lease: &exocortex_storage::OwnerLease,
+    ) -> anyhow::Result<Vec<Discovery>> {
         let relationships = self
             .storage
             .relationships_in_region(region, MAX_DISCOVERY_PATH_INSPECTIONS as u32)
@@ -1508,17 +1552,20 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         self.discoveries.clear();
         for discovery in &out {
             self.storage
-                .store_discovery(&exocortex_storage::DiscoveryRecord {
-                    discovery_id: discovery.id.to_string().into(),
-                    region: region.clone(),
-                    from: discovery.endpoints.0,
-                    to: discovery.endpoints.1,
-                    discovery_type: "transitive".into(),
-                    quality: discovery.quality,
-                    via_types: [discovery.via_types.0, discovery.via_types.1],
-                    discovery_cycle_id: discovery.discovery_cycle_id.clone(),
-                    discovered_at: discovery.discovered_at,
-                })
+                .store_discovery_fenced(
+                    &exocortex_storage::DiscoveryRecord {
+                        discovery_id: discovery.id.to_string().into(),
+                        region: region.clone(),
+                        from: discovery.endpoints.0,
+                        to: discovery.endpoints.1,
+                        discovery_type: "transitive".into(),
+                        quality: discovery.quality,
+                        via_types: [discovery.via_types.0, discovery.via_types.1],
+                        discovery_cycle_id: discovery.discovery_cycle_id.clone(),
+                        discovered_at: discovery.discovered_at,
+                    },
+                    lease,
+                )
                 .await?;
             emit_discovery_metric(discovery);
             self.discoveries.insert(discovery.id, discovery.clone());
