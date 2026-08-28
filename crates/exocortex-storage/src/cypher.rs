@@ -1216,23 +1216,27 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "claim_schema_v0",
         read_only: false,
-        required_params: &[],
+        required_params: &["migration_token"],
         cypher: r#"
-            MERGE (m:_ExocortexMeta {key: 'schema_version'})
-            ON CREATE SET m.value = 0
-            WITH m WHERE m.value = 0
-            RETURN m.value
+            MERGE (schema:_ExocortexMeta {key: 'schema_version'})
+            ON CREATE SET schema.value = 0
+            WITH schema WHERE schema.value = 0
+            MERGE (owner:_ExocortexMeta {key: 'schema_migration_owner'})
+            SET owner.value = $migration_token
+            RETURN schema.value
         "#,
     });
 
     reg!(Template {
         id: "finish_schema_migration_v1",
         read_only: false,
-        required_params: &["from_version", "to_version"],
+        required_params: &["from_version", "to_version", "migration_token"],
         cypher: r#"
-            MATCH (m:_ExocortexMeta {key: 'schema_version', value: $from_version})
-            SET m.value = $to_version
-            RETURN m.value
+            MATCH (schema:_ExocortexMeta {key: 'schema_version', value: $from_version})
+            MATCH (owner:_ExocortexMeta {key: 'schema_migration_owner', value: $migration_token})
+            SET schema.value = $to_version
+            DELETE owner
+            RETURN schema.value
         "#,
     });
 
@@ -1278,11 +1282,15 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "invalidated_by",
             "recorded_at",
             "lsn",
-            "expected_schema_version"
+            "expected_schema_version",
+            "migration_token"
         ],
         cypher: r#"
             MATCH (schema:_ExocortexMeta {key: 'schema_version', value: $expected_schema_version})
-            WITH schema
+            OPTIONAL MATCH (owner:_ExocortexMeta {key: 'schema_migration_owner'})
+            WITH schema, owner
+            WHERE ($expected_schema_version = 1 AND $migration_token = '')
+               OR owner.value = $migration_token
             MATCH (m:Memory {id: $id})
             WHERE m.lsn = $lsn
             SET m.memory_type_label = $memory_type_label,
@@ -1347,11 +1355,15 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "invalidated_by",
             "recorded_at",
             "lsn",
-            "expected_schema_version"
+            "expected_schema_version",
+            "migration_token"
         ],
         cypher: r#"
             MATCH (schema:_ExocortexMeta {key: 'schema_version', value: $expected_schema_version})
-            WITH schema
+            OPTIONAL MATCH (owner:_ExocortexMeta {key: 'schema_migration_owner'})
+            WITH schema, owner
+            WHERE ($expected_schema_version = 1 AND $migration_token = '')
+               OR owner.value = $migration_token
             MATCH (m:Memory {id: $id})
             WHERE m.lsn = $lsn
             OPTIONAL MATCH (current:_MemoryAssertion {id: m.id, lsn: m.lsn})
@@ -1379,10 +1391,11 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "migrate_relationship_schema_v1",
         read_only: false,
-        required_params: &["rel_id", "expected_schema_version"],
+        required_params: &["rel_id", "expected_schema_version", "migration_token"],
         cypher: r#"
             MATCH (schema:_ExocortexMeta {key: 'schema_version', value: $expected_schema_version})
-            WITH schema
+            MATCH (owner:_ExocortexMeta {key: 'schema_migration_owner', value: $migration_token})
+            WITH schema, owner
             MATCH ()-[r]->() WHERE r.id = $rel_id
             MERGE (h:_RelationshipAssertion {id: r.id, lsn: r.lsn})
             ON CREATE SET h.from = startNode(r).id,
@@ -1411,6 +1424,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (rh:_RelationshipAssertion) DELETE rh
             WITH memory_count, memory_history_count, count(rh) AS relationship_history_count
             MATCH (v:_ExocortexMeta {key: 'schema_version'}) DELETE v
+            WITH memory_count, memory_history_count, relationship_history_count
+            OPTIONAL MATCH (owner:_ExocortexMeta {key: 'schema_migration_owner'}) DELETE owner
             RETURN memory_count, memory_history_count, relationship_history_count
         "#,
     });

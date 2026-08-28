@@ -541,6 +541,7 @@ itest!(
                 "recorded_at": captured.recorded_at.to_rfc3339(),
                 "lsn": captured_lsn,
                 "expected_schema_version": 1,
+                "migration_token": "",
             }),
             read_only: false,
             deadline: Utc::now() + Duration::seconds(5),
@@ -568,7 +569,7 @@ itest!(
         storage
             .query_cypher(&CypherQuery {
                 template_id: "claim_schema_v0",
-                params: serde_json::json!({}),
+                params: serde_json::json!({ "migration_token": "future-test-owner" }),
                 read_only: false,
                 deadline: Utc::now() + Duration::seconds(5),
             })
@@ -604,6 +605,7 @@ itest!(
                 "recorded_at": captured.recorded_at.to_rfc3339(),
                 "lsn": captured.lsn.value,
                 "expected_schema_version": 0,
+                "migration_token": "future-test-owner",
             }),
             read_only: false,
             deadline: Utc::now() + Duration::seconds(5),
@@ -614,7 +616,11 @@ itest!(
         let finish = storage
             .query_cypher(&CypherQuery {
                 template_id: "finish_schema_migration_v1",
-                params: serde_json::json!({ "from_version": 0, "to_version": 1 }),
+                params: serde_json::json!({
+                    "from_version": 0,
+                    "to_version": 1,
+                    "migration_token": "future-test-owner",
+                }),
                 read_only: false,
                 deadline: Utc::now() + Duration::seconds(5),
             })
@@ -911,6 +917,73 @@ itest!(
         assert_eq!(state.relationship_count, 2, "edge plus required inverse");
     }
 );
+
+itest!(
+    concurrent_compatible_migrators_share_one_recoverable_owner,
+    {
+        let graph = format!("exocortex_test_{}", graph_suffix());
+        let first = connect_graph("migration-owner-seed", graph.clone()).await;
+        let memory = mem("migration-owner-row", 3, Visibility::Org);
+        first.upsert_memory(&memory).await.unwrap();
+        first.make_legacy_schema_for_testing().await.unwrap();
+        drop(first);
+
+        let url = falkor_url().unwrap();
+        let config = |node: &str| FalkorConfig {
+            falkor_url: url.clone(),
+            redis_url: std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+            graph_name: graph.clone(),
+            org_id: "test-org".into(),
+            node_id: node.into(),
+        };
+        let (left, right) = tokio::join!(
+            FalkorStorage::connect(config("migration-owner-left"), ontology()),
+            FalkorStorage::connect(config("migration-owner-right"), ontology()),
+        );
+        let left = left.expect("first compatible connector succeeds");
+        let right = right.expect("waiting compatible connector accepts target schema");
+        assert_eq!(
+            left.get_memory(&memory.id).await.unwrap().unwrap().id,
+            memory.id
+        );
+        assert_eq!(
+            right.get_memory(&memory.id).await.unwrap().unwrap().id,
+            memory.id
+        );
+        let assertions = left
+            .query_cypher(&CypherQuery {
+                template_id: "integration_memory_assertion_count",
+                params: serde_json::json!({ "id": id_hex(&memory.id.0) }),
+                read_only: true,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(assertions.rows, vec![serde_json::json!([1])]);
+        let schema = right
+            .query_cypher(&CypherQuery {
+                template_id: "read_schema_version",
+                params: serde_json::json!({}),
+                read_only: true,
+                deadline: Utc::now() + Duration::seconds(5),
+            })
+            .await
+            .unwrap();
+        assert_eq!(schema.rows, vec![serde_json::json!([1])]);
+    }
+);
+
+itest!(snapshot_frontier_failure_is_not_reported_as_lsn_zero, {
+    let storage = connect("snapshot-frontier-failure").await;
+    storage.fail_next_backend_lsn_for_testing();
+    let result = storage.get_state_at(Utc::now()).await;
+    assert!(matches!(
+        result,
+        Err(StorageError::Backend(detail))
+            if detail == "injected backend LSN frontier failure"
+    ));
+});
 
 itest!(ingest_settlement_survives_backend_reconnect, {
     let first = connect("ingest-restart-a").await;
@@ -2635,7 +2708,6 @@ itest!(batch_invalidation_publish_uses_one_redis_round_trip, {
         .subscribe_invalidations(&region)
         .await
         .expect("subscribe before batch commit");
-    tokio::time::sleep(StdDuration::from_millis(100)).await;
     publisher.take_publish_round_trips_for_testing();
     let memories = (0..64)
         .map(|index| mem(&format!("publish-batch-{index}"), 3, Visibility::Org))

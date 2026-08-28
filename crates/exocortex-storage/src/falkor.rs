@@ -68,6 +68,8 @@ pub struct FalkorStorage {
     #[cfg(feature = "integration")]
     fail_next_publish: std::sync::atomic::AtomicBool,
     #[cfg(feature = "integration")]
+    fail_next_backend_lsn: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "integration")]
     pause_next_publish: std::sync::atomic::AtomicBool,
     #[cfg(feature = "integration")]
     publish_paused: tokio::sync::Notify,
@@ -420,6 +422,8 @@ impl FalkorStorage {
             #[cfg(feature = "integration")]
             fail_next_publish: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "integration")]
+            fail_next_backend_lsn: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "integration")]
             pause_next_publish: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "integration")]
             publish_paused: tokio::sync::Notify::new(),
@@ -517,8 +521,64 @@ impl FalkorStorage {
             return Ok(());
         }
 
+        const LOCK_TTL_MS: u64 = 30_000;
+        const WAIT_ATTEMPTS: usize = 6_000;
+        let lock_key = format!("exocortex:{}:{}:schema-migration", self.org_id, self.graph);
+        let sequence_key = format!("{lock_key}:sequence");
+        let sequence: u64 = self
+            .redis
+            .clone()
+            .incr(&sequence_key, 1u64)
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        let token = format!("{}:{sequence}", self.node_id);
+        for _ in 0..WAIT_ATTEMPTS {
+            let acquired: Option<String> = redis::cmd("SET")
+                .arg(&lock_key)
+                .arg(&token)
+                .arg("NX")
+                .arg("PX")
+                .arg(LOCK_TTL_MS)
+                .query_async(&mut self.redis.clone())
+                .await
+                .map_err(|error| StorageError::Backend(error.to_string()))?;
+            if acquired.is_some() {
+                let outcome = self
+                    .migrate_schema_owned(&lock_key, &token, LOCK_TTL_MS)
+                    .await;
+                if let Err(error) = self.release_schema_migration_lock(&lock_key, &token).await {
+                    tracing::warn!(?error, "schema migration lock cleanup will rely on expiry");
+                }
+                return outcome;
+            }
+            let rows = self
+                .run_template("read_schema_version", &serde_json::json!({}), true)
+                .await?;
+            if !schema_needs_migration(&rows)? {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Err(StorageError::Backend(
+            "timed out waiting for compatible schema migration owner".into(),
+        ))
+    }
+
+    async fn migrate_schema_owned(
+        &self,
+        lock_key: &str,
+        token: &str,
+        lock_ttl_ms: u64,
+    ) -> Result<(), StorageError> {
+        self.renew_schema_migration_lock(lock_key, token, lock_ttl_ms)
+            .await?;
+
         let claim = self
-            .run_template("claim_schema_v0", &serde_json::json!({}), false)
+            .run_template(
+                "claim_schema_v0",
+                &serde_json::json!({ "migration_token": token }),
+                false,
+            )
             .await?;
         if claim.is_empty() {
             return Err(StorageError::CorruptMetadata {
@@ -529,6 +589,8 @@ impl FalkorStorage {
 
         let mut memories = <Self as Storage>::stream_all_memories(self).await;
         while let Some(memory) = memories.next().await {
+            self.renew_schema_migration_lock(lock_key, token, lock_ttl_ms)
+                .await?;
             #[cfg(feature = "integration")]
             self.migration_peak_rows.fetch_max(1, Ordering::SeqCst);
             let mut memory = memory?;
@@ -547,6 +609,10 @@ impl FalkorStorage {
                 .as_object_mut()
                 .expect("memory params are an object")
                 .insert("expected_schema_version".into(), serde_json::json!(0));
+            params
+                .as_object_mut()
+                .expect("memory params are an object")
+                .insert("migration_token".into(), serde_json::json!(token));
             let migrated = self
                 .run_template("migrate_memory_schema_v1", &params, false)
                 .await?;
@@ -561,6 +627,8 @@ impl FalkorStorage {
 
         let mut relationships = <Self as Storage>::stream_all_relationships(self).await;
         while let Some(relationship) = relationships.next().await {
+            self.renew_schema_migration_lock(lock_key, token, lock_ttl_ms)
+                .await?;
             #[cfg(feature = "integration")]
             self.migration_peak_rows.fetch_max(1, Ordering::SeqCst);
             let relationship = relationship?;
@@ -570,6 +638,7 @@ impl FalkorStorage {
                     &serde_json::json!({
                         "rel_id": hex(&relationship.id.0),
                         "expected_schema_version": 0,
+                        "migration_token": token,
                     }),
                     false,
                 )
@@ -580,7 +649,10 @@ impl FalkorStorage {
         }
         drop(relationships);
 
-        self.repair_legacy_memories().await?;
+        self.repair_legacy_memories_with_lock(Some((lock_key, token, lock_ttl_ms)))
+            .await?;
+        self.renew_schema_migration_lock(lock_key, token, lock_ttl_ms)
+            .await?;
 
         let finished = self
             .run_template(
@@ -588,6 +660,7 @@ impl FalkorStorage {
                 &serde_json::json!({
                     "from_version": 0,
                     "to_version": STORAGE_SCHEMA_VERSION,
+                    "migration_token": token,
                 }),
                 false,
             )
@@ -599,6 +672,46 @@ impl FalkorStorage {
                 detail: "v0 migration lost its final schema transition".into(),
             });
         }
+        Ok(())
+    }
+
+    async fn renew_schema_migration_lock(
+        &self,
+        lock_key: &str,
+        token: &str,
+        ttl_ms: u64,
+    ) -> Result<(), StorageError> {
+        let renewed: i64 = redis::cmd("EVAL")
+            .arg("if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) else return 0 end")
+            .arg(1)
+            .arg(lock_key)
+            .arg(token)
+            .arg(ttl_ms)
+            .query_async(&mut self.redis.clone())
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        if renewed == 1 {
+            Ok(())
+        } else {
+            Err(StorageError::Backend(
+                "schema migration ownership expired or was replaced".into(),
+            ))
+        }
+    }
+
+    async fn release_schema_migration_lock(
+        &self,
+        lock_key: &str,
+        token: &str,
+    ) -> Result<(), StorageError> {
+        let _: i64 = redis::cmd("EVAL")
+            .arg("if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end")
+            .arg(1)
+            .arg(lock_key)
+            .arg(token)
+            .query_async(&mut self.redis.clone())
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
         Ok(())
     }
 
@@ -648,6 +761,13 @@ impl FalkorStorage {
     /// has no canonical assertion. Current-shaped tenantless rows retain their
     /// assertion and remain fail-closed.
     async fn repair_legacy_memories(&self) -> Result<(), StorageError> {
+        self.repair_legacy_memories_with_lock(None).await
+    }
+
+    async fn repair_legacy_memories_with_lock(
+        &self,
+        migration_lock: Option<(&str, &str, u64)>,
+    ) -> Result<(), StorageError> {
         let schema = self
             .run_template("read_schema_version", &serde_json::json!({}), true)
             .await?;
@@ -657,6 +777,9 @@ impl FalkorStorage {
             STORAGE_SCHEMA_VERSION
         };
         loop {
+            if let Some((key, token, ttl_ms)) = migration_lock {
+                self.renew_schema_migration_lock(key, token, ttl_ms).await?;
+            }
             let rows = self
                 .run_template(
                     "legacy_memory_candidates",
@@ -676,10 +799,9 @@ impl FalkorStorage {
                     });
                 };
                 let mut memory = memory_from_value(value)?;
-                if memory.context.tenant_id.is_some() {
-                    continue;
+                if memory.context.tenant_id.is_none() {
+                    memory.context.tenant_id = Some(self.org_id.clone());
                 }
-                memory.context.tenant_id = Some(self.org_id.clone());
                 let label = self
                     .ontology
                     .memory_type_names
@@ -694,6 +816,13 @@ impl FalkorStorage {
                     .insert(
                         "expected_schema_version".into(),
                         serde_json::json!(expected_schema_version),
+                    );
+                params
+                    .as_object_mut()
+                    .expect("memory params are an object")
+                    .insert(
+                        "migration_token".into(),
+                        serde_json::json!(migration_lock.map(|(_, token, _)| token).unwrap_or("")),
                     );
                 let changed = self
                     .run_template("repair_legacy_memory_v1", &params, false)
@@ -2959,23 +3088,21 @@ impl Storage for FalkorStorage {
         let rel_rows = self
             .run_template("count_state_at_rels", &params, true)
             .await?;
-        let n = |rows: &Vec<Vec<FalkorValue>>| {
-            rows.first()
-                .and_then(|r| r.first())
-                .and_then(|v| {
-                    if let FalkorValue::I64(i) = v {
-                        Some(*i as u64)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0)
+        let n = |rows: &[Vec<FalkorValue>], key: &'static str| match rows
+            .first()
+            .and_then(|row| row.first())
+        {
+            Some(FalkorValue::I64(value)) if *value >= 0 => Ok(*value as u64),
+            other => Err(StorageError::CorruptMetadata {
+                key,
+                detail: format!("expected one non-negative integer count, got {other:?}"),
+            }),
         };
         Ok(GraphSnapshot {
             as_of: t,
-            backend_lsn: self.last_backend_lsn().await,
-            memory_count: n(&mem_rows),
-            relationship_count: n(&rel_rows),
+            backend_lsn: self.last_backend_lsn().await?,
+            memory_count: n(&mem_rows, "snapshot_memory_count")?,
+            relationship_count: n(&rel_rows, "snapshot_relationship_count")?,
         })
     }
 
@@ -3762,9 +3889,34 @@ impl FalkorStorage {
     pub fn release_paused_lsn_for_testing(&self) {
         self.lsn_release.notify_one();
     }
+    /// Inject a Redis frontier failure before the next snapshot read.
+    #[cfg(feature = "integration")]
+    #[doc(hidden)]
+    pub fn fail_next_backend_lsn_for_testing(&self) {
+        self.fail_next_backend_lsn.store(true, Ordering::SeqCst);
+    }
     /// Current backend LSN frontier (Redis GET).
-    async fn last_backend_lsn(&self) -> u64 {
-        self.redis.clone().get(&self.lsn_key).await.unwrap_or(0)
+    async fn last_backend_lsn(&self) -> Result<u64, StorageError> {
+        #[cfg(feature = "integration")]
+        if self.fail_next_backend_lsn.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::Backend(
+                "injected backend LSN frontier failure".into(),
+            ));
+        }
+        let value: Option<i64> = self
+            .redis
+            .clone()
+            .get(&self.lsn_key)
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        match value {
+            None => Ok(0),
+            Some(value) if value >= 0 => Ok(value as u64),
+            Some(value) => Err(StorageError::CorruptMetadata {
+                key: "backend_lsn",
+                detail: format!("expected a non-negative Redis integer, got {value}"),
+            }),
+        }
     }
 }
 
