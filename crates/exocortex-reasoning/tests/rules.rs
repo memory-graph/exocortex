@@ -3,6 +3,7 @@
 //! Steel tree naming every input fact; R6 reverses Solves; the read path
 //! carries no serialization (CR-8).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use exocortex_kernel::{
@@ -331,11 +332,83 @@ async fn derived_writeback_is_idempotent() {
 
 #[tokio::test]
 async fn queue_overflow_is_observable_not_silent() {
+    #[derive(Default)]
+    struct CounterValue(AtomicU64);
+
+    impl metrics::CounterFn for CounterValue {
+        fn increment(&self, value: u64) {
+            self.0.fetch_add(value, Ordering::SeqCst);
+        }
+
+        fn absolute(&self, value: u64) {
+            self.0.fetch_max(value, Ordering::SeqCst);
+        }
+    }
+
+    struct DropRecorder {
+        dropped: Arc<CounterValue>,
+    }
+
+    impl metrics::Recorder for DropRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            if key.name() == "exocortex_reasoning_dropped_total" {
+                metrics::Counter::from_arc(self.dropped.clone())
+            } else {
+                metrics::Counter::noop()
+            }
+        }
+
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    let dropped = Arc::new(CounterValue::default());
+    let recorder = DropRecorder {
+        dropped: dropped.clone(),
+    };
+    let _recorder = metrics::set_default_local_recorder(&recorder);
     let onto = ontology();
     let storage = InMemoryStorage::new(onto);
     let engine = ReasoningEngine::new(Arc::new(storage.clone_dyn()), 1, 2);
-    // Depth-1 queue with no consumer: the second enqueue must not panic and
-    // must register the drop (metrics counter; observable via no-crash here).
+    // Depth-1 queue with no consumer: the second enqueue must register one
+    // observable drop rather than silently losing work.
     engine
         .enqueue(ReasoningWork::KHopOver {
             seed: MemoryId::new_v7(),
@@ -348,6 +421,7 @@ async fn queue_overflow_is_observable_not_silent() {
             k: 2,
         })
         .await;
+    assert_eq!(dropped.0.load(Ordering::SeqCst), 1);
 }
 
 #[test]

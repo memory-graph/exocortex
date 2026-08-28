@@ -763,6 +763,7 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
                     source.contains(needle),
                     "criterion {criterion} evidence symbol `{needle}` is absent from {relative}"
                 );
+                validate_executable_evidence(criterion, relative, needle, &source, columns[4])?;
             }
         }
     }
@@ -770,6 +771,54 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
         seen.len() == 30,
         "acceptance matrix covers {} of 30 criteria",
         seen.len()
+    );
+    Ok(())
+}
+
+fn validate_executable_evidence(
+    criterion: u8,
+    relative: &str,
+    needle: &str,
+    source: &str,
+    command: &str,
+) -> Result<()> {
+    if !relative.ends_with(".rs") {
+        return Ok(());
+    }
+    let symbol = needle
+        .strip_prefix("fn ")
+        .unwrap_or(needle)
+        .split(|character: char| character == '(' || character.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    let function_pattern = format!("fn {symbol}");
+    let Some(function_offset) = source.find(&function_pattern) else {
+        // Some Rust evidence is deliberately a constant, method call, or
+        // invariant-bearing expression rather than a test function.
+        return Ok(());
+    };
+    let prefix = &source[..function_offset];
+    let attribute_window = &prefix[prefix.len().saturating_sub(512)..];
+    let is_test = attribute_window.contains("#[test")
+        || attribute_window.contains("#[tokio::test");
+    anyhow::ensure!(
+        !(relative.starts_with("tests/") || relative.contains("/tests/")) || is_test,
+        "criterion {criterion} evidence `{relative}::{needle}` is not an executable test"
+    );
+    if !is_test {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !attribute_window.contains("#[ignore"),
+        "criterion {criterion} evidence `{relative}::{needle}` is ignored"
+    );
+    let target = std::path::Path::new(relative)
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default();
+    anyhow::ensure!(
+        command.contains(symbol) || command.contains(&format!("--test {target}")),
+        "criterion {criterion} command does not execute evidence `{relative}::{needle}`"
     );
     Ok(())
 }
@@ -1309,7 +1358,7 @@ mod tests {
             "docs/master-plan.prd",
             "| R6-B30-14 | missing stamp |\n",
         );
-        write(&root, "tests/direct.rs", "fn direct_case() {}\n");
+        write(&root, "tests/direct.rs", "#[test]\nfn direct_case() {}\n");
         let header = "criterion\tstatus\trequirement\texecutable_evidence\tcommand\ttracking\n";
         let mut rows = String::from(header);
         for criterion in 1..=30 {
@@ -1329,6 +1378,22 @@ mod tests {
             "tests/direct.rs::removed_case",
         );
         write(&root, "docs/acceptance/section-23.tsv", &stale);
+        assert!(validate_acceptance_matrix(&root).is_err());
+
+        write(&root, "tests/direct.rs", "fn direct_case() {}\n");
+        write(&root, "docs/acceptance/section-23.tsv", &rows);
+        assert!(validate_acceptance_matrix(&root).is_err());
+
+        write(
+            &root,
+            "tests/direct.rs",
+            "#[test]\n#[ignore]\nfn direct_case() {}\n",
+        );
+        assert!(validate_acceptance_matrix(&root).is_err());
+
+        write(&root, "tests/direct.rs", "#[test]\nfn direct_case() {}\n");
+        let mismatched = rows.replace("cargo test direct_case", "cargo test unrelated");
+        write(&root, "docs/acceptance/section-23.tsv", &mismatched);
         assert!(validate_acceptance_matrix(&root).is_err());
     }
 }
