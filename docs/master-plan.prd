@@ -313,6 +313,19 @@ idea:
 | R6-R35 | Final strict-review documentation truth: reconcile the stale B30-27 milestone entry with its later executable closure | Codex | Done — the report preserves the original conflict and records the later append-only assertion resolution without changing the PRD |
 | R6-R36 | Final strict-review discovery delivery: publish newly persisted structured discoveries over the authenticated SSE change feed | Codex | Done — persistence publishes a typed record once, SSE filters both endpoints per caller, and clients advance order without mutating the graph cache |
 | R6-R37 | Final validation test quality: make the per-client SSE HMAC test establish an authoritative authenticated reseed frontier | Codex | Done — the test waits for a derived-key-verified initial image before exercising live delivery instead of manufacturing an unrelated gap around a manual cache seed |
+| R6-R38 | Strict-review SSE ordering: trigger revocation reseed when an out-of-order held visibility advance is released | Codex | In progress — verified blocking finding from the fresh correctness lens |
+| R6-R39 | Strict-review cache hydration: reject partial authoritative snapshots on any storage stream error | Codex | In progress — verified blocking finding from the fresh correctness lens |
+| R6-R40 | Strict-review Dreams reads: abort owner work rather than mutating from a truncated storage scan | Codex | In progress — verified blocking finding from the fresh correctness lens |
+| R6-R41 | Strict-review lease lifecycle: supervise renewal failure and restore the exact preimage before lease loss | Codex | In progress — verified blocking finding from the fresh correctness lens |
+| R6-R42 | Strict-review ingest idempotency: fail closed on malformed persisted Falkor settlement fields | Codex | In progress — verified blocking finding from the fresh correctness lens |
+| R6-R43 | Strict-review live discovery parity: prove Falkor persistence-before-publication and retry idempotency | Codex | In progress — verified advisory from the fresh test-quality lens |
+| R6-R44 | Strict-review conformance truth: reject empty/configured-out live Falkor test targets | Codex | In progress — verified advisory from the fresh test-quality lens |
+| R6-R45 | Strict-review transport security: reject remote plaintext backend URLs before attaching bearer credentials | Codex | In progress — verified blocking finding from the fresh security lens |
+| R6-R46 | Strict-review producer authentication: separate registered producer signing keys from the cluster peer key | Codex | In progress — verified blocking finding from the fresh security lens |
+| R6-R47 | Strict-review checksum integrity: replace delimiter-based batch canonicalization with an unambiguous versioned encoding | Codex | In progress — verified blocking finding from the fresh security lens |
+| R6-R48 | Strict-review derived visibility: derive Dreams `SimilarTo` visibility from both endpoints | Codex | In progress — verified blocking finding from the fresh security lens |
+| R6-R49 | Strict-review release immutability: refuse non-identical repeated-tag assets instead of clobbering published binaries | Codex | In progress — verified blocking finding from the fresh security lens |
+| R6-Q3 | Verify whether dependency connection errors can expose credential-bearing Falkor/Redis URLs | Codex | In progress — targeted sentinel capture required by the fresh security lens |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence
