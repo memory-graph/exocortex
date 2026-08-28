@@ -8,7 +8,7 @@ the Backlog below as R6-S1 through R6-Q1. The prior post-BR-PRD green-gate
 claim is historical, not the current release verdict.
 
 **Status (2026-08-27):** Palantir-expansion PRD drafted
-(`docs/exocortex-palantir-expansion-prd.md`, rev 2) — five post-v1
+(`docs/prd/exocortex-palantir-expansion-prd.md`, rev 2) — five post-v1
 capabilities promoted below as PX1-PX6. **None are release-blocking and
 none start while Round 6 is open**; they are recorded here so the plan
 reflects accepted scope rather than living only in a PRD. PX1 closes the
@@ -112,6 +112,27 @@ leader-kill in 1290-1448ms (M5 AC < 2s).
 **Pre-audit baseline (2026-08-25, post-round-3):** 138 tests / 0 failed
 across 68 suites; fingerprint `d8bcd004…4e8c`.
 
+## PRD index
+
+Every PRD in the repo, what it owns, and where its work sits in the sequence.
+A PRD that is not listed here is not accepted work.
+
+| PRD | Owns | State |
+|---|---|---|
+| `docs/prd/exocortex-core-prd.md` | The authoritative spec. Every `§`-reference in code points here | Shipped through M0-M8; still authority |
+| `docs/prd/agent-instructions-prd.md` | The agent playbook, `preflight_wrapup`, write grouping, producer kinds, the generated-vs-prose split in the CLAUDE.md/AGENTS.md block | Shipped (A-PRD rows in Done) |
+| `docs/prd/mintlify-docs-integration-prd.md` | The docs producer's ingest contract | Shipped as its own repo (ML1); first real-corpus run is PX4, Wave 2 |
+| `docs/prd/backup-restore-prd.md` | `--export` / `--import`, fingerprint-gated, all-or-nothing | Shipped (BR-PRD rows in Done); its restore gate is relaxed by OC-PRD |
+| `docs/prd/ontology-compatibility-prd.md` | How two components decide they may exchange data: the fingerprint, its six enforcement sites, and their migration | **Wave 0** — blocks PX2 |
+| `docs/prd/exocortex-palantir-expansion-prd.md` | Second pack, pack-registered Actions/Functions, seam inventory, first real docs run, read-only explorer | **Waves 1-3** as PX1-PX6 |
+| `docs/bug-prd-codebase-audit.md` | The 70-defect audit and its fix order | Closed in sweep rounds 4-5 |
+| `docs/bug-prd-standalone-readback.md` | Zero-setup mode's write→read loop | Closed (SR-PRD) |
+| `docs/bug-prd-external-key-identity.md` | `ExternalKey` identity stability | Closed |
+| `docs/reviews/round-<n>-review.prd` | Findings against completed work; 1, 2, 3 closed, **6 is the live release gate** | Round 6 open — RELEASE BLOCKED |
+
+Bug PRDs keep their `docs/` paths because source comments cite them; feature
+PRDs live in `docs/prd/`.
+
 ## Initial build (M0–M8, shipped 2026-08)
 
 All nine milestones landed in order, one commit each, every gate green at
@@ -164,14 +185,17 @@ each step (88 tests at completion).
 | BR2 | Backend-mode org backup/restore: storage-side export/import as one-shot node flags (BR-PRD's deferred leg) | BR-PRD §deferred | **Done** — `exocortex-server/src/org_backup.rs` (`--export-org`/`--import-org` + `--graph-name` on `exocortex-node`): versioned fingerprint+org-gated JSON over the kernel row shapes, DR-faithful restore (ids/provenance/content intact; LSNs re-stamped by the target store, §6.2), idempotent re-import; 4 tests in `server/tests/org_backup.rs`. Side fix: the backend-node falkor arm defaulted its graph name to `exocortex-node-<pid>` — every restart served a fresh empty graph; now pinned via `--graph-name` (default `exocortex-org`) |
 | SR-PRD | Standalone read-back (F1-F5): materializer, live write-back, boot seeding, synthetic-seed removal, local D6 parity — the zero-setup mode write→read loop | `docs/bug-prd-standalone-readback.md` | **Done** — shipped as `exocortex-client 0.2.1`; one commit per fix (F3+F4 combined — replacing the boot seed left the synth path dead code); all seven acceptance criteria covered by `client/tests/standalone_readback.rs` (AC5 additionally by `e2e_chain` + the CL5 stdio test) |
 | ML1 | `exocortex-adapter-mintlify`: the reference Ingestion Protocol adapter (Mintlify MDX + `exocortex:` frontmatter → typed memories). First shipped adapter — closes the largest "open-source Palantir" gap (no data-plane integrations today) | `docs/prd/mintlify-docs-integration-prd.md` | **Done** — shipped as its own repo, [memory-graph/exocortex-adapter-mintlify](https://github.com/memory-graph/exocortex-adapter-mintlify) 0.1.0: signed registrations + batches, identity-stable pages (ExternalKey/R-T18a), entities as convergent join points, runbook Precedes chains, deletion closures, durable cursor with no-advance-past-failure discipline, `validate` subcommand for docs CI; 8 golden-batch tests + mock-server integration test (registration, first-run ingest, no-op poll, outage replay). Documented v1 deviations in its README (references→content, deprecates→tags) |
+| OC-PRD | **Wave 0.** Ontology compatibility: two-level fingerprint (compatibility hash gates, build hash reports), per-boundary policy across the six enforcement sites, superset acceptance for rolling upgrades, and migration for the fingerprint already pinned in every existing graph. Blocks PX2 | `docs/prd/ontology-compatibility-prd.md` | Accepted — Wave 0, ahead of all PX work |
 | PX1 | Second pack `exocortex-pack-mortgage-v1`, authored by a non-primary author against `ONTOLOGY_GUIDE.md`; composes with dev-v1 into one byte-stable fingerprint; <3 open `pack-seam` kernel issues at ship | palantir-expansion PRD §3.1 | Accepted — post-v1, not release-blocking. **Supersedes deferred D2** |
-| PX2 | Pack-registered Actions and Functions: `actions!` / `functions!` / `guidance!` sections on the `pack!` macro, macro-generated `inventory::submit!` registration (one registry, R-P1/R-P2 preserved), audit + preflight + visibility-ceiling enforcement, generated Function-SLO bench harness, `--dump-tools`, `--dump-fingerprint` | palantir-expansion PRD §3.2, §4.1-4.3 | Accepted — post-v1, not release-blocking |
+| PX2 | **Depends on OC-PRD (Wave 0)** — adding sections to `PackDef` moves the fingerprint for every pack including dev-v1, so the compatibility split lands first. Pack-registered Actions and Functions: `actions!` / `functions!` / `guidance!` sections on the `pack!` macro, macro-generated `inventory::submit!` registration (one registry, R-P1/R-P2 preserved), audit + preflight + visibility-ceiling enforcement, generated Function-SLO bench harness, `--dump-tools`, `--dump-fingerprint` | palantir-expansion PRD §3.2, §4.1-4.3 | Accepted — post-v1, not release-blocking |
 | PX3 | Seam inventory (`cargo xtask seam-inventory`) + six conformance suites. **Note:** the existing `storage-conformance` gate runs `cargo test -p exocortex-storage` plus the Falkor integration suite when `FALKOR_URL` is set — two different test sets against two backends, not one shared corpus run against every `Storage` impl. There are three impls (Falkor, InMemory, `NoBackendStorage` in the client), and the third is where the SR-PRD read-back defects lived. The gate's name currently overstates it | palantir-expansion PRD §3.3 | Accepted — post-v1; the naming finding is worth folding into Round 6 verification |
 | PX4 | Mintlify adapter end-to-end on a real `loanlight-engineering/docs` checkout: >=30 memories + >=50 edges through the live ingest path as `ProducerKind::DocsAdapter`, idempotent rerun, `RejectCode::UnknownType` exercised against real input | palantir-expansion PRD §3.4 | Accepted — post-v1, not release-blocking |
 | PX5 | Read-only object explorer at `/explorer` on the node binary: six views, bearer auth, `VisibilityContext`-filtered at every render, no JS build step | palantir-expansion PRD §3.5 | Accepted — post-v1; depends on PX6 for the provenance view |
 | PX6 | Kernel catalogue <-> operation registry bijection: `GetChain`, `ExplainEdge`, and `RetractEdge` are declared in `exocortex-kernel/src/actions.rs` / `functions.rs` with names and budgets and have no registered operation. `operations.rs:3` already documents `retract_edge` as living in that module; it does not. Implement all three | palantir-expansion PRD §3.3 S6 | Accepted — post-v1. Smallest item; `soft_delete_relationship` already exists under `RetractEdge` |
 
-**Wave assignment for the PX rows above:** PX2 and PX6 are Wave 1 and
+**Wave assignment for the PX rows above:** OC-PRD is Wave 0 and blocks PX2 —
+the fingerprint moves once, deliberately, before pack verbs force it to move
+by accident. PX2 and PX6 are Wave 1 and
 unblock the rest (PX6 is the smallest item in the plan and PX5 depends on
 it); PX1 and PX3 are Wave 1; PX4 is Wave 2, alongside D1 and D13 — the
 docs run is one producer among several rather than the headline; PX5 is
@@ -227,7 +251,7 @@ Wave 3.
 | R6-R32 | Final strict-review SSE fan-out: hydrate each event once before per-subscriber visibility filtering | Codex | In progress — performance advisory; backend reads currently multiply by subscribers and replay length |
 | R6-R33 | Final strict-review semantic guards: close alias/target-section/unreachable-code bypasses in kernel-purity, signing-hygiene, no-LLM, dead-enforcement, and add executable Cypher confinement | Codex | In progress — architecture lens confirmed the first four syntactic bypasses; the Cypher question requires a deliberate violating fixture |
 | R6-R34 | Final strict-review cleanup: remove discarded reasoning/Dreams work, consolidate SSE visibility helpers, and delete stale stream commentary | Codex | In progress — cleanup lens found three advisory-only maintenance defects |
-| R6-R35 | Final strict-review documentation truth: reconcile the stale B30-27 milestone entry with its later executable closure | Codex | In progress — product lens confirmed the milestone report contradicts the completed plan row |
+| R6-R35 | Final strict-review documentation truth: reconcile the stale B30-27 milestone entry with its later executable closure | Codex | Done — the report preserves the original conflict and records the later append-only assertion resolution without changing the PRD |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | In progress — no question will be closed from source-shape assumptions |
 
 ### Round 6 item evidence
@@ -307,6 +331,7 @@ Wave 3.
 | R6-R15 | **Done** — one failed fetch aborts its complete invalidation microbatch before any later success can advance the frontier; local writers serialize read/merge/publication under the graph generation lock and preserve late lower-LSN rows without frontier regression | cache `failed_fetch_aborts_the_whole_invalidation_microbatch` and `out_of_order_concurrent_local_publications_merge_generations`; full cache suite 21/21 and focused all-target clippy |
 | R6-R20 | **Done** — standalone backup enforces a 640 MiB encoded ceiling preserving the 100 MiB WAL's worst-case JSON expansion; organization backup enforces 256 MiB; both bound serialization, reject oversized metadata before allocation, recheck limit+1 during reads, and preserve atomic destinations; org import commits through one batch | client backup units 2/2 and `backup_restore` 6/6; server backup units 2/2 and `org_backup` 6/6 include exact/plus-one, sparse oversized, and late-invalid-relationship rollback regressions; focused clippy |
 | R6-R26 | **Done** — SSE hydration counts each encoded visible row before retaining it, retains one full copy rather than a second endpoint map, and rejects cumulative payloads above 32 MiB during harvesting | server `sse::tests::hydration_rejects_aggregate_bytes_while_harvesting_rows` uses 520 individually valid 64 KiB memories and fails during row harvest; `hydration_budget_is_inclusive_and_fail_closed`; focused SSE unit suite 3/3 |
+| R6-R35 | **Done** — the milestone report now distinguishes the original current-row-only defect from the later append-only assertion implementation and no longer says B30-27 is open | `docs/MILESTONE_REPORT.md` Round 6 deviation; existing storage `relationship_assertion_history_is_bitemporal`, live `bi_temporal_valid_at`, and master-plan R6-B30-27 closure |
 | R6-R13 | **Done** — discovery quality is stamped once and the metric recorder observes that exact value; production cycles persist structured candidates in both storage backends; `list_discoveries` filters endpoints by caller visibility and `issue_discovery` binds the durable record to an immutable caller/kind/derived-visibility proposal consumed by the existing audited acceptance | Dreams `discovery_metric_reports_the_stamped_quality` and transitive suite; ops `durable_discovery_survives_engine_restart_and_reaches_acceptance`; HTTP/typed parity; storage catalogue and focused Dreams/ops tests |
 | R6-R16 | **Done** — Dreams renews the owner lease every TTL/3 for the complete consolidation/rollback lifetime, and rollback after the original lease expiry still restores the exact preimage | Dreams `injected_mid_cycle_failure_restores_exact_mixed_preimage` uses a 60 ms TTL plus 180 ms post-mutation pause; full Dreams suite 16/16 and all-target clippy with testing |
 | R6-R18 | **Done** — ingestion ignores producer edge visibility and derives it from both endpoints; visibility promotion rejects any target above the request principal ceiling without mutation/audit; audit reads require an explicit administrator capability carried by immutable bearer policy into each operation context | ingest conflicting-visibility regression and suite 31/31; ops `promote_visibility_denies_target_above_caller_ceiling`, `list_audit_records_denies_non_admin_context`, parity 13/13; server principal/auth suites |

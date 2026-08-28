@@ -375,15 +375,16 @@ proto-sync-guarded copy).
   proposals so acceptance can be authorized and replay-safe. The prior
   Discovery shape omitted those fields; they are enforcement metadata rather
   than a silent change to discovery semantics.
-- **External snapshot history conflicts with the ST7/ST8 current-row model.**
+- **External snapshot history originally conflicted with the ST7/ST8
+  current-row model; Round 6 resolved it without changing stable identity.**
   PRD §23.27 and R-T16a require a snapshot bump to preserve an additional
-  temporal assertion. The current ingestion identity correctly excludes the
-  snapshot id, while both storage backends currently replace the one row for
-  that stable id (`MERGE` in Falkor; `insert(id, vec![row])` in the double).
-  The existing two-sync test therefore proves only the latest current row and
-  cannot close §23.27. R6-B30-27 remains open to add versioned temporal
-  assertions while preserving current-row reads; this conflict is recorded
-  rather than weakening the PRD or falsely treating overwrite as append.
+  temporal assertion. The initial Round 6 implementation retained only the
+  current row for a stable id, so the earlier two-sync test could prove only
+  latest-state replacement. R6-B30-27 subsequently added append-only memory
+  and relationship assertion records in Falkor plus matching history stacks
+  in the double; current-row reads still return the latest assertion while
+  valid-time and recorded-time cuts retain earlier snapshots. The historical
+  conflict is preserved here, but it is no longer open.
 - **Pack omission now has both link-time and assembly-time enforcement.** PRD
   §23.25 requires omission of dev-v1 to fail linking. Inventory still provides
   additive runtime discovery and `UnboundKernelConstant` validation, while the
