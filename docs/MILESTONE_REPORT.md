@@ -148,6 +148,16 @@ cross-cutting gates (§3). Commits: one per milestone, `M<n>: <what and why>`.
     source identity, snapshot id, schema hash, observation time, and producer;
     a future wire revision must add an explicit edge key before adapters may
     model an edge independently of its source memory row.
+18. **External identity framing is upgraded to v2** (R-T18a): the original
+    implementation separated unrestricted org/source/key bytes with `0x1e`,
+    so moving that byte across a field boundary produced the same preimage for
+    distinct coordinates and could defeat org scoping. Identity now hashes a
+    version domain plus a fixed-width length before every variable byte field;
+    raw `table_uuid` bytes remain unmodified. Existing v1-derived external ids
+    therefore require an explicit re-import/migration rather than being mixed
+    with v2 ids. The core PRD already places migration of existing production
+    data in a separate plan; this release does not guess or silently rewrite
+    stored external identity.
 
 ## Post-review round 1 (2026-08-24)
 

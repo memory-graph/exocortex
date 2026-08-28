@@ -776,6 +776,16 @@ entity identity on one stable memory and asserts one live row, interner entry,
 tag/entity bucket, bounded interner compaction residue, and a resident-sized
 estimate.
 
+### R6-R218 — Delimiter framing allowed cross-org external-id collisions
+
+`MemoryId::from_external` previously separated unrestricted string/byte
+coordinates with a byte that the coordinates themselves could contain. The
+identity preimage is now versioned and length-framed without converting raw
+UUID bytes. The exact `("a", "b\\x1ec")` versus `("a\\x1eb", "c")`
+collision shape now derives distinct ids. Milestone deviation 18 records that
+v1-derived external ids require explicit re-import/migration and are not
+silently rewritten.
+
 ### Historical pre-R176 closure evidence (superseded)
 
 At the earlier closure point, the complete mandatory gate matrix passed:

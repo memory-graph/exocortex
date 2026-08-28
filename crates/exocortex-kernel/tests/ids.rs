@@ -59,6 +59,17 @@ fn external_identity_determinism_and_forks() {
     );
 }
 
+#[test]
+fn external_identity_length_framing_blocks_cross_org_separator_collisions() {
+    let uuid = [3u8; 16];
+    let first = MemoryId::from_external("a", "b\u{1e}c", &uuid, b"pk", 1);
+    let second = MemoryId::from_external("a\u{1e}b", "c", &uuid, b"pk", 1);
+    assert_ne!(
+        first, second,
+        "distinct org/source coordinates must not share a hash preimage"
+    );
+}
+
 /// §23.29 property sweep: layout coordinates are deliberately absent from
 /// the identity API. Varying path/offset/timestamp-shaped distractors cannot
 /// affect an id, while the one schema-evolution coordinate does.

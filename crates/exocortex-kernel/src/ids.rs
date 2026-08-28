@@ -8,7 +8,9 @@ pub struct MemoryId(pub [u8; 16]);
 impl MemoryId {
     /// Derive a `MemoryId` from external-source coordinates (R-T18a).
     ///
-    /// `MemoryId = blake3(org_id || source_uri || table_uuid || logical_pk || mapping_version)[..16]`
+    /// `MemoryId = blake3(version || framed coordinates)[..16]`, where each
+    /// variable-width coordinate is length-prefixed. Framing is mandatory:
+    /// delimiters are legal input bytes and therefore cannot be structural.
     ///
     /// `table_uuid` is raw bytes (§18.6: 16 uniformly random bytes —
     /// overwhelmingly not valid UTF-8). It MUST NOT pass through a lossy
@@ -23,14 +25,11 @@ impl MemoryId {
         mapping_version: u32,
     ) -> Self {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(org_id.as_bytes());
-        hasher.update(b"\x1e"); // record separator
-        hasher.update(source_uri.as_bytes());
-        hasher.update(b"\x1e");
-        hasher.update(table_uuid);
-        hasher.update(b"\x1e");
-        hasher.update(logical_pk);
-        hasher.update(b"\x1e");
+        hasher.update(b"exocortex-external-id-v2");
+        update_framed(&mut hasher, org_id.as_bytes());
+        update_framed(&mut hasher, source_uri.as_bytes());
+        update_framed(&mut hasher, table_uuid);
+        update_framed(&mut hasher, logical_pk);
         hasher.update(&mapping_version.to_le_bytes());
         let hash = hasher.finalize();
         let mut out = [0u8; 16];
@@ -55,6 +54,11 @@ impl MemoryId {
     pub fn new_v7() -> Self {
         Self(*uuid::Uuid::now_v7().as_bytes())
     }
+}
+
+fn update_framed(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 /// Relationship identity — always derived (never external-keyed).
