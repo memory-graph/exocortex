@@ -520,6 +520,63 @@ itest!(find_by_entity_reads_persisted_memory_entity_ids, {
     assert_eq!(rows[0].id, matching.id);
 });
 
+itest!(
+    attribute_cohort_uses_scalar_index_and_tracks_replacements,
+    {
+        let graph = format!("exocortex_test_{}", graph_suffix());
+        let s = connect_graph("attribute-index", graph.clone()).await;
+        let mut matching = mem("attribute-indexed", 3, Visibility::Org);
+        matching.tags.push("needle".into());
+        s.upsert_memory(&matching)
+            .await
+            .expect("atomically persist row and attribute posting");
+
+        let rows = s
+            .memories_sharing_attributes(&["needle".into()], &[], 10)
+            .await
+            .expect("indexed tag lookup");
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [matching.id]
+        );
+
+        matching.tags.clear();
+        matching.tags.push("replacement".into());
+        s.upsert_memory(&matching)
+            .await
+            .expect("atomically replace row and attribute posting");
+        assert!(s
+            .memories_sharing_attributes(&["needle".into()], &[], 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            s.memories_sharing_attributes(&["replacement".into()], &[], 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let redis_url = std::env::var("REDIS_URL")
+            .unwrap_or_else(|_| falkor_url().unwrap().replacen("falkor://", "redis://", 1));
+        let client = redis::Client::open(redis_url).expect("profile client");
+        let mut connection = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("profile connection");
+        let profile: redis::Value = redis::cmd("GRAPH.PROFILE")
+        .arg(&graph)
+        .arg("UNWIND ['t:replacement'] AS key MATCH (attribute:_MemoryAttribute {key: key})-[:_INDEXES_MEMORY]->(m:Memory) RETURN DISTINCT m ORDER BY m.lsn ASC LIMIT 10")
+        .query_async(&mut connection)
+        .await
+        .expect("profile production query shape");
+        let plan = format!("{profile:?}");
+        assert!(plan.contains("Node By Index Scan"), "{plan}");
+        assert!(!plan.contains("Node By Label Scan"), "{plan}");
+    }
+);
+
 itest!(find_by_entity_filters_tenant_before_limit, {
     let s = connect("entity-tenant-limit").await;
     let entity = EntityId([10; 16]);

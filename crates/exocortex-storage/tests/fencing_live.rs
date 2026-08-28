@@ -386,7 +386,8 @@ async fn fenced_restore_is_one_live_atomic_preimage_swap() {
     let mut preclosed = mem(20);
     preclosed.valid_until = Some(Utc::now());
     preclosed.invalidated_by = Some(MemoryId([0x55; 16]));
-    let existing = mem(21);
+    let mut existing = mem(21);
+    existing.tags.push("before-cycle".into());
     let target = mem(22);
     let mut preclosed_edge = rel(preclosed.id, target.id);
     preclosed_edge.valid_until = preclosed.valid_until;
@@ -411,9 +412,12 @@ async fn fenced_restore_is_one_live_atomic_preimage_swap() {
     reopened.valid_until = None;
     let mut changed = existing.clone();
     changed.title = "changed".into();
+    changed.tags.clear();
+    changed.tags.push("during-cycle".into());
     let mut changed_edge = existing_edge.clone();
     changed_edge.properties.evidence_count += 4;
-    let created = mem(23);
+    let mut created = mem(23);
+    created.tags.push("created-during-cycle".into());
     let mut created_edge = rel(created.id, target.id);
     created_edge.kind = exocortex_kernel::RelKindId(0x8000_0024);
     created_edge.id =
@@ -470,6 +474,24 @@ async fn fenced_restore_is_one_live_atomic_preimage_swap() {
         existing.title
     );
     assert!(s.get_memory(&created.id).await.unwrap().is_none());
+    assert_eq!(
+        s.memories_sharing_attributes(&["before-cycle".into()], &[], 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|memory| memory.id)
+            .collect::<Vec<_>>(),
+        [existing.id]
+    );
+    for rolled_back_tag in ["during-cycle", "created-during-cycle"] {
+        assert!(
+            s.memories_sharing_attributes(&[rolled_back_tag.into()], &[], 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "rollback must remove the {rolled_back_tag} posting in the fenced transaction"
+        );
+    }
     let mut relationships = s.stream_all_relationships().await;
     let mut by_id = std::collections::HashMap::new();
     while let Some(row) = relationships.next().await {

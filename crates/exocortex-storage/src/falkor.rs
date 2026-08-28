@@ -443,6 +443,7 @@ impl FalkorStorage {
         this.pin_fingerprint(graph_exists).await?;
         this.migrate_schema().await?;
         this.repair_legacy_memories().await?;
+        this.ensure_memory_attribute_index().await?;
         Ok(this)
     }
 
@@ -598,22 +599,59 @@ impl FalkorStorage {
     }
 
     async fn ensure_schema_v0(&self) -> Result<(), StorageError> {
+        self.ensure_schema_version(0).await
+    }
+
+    async fn ensure_schema_version(&self, expected: i64) -> Result<(), StorageError> {
         let rows = self
             .run_template("read_schema_version", &serde_json::json!({}), true)
             .await?;
         match rows.first().and_then(|row| row.first()) {
-            Some(FalkorValue::I64(0)) => Ok(()),
+            Some(FalkorValue::I64(actual)) if *actual == expected => Ok(()),
             other => Err(StorageError::CorruptMetadata {
                 key: "schema_version",
-                detail: format!("schema changed during v0 migration: {other:?}"),
+                detail: format!(
+                    "schema changed while operation required version {expected}: {other:?}"
+                ),
             }),
         }
+    }
+
+    async fn ensure_memory_attribute_index(&self) -> Result<(), StorageError> {
+        match self
+            .run_template(
+                "create_memory_attribute_key_index",
+                &serde_json::json!({}),
+                false,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(StorageError::Backend(detail))
+                if detail.contains("already indexed") || detail.contains("already exists") => {}
+            Err(error) => return Err(error),
+        }
+        self.run_template(
+            "repair_memory_attribute_index_v1",
+            &serde_json::json!({}),
+            false,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Adopt only the unambiguous pre-v1 shape: a current row whose exact LSN
     /// has no canonical assertion. Current-shaped tenantless rows retain their
     /// assertion and remain fail-closed.
     async fn repair_legacy_memories(&self) -> Result<(), StorageError> {
+        let schema = self
+            .run_template("read_schema_version", &serde_json::json!({}), true)
+            .await?;
+        let expected_schema_version = if schema_needs_migration(&schema)? {
+            0
+        } else {
+            STORAGE_SCHEMA_VERSION
+        };
         loop {
             let rows = self
                 .run_template(
@@ -649,12 +687,15 @@ impl FalkorStorage {
                 params
                     .as_object_mut()
                     .expect("memory params are an object")
-                    .insert("expected_schema_version".into(), serde_json::json!(0));
+                    .insert(
+                        "expected_schema_version".into(),
+                        serde_json::json!(expected_schema_version),
+                    );
                 let changed = self
                     .run_template("repair_legacy_memory_v1", &params, false)
                     .await?;
                 if changed.is_empty() {
-                    self.ensure_schema_v0().await?;
+                    self.ensure_schema_version(expected_schema_version).await?;
                 }
                 repaired += usize::from(!changed.is_empty());
             }
@@ -1022,6 +1063,17 @@ impl FalkorStorage {
     }
 
     fn memory_params(&self, m: &Memory, lsn: u64, mt_label: &str) -> serde_json::Value {
+        let attribute_keys = m
+            .tags
+            .iter()
+            .map(|tag| format!("t:{tag}"))
+            .chain(
+                m.context
+                    .entities
+                    .iter()
+                    .map(|entity| format!("e:{}", hex(&entity.0))),
+            )
+            .collect::<Vec<_>>();
         serde_json::json!({
             "id": hex(&m.id.0),
             "memory_type_label": mt_label,
@@ -1029,6 +1081,7 @@ impl FalkorStorage {
             "props_json": FalkorStorage::props_json(m, lsn),
             "tags": m.tags.iter().map(|tag| tag.as_str()).collect::<Vec<_>>(),
             "entity_ids": m.context.entities.iter().map(|entity| hex(&entity.0)).collect::<Vec<_>>(),
+            "attribute_keys": attribute_keys,
             "tenant_id": m.context.tenant_id,
             "user_id": m.context.user_id,
             "project_id": m.context.project_id,
@@ -2610,8 +2663,11 @@ impl Storage for FalkorStorage {
             .run_template(
                 "memories_sharing_attributes",
                 &serde_json::json!({
-                    "tags": tags.iter().map(|tag| tag.as_str()).collect::<Vec<_>>(),
-                    "entity_ids": entities.iter().map(|id| hex(&id.0)).collect::<Vec<_>>(),
+                    "attribute_keys": tags
+                        .iter()
+                        .map(|tag| format!("t:{tag}"))
+                        .chain(entities.iter().map(|id| format!("e:{}", hex(&id.0))))
+                        .collect::<Vec<_>>(),
                     "limit": limit,
                 }),
                 true,
@@ -3316,6 +3372,10 @@ impl Storage for FalkorStorage {
                 "batch_purge_memory_if_current",
                 serde_json::json!({ "id": hex(&memory.id.0), "owned_lsns": owned_lsns }),
             ));
+            parts.push((
+                "refresh_memory_attribute_index",
+                serde_json::json!({ "id": hex(&memory.id.0) }),
+            ));
             push_record(next);
             invalidations.push(Invalidation::MemoryUpserted {
                 id: memory.id,
@@ -3338,6 +3398,10 @@ impl Storage for FalkorStorage {
             params["owned_lsns"] = serde_json::json!(owned_lsns);
             params["preimage_lsn"] = serde_json::json!(memory.lsn.value);
             parts.push(("batch_restore_memory_if_current", params));
+            parts.push((
+                "refresh_memory_attribute_index",
+                serde_json::json!({ "id": hex(&memory.id.0) }),
+            ));
             push_record(next);
             invalidations.push(Invalidation::MemoryUpserted {
                 id: memory.id,

@@ -246,6 +246,36 @@ async fn org_round_trip_is_byte_faithful_across_storage_instances() {
 }
 
 #[tokio::test]
+async fn legacy_unstamped_embedding_backup_imports_as_known_v1_model() {
+    let onto = ontology();
+    let mut document = serde_json::to_value(backup_document(
+        &onto,
+        vec![test_mem("legacy-embedding", 41)],
+        vec![],
+    ))
+    .unwrap();
+    document["memories"][0]["embedding"] = serde_json::json!([0.25, -0.5, 0.75]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("legacy-org.json");
+    std::fs::write(&file, serde_json::to_vec(&document).unwrap()).unwrap();
+    let restored = InMemoryStorage::new(onto.clone());
+    org_backup::import_org(&restored, &onto, "org", &file)
+        .await
+        .expect("the documented pre-stamp backup shape remains readable");
+
+    let memory = restored
+        .get_memory(&MemoryId([41; 16]))
+        .await
+        .unwrap()
+        .expect("restored legacy memory");
+    let embedding = memory.embedding.expect("legacy vector is retained");
+    assert_eq!(embedding.model.name.as_str(), "bge-small");
+    assert_eq!(embedding.model.version.as_str(), "v1");
+    assert_eq!(embedding.vector, [0.25, -0.5, 0.75]);
+}
+
+#[tokio::test]
 async fn fingerprint_mismatch_aborts_before_any_write() {
     let onto = ontology();
     let fp = fingerprint_hex(&onto);

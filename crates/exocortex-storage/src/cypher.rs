@@ -40,6 +40,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "props_json",
             "tags",
             "entity_ids",
+            "attribute_keys",
             "tenant_id",
             "user_id",
             "project_id",
@@ -88,6 +89,13 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                 props_json: $props_json, tags: $tags, entity_ids: $entity_ids,
                 tenant_id: $tenant_id, user_id: $user_id, project_id: $project_id,
                 team_id: $team_id, lsn: $lsn})
+            WITH m
+            OPTIONAL MATCH (:_MemoryAttribute)-[old:_INDEXES_MEMORY]->(m)
+            DELETE old
+            WITH m
+            FOREACH (key IN $attribute_keys |
+                MERGE (attribute:_MemoryAttribute {key: key})
+                MERGE (attribute)-[:_INDEXES_MEMORY]->(m))
             RETURN id(m) AS node_id, m.lsn AS lsn
         "#,
     });
@@ -115,6 +123,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "props_json",
             "tags",
             "entity_ids",
+            "attribute_keys",
             "tenant_id",
             "user_id",
             "project_id",
@@ -163,6 +172,31 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                 props_json: $props_json, tags: $tags, entity_ids: $entity_ids,
                 tenant_id: $tenant_id, user_id: $user_id, project_id: $project_id,
                 team_id: $team_id, lsn: $lsn})
+            WITH m
+            OPTIONAL MATCH (:_MemoryAttribute)-[old:_INDEXES_MEMORY]->(m)
+            DELETE old
+            WITH m
+            FOREACH (key IN $attribute_keys |
+                MERGE (attribute:_MemoryAttribute {key: key})
+                MERGE (attribute)-[:_INDEXES_MEMORY]->(m))
+        "#,
+    });
+
+    reg!(Template {
+        id: "refresh_memory_attribute_index",
+        read_only: false,
+        required_params: &["id"],
+        cypher: r#"
+            OPTIONAL MATCH (m:Memory {id: $id})
+            OPTIONAL MATCH (:_MemoryAttribute)-[old:_INDEXES_MEMORY]->(m)
+            DELETE old
+            WITH m
+            WITH m,
+                [tag IN coalesce(m.tags, []) | 't:' + tag]
+                + [entity IN coalesce(m.entity_ids, []) | 'e:' + entity] AS attribute_keys
+            FOREACH (key IN attribute_keys |
+                MERGE (attribute:_MemoryAttribute {key: key})
+                MERGE (attribute)-[:_INDEXES_MEMORY]->(m))
         "#,
     });
 
@@ -825,12 +859,42 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "memories_sharing_attributes",
         read_only: true,
-        required_params: &["tags", "entity_ids", "limit"],
+        required_params: &["attribute_keys", "limit"],
         cypher: r#"
-            MATCH (m:Memory)
-            WHERE any(tag IN $tags WHERE tag IN m.tags)
-               OR any(entity_id IN $entity_ids WHERE entity_id IN m.entity_ids)
+            UNWIND $attribute_keys AS key
+            MATCH (attribute:_MemoryAttribute {key: key})-[:_INDEXES_MEMORY]->(m:Memory)
             RETURN DISTINCT m ORDER BY m.lsn ASC LIMIT $limit
+        "#,
+    });
+
+    reg!(Template {
+        id: "create_memory_attribute_key_index",
+        read_only: false,
+        required_params: &[],
+        cypher: "CREATE INDEX FOR (attribute:_MemoryAttribute) ON (attribute.key)",
+    });
+
+    reg!(Template {
+        id: "repair_memory_attribute_index_v1",
+        read_only: false,
+        required_params: &[],
+        cypher: r#"
+            MERGE (state:_AttributeIndexState {id: 'v1'})
+            ON CREATE SET state.ready = false
+            WITH state
+            WHERE state.ready = false
+            MATCH (m:Memory)
+            OPTIONAL MATCH (:_MemoryAttribute)-[old:_INDEXES_MEMORY]->(m)
+            DELETE old
+            WITH state, m,
+                [tag IN coalesce(m.tags, []) | 't:' + tag]
+                + [entity IN coalesce(m.entity_ids, []) | 'e:' + entity] AS attribute_keys
+            FOREACH (key IN attribute_keys |
+                MERGE (attribute:_MemoryAttribute {key: key})
+                MERGE (attribute)-[:_INDEXES_MEMORY]->(m))
+            WITH DISTINCT state
+            SET state.ready = true
+            RETURN state.ready
         "#,
     });
 
