@@ -308,10 +308,13 @@ fn is_call_to(body: &str, offset: usize, method: Option<bool>) -> bool {
 }
 
 fn call_is_reachable(body: &str, offset: usize) -> bool {
+    call_is_reachable_outside_closure(body, offset) && !inside_uncalled_closure(body, offset)
+}
+
+fn call_is_reachable_outside_closure(body: &str, offset: usize) -> bool {
     !configured_out_at(body, offset)
         && !after_unconditional_exit(body, offset)
         && !inside_constant_false_block(body, offset)
-        && !inside_uncalled_closure(body, offset)
 }
 
 fn inside_constant_false_block(body: &str, offset: usize) -> bool {
@@ -350,12 +353,10 @@ fn inside_uncalled_closure(body: &str, offset: usize) -> bool {
     if binding.is_empty() || !value.contains('|') {
         return false;
     }
-    !body[offset..]
-        .match_indices(&format!("{binding}("))
-        .any(|(at, _)| {
-            is_call_to(&body[offset..], at, Some(false))
-                && !after_unconditional_exit(&body[offset..], at)
-        })
+    let suffix = &body[offset..];
+    !suffix.match_indices(&format!("{binding}(")).any(|(at, _)| {
+        is_call_to(suffix, at, Some(false)) && call_is_reachable_outside_closure(suffix, at)
+    })
 }
 
 fn rust_functions(source: &str) -> Vec<RustFunction> {
@@ -1218,29 +1219,66 @@ fn shell_evidence_is_executed(
         return Ok(false);
     }
     let source = std::fs::read_to_string(root.join("xtask/src/main.rs"))?;
+    let clean_source = strip_comments_and_strings(&source);
     let pattern = format!("fn {function}");
-    let Some(start) = source.find(&pattern) else {
+    let Some(start) = clean_source.find(&pattern) else {
         return Ok(false);
     };
-    let Some(open) = function_body_start(&source, start + pattern.len()) else {
+    let Some(open) = function_body_start(&clean_source, start + pattern.len()) else {
         return Ok(false);
     };
-    let Some(close) = matching_brace(&source, open) else {
+    let functions = rust_functions(&clean_source);
+    let Some(entry) = functions
+        .iter()
+        .position(|candidate| candidate.name == function && candidate.body_start == open + 1)
+    else {
         return Ok(false);
     };
-    let body = &source[open..=close];
-    let clean = strip_comments_and_strings(body);
-    Ok(["read_to_string", "Command::new", "include_str!"]
-        .into_iter()
-        .any(|call| {
-            let needle = format!("{call}(\"{relative}\")");
-            body.match_indices(&needle).any(|(offset, _)| {
-                clean[offset..]
-                    .get(..call.len())
-                    .is_some_and(|candidate| candidate == call)
-                    && call_is_reachable(&clean, offset)
+    let mut reachable = vec![false; functions.len()];
+    reachable[entry] = true;
+    loop {
+        let mut changed = false;
+        for caller in 0..functions.len() {
+            if !reachable[caller] {
+                continue;
+            }
+            let body = body_without_nested_functions(&clean_source, &functions[caller], &functions);
+            for callee in 0..functions.len() {
+                if !reachable[callee]
+                    && !functions[callee].configured_out
+                    && contains_call(
+                        &body,
+                        &functions[callee].name,
+                        Some(functions[callee].method),
+                    )
+                {
+                    reachable[callee] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(functions.iter().enumerate().any(|(index, function)| {
+        if !reachable[index] {
+            return false;
+        }
+        let body = body_without_nested_functions(&source, function, &functions);
+        let clean = body_without_nested_functions(&clean_source, function, &functions);
+        ["read_to_string", "Command::new", "include_str!"]
+            .into_iter()
+            .any(|call| {
+                let needle = format!("{call}(\"{relative}\")");
+                body.match_indices(&needle).any(|(offset, _)| {
+                    clean[offset..]
+                        .get(..call.len())
+                        .is_some_and(|candidate| candidate == call)
+                        && call_is_reachable(&clean, offset)
+                })
             })
-        }))
+    }))
 }
 
 fn command_invocations(command: &str) -> Vec<Vec<&str>> {
@@ -1852,6 +1890,8 @@ mod tests {
         for source in [
             "pub fn root() { fn nested() { fence(); } } fn fence() {}\n",
             "pub fn root() { let unused = || { fence(); }; let _ = unused; } fn fence() {}\n",
+            "pub fn root() { let unused = || { fence(); }; #[cfg(any())] unused(); } fn fence() {}\n",
+            "pub fn root() { let unused = || { fence(); }; if false { unused(); } } fn fence() {}\n",
         ] {
             write(&root, "crates/example/src/lib.rs", source);
             assert_eq!(
@@ -2315,6 +2355,7 @@ mod tests {
             "fn inspect() { return; let _ = std::fs::read_to_string(\"scripts/check\"); }\n",
             "fn inspect() { #[cfg(any())] let _ = std::fs::read_to_string(\"scripts/check\"); }\n",
             "fn inspect() { if false { let _ = std::fs::read_to_string(\"scripts/check\"); } }\n",
+            "fn inspect() { fn unused() { let _ = std::fs::read_to_string(\"scripts/check\"); } }\n",
         ] {
             write(&root, "xtask/src/main.rs", inert_body);
             assert!(
@@ -2322,6 +2363,15 @@ mod tests {
                 "inspecting Rust I/O must be reachable"
             );
         }
+        write(
+            &root,
+            "xtask/src/main.rs",
+            "fn inspect() { fn used() { let _ = std::fs::read_to_string(\"scripts/check\"); } used(); }\n",
+        );
+        assert!(
+            validate_acceptance_matrix(&root).is_ok(),
+            "called nested I/O remains executable evidence"
+        );
         write(&root, "docs/acceptance/section-23.tsv", &rows);
 
         write(
