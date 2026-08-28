@@ -11,6 +11,7 @@
 //! the drain).
 
 use anyhow::{Context, Result};
+use std::io::Read as _;
 use std::io::Write as _;
 
 use crate::wal::{Wal, WalEntry};
@@ -19,6 +20,12 @@ use crate::wal::{Wal, WalEntry};
 pub const FORMAT: &str = "exocortex-backup";
 /// The format version this build writes and accepts.
 pub const VERSION: u32 = 1;
+/// Maximum encoded backup size accepted or produced by the standalone tool.
+///
+/// The WAL itself is capped at 100 MiB. JSON string escaping can expand one
+/// input byte to six output bytes, so 640 MiB preserves exportability of every
+/// valid WAL while still placing a strict ceiling on serialization and parsing.
+pub const MAX_BACKUP_BYTES: u64 = 640 * 1024 * 1024;
 
 /// One backup document.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -47,8 +54,8 @@ pub fn export(wal: &Wal, fingerprint: &str, path: &std::path::Path) -> Result<us
         entries,
     };
     let n = doc.entries.len();
-    let json = serde_json::to_string_pretty(&doc).context("serialize backup")?;
-    atomic_write_private(path, json.as_bytes())
+    let json = serialize_bounded(&doc, MAX_BACKUP_BYTES).context("serialize backup")?;
+    atomic_write_private(path, &json)
         .with_context(|| format!("write backup {}", path.display()))?;
     Ok(n)
 }
@@ -74,9 +81,8 @@ pub fn import(
     ontology: &exocortex_kernel::Ontology,
     path: &std::path::Path,
 ) -> Result<ImportReport> {
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("read backup {}", path.display()))?;
-    let doc: Backup = serde_json::from_str(&raw).context("parse backup")?;
+    let raw = read_bounded(path, MAX_BACKUP_BYTES)?;
+    let doc: Backup = serde_json::from_slice(&raw).context("parse backup")?;
     anyhow::ensure!(
         doc.format == FORMAT,
         "not an exocortex backup (format `{}`)",
@@ -120,6 +126,69 @@ pub fn import(
         imported,
         first_local_lsn: first,
     })
+}
+
+fn ensure_backup_size(size: u64, limit: u64) -> Result<()> {
+    anyhow::ensure!(
+        size <= limit,
+        "backup is {size} bytes; maximum supported size is {limit} bytes"
+    );
+    Ok(())
+}
+
+fn serialize_bounded<T: serde::Serialize>(value: &T, limit: u64) -> Result<Vec<u8>> {
+    let mut output = BoundedOutput::new(limit);
+    serde_json::to_writer_pretty(&mut output, value)?;
+    Ok(output.bytes)
+}
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    limit: u64,
+}
+
+impl BoundedOutput {
+    fn new(limit: u64) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+}
+
+impl std::io::Write for BoundedOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if (self.bytes.len() as u64).saturating_add(bytes.len() as u64) > self.limit {
+            return Err(std::io::Error::other(format!(
+                "backup exceeds maximum supported size of {} bytes",
+                self.limit
+            )));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn read_bounded(path: &std::path::Path, limit: u64) -> Result<Vec<u8>> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("read backup {}", path.display()))?;
+    ensure_backup_size(
+        file.metadata()
+            .with_context(|| format!("inspect backup {}", path.display()))?
+            .len(),
+        limit,
+    )?;
+    let mut raw = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut raw)
+        .with_context(|| format!("read backup {}", path.display()))?;
+    ensure_backup_size(raw.len() as u64, limit)?;
+    Ok(raw)
 }
 
 fn hex(b: &[u8]) -> String {
@@ -188,7 +257,24 @@ fn atomic_write_private_with(
 
 #[cfg(test)]
 mod tests {
-    use super::atomic_write_private_with;
+    use super::{atomic_write_private_with, ensure_backup_size, read_bounded, serialize_bounded};
+
+    #[test]
+    fn backup_size_boundary_is_inclusive_and_file_reads_are_bounded() {
+        assert!(ensure_backup_size(7, 7).is_ok());
+        assert!(ensure_backup_size(8, 7).is_err());
+
+        let dir =
+            std::env::temp_dir().join(format!("exocortex-bounded-backup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("backup.json");
+        std::fs::write(&path, b"1234567").unwrap();
+        assert_eq!(read_bounded(&path, 7).unwrap(), b"1234567");
+        assert!(read_bounded(&path, 6).is_err());
+        assert!(serialize_bounded(&"x", 3).is_ok());
+        assert!(serialize_bounded(&"x", 2).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn private_atomic_write_preserves_previous_file_on_injected_failure() {

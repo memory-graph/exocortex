@@ -255,3 +255,61 @@ async fn re_import_converges_without_duplicates() {
     assert_eq!(mems.len(), 1, "upsert semantics: no duplicates");
     assert!(rels.is_empty());
 }
+
+#[tokio::test]
+async fn oversized_org_backup_is_rejected_without_touching_storage() {
+    let onto = ontology();
+    let target = InMemoryStorage::new(onto.clone());
+    let existing = test_mem("existing", 41);
+    target.upsert_memory(&existing).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("oversized.json");
+    let oversized = std::fs::File::create(&file).unwrap();
+    oversized
+        .set_len(org_backup::MAX_ORG_BACKUP_BYTES + 1)
+        .unwrap();
+    drop(oversized);
+
+    let error = org_backup::import_org(&target, &onto, "org", &file)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("maximum supported size"));
+    let (memories, relationships) = rows(&target).await;
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].id, existing.id);
+    assert!(relationships.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_late_relationship_rolls_back_the_entire_org_import() {
+    let onto = ontology();
+    let target = InMemoryStorage::new(onto.clone());
+    let memory = test_mem("would-have-been-partial", 51);
+    let relationship = test_rel(
+        memory.id,
+        MemoryId([99; 16]),
+        onto.kind_id("Fixes").unwrap(),
+    );
+    let document = org_backup::OrgBackup {
+        format: org_backup::FORMAT.into(),
+        version: org_backup::VERSION,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        org_id: "org".into(),
+        ontology_fingerprint: fingerprint_hex(&onto),
+        memories: vec![memory.clone()],
+        relationships: vec![relationship],
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("invalid-late-row.json");
+    std::fs::write(&file, serde_json::to_vec(&document).unwrap()).unwrap();
+
+    org_backup::import_org(&target, &onto, "org", &file)
+        .await
+        .unwrap_err();
+    let (memories, relationships) = rows(&target).await;
+    assert!(
+        memories.is_empty(),
+        "a late relationship failure must roll back earlier memory rows"
+    );
+    assert!(relationships.is_empty());
+}

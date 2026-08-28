@@ -16,12 +16,17 @@ use anyhow::{Context, Result};
 use exocortex_kernel::{Memory, Ontology, Relationship};
 use exocortex_storage::Storage;
 use futures::StreamExt;
+use std::io::Read as _;
 use std::io::Write as _;
 
 /// The format discriminator written into every org backup.
 pub const FORMAT: &str = "exocortex-org-backup";
 /// The format version this build writes and accepts.
 pub const VERSION: u32 = 1;
+/// Maximum encoded org backup accepted or produced by the one-shot DR tool.
+/// This is deliberately finite because row payloads and graph cardinality are
+/// operator-controlled rather than constrained by the ingestion batch limits.
+pub const MAX_ORG_BACKUP_BYTES: u64 = 256 * 1024 * 1024;
 
 /// One org backup document.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -61,14 +66,29 @@ pub async fn export_org<S: Storage>(
     path: &std::path::Path,
 ) -> Result<(usize, usize)> {
     let mut memories = Vec::new();
+    let mut encoded_row_bytes = 0u64;
     let mut rows = storage.stream_all_memories().await;
     while let Some(row) = rows.next().await {
-        memories.push(row.context("stream memory")?);
+        let row = row.context("stream memory")?;
+        encoded_row_bytes = encoded_row_bytes.saturating_add(
+            serde_json::to_vec(&row)
+                .context("size memory for backup")?
+                .len() as u64,
+        );
+        ensure_backup_size(encoded_row_bytes, MAX_ORG_BACKUP_BYTES)?;
+        memories.push(row);
     }
     let mut relationships = Vec::new();
     let mut rels = storage.stream_all_relationships().await;
     while let Some(r) = rels.next().await {
-        relationships.push(r.context("stream relationship")?);
+        let r = r.context("stream relationship")?;
+        encoded_row_bytes = encoded_row_bytes.saturating_add(
+            serde_json::to_vec(&r)
+                .context("size relationship for backup")?
+                .len() as u64,
+        );
+        ensure_backup_size(encoded_row_bytes, MAX_ORG_BACKUP_BYTES)?;
+        relationships.push(r);
     }
     let (nm, nr) = (memories.len(), relationships.len());
     let doc = OrgBackup {
@@ -80,7 +100,7 @@ pub async fn export_org<S: Storage>(
         memories,
         relationships,
     };
-    let bytes = serde_json::to_vec_pretty(&doc).context("serialize backup")?;
+    let bytes = serialize_bounded(&doc, MAX_ORG_BACKUP_BYTES).context("serialize backup")?;
     atomic_write_private(path, &bytes)
         .with_context(|| format!("write backup {}", path.display()))?;
     Ok((nm, nr))
@@ -96,9 +116,8 @@ pub async fn import_org<S: Storage>(
     org_id: &str,
     path: &std::path::Path,
 ) -> Result<ImportReport> {
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("read backup {}", path.display()))?;
-    let doc: OrgBackup = serde_json::from_str(&raw).context("parse backup")?;
+    let raw = read_bounded(path, MAX_ORG_BACKUP_BYTES)?;
+    let doc: OrgBackup = serde_json::from_slice(&raw).context("parse backup")?;
     anyhow::ensure!(
         doc.format == FORMAT,
         "not an exocortex org backup (format `{}`)",
@@ -120,19 +139,77 @@ pub async fn import_org<S: Storage>(
         "ontology fingerprint mismatch: backup {} vs binary {expected} — the backup was written against a different pack set",
         doc.ontology_fingerprint
     );
-    for m in &doc.memories {
-        storage.upsert_memory(m).await.context("restore memory")?;
-    }
-    for r in &doc.relationships {
-        storage
-            .upsert_relationship(r)
-            .await
-            .context("restore relationship")?;
-    }
+    storage
+        .upsert_batch(&doc.memories, &doc.relationships)
+        .await
+        .context("atomically restore org backup")?;
     Ok(ImportReport {
         memories: doc.memories.len(),
         relationships: doc.relationships.len(),
     })
+}
+
+fn ensure_backup_size(size: u64, limit: u64) -> Result<()> {
+    anyhow::ensure!(
+        size <= limit,
+        "org backup is {size} bytes; maximum supported size is {limit} bytes"
+    );
+    Ok(())
+}
+
+fn serialize_bounded<T: serde::Serialize>(value: &T, limit: u64) -> Result<Vec<u8>> {
+    let mut output = BoundedOutput::new(limit);
+    serde_json::to_writer_pretty(&mut output, value)?;
+    Ok(output.bytes)
+}
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    limit: u64,
+}
+
+impl BoundedOutput {
+    fn new(limit: u64) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+}
+
+impl std::io::Write for BoundedOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if (self.bytes.len() as u64).saturating_add(bytes.len() as u64) > self.limit {
+            return Err(std::io::Error::other(format!(
+                "org backup exceeds maximum supported size of {} bytes",
+                self.limit
+            )));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn read_bounded(path: &std::path::Path, limit: u64) -> Result<Vec<u8>> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("read backup {}", path.display()))?;
+    ensure_backup_size(
+        file.metadata()
+            .with_context(|| format!("inspect backup {}", path.display()))?
+            .len(),
+        limit,
+    )?;
+    let mut raw = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut raw)
+        .with_context(|| format!("read backup {}", path.display()))?;
+    ensure_backup_size(raw.len() as u64, limit)?;
+    Ok(raw)
 }
 
 fn hex(b: &[u8]) -> String {
@@ -201,7 +278,21 @@ fn atomic_write_private_with(
 
 #[cfg(test)]
 mod tests {
-    use super::atomic_write_private_with;
+    use super::{atomic_write_private_with, ensure_backup_size, read_bounded, serialize_bounded};
+
+    #[test]
+    fn org_backup_size_boundary_is_inclusive_and_file_reads_are_bounded() {
+        assert!(ensure_backup_size(11, 11).is_ok());
+        assert!(ensure_backup_size(12, 11).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("org.json");
+        std::fs::write(&path, b"12345678901").unwrap();
+        assert_eq!(read_bounded(&path, 11).unwrap(), b"12345678901");
+        assert!(read_bounded(&path, 10).is_err());
+        assert!(serialize_bounded(&"x", 3).is_ok());
+        assert!(serialize_bounded(&"x", 2).is_err());
+    }
 
     #[test]
     fn org_backup_atomic_write_preserves_previous_file_on_injected_failure() {

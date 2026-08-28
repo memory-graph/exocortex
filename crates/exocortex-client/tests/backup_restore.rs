@@ -353,3 +353,39 @@ fn states_ride_verbatim() {
         other => panic!("expected Synced, got {other:?}"),
     }
 }
+
+/// R6-R20: oversized files are rejected from metadata before allocation or
+/// parsing, and the pre-existing WAL remains byte-for-byte usable.
+#[test]
+fn oversized_backup_is_rejected_without_partial_import() {
+    let dir = tempdir();
+    let file = dir.join("oversized.json");
+    {
+        let mut c = Client::spawn_serving(&dir);
+        let mut msgs = init_msgs();
+        msgs.push(end_session_msg(80));
+        c.send_all(&msgs);
+        let _init = c.read_line();
+        assert!(c.read_line().get("result").is_some());
+    }
+    let oversized = std::fs::File::create(&file).unwrap();
+    oversized
+        .set_len(exocortex_client::backup::MAX_BACKUP_BYTES + 1)
+        .unwrap();
+    drop(oversized);
+
+    let out = Client::run_oneshot(&dir, "--import", &file);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("maximum supported size"),
+        "resource rejection must be explicit: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut c = Client::spawn_serving(&dir);
+    let mut msgs = init_msgs();
+    msgs.push(search_msg(90, "yak"));
+    c.send_all(&msgs);
+    let _init = c.read_line();
+    assert_eq!(hits_of(&c.read_line()).len(), 1, "existing WAL is intact");
+}

@@ -206,7 +206,7 @@ each step (88 tests at completion).
 | R6-R17 | Strict-review change-feed durability repair: reconcile graph commits whose invalidation publication fails | Codex | In progress — verified committed rows can remain indefinitely absent from already-live caches |
 | R6-R18 | Strict-review authorization repair: derive all relationship visibility, enforce promotion ceilings, and restrict audit reads to administrators | Codex | In progress — verified producer-declared within-batch widening, over-ceiling promotion, and org-wide audit enumeration by any bearer |
 | R6-R19 | Strict-review release hardening: least-privilege workflows, immutable action pins, non-root containers, and loopback-only test services | Codex | In progress — verified global write permission, mutable action refs, root daemon, and publicly bound development services |
-| R6-R20 | Strict-review backup hardening: bound or stream standalone and organization backup import/export memory use | Codex | In progress — verified whole-file and whole-org allocation occurs before existing commit budgets |
+| R6-R20 | Strict-review backup hardening: bound or stream standalone and organization backup import/export memory use | Codex | Done — serialization and file reads enforce documented ceilings before allocation; org restore is one atomic batch |
 
 ### Round 6 item evidence
 
@@ -283,6 +283,7 @@ each step (88 tests at completion).
 | R6-R11 | **Done** — the 100,000-row search benchmark now supplies the same explicit tenant and project membership required of production rows and callers; before the repair every query correctly returned zero under fail-closed visibility and the mandatory gate aborted | `cargo bench -p exocortex-cache --bench search`: `auth fix` and the complete query rotation return visible hits; p50 32.2 µs, p99 761.8 µs; R-Lat1 PASS |
 | R6-R12 | **Done** — memory deletion removes both incoming and outgoing relationship IDs before petgraph frees their edge slots, preventing a delayed stale-ID delete from removing a new edge that reused the same index | cache `node_delete_clears_incident_ids_before_edge_index_reuse` performs delete → edge-slot reuse → delayed stale delete and proves the new edge survives; full cache suite 19/19, allocation test, and targeted clippy |
 | R6-R15 | **Done** — one failed fetch aborts its complete invalidation microbatch before any later success can advance the frontier; local writers serialize read/merge/publication under the graph generation lock and preserve late lower-LSN rows without frontier regression | cache `failed_fetch_aborts_the_whole_invalidation_microbatch` and `out_of_order_concurrent_local_publications_merge_generations`; full cache suite 21/21 and focused all-target clippy |
+| R6-R20 | **Done** — standalone backup enforces a 640 MiB encoded ceiling preserving the 100 MiB WAL's worst-case JSON expansion; organization backup enforces 256 MiB; both bound serialization, reject oversized metadata before allocation, recheck limit+1 during reads, and preserve atomic destinations; org import commits through one batch | client backup units 2/2 and `backup_restore` 6/6; server backup units 2/2 and `org_backup` 6/6 include exact/plus-one, sparse oversized, and late-invalid-relationship rollback regressions; focused clippy |
 
 ## Done
 
