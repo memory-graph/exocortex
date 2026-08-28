@@ -3576,6 +3576,109 @@ impl Storage for FalkorStorage {
         Ok(())
     }
 
+    async fn cycle_succeeded(&self, key: &LeaseKey, cycle_id: &str) -> Result<bool, StorageError> {
+        let rows = self
+            .run_template(
+                "cycle_journal_succeeded",
+                &serde_json::json!({
+                    "lease_key": serde_json::to_string(key)
+                        .map_err(|error| StorageError::Backend(error.to_string()))?,
+                    "cycle_id": cycle_id,
+                }),
+                true,
+            )
+            .await?;
+        match rows.first().and_then(|row| row.first()) {
+            Some(FalkorValue::I64(0)) => Ok(false),
+            Some(FalkorValue::I64(1)) => Ok(true),
+            other => Err(StorageError::CorruptMetadata {
+                key: "cycle journal success count",
+                detail: format!("expected 0 or 1, got {other:?}"),
+            }),
+        }
+    }
+
+    async fn settle_dreams_cycle_fenced(
+        &self,
+        cycle_id: &str,
+        discoveries: &[DiscoveryRecord],
+        lease: &OwnerLease,
+    ) -> Result<(), StorageError> {
+        let mut discovery_ids = Vec::with_capacity(discoveries.len());
+        let mut org_ids = Vec::with_capacity(discoveries.len());
+        let mut region_projects = Vec::with_capacity(discoveries.len());
+        let mut region_memory_types = Vec::with_capacity(discoveries.len());
+        let mut from_ids = Vec::with_capacity(discoveries.len());
+        let mut to_ids = Vec::with_capacity(discoveries.len());
+        let mut discovered_ats = Vec::with_capacity(discoveries.len());
+        let mut discovery_props = Vec::with_capacity(discoveries.len());
+        let mut discovery_lsns = Vec::with_capacity(discoveries.len());
+        let mut max_lsn = 0u64;
+        for discovery in discoveries {
+            let lsn = self.next_lsn().await?;
+            max_lsn = max_lsn.max(lsn);
+            discovery_ids.push(discovery.discovery_id.to_string());
+            org_ids.push(discovery.region.org.to_string());
+            region_projects.push(discovery.region.project.to_string());
+            region_memory_types.push(discovery.region.memory_type);
+            from_ids.push(hex(&discovery.from.0));
+            to_ids.push(hex(&discovery.to.0));
+            discovered_ats.push(discovery.discovered_at.to_rfc3339());
+            discovery_props.push(
+                serde_json::to_string(discovery)
+                    .map_err(|error| StorageError::Backend(error.to_string()))?,
+            );
+            discovery_lsns.push(lsn);
+        }
+        let discovery_indexes = (0..discoveries.len() as u64).collect::<Vec<_>>();
+        let settled = self
+            .run_template(
+                "dreams_cycle_settle_fenced",
+                &serde_json::json!({
+                    "lease_key": serde_json::to_string(&lease.key)
+                        .map_err(|error| StorageError::Backend(error.to_string()))?,
+                    "cycle_id": cycle_id,
+                    "token": lease.fencing_token.as_str(),
+                    "epoch": lease.epoch,
+                    "now_ms": Utc::now().timestamp_millis(),
+                    "discovery_indexes": discovery_indexes,
+                    "discovery_ids": discovery_ids,
+                    "org_ids": org_ids,
+                    "region_projects": region_projects,
+                    "region_memory_types": region_memory_types,
+                    "from_ids": from_ids,
+                    "to_ids": to_ids,
+                    "discovered_ats": discovered_ats,
+                    "discovery_props": discovery_props,
+                    "discovery_lsns": discovery_lsns,
+                    "max_lsn": max_lsn,
+                }),
+                false,
+            )
+            .await?;
+        if settled.is_empty() {
+            return Err(StorageError::FencedWriteRejected {
+                lease_epoch: lease.epoch,
+            });
+        }
+        match self.drain_discovery_outbox().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                for discovery in discoveries {
+                    if !self.discovery_is_durably_pending(discovery).await? {
+                        return Err(error);
+                    }
+                }
+                tracing::warn!(
+                    count = discoveries.len(),
+                    ?error,
+                    "Dreams cycle settled; discovery publication remains in durable outbox"
+                );
+                Ok(())
+            }
+        }
+    }
+
     async fn delete_memory_fenced(
         &self,
         id: &MemoryId,

@@ -128,9 +128,9 @@ struct CycleJournal {
 }
 
 impl CycleJournal {
-    fn new() -> Self {
+    fn new(cycle_id: impl Into<SmolStr>) -> Self {
         Self {
-            cycle_id: format!("dream:{}", uuid::Uuid::new_v4()).into(),
+            cycle_id: cycle_id.into(),
             memories: Default::default(),
             relationships: Default::default(),
             created_memories: Default::default(),
@@ -597,10 +597,22 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     /// region-owner lease.
     pub async fn run(self: Arc<Self>) {
         while let Some((region, fired_at)) = { self.rx_fire.lock().await.recv().await } {
-            let success = match self.try_consolidate(&region).await {
-                Ok(res) => {
+            let fire_cycle_id = self
+                .distributed_notifications
+                .get(&region)
+                .and_then(|notification| notification.fire_id.clone())
+                .map(|fire_id| format!("dream-fire:{fire_id}"));
+            let success = match self
+                .try_consolidate_inner(&region, fire_cycle_id.as_deref())
+                .await
+            {
+                Ok(Some(res)) => {
                     *self.last_result.write().await = Some(res.clone());
                     info!(?res, "Dreams cycle ok");
+                    true
+                }
+                Ok(None) => {
+                    info!(?region, "Dreams fire already settled; acknowledging replay");
                     true
                 }
                 Err(e) => {
@@ -642,6 +654,29 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     /// ride the fenced paths so a stale owner can never commit (R-C3).
     #[instrument(skip(self))]
     pub async fn try_consolidate(&self, region: &RegionKey) -> anyhow::Result<ConsolidationResult> {
+        self.try_consolidate_inner(region, None)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("fresh Dreams cycle unexpectedly already settled"))
+    }
+
+    /// Execute the exact distributed-fire idempotency path with a stable fire
+    /// identity. Returns `None` when that fire already settled successfully.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub async fn try_consolidate_once_for_testing(
+        &self,
+        region: &RegionKey,
+        fire_id: &str,
+    ) -> anyhow::Result<Option<ConsolidationResult>> {
+        self.try_consolidate_inner(region, Some(&format!("dream-fire:{fire_id}")))
+            .await
+    }
+
+    async fn try_consolidate_inner(
+        &self,
+        region: &RegionKey,
+        stable_cycle_id: Option<&str>,
+    ) -> anyhow::Result<Option<ConsolidationResult>> {
         // CS4: a follower (lost re-election) performs no consolidation,
         // even before contending on the region lease.
         if let Some(gate) = &self.leader_gate {
@@ -659,6 +694,21 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             .acquire_lease(&lease_key, self.lease_ttl)
             .await
             .map_err(|e| anyhow::anyhow!("lease: {e}"))?;
+        let cycle_id = stable_cycle_id
+            .map(SmolStr::new)
+            .unwrap_or_else(|| format!("dream:{}", uuid::Uuid::new_v4()).into());
+        if self
+            .storage
+            .cycle_succeeded(&lease_key, cycle_id.as_str())
+            .await
+            .map_err(|error| anyhow::anyhow!("load Dreams cycle settlement: {error}"))?
+        {
+            self.storage
+                .release_lease(lease)
+                .await
+                .map_err(|error| anyhow::anyhow!("release settled Dreams lease: {error}"))?;
+            return Ok(None);
+        }
         if let Err(error) = self.recover_active_cycle(&lease_key, &lease).await {
             let _ = self.storage.release_lease(lease).await;
             return Err(error);
@@ -679,7 +729,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         // otherwise an expiry after an early write makes rollback itself fail
         // its fence and strands a partial cycle.
         let mut renewal = self.spawn_lease_renewal(lease.clone());
-        let mut journal = CycleJournal::new();
+        let mut journal = CycleJournal::new(cycle_id);
         let mut renewal_stopped = false;
         let outcome = {
             let consolidation =
@@ -721,7 +771,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         };
         let outcome = match outcome {
             Ok(result) if !renewal_stopped && !crashed => {
-                let discovery = self.run_discovery_fenced(region, &lease);
+                let discovery =
+                    self.run_discovery_fenced(region, &lease, Some(journal.cycle_id.as_str()));
                 tokio::pin!(discovery);
                 tokio::select! {
                     biased;
@@ -743,7 +794,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         }
         let release = self.storage.release_lease(lease).await;
         match (outcome, release) {
-            (Ok(result), Ok(())) => Ok(result),
+            (Ok(result), Ok(())) => Ok(Some(result)),
             (Err(error), Ok(())) => Err(error),
             (Ok(_), Err(release)) => Err(anyhow::anyhow!("release Dreams lease: {release}")),
             (Err(error), Err(release)) => Err(anyhow::anyhow!(
@@ -849,15 +900,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         lease: &exocortex_storage::OwnerLease,
     ) -> anyhow::Result<ConsolidationResult> {
         match outcome {
-            Ok(result) => {
-                if !journal.is_empty() {
-                    self.storage
-                        .complete_cycle_journal_fenced(journal.cycle_id.as_str(), lease)
-                        .await
-                        .map_err(|error| anyhow::anyhow!("complete Dreams journal: {error}"))?;
-                }
-                Ok(result)
-            }
+            Ok(result) => Ok(result),
             Err(error) => {
                 if !journal.is_empty() {
                     self.rollback(journal, lease).await.map_err(|rollback| {
@@ -1492,7 +1535,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let outcome = {
             let discovery = async {
                 self.validate_region(region).await?;
-                self.run_discovery_fenced(region, &lease).await
+                self.run_discovery_fenced(region, &lease, None).await
             };
             tokio::pin!(discovery);
             tokio::select! {
@@ -1518,6 +1561,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         &self,
         region: &RegionKey,
         lease: &exocortex_storage::OwnerLease,
+        cycle_id: Option<&str>,
     ) -> anyhow::Result<Vec<Discovery>> {
         let relationships = self
             .storage
@@ -1536,7 +1580,9 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             .collect();
         let (candidates, _) = transitive_candidates(&edges, MAX_DISCOVERY_PATH_INSPECTIONS);
 
-        let cycle: SmolStr = format!("dream:{}", uuid::Uuid::new_v4()).into();
+        let cycle: SmolStr = cycle_id
+            .map(SmolStr::new)
+            .unwrap_or_else(|| format!("dream:{}", uuid::Uuid::new_v4()).into());
         let out: Vec<_> = candidates
             .into_iter()
             .map(|(a, c, k1, k2)| Discovery {
@@ -1549,24 +1595,31 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 discovered_at: chrono::Utc::now(),
             })
             .collect();
+        let records = out
+            .iter()
+            .map(|discovery| exocortex_storage::DiscoveryRecord {
+                discovery_id: discovery.id.to_string().into(),
+                region: region.clone(),
+                from: discovery.endpoints.0,
+                to: discovery.endpoints.1,
+                discovery_type: "transitive".into(),
+                quality: discovery.quality,
+                via_types: [discovery.via_types.0, discovery.via_types.1],
+                discovery_cycle_id: discovery.discovery_cycle_id.clone(),
+                discovered_at: discovery.discovered_at,
+            })
+            .collect::<Vec<_>>();
+        if let Some(cycle_id) = cycle_id {
+            self.storage
+                .settle_dreams_cycle_fenced(cycle_id, &records, lease)
+                .await?;
+        } else {
+            for record in &records {
+                self.storage.store_discovery_fenced(record, lease).await?;
+            }
+        }
         self.discoveries.clear();
         for discovery in &out {
-            self.storage
-                .store_discovery_fenced(
-                    &exocortex_storage::DiscoveryRecord {
-                        discovery_id: discovery.id.to_string().into(),
-                        region: region.clone(),
-                        from: discovery.endpoints.0,
-                        to: discovery.endpoints.1,
-                        discovery_type: "transitive".into(),
-                        quality: discovery.quality,
-                        via_types: [discovery.via_types.0, discovery.via_types.1],
-                        discovery_cycle_id: discovery.discovery_cycle_id.clone(),
-                        discovered_at: discovery.discovered_at,
-                    },
-                    lease,
-                )
-                .await?;
             emit_discovery_metric(discovery);
             self.discoveries.insert(discovery.id, discovery.clone());
         }

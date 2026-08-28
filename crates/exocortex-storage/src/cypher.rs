@@ -256,6 +256,70 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         "#,
     });
 
+    reg!(Template {
+        id: "cycle_journal_succeeded",
+        read_only: true,
+        required_params: &["lease_key", "cycle_id"],
+        cypher: r#"
+            MATCH (journal:_CycleJournal {
+                lease_key: $lease_key, cycle_id: $cycle_id, state: 'Succeeded'
+            })
+            RETURN count(journal)
+        "#,
+    });
+
+    reg!(Template {
+        id: "dreams_cycle_settle_fenced",
+        read_only: false,
+        required_params: &[
+            "lease_key",
+            "cycle_id",
+            "token",
+            "epoch",
+            "now_ms",
+            "discovery_indexes",
+            "discovery_ids",
+            "org_ids",
+            "region_projects",
+            "region_memory_types",
+            "from_ids",
+            "to_ids",
+            "discovered_ats",
+            "discovery_props",
+            "discovery_lsns",
+            "max_lsn"
+        ],
+        cypher: r#"
+            MATCH (lease:_ExocortexLease {lease_key: $lease_key, token: $token})
+            WHERE lease.epoch = $epoch AND lease.expires_at_ms > $now_ms
+            OPTIONAL MATCH (existing:_CycleJournal {lease_key: $lease_key})
+            WITH lease, existing
+            WHERE existing IS NULL OR existing.state <> 'Active'
+                  OR existing.cycle_id = $cycle_id
+            MERGE (journal:_CycleJournal {lease_key: $lease_key})
+            SET journal.cycle_id = $cycle_id,
+                journal.lease_epoch = $epoch,
+                journal.state = 'Succeeded',
+                journal.completed_by_epoch = $epoch
+            MERGE (order:_ExocortexMeta {key: 'committed_lsn'})
+            ON CREATE SET order.value = 0
+            SET order.value = CASE
+                WHEN order.value < $max_lsn THEN $max_lsn ELSE order.value END
+            FOREACH (i IN $discovery_indexes |
+                MERGE (d:_Discovery {discovery_id: $discovery_ids[i]})
+                ON CREATE SET d.org_id = $org_ids[i],
+                              d.region_project = $region_projects[i],
+                              d.region_memory_type = $region_memory_types[i],
+                              d.from = $from_ids[i],
+                              d.to = $to_ids[i],
+                              d.discovered_at = $discovered_ats[i],
+                              d.props_json = $discovery_props[i],
+                              d.lsn = $discovery_lsns[i],
+                              d.published = false)
+            RETURN journal.cycle_id
+        "#,
+    });
+
     // Fenced rollback physically removes only rows proven absent from the
     // cycle preimage. OPTIONAL MATCH makes an ambiguous failed write safe to
     // compensate even when the row never reached storage.

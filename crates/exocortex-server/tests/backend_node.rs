@@ -96,6 +96,84 @@ async fn standalone_requires_its_configured_durable_fire_transport() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn standalone_startup_recovers_the_supervised_redis_processing_list() {
+    let Ok(redis_url) = std::env::var("REDIS_URL") else {
+        eprintln!("SKIP: REDIS_URL absent; standalone startup recovery unexecuted");
+        return;
+    };
+    let org = format!(
+        "standalone-recovery-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_micros()
+    );
+    let client = redis::Client::open(redis_url.as_str()).unwrap();
+    let producer = client.get_multiplexed_async_connection().await.unwrap();
+    let mut queue = exocortex_dreams::fire::RedisFireQueue::new(
+        producer,
+        exocortex_dreams::fire::QuietHours::none(),
+        org.clone(),
+    );
+    let region = exocortex_storage::RegionKey {
+        org: org.clone().into(),
+        project: "restart".into(),
+        memory_type: 3,
+    };
+    queue.fire(&region, "crashed-standalone").await.unwrap();
+    assert!(matches!(
+        queue.drain(Duration::from_secs(1)).await.unwrap(),
+        exocortex_dreams::fire::DrainResult::Ready(_)
+    ));
+    drop(queue);
+
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let mut config = args("127.0.0.1:0", 0, Vec::new());
+    config.org = org.clone();
+    config.redis_url = Some(redis_url);
+    let node = run_standalone_backend_node(storage, onto, config, [9; 32])
+        .await
+        .expect("standalone recovers its durable local fire queue before serving");
+
+    let queue_key = format!(
+        "exocortex:dreams:queue:org:{}",
+        serde_json::to_string(&org).unwrap()
+    );
+    let processing_key = format!("{queue_key}:processing");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut inspect = client.get_multiplexed_async_connection().await.unwrap();
+    loop {
+        let ready: u64 = redis::cmd("LLEN")
+            .arg(&queue_key)
+            .query_async(&mut inspect)
+            .await
+            .unwrap();
+        let processing: u64 = redis::cmd("LLEN")
+            .arg(&processing_key)
+            .query_async(&mut inspect)
+            .await
+            .unwrap();
+        if ready == 0 && processing == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "production standalone startup must recover and settle the in-flight fire"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(node);
+    let _: u64 = redis::cmd("DEL")
+        .arg(&queue_key)
+        .arg(&processing_key)
+        .arg(format!("{queue_key}:deferred"))
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn dropping_backend_node_stops_ingress_and_releases_its_port() {
     let onto = Arc::new(
         exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),

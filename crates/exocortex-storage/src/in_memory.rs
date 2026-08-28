@@ -1871,6 +1871,76 @@ impl Storage for InMemoryStorage {
         journal.state = CycleJournalState::Completed;
         Ok(())
     }
+    async fn cycle_succeeded(&self, key: &LeaseKey, cycle_id: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .inner
+            .cycle_journals
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|journal| {
+                journal.cycle_id == cycle_id && journal.state == CycleJournalState::Succeeded
+            }))
+    }
+    async fn settle_dreams_cycle_fenced(
+        &self,
+        cycle_id: &str,
+        records: &[DiscoveryRecord],
+        lease: &OwnerLease,
+    ) -> Result<(), StorageError> {
+        let invalidations = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            self.check_lease_current(lease)?;
+            let mut journals = self.inner.cycle_journals.lock().unwrap();
+            if journals.get(&lease.key).is_some_and(|journal| {
+                journal.state == CycleJournalState::Active && journal.cycle_id != cycle_id
+            }) {
+                return Err(StorageError::Backend(
+                    "another active Dreams cycle requires recovery".into(),
+                ));
+            }
+            let proposals = self.inner.proposals.lock().unwrap();
+            let mut discoveries = self.inner.discoveries.lock().unwrap();
+            for record in records {
+                if proposals.contains_key(&record.discovery_id)
+                    || discoveries
+                        .get(&record.discovery_id)
+                        .is_some_and(|stored| stored != record)
+                {
+                    return Err(StorageError::ProposalMismatch);
+                }
+            }
+            let mut invalidations = Vec::new();
+            for record in records {
+                if discoveries.contains_key(&record.discovery_id) {
+                    continue;
+                }
+                let lsn = self.lsn.load(Ordering::SeqCst) + 1;
+                discoveries.insert(record.discovery_id.clone(), record.clone());
+                self.lsn.store(lsn, Ordering::SeqCst);
+                invalidations.push(Invalidation::DiscoveryAvailable {
+                    record: record.clone(),
+                    lsn,
+                });
+            }
+            journals.insert(
+                lease.key.clone(),
+                CycleJournalRecord {
+                    cycle_id: cycle_id.into(),
+                    lease_key: lease.key.clone(),
+                    lease_epoch: lease.epoch,
+                    restore: FencedRestore::default(),
+                    state: CycleJournalState::Succeeded,
+                },
+            );
+            invalidations
+        };
+        for invalidation in invalidations {
+            self.index_invalidation(&invalidation);
+            let _ = self.feed.send(invalidation);
+        }
+        Ok(())
+    }
     async fn delete_memory_fenced(
         &self,
         id: &MemoryId,

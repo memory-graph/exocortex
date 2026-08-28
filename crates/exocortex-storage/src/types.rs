@@ -225,6 +225,8 @@ pub enum CycleJournalState {
     Active,
     /// Recovery or the normal cycle completed; retained as an idempotent tombstone.
     Completed,
+    /// The whole cycle, including durable discoveries, settled successfully.
+    Succeeded,
 }
 
 /// Durable rollback material for one fenced owner cycle.

@@ -2603,6 +2603,56 @@ itest!(lease_race_single_winner, {
     assert!(second.epoch > 0, "epoch fencing increments");
 });
 
+itest!(dreams_cycle_settlement_is_atomic_and_idempotent, {
+    let s = connect("settlement-node").await;
+    let region = RegionKey {
+        org: "test-org".into(),
+        project: "settlement".into(),
+        memory_type: 3,
+    };
+    let lease_key = LeaseKey::Dreams {
+        org: region.org.clone(),
+        region: format!("{}:{}", region.project, region.memory_type).into(),
+    };
+    let lease = s
+        .acquire_lease(&lease_key, StdDuration::from_secs(30))
+        .await
+        .unwrap();
+    let cycle_id = format!("dream-fire:{}", graph_suffix());
+    let record = DiscoveryRecord {
+        discovery_id: format!("discovery:{}", graph_suffix()).into(),
+        region,
+        from: MemoryId([0x71; 16]),
+        to: MemoryId([0x72; 16]),
+        discovery_type: "transitive".into(),
+        quality: 0.8,
+        via_types: [1, 2],
+        discovery_cycle_id: cycle_id.clone().into(),
+        discovered_at: Utc::now(),
+    };
+    s.settle_dreams_cycle_fenced(&cycle_id, std::slice::from_ref(&record), &lease)
+        .await
+        .unwrap();
+    assert!(s.cycle_succeeded(&lease_key, &cycle_id).await.unwrap());
+    assert_eq!(
+        s.get_discovery(record.discovery_id.as_str()).await.unwrap(),
+        Some(record.clone())
+    );
+    s.settle_dreams_cycle_fenced(&cycle_id, std::slice::from_ref(&record), &lease)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.list_discoveries("test-org", 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|candidate| candidate.discovery_id == record.discovery_id)
+            .count(),
+        1
+    );
+    s.release_lease(lease).await.unwrap();
+});
+
 itest!(demoted_owner_cannot_persist_a_discovery, {
     let storage = connect("discovery-fence").await;
     let key = LeaseKey::Dreams {

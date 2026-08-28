@@ -601,6 +601,27 @@ pub trait Storage: Send + Sync + 'static {
             "durable fenced cycle journals unsupported".into(),
         ))
     }
+    /// Whether this exact cycle identity durably settled successfully.
+    async fn cycle_succeeded(&self, key: &LeaseKey, cycle_id: &str) -> crate::Result<bool> {
+        let _ = (key, cycle_id);
+        Err(StorageError::Backend(
+            "durable cycle settlement unsupported".into(),
+        ))
+    }
+    /// Atomically persist every discovery and mark the exact owner cycle as
+    /// successful. A crash before this operation leaves an active mutation
+    /// journal; a crash after it leaves an idempotent success tombstone.
+    async fn settle_dreams_cycle_fenced(
+        &self,
+        cycle_id: &str,
+        discoveries: &[DiscoveryRecord],
+        lease: &OwnerLease,
+    ) -> crate::Result<()> {
+        let _ = (cycle_id, discoveries, lease);
+        Err(StorageError::Backend(
+            "atomic Dreams cycle settlement unsupported".into(),
+        ))
+    }
     /// [`Storage::delete_memory`](Self::delete_memory) under the same
     /// fencing check (a rollback must not delete a newer owner's rows).
     async fn delete_memory_fenced(

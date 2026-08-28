@@ -1163,6 +1163,74 @@ async fn production_cycle_runs_discovery_after_consolidation() {
 }
 
 #[tokio::test]
+async fn successful_fire_replay_is_settled_without_repeating_graph_mutations() {
+    let storage = InMemoryStorage::new(ontology());
+    let [a, b, c] = [MemoryId([21; 16]), MemoryId([22; 16]), MemoryId([23; 16])];
+    for (i, id) in [a, b, c].into_iter().enumerate() {
+        let mut memory = mem_with_embedding(i + 300, None, unit(i));
+        memory.id = id;
+        memory.embedding = None;
+        storage.upsert_memory(&memory).await.unwrap();
+    }
+    let first_edge = discovery_test_relationship(a, b);
+    storage.upsert_relationship(&first_edge).await.unwrap();
+    storage
+        .upsert_relationship(&discovery_test_relationship(b, c))
+        .await
+        .unwrap();
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        false,
+        "success-replay".into(),
+    );
+    let region = RegionKey {
+        org: "o".into(),
+        project: "p".into(),
+        memory_type: 3,
+    };
+
+    assert!(engine
+        .try_consolidate_once_for_testing(&region, "success-before-ack")
+        .await
+        .unwrap()
+        .is_some());
+    let evidence_after_success = storage
+        .get_relationship(&first_edge.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .properties
+        .evidence_count;
+    let discoveries_after_success = storage.list_discoveries("o", 100).await.unwrap();
+    assert!(!discoveries_after_success.is_empty());
+
+    assert!(engine
+        .try_consolidate_once_for_testing(&region, "success-before-ack")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        storage
+            .get_relationship(&first_edge.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .properties
+            .evidence_count,
+        evidence_after_success,
+        "a recovered successful fire must not strengthen twice"
+    );
+    assert_eq!(
+        storage.list_discoveries("o", 100).await.unwrap(),
+        discoveries_after_success,
+        "a recovered successful fire must preserve one discovery identity"
+    );
+}
+
+#[tokio::test]
 async fn discovery_budget_selects_the_same_bounded_pairs() {
     let storage = InMemoryStorage::new(ontology());
     for chain in 0..20u8 {
