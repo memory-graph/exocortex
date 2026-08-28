@@ -110,8 +110,10 @@ impl<S: Storage> BackendNode<S> {
 /// only after the cache writer acknowledges an atomic publication. Hydration
 /// failures retry the same item, preserving feed order and making lag honest.
 #[doc(hidden)]
-pub async fn apply_cache_invalidation_with_retry(
+pub async fn apply_cache_invalidation_with_retry<S: Storage>(
     cache: &LocalCache,
+    storage: &S,
+    org: &str,
     health: &arc_swap::ArcSwap<HealthSnapshot>,
     invalidation: exocortex_storage::Invalidation,
     retry_delay: Duration,
@@ -122,20 +124,31 @@ pub async fn apply_cache_invalidation_with_retry(
         next.backend_lsn = next.backend_lsn.max(lsn);
         Arc::new(next)
     });
-    loop {
-        match cache.apply_invalidation(invalidation.clone()).await {
-            Ok(()) => {
-                health.rcu(|current| {
-                    let mut next = (**current).clone();
-                    next.sync_lsn = next.sync_lsn.max(lsn);
-                    Arc::new(next)
-                });
-                return;
+    match cache.apply_invalidation(invalidation).await {
+        Ok(()) => {
+            health.rcu(|current| {
+                let mut next = (**current).clone();
+                next.sync_lsn = next.sync_lsn.max(lsn);
+                Arc::new(next)
+            });
+        }
+        Err(error) => {
+            tracing::warn!(%error, lsn, "cache invalidation apply failed; reseeding");
+            loop {
+                let org = org.into();
+                match cache.reseed_from_storage(storage, &org).await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        tracing::warn!(%error, lsn, "cache reseed failed; retrying");
+                        tokio::time::sleep(retry_delay).await;
+                    }
+                }
             }
-            Err(error) => {
-                tracing::warn!(%error, lsn, "cache invalidation apply failed; retrying");
-                tokio::time::sleep(retry_delay).await;
-            }
+            health.rcu(|current| {
+                let mut next = (**current).clone();
+                next.sync_lsn = next.sync_lsn.max(lsn);
+                Arc::new(next)
+            });
         }
     }
 }
@@ -209,6 +222,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
         let cache = cache.clone();
         let storage = storage.clone();
         let health = health.clone();
+        let org = org.to_string();
         tokio::spawn(async move {
             let region = exocortex_storage::RegionKey {
                 org: "*".into(),
@@ -224,6 +238,8 @@ pub async fn run_backend_node<S: Storage + 'static>(
                                 Ok(inv) => {
                                     apply_cache_invalidation_with_retry(
                                         &cache,
+                                        &*storage,
+                                        &org,
                                         &health,
                                         inv,
                                         Duration::from_millis(100),

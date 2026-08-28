@@ -55,7 +55,7 @@ async fn http_get(addr: std::net::SocketAddr, path: &str, bearer: Option<&str>) 
 }
 
 #[tokio::test]
-async fn cache_bridge_retries_failed_fetch_before_advancing_sync_health() {
+async fn cache_bridge_reseeds_past_an_upsert_whose_row_was_already_deleted() {
     use exocortex_kernel::{Provenance, Relationship, RelationshipId, RelationshipProperties};
     use exocortex_storage::{Direction, Invalidation, TraversalSpec};
 
@@ -112,42 +112,40 @@ async fn cache_bridge_retries_failed_fetch_before_advancing_sync_health() {
     let health = Arc::new(arc_swap::ArcSwap::from_pointee(
         exocortex_server::http_bind::HealthSnapshot::default(),
     ));
-    let bridge = tokio::spawn({
-        let cache = cache.clone();
-        let health = health.clone();
-        let invalidation = Invalidation::RelationshipUpserted {
-            id: relationship.id,
-            from: relationship.from,
-            to: relationship.to,
-            kind: relationship.kind,
-            lsn: 54,
-        };
-        async move {
-            exocortex_server::backend::apply_cache_invalidation_with_retry(
-                &cache,
-                &health,
-                invalidation,
-                Duration::from_millis(1),
-            )
-            .await;
-        }
-    });
-
-    tokio::time::timeout(Duration::from_millis(250), async {
-        while health.load().backend_lsn < 54 {
-            tokio::task::yield_now().await;
-        }
-    })
+    let invalidation = Invalidation::RelationshipUpserted {
+        id: relationship.id,
+        from: relationship.from,
+        to: relationship.to,
+        kind: relationship.kind,
+        lsn: 54,
+    };
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        exocortex_server::backend::apply_cache_invalidation_with_retry(
+            &cache,
+            &*storage,
+            "org",
+            &health,
+            invalidation,
+            Duration::from_millis(1),
+        ),
+    )
     .await
-    .expect("observed frontier advances before hydration succeeds");
-    assert_eq!(health.load().sync_lsn, 0, "failed fetch is not applied");
-
-    storage.upsert_relationship(&relationship).await.unwrap();
-    tokio::time::timeout(Duration::from_millis(250), bridge)
-        .await
-        .expect("same invalidation retries")
-        .unwrap();
+    .expect("authoritative reseed lets the bridge pass a stale upsert");
     assert_eq!(health.load().sync_lsn, 54);
+    exocortex_server::backend::apply_cache_invalidation_with_retry(
+        &cache,
+        &*storage,
+        "org",
+        &health,
+        Invalidation::RelationshipDeleted {
+            id: relationship.id,
+            lsn: 55,
+        },
+        Duration::from_millis(1),
+    )
+    .await;
+    assert_eq!(health.load().sync_lsn, 55);
     let visible =
         exocortex_ops::operations::ops_vc("org", "test", exocortex_kernel::Visibility::Org);
     let reached = cache.traverse(
@@ -164,7 +162,7 @@ async fn cache_bridge_retries_failed_fetch_before_advancing_sync_health() {
     );
     assert_eq!(
         reached.iter().map(|memory| memory.id).collect::<Vec<_>>(),
-        vec![to.id]
+        Vec::<exocortex_kernel::MemoryId>::new()
     );
     writer.abort();
 }
