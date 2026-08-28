@@ -246,14 +246,19 @@ fn rust_functions(source: &str) -> Vec<RustFunction> {
 fn function_body_start(source: &str, signature_start: usize) -> Option<usize> {
     let mut parentheses = 0usize;
     let mut brackets = 0usize;
+    let mut angles = 0usize;
     for (offset, byte) in source.as_bytes()[signature_start..].iter().enumerate() {
         match byte {
             b'(' => parentheses += 1,
             b')' => parentheses = parentheses.saturating_sub(1),
             b'[' => brackets += 1,
             b']' => brackets = brackets.saturating_sub(1),
-            b';' if parentheses == 0 && brackets == 0 => return None,
-            b'{' if parentheses == 0 && brackets == 0 => return Some(signature_start + offset),
+            b'<' if parentheses == 0 && brackets == 0 => angles += 1,
+            b'>' if parentheses == 0 && brackets == 0 => angles = angles.saturating_sub(1),
+            b';' if parentheses == 0 && brackets == 0 && angles == 0 => return None,
+            b'{' if parentheses == 0 && brackets == 0 && angles == 0 => {
+                return Some(signature_start + offset)
+            }
             _ => {}
         }
     }
@@ -854,8 +859,13 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
                 let source = std::fs::read_to_string(root.join(relative)).map_err(|_| {
                     anyhow::anyhow!("criterion {criterion} evidence file `{relative}` is missing")
                 })?;
+                let searchable = if relative.ends_with(".rs") {
+                    strip_comments_and_strings(&source)
+                } else {
+                    source.clone()
+                };
                 anyhow::ensure!(
-                    source.contains(needle),
+                    searchable.contains(needle),
                     "criterion {criterion} evidence symbol `{needle}` is absent from {relative}"
                 );
                 validate_executable_evidence(criterion, relative, needle, &source, columns[4])?;
@@ -880,6 +890,7 @@ fn validate_executable_evidence(
     if !relative.ends_with(".rs") {
         return Ok(());
     }
+    let clean_source = strip_comments_and_strings(source);
     let symbol = needle
         .strip_prefix("fn ")
         .unwrap_or(needle)
@@ -887,26 +898,43 @@ fn validate_executable_evidence(
         .next()
         .unwrap_or_default();
     let function_pattern = format!("fn {symbol}");
-    let Some(function_offset) = source.find(&function_pattern) else {
+    let function_offset =
+        clean_source
+            .match_indices(&function_pattern)
+            .find_map(|(offset, text)| {
+                let end = offset + text.len();
+                (!clean_source
+                    .as_bytes()
+                    .get(end)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_'))
+                .then_some(offset)
+            });
+    let Some(function_offset) = function_offset else {
         // Some Rust evidence is deliberately a constant, method call, or
         // invariant-bearing expression rather than a test function.
+        if (relative.starts_with("tests/") || relative.contains("/tests/"))
+            && macro_generates_test(&clean_source, symbol)
+        {
+            let target = std::path::Path::new(relative)
+                .file_stem()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or_default();
+            anyhow::ensure!(
+                command.contains(symbol) || command.contains(&format!("--test {target}")),
+                "criterion {criterion} command does not execute evidence `{relative}::{needle}`"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !(relative.starts_with("tests/") || relative.contains("/tests/")),
+            "criterion {criterion} evidence `{relative}::{needle}` is not an executable test"
+        );
         return Ok(());
     };
     let prefix = &source[..function_offset];
-    let attribute_window = &prefix[prefix.len().saturating_sub(512)..];
-    let is_test = attribute_window.contains("#[test") || attribute_window.contains("#[tokio::test");
-    anyhow::ensure!(
-        !(relative.starts_with("tests/") || relative.contains("/tests/")) || is_test,
-        "criterion {criterion} evidence `{relative}::{needle}` is not an executable test"
-    );
-    if !is_test {
-        return Ok(());
-    }
-    anyhow::ensure!(
-        !attribute_window.contains("#[ignore"),
-        "criterion {criterion} evidence `{relative}::{needle}` is ignored"
-    );
-    let function_attributes = prefix
+    let declaration_line_start = prefix.rfind('\n').map_or(0, |line| line + 1);
+    let attribute_prefix = &prefix[..declaration_line_start];
+    let function_attributes = attribute_prefix
         .lines()
         .rev()
         .skip_while(|line| line.trim().is_empty())
@@ -916,6 +944,19 @@ fn validate_executable_evidence(
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
+    let is_test =
+        function_attributes.contains("#[test") || function_attributes.contains("#[tokio::test");
+    anyhow::ensure!(
+        !(relative.starts_with("tests/") || relative.contains("/tests/")) || is_test,
+        "criterion {criterion} evidence `{relative}::{needle}` is not an executable test"
+    );
+    if !is_test {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !function_attributes.contains("#[ignore"),
+        "criterion {criterion} evidence `{relative}::{needle}` is ignored"
+    );
     let file_attributes = source
         .lines()
         .take_while(|line| {
@@ -943,6 +984,38 @@ fn validate_executable_evidence(
         "criterion {criterion} command does not execute evidence `{relative}::{needle}`"
     );
     Ok(())
+}
+
+fn macro_generates_test(source: &str, symbol: &str) -> bool {
+    let invocation = format!("({symbol},");
+    source.match_indices(&invocation).any(|(offset, _)| {
+        let before = source[..offset].trim_end();
+        let Some(bang) = before.strip_suffix('!') else {
+            return false;
+        };
+        let macro_name = bang
+            .rsplit(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .next()
+            .unwrap_or_default();
+        if macro_name.is_empty() {
+            return false;
+        }
+        let declaration = format!("macro_rules! {macro_name}");
+        let Some(declaration_at) = source[..offset].find(&declaration) else {
+            return false;
+        };
+        let Some(open) = source[declaration_at..offset]
+            .find('{')
+            .map(|relative| declaration_at + relative)
+        else {
+            return false;
+        };
+        let Some(close) = matching_brace(source, open) else {
+            return false;
+        };
+        let body = &source[open..=close];
+        (body.contains("#[test") || body.contains("#[tokio::test")) && body.contains("fn $name")
+    })
 }
 
 fn command_enables_configuration(command: &str, configuration: &str) -> bool {
@@ -1340,6 +1413,20 @@ mod tests {
                 .is_empty(),
             "array-type semicolons are not function declaration terminators"
         );
+
+        let root = fixture("const-generic-signature");
+        write(
+            &root,
+            "crates/example/src/lib.rs",
+            "struct Marker<const N: usize>;\npub fn root() { let _ = helper(); }\nfn helper() -> Marker<{ fence() }> { Marker }\nconst fn fence() -> usize { 1 }\n",
+        );
+        assert_eq!(
+            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")])
+                .unwrap()
+                .len(),
+            1,
+            "a const-generic expression in a signature is not a runtime enforcement call"
+        );
     }
 
     #[test]
@@ -1590,6 +1677,17 @@ mod tests {
         write(&root, "docs/acceptance/section-23.tsv", &rows);
         assert!(validate_acceptance_matrix(&root).is_ok());
 
+        write(
+            &root,
+            "tests/direct.rs",
+            "macro_rules! case { ($name:ident, $body:block) => { #[test] fn $name() $body }; }\ncase!(direct_case, {});\n",
+        );
+        assert!(
+            validate_acceptance_matrix(&root).is_ok(),
+            "a locally defined test-generating macro remains executable evidence"
+        );
+        write(&root, "tests/direct.rs", "#[test]\nfn direct_case() {}\n");
+
         let missing = rows.replace("30\tverified", "29\tverified");
         write(&root, "docs/acceptance/section-23.tsv", &missing);
         assert!(validate_acceptance_matrix(&root).is_err());
@@ -1600,6 +1698,17 @@ mod tests {
         );
         write(&root, "docs/acceptance/section-23.tsv", &stale);
         assert!(validate_acceptance_matrix(&root).is_err());
+
+        write(
+            &root,
+            "tests/direct.rs",
+            "// direct_case was removed; this comment is not executable evidence\n",
+        );
+        write(&root, "docs/acceptance/section-23.tsv", &rows);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "a deleted test name surviving only in a comment must not satisfy acceptance evidence"
+        );
 
         write(&root, "tests/direct.rs", "fn direct_case() {}\n");
         write(&root, "docs/acceptance/section-23.tsv", &rows);
