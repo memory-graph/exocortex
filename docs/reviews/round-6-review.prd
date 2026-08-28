@@ -459,3 +459,9 @@ exact entrypoint and retain an executable manifest regression.
 R6-R145 is closed: the control manifest now names `on_writes_once`, its unit
 test rejects the superseded name, and `cargo xtask dead-enforcement` passes
 against the executable ingest call graph.
+
+The live cluster run promoted R6-R146. Direct `sse_router` integration
+fixtures install a scoped principal extension but their raw HTTP requests
+predate the handler's required bearer presence check, so reconnect correctly
+returned 401. Both direct-router live requests must carry explicit credentials;
+production authentication remains owned by the enclosing `HttpBind` middleware.
