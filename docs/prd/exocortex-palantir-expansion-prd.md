@@ -103,7 +103,7 @@ Five capabilities, each independently shippable and testable. Ordered so D2 unbl
 - Loading dev-v1 and mortgage-v1 into one node produces one composed ontology, one fingerprint, and no kind-id or triple collisions.
 - A cross-pack `Fixes` triple (`Fix` in dev-v1 → `RuleDefect` in mortgage-v1) writes and reads correctly.
 - Fingerprint of `{dev-v1, mortgage-v1}` is byte-stable across two clean builds, in the shape `crates/exocortex-pack-dev-v1/tests/dev_v1_fingerprint.txt` already establishes for one pack.
-- Fewer than 3 open `pack-seam` kernel issues at ship time (§6 S1 is the authoritative bar; there is no separate "empty list" criterion).
+- Every `pack-seam` issue the pack author filed is either closed or explicitly accepted as a permanent seam limitation with a written reason. The bar is disposition, not headcount — three trivial issues and one that says "the macro cannot express this" are not the same result, and a threshold cannot tell them apart.
 
 ### 3.2 D2 — Pack-registered Actions and Functions
 
@@ -186,10 +186,10 @@ Callers hit these over MCP by name — `exocortex.pack.mortgage.is_categorically
 **CI wiring:** `xtask seam-inventory` enumerates the seven seams and their suites. Two failure conditions: a listed seam with no green suite, and an implementation of an already-seamed contract (a fourth `Storage`, a third operation surface, a fourth signing producer) that does not appear in the corresponding suite. This second condition is the point of the deliverable — it converts seam coverage from a thing someone remembers into a thing CI requires.
 
 **Acceptance:**
-- Seven suites enumerated by `xtask seam-inventory`, all green on the runner.
+- Every declared seam has a green conformance suite, and every suite is a declared seam — a bijection, checked in both directions. The gate asserts the relationship, never a number: an eighth seam with a suite passes without editing anything.
 - Adding a fourth `Storage` implementation without adding it to S1's corpus fails the gate. Demonstrated with a throwaway impl in a test.
 - S6 reports a bijection: zero kernel-declared verbs without an operation, zero operations without a kernel declaration.
-- Each of the seven seams lands as a row in `docs/acceptance/section-23.tsv` with a runnable command (P7).
+- Each declared seam lands as a row in `docs/acceptance/section-23.tsv` with a runnable command (P7).
 - S7's suite covers the CS1 case explicitly: a consumer asking from an offset the ring no longer holds receives 409 Resync, never "you are current".
 
 ### 3.4 D4 — Mintlify adapter, end-to-end, on `loanlight-engineering/docs`
@@ -211,7 +211,7 @@ Callers hit these over MCP by name — `exocortex.pack.mortgage.is_categorically
 The bar is not "ingest all 70 pages" — it is "ingest a real, non-toy subset that exercises cross-pack triples and produces something a LoanLight engineer would search for and get a useful result from."
 
 **Acceptance:**
-- The adapter runs against a real checkout and commits ≥30 memories + ≥50 edges through the live ingest path (`ProducerKind::DocsAdapter`).
+- The adapter runs against a real checkout and commits through the live ingest path (`ProducerKind::DocsAdapter`) — every page in the declared projection that carries `exocortex:` frontmatter, and nothing outside it. Coverage is the criterion; row counts are an outcome, not a target.
 - Every committed memory has `Provenance::Extracted` and an `ExternalKey` pointing back to the source page.
 - Rerunning the adapter produces zero new memories (idempotency).
 - A LoanLight engineer, given only the Exocortex client, can answer a real question from the graph — "what rule bundles govern `first-lender-services`?" — using only `search_memories` and `find_related`. Screenshot in the PRD closeout.
@@ -337,16 +337,16 @@ Each of these is accepted work with a wave, not a deferral.
 
 Numbered, checkable, and each one a row in `docs/acceptance/section-23.tsv` with a runnable command (P7).
 
-**S1 — The pack seam is a product.** `exocortex-pack-mortgage-v1` is authored by an engineer who is not the Exocortex primary author, ships with zero kernel changes forced by the author *after* D2 lands, and composes with dev-v1 into one byte-stable fingerprint. Fewer than 3 open `pack-seam` kernel issues at ship time.
+**S1 — The pack seam is a product.** `exocortex-pack-mortgage-v1` is authored by an engineer who is not the Exocortex primary author, ships with zero kernel changes forced by the author *after* D2 lands, and composes with dev-v1 into one byte-stable fingerprint. Every `pack-seam` issue is closed or carries a written, accepted reason why it stays open.
 *Command:* `cargo xtask pack-acceptance --packs dev-v1,mortgage-v1`
 
-**S2 — Actions and Functions are ontology surface.** ≥5 pack Actions and ≥3 pack Functions ship in mortgage-v1. Every one has an audit row per call, a budget enforced by the generated bench harness, an MCP↔HTTP parity assertion (D3-S2), and an entry in `--dump-tools`. A pack Action missing any of the four fails at compile time.
+**S2 — Actions and Functions are ontology surface.** mortgage-v1 ships the domain verbs its own ontology needs — the pack author decides which, because a quota would produce verbs written to satisfy a quota. What is checkable is the property: **every** pack Action has an audit row per call, a budget enforced by the generated bench harness, an MCP↔HTTP parity assertion (D3-S2), and an entry in `--dump-tools`, and an Action missing any of the four fails at compile time. The same holds for every Function.
 *Command:* `cargo xtask pack-verb-acceptance`
 
-**S3 — The seam set is enforced.** Seven conformance suites green on the runner; `xtask seam-inventory` reports exactly seven; a throwaway fourth `Storage` impl added without a corpus row fails the gate; S6 reports a kernel-catalogue ↔ registry bijection with zero orphans on either side.
+**S3 — The seam set is enforced.** `xtask seam-inventory` asserts a bijection between declared seams and green suites, in both directions — no seam without a suite, no suite outside the inventory. A throwaway fourth `Storage` impl added without a corpus row fails the gate. S6 reports a kernel-catalogue ↔ registry bijection with zero orphans on either side. No criterion here names a quantity: quantities drift, and a gate that fails on a legitimate addition teaches people to edit the constant.
 *Command:* `cargo xtask seam-inventory --verify`
 
-**S4 — Documents feed the graph.** D4's adapter commits ≥30 memories + ≥50 edges from a real LoanLight docs checkout into a real node, idempotently, and a LoanLight engineer (Gregory or one other person) answers ≥2 real questions from the resulting graph using only the client tools. Recorded in the D4 closeout note.
+**S4 — Documents feed the graph.** D4's adapter commits its full declared projection from a real LoanLight docs checkout into a real node, idempotently. A LoanLight engineer who did not build the adapter answers real questions from the resulting graph using only the client tools, and the questions are ones they actually had — recorded verbatim in the D4 closeout note along with whether the graph answered them. A question invented to be answerable proves nothing.
 *Command:* `cargo xtask docs-adapter-acceptance --checkout <path>`
 
 **S5 — Users can see the ontology.** D5 renders all six views against the D4 corpus without a JS build step, behind the existing bearer-token auth, enforcing visibility filtering at every render. A 30s loom walks from `--verify` install through `/explorer/ontology` → memory detail → provenance trace → audit ledger, on real data.
@@ -379,7 +379,7 @@ as PX1-PX6 alongside the rest of the plan.
 | **1e** | D3-S2 extended to pack verbs; D3-S5 signing symmetry | Platform | 1a |
 | **1f** | Draft `exocortex-pack-mortgage-v1` (D1) — non-primary author, from `ONTOLOGY_GUIDE.md` alone | LoanLight eng (not Gregory) | 1a, 1b |
 | **1g** | D3-S3 / D3-S4 extended to pack-produced drafts; seam-inventory gate on in CI | Platform | 1d, 1e |
-| **1h** | Resolve every `pack-seam` issue from 1f; count below 3 | Platform | 1f |
+| **1h** | Dispose of every `pack-seam` issue from 1f — each closed, or accepted as a permanent seam limitation with a written reason | Platform | 1f |
 | **1i** | Ship mortgage-v1 v0.1.0 + composed fingerprint stability gate | Platform + LoanLight eng | 1f, 1h |
 
 **Wave 2 — data breadth.** D4 is one producer here, not the headline; it sits beside the structured-source adapters (master plan D1) and deterministic entity resolution (D13).
@@ -441,7 +441,7 @@ Recorded, not blocking.
 - **Why Actions and Functions as one deliverable, not two?** Because they share dispatch, audit, visibility, and parity machinery. Splitting them means shipping half the ontology-verb surface, which is worse than shipping none.
 - **Why is pack guidance structured rather than a prose fragment?** Because the rule that a pack may only describe its own types is trivially enforceable when the names are macro tokens and nearly unenforceable when they are English. The prose version required building a text analyzer with false positives on ordinary sentences — and it would have aimed that analyzer at the one external pack author whose experience D1 exists to measure. `agent-instructions-prd.md` had already drawn this line: ontology-naming content is generated, situational prose is hand-written. Pack guidance is the former, and rev 2's first draft put it in the wrong bucket.
 - **Why compile-time pack-verb registration instead of a runtime registry?** Because one registry enumerated by every surface is the invariant that makes MCP/HTTP parity checkable at all. Dynamism that costs the invariant is a bad trade at single-binary scale (§4.3).
-- **Why seven seams, not five?** Because two of them were already known to be broken. The kernel's Action/Function catalogue is a contract with the operation registry and is violated by three verbs (S6). The change feed had no named contract at all, and the audit's CS1 — a silent-data-loss reconnect bug — is what an unnamed contract spread across three crates produces (S7). A seam set that omits the seams known to be broken is decorative.
+- **Why these seams, and why not stop at the five the first draft named?** Because two more were already known to be broken. The kernel's Action/Function catalogue is a contract with the operation registry and is violated by three verbs (S6). The change feed had no named contract at all, and the audit's CS1 — a silent-data-loss reconnect bug — is what an unnamed contract spread across three crates produces (S7). A seam set that omits the seams known to be broken is decorative. The set is not fixed at any size: the gate asserts that every seam has a suite, not that there are N of them, so the eighth costs a suite rather than an argument about a constant.
 - **Why name the `ChangeLog` seam without adopting a broker?** Because the argument for naming it is CS1, not scale. The contract is worth writing whether or not anything ever replaces the in-memory ring; a broker becomes an adapter rather than surgery on `sync.rs` if it is ever wanted, and that optionality is a side benefit rather than the case.
 - **Why implement `RetractEdge` rather than delete it?** Because it is the only governed way to retract a belief, and an append-only store without one does not stop having retractions — it just stops recording them. The alternative retraction path is manual and invisible. It is also cheap: storage already closes `valid_until`, so this is an operation wrapper, not a feature.
 - **Why extend three existing suites instead of writing six fresh ones?** Because `http_parity.rs`, `write_path_parity.rs`, and `standalone_readback.rs` already encode the right designs. Rewriting them under a new directory would discard working assertions to make an org chart tidier. The deliverable is the *inventory and the gate*, not the file layout.
