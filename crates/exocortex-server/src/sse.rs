@@ -370,14 +370,26 @@ async fn graph_reseed_envelope<S: Storage + 'static>(
     visibility: Option<&VisibilityContext>,
 ) -> Result<InvalidationEnvelope, StorageError> {
     let now = chrono::Utc::now();
+    // Capture the authoritative frontier before either scan. The subscription
+    // is already live, so every later commit is buffered. Advancing this
+    // frontier from rows observed during the two scans could otherwise discard
+    // a buffered endpoint upsert while retaining its later relationship.
+    let frontier = cluster.storage.get_state_at(now).await?.backend_lsn;
+    graph_reseed_envelope_at(cluster, visibility, now, frontier).await
+}
+
+async fn graph_reseed_envelope_at<S: Storage + 'static>(
+    cluster: &ClusterNode<S>,
+    visibility: Option<&VisibilityContext>,
+    now: chrono::DateTime<chrono::Utc>,
+    frontier: u64,
+) -> Result<InvalidationEnvelope, StorageError> {
     let mut all_memories = std::collections::HashMap::new();
     let mut memories = Vec::new();
-    let mut frontier = 0;
     let mut memory_rows = cluster.storage.stream_all_memories().await;
     while let Some(row) = memory_rows.next().await {
         let mut memory = row?;
         ensure_reseed_budget(all_memories.len() + 1, 0)?;
-        frontier = frontier.max(memory.lsn.value);
         let live =
             memory.valid_until.is_none_or(|until| until > now) && memory.invalidated_by.is_none();
         let visible = visibility.is_none_or(|vc| memory_visible(&memory, vc));
@@ -394,7 +406,6 @@ async fn graph_reseed_envelope<S: Storage + 'static>(
         let relationship = row?;
         relationship_rows_seen += 1;
         ensure_reseed_budget(all_memories.len() + relationship_rows_seen, 0)?;
-        frontier = frontier.max(relationship.lsn.value);
         let live = relationship.valid_until.is_none_or(|until| until > now)
             && relationship.invalidated_by.is_none();
         if !live {
@@ -509,12 +520,78 @@ fn prost_encode(env: &exocortex_wire::cluster::v1::InvalidationEnvelope) -> Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_reseed_budget, MAX_RESEED_BYTES, MAX_RESEED_ROWS};
+    use super::{
+        ensure_reseed_budget, graph_reseed_envelope_at, MAX_RESEED_BYTES, MAX_RESEED_ROWS,
+    };
+    use exocortex_cluster::ClusterNode;
+    use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
+    use exocortex_storage::{InMemoryStorage, Storage};
+    use std::sync::Arc;
 
     #[test]
     fn hydration_budget_is_inclusive_and_fail_closed() {
         assert!(ensure_reseed_budget(MAX_RESEED_ROWS, MAX_RESEED_BYTES).is_ok());
         assert!(ensure_reseed_budget(MAX_RESEED_ROWS + 1, 0).is_err());
         assert!(ensure_reseed_budget(0, MAX_RESEED_BYTES + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn hydration_never_advances_past_its_captured_frontier() {
+        let ontology = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = Arc::new(InMemoryStorage::new(ontology.clone()));
+        let now = chrono::Utc::now();
+        let memory = Memory {
+            id: MemoryId::new_v7(),
+            memory_type: 3,
+            title: "concurrent".into(),
+            content: "row".into(),
+            summary: None,
+            tags: Default::default(),
+            visibility: Visibility::Org,
+            provenance: Provenance::Asserted {
+                author: "test".into(),
+                producer_kind: None,
+            },
+            context: MemoryContext {
+                timestamp: now,
+                project_id: None,
+                project_path: None,
+                team_id: None,
+                tenant_id: Some("org".into()),
+                session_id: None,
+                user_id: None,
+                created_by: None,
+                files_involved: Default::default(),
+                languages: Default::default(),
+                frameworks: Default::default(),
+                technologies: Default::default(),
+                git_commit: None,
+                git_branch: None,
+                working_directory: None,
+                entities: Default::default(),
+                additional_metadata: serde_json::Value::Null,
+            },
+            importance: exocortex_kernel::memory::F01::new(0.5).unwrap(),
+            confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
+            effectiveness: None,
+            usage_count: 0,
+            valid_from: now,
+            valid_until: None,
+            recorded_at: now,
+            invalidated_by: None,
+            embedding: None,
+            lsn: LSN::new_local(0),
+        };
+        let captured = storage.get_state_at(now).await.unwrap().backend_lsn;
+        let later = storage.upsert_memory(&memory).await.unwrap().lsn;
+        assert!(later > captured);
+        let cluster = ClusterNode::new(storage, "seed-race".into(), ontology.fingerprint, [4; 32]);
+        let envelope = graph_reseed_envelope_at(&cluster, None, now, captured)
+            .await
+            .unwrap();
+        assert_eq!(envelope.inv.unwrap().backend_lsn, captured, "a row observed after capture is replayed from the live subscription, never acknowledged by the snapshot frontier");
     }
 }

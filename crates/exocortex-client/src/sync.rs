@@ -67,6 +67,10 @@ pub struct SseSyncConfig {
     pub gap_timeout: Duration,
     /// Reconnect backoff (capped at 10s).
     pub backoff: Duration,
+    /// Maximum time an already-live cache may run without an authoritative
+    /// replacement image. This repairs durable commits whose best-effort
+    /// change-feed publication was lost.
+    pub reconcile_interval: Duration,
     /// Optional first-connection signal for supervisors and deterministic
     /// integration tests. A permit is emitted after the SSE handshake.
     pub connection_ready: Option<Arc<tokio::sync::Notify>>,
@@ -88,6 +92,7 @@ impl SseSyncConfig {
             stall_timeout: Duration::from_secs(15),
             gap_timeout: Duration::from_secs(2),
             backoff: Duration::from_secs(1),
+            reconcile_interval: Duration::from_secs(60),
             connection_ready: None,
             hydration_ready: None,
             org: "org".into(),
@@ -252,7 +257,6 @@ fn decode_event(
 #[derive(Debug, Default)]
 pub struct LsnGate {
     next: u64,
-    anchored: bool,
     held: BTreeMap<u64, Invalidation>,
     gap_since: Option<Instant>,
 }
@@ -262,7 +266,6 @@ impl LsnGate {
     pub fn new(next: u64) -> Self {
         Self {
             next,
-            anchored: false,
             held: BTreeMap::new(),
             gap_since: None,
         }
@@ -275,16 +278,6 @@ impl LsnGate {
 
     /// Push one envelope; returns the invalidations now releasable in order.
     pub fn push(&mut self, lsn: u64, inv: Invalidation) -> Vec<Invalidation> {
-        if !self.anchored {
-            // Servers do not replay below `since_lsn`; the first envelope at
-            // or beyond `next` anchors the sequence. Ordering and gap
-            // detection then apply strictly within the stream.
-            if lsn < self.next {
-                return vec![];
-            }
-            self.next = lsn;
-            self.anchored = true;
-        }
         if lsn < self.next {
             // Stale replay from a resubscribe: already applied.
             return vec![];
@@ -361,7 +354,20 @@ pub async fn run_sse_sync(
             }
             let client = builder.read_timeout(cfg.stall_timeout).build();
             let mut stream = client.stream();
-            while let Some(item) = stream.next().await {
+            let reconcile = tokio::time::sleep(cfg.reconcile_interval);
+            tokio::pin!(reconcile);
+            loop {
+                let item = tokio::select! {
+                    _ = &mut reconcile => {
+                        needs_seed = true;
+                        reconnect_reason = "periodic authoritative reconciliation";
+                        break;
+                    }
+                    item = stream.next() => item,
+                };
+                let Some(item) = item else {
+                    break;
+                };
                 match item {
                     // R-C5: heartbeats/connect anchors arrive as comments;
                     // transport-level silence trips `read_timeout` below.

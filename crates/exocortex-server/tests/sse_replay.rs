@@ -494,6 +494,7 @@ async fn backend_router_rejects_token_query_without_bearer() {
             "backend",
             exocortex_kernel::Visibility::Org,
         ),
+        audit_admin: false,
         storage: Arc::new(exocortex_storage::InMemoryStorage::new(onto.clone()))
             as Arc<dyn exocortex_storage::Storage>,
         cache: Arc::new(cache),

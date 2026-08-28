@@ -47,6 +47,14 @@ fn lsn_gate_holds_out_of_order_and_releases_in_order() {
     // Pre-anchor stale replay (below the subscribe point) is dropped.
     assert!(LsnGate::new(4).push(2, inv(2, 2)).is_empty());
 
+    // The first observed envelope may itself be ahead of an in-flight earlier
+    // publish. It must be held, not promoted to the expected frontier.
+    let mut first_out_of_order = LsnGate::new(4);
+    assert!(first_out_of_order.push(5, inv(5, 5)).is_empty());
+    let released = first_out_of_order.push(4, inv(4, 4));
+    assert_eq!(released.len(), 2);
+    assert_eq!(first_out_of_order.next_lsn(), 6);
+
     // 1 anchors the stream and releases immediately.
     let first = gate.push(1, inv(1, 1));
     assert_eq!(first.len(), 1);
@@ -202,6 +210,7 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
     let (server_cache, _server_rx) = LocalCache::new(1024 * 1024);
     let ctx = Arc::new(exocortex_ops::OpContext {
         visibility_ctx: vc.clone(),
+        audit_admin: false,
         storage: storage.clone() as Arc<dyn Storage>,
         cache: Arc::new(server_cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
@@ -262,6 +271,77 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
     let _ = hex16(&m.id.0);
     let _ = RelKindId(0);
     let _ = CacheWrite::Evict("x".into());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn periodic_reseed_repairs_a_commit_with_no_change_feed_publication() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let cluster = Arc::new(ClusterNode::new(
+        storage.clone(),
+        "reconcile".into(),
+        onto.fingerprint,
+        HMAC_KEY,
+    ));
+    // Deliberately do not run ClusterNode::run: storage commits therefore
+    // have no path into the replay ring or live SSE broadcast.
+    let app = exocortex_server::sse::sse_router(cluster).layer(axum::Extension(
+        exocortex_ops::operations::ops_vc(
+            "org",
+            "reconcile-reader",
+            exocortex_kernel::Visibility::Org,
+        ),
+    ));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (cache, rx) = LocalCache::new(16 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    tokio::spawn({
+        let cache = cache.clone();
+        let storage = storage.clone();
+        async move { cache.run(storage, rx).await }
+    });
+    let hydrated = Arc::new(tokio::sync::Notify::new());
+    let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+    cfg.bearer = Some("reconcile-token".into());
+    cfg.client_key = Some(exocortex_wire::signing::derive_sse_client_key(
+        &HMAC_KEY,
+        "reconcile-token",
+    ));
+    cfg.backoff = Duration::from_millis(5);
+    cfg.reconcile_interval = Duration::from_millis(40);
+    cfg.hydration_ready = Some(hydrated.clone());
+    let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 0, None));
+    tokio::time::timeout(Duration::from_secs(2), hydrated.notified())
+        .await
+        .expect("initial authoritative image");
+
+    let missed = test_memory("missed-publication", 44);
+    storage.upsert_memory(&missed).await.unwrap();
+    let vc = VisibilityContext {
+        user_id: "reconcile-reader".into(),
+        org_id: "org".into(),
+        project_ids: Default::default(),
+        team_ids: Default::default(),
+        max_visibility: exocortex_kernel::Visibility::Org,
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while cache.get_memory("org", &missed.id, &vc).is_none()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sync.abort();
+    assert!(
+        cache.get_memory("org", &missed.id, &vc).is_some(),
+        "bounded authoritative reconciliation repairs a lost publication"
+    );
 }
 
 /// R-Sec5: a token-bearing subscriber's envelopes verify against the
@@ -430,6 +510,7 @@ async fn production_backend_sync_hydrates_before_ready_and_stays_live() {
         exocortex_ops::operations::ops_vc("org", "reader", exocortex_kernel::Visibility::Org);
     let ctx = Arc::new(exocortex_ops::OpContext {
         visibility_ctx: principal.clone(),
+        audit_admin: false,
         storage: storage.clone() as Arc<dyn Storage>,
         cache: Arc::new(server_cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
