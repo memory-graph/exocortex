@@ -330,6 +330,17 @@ idea:
 | R6-R51 | Full-gate SSE readiness: recognize the first successfully parsed SSE item when the client library omits a distinct `Connected` item | Codex | Done — readiness reflects a parsed authenticated SSE response; scheduler-tolerant harness startup is separate from the unchanged 500 ms post-write deadline |
 | R6-R52 | Full-gate worker fixture: provision the now-required exact producer key and fail if its backend never becomes reachable | Codex | Done — the out-of-process fixture carries the exact policy key and asserts listener readiness before launching the producer |
 | R6-R53 | Full-gate enforcement witness: track the production exact-source-policy constructor after removal of the ceiling-only builder | Codex | Done — `dead-enforcement` now requires the fail-closed `new_with_admin_policies` call in backend assembly and retains its unreachable/configured-out negative fixtures |
+| R6-R54 | Strict-review cache acknowledgement: retry failed invalidations and advance health only after cache publication | Codex | In progress — verified blocking finding from the fresh correctness lens |
+| R6-R55 | Strict-review lease rollback: keep Dreams renewal supervised through compensation and release | Codex | In progress — verified blocking finding from the fresh correctness lens |
+| R6-R56 | Strict-review traversal visibility: prevent hidden intermediate nodes from affecting Falkor reachability | Codex | In progress — verified blocking finding from the fresh storage lens |
+| R6-R57 | Strict-review rollback isolation: remove only exact Dreams-owned assertions without deleting concurrent writes | Codex | In progress — verified blocking finding from the fresh storage lens |
+| R6-R58 | Strict-review stream cursors: fail closed on malformed, negative, or non-advancing Falkor page LSNs | Codex | In progress — verified blocking finding from the fresh storage lens |
+| R6-R59 | Strict-review discovery lifecycle: forbid candidate resurrection after proposal or consumption | Codex | In progress — verified blocking finding from the fresh storage lens |
+| R6-R60 | Strict-review discovery corruption: reject malformed durable proposals and bind acceptance to validated immutable state | Codex | In progress — verified blocking finding from the fresh storage lens |
+| R6-R61 | Strict-review metadata initialization: validate future schemas before writing an absent fingerprint | Codex | In progress — verified advisory from the fresh storage lens |
+| R6-R62 | Strict-review health authorization: protect topology/cache details and test every health route | Codex | In progress — verified advisory from the fresh security lens |
+| R6-R63 | Strict-review build reproducibility: pin release protoc and container base images to immutable inputs | Codex | In progress — verified advisory from the fresh security lens |
+| R6-R64 | Strict-review entity lookup tenancy: filter exact tenant before Falkor LIMIT so foreign/tenantless rows cannot starve valid matches | Codex | In progress — verified advisory from the fresh storage lens |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence
