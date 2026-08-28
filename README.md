@@ -157,9 +157,11 @@ end to end:
 curl -LsSf https://github.com/memory-graph/exocortex/releases/latest/download/install.sh | sh
 ```
 
-Installs `exocortex-mcp-client` (plus `exocortex-node` and
-`exocortex-worker` for team mode) into `~/.cargo/bin`. No Rust toolchain
-or protoc needed.
+Installs the `exocortex` entrypoint and its client/node/worker binaries into
+`~/.cargo`. Linux x64 and Apple Silicon archives also include the verified
+standalone Falkor runtime; macOS Intel supports client and team/backend modes
+because upstream publishes no Intel embedded runtime. No Rust toolchain or
+protoc is needed.
 
 **From source** (any platform; needs Rust 1.85+ and `protoc`):
 
@@ -172,8 +174,9 @@ or from a checkout:
 ```sh
 git clone https://github.com/memory-graph/exocortex
 cd exocortex
-cargo build --release -p exocortex-client
-# binary at target/release/exocortex-mcp-client
+cargo build --release -p exocortex-client -p exocortex-server
+# use scripts/exocortex; source builds require --redis-server-bin and
+# --falkordb-module (or their EXOCORTEX_* environment equivalents)
 ```
 
 ### 2. Register with your agent
@@ -183,7 +186,7 @@ The server speaks MCP over stdio. Add it to your agent's MCP config:
 **Claude Code**
 
 ```sh
-claude mcp add exocortex -- exocortex-mcp-client --org my-org --user me
+claude mcp add exocortex -- exocortex --mode mcp-standalone --org my-org --user me
 ```
 
 **Codex / Cursor / any MCP client** — point the stdio server config at
@@ -193,15 +196,15 @@ the binary:
 {
   "mcpServers": {
     "exocortex": {
-      "command": "exocortex-mcp-client",
-      "args": ["--org", "my-org", "--user", "me"]
+      "command": "exocortex",
+      "args": ["--mode", "mcp-standalone", "--org", "my-org", "--user", "me"]
     }
   }
 }
 ```
 
-If you installed from a checkout, use the full path to
-`target/release/exocortex-mcp-client`.
+If you installed from a checkout, use the full path to `scripts/exocortex`
+and configure the source-build Falkor runtime paths described above.
 
 ### 3. Tell your agent to use it
 
@@ -252,14 +255,20 @@ authenticated HTTP.
 |---|---|---|
 | `--org` | `personal` | Your org id (personal use = any string). |
 | `--user` | `dev` | Your user id — drives Private-memory visibility. |
-| `--backend` | none | Backend URL for shared-org mode (see below). Omitted: standalone personal mode — writes land in the local WAL and are searchable immediately and across restarts (the WAL is the embedded store). |
-| `--data-dir` | OS data home | Where the offline WAL and the playbook live. |
+| `--backend` | none | Client-only backend URL for shared-org mode (see below). Omitted on the raw client: writes buffer in the offline WAL until a backend is available. The installed personal entrypoint supplies its supervised loopback backend automatically. |
+| `--data-dir` | OS data home | Where the client offline WAL and playbook live. In `mcp-standalone`, `--standalone-data-dir` owns the durable Falkor graph across restarts. |
 | `--dump-playbook` | — | Print the compiled playbook and exit. |
 | `--dump-block` | — | Print the CLAUDE.md/AGENTS.md instruction block and exit. |
 | `--verify` | — | Green/red checklist of every client-checkable write precondition; exit code = red count. |
 | `--tail-audit [--last N]` | 5 | Print the N most recent local writes (WAL), newest first. |
 | `--export <file>` | — | One-shot backup: dump every WAL entry (all states, LSN order) to a versioned, fingerprint-stamped JSON file. |
 | `--import <file>` | — | One-shot restore: import a backup into this data-dir's WAL — all-or-nothing, fingerprint-gated, idempotent (same ids upsert; `Synced` entries never re-drain). |
+
+`exocortex --mode mcp-standalone` is the personal persistent topology: the
+wrapper supervises one loopback FalkorDB process and one node, then connects
+the foreground MCP client to that node for both writes and reads. It uses an
+in-process coordinator—no gossip, distributed fire queue, or cluster election.
+The client WAL is a bounded offline buffer, not the standalone database.
 
 ## The ontology
 

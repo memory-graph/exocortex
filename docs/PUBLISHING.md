@@ -52,12 +52,22 @@ workspace license/repository metadata applies).
 - `cargo publish -p exocortex-kernel --dry-run` passes (verified:
   packages, compiles from the packaged tarball, uploads cleanly)
 
+The release archive's only non-Cargo runtime dependency is the official
+`@falkordblite/{linux-x64,darwin-arm64}` package at
+`8.2.3-falkordb.4.16.3`. It is required to satisfy the PRD's zero-setup
+standalone topology: it supplies the matched Redis server and FalkorDB module
+that the existing supervisor launches. `scripts/fetch-standalone-runtime.sh`
+pins both platform archives by SHA-512; the application performs no runtime
+download. The official package's license declaration and exact component
+source/license coordinates ride the packaged `RUNTIME-MANIFEST.txt`.
+
 ## Binaries
 
 - **Installer (primary)**: tag push (`git tag v0.2.2 && git push
   memory-graph v0.2.2`) triggers `.github/workflows/release.yml` —
-  cross-platform release builds (macOS arm64 and Intel via macos-14, Linux
-  x64) for all three binaries, sha256 checksums, and an
+  cross-platform release builds (macOS arm64 on `macos-14`, Intel on the
+  native `macos-15-intel` runner, and Linux x64) for all three binaries,
+  sha256 checksums, and an
   auto-generated `install.sh` attached to the GitHub Release:
 
   ```sh
@@ -66,8 +76,12 @@ workspace license/repository metadata applies).
 
   The script resolves `latest` (or honors `$INSTALL_VERSION`), downloads the
   archive and its published SHA-256 file, refuses a mismatch before extraction,
-  and installs into `$CARGO_HOME/bin`. No Rust
-  toolchain or protoc required — that was the point.
+  and installs into `$CARGO_HOME/bin`. Linux x64 and macOS arm64 archives also
+  carry the SHA-512-pinned official `@falkordblite` Redis 8.2.3/FalkorDB
+  4.16.3 runtime under `$CARGO_HOME/share/exocortex/standalone`; release CI
+  executes its installed-wrapper write/read/restart target. macOS Intel ships
+  client/backend binaries only because upstream has no self-contained x64
+  runtime (deviation 19). No Rust toolchain or protoc required.
   The build and release jobs cannot start until `scripts/verify-release.sh`
   and the disposable publish regression pass on the tagged commit.
   CI and release builds install protobuf 28.3 from the upstream release ZIP

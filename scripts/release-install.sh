@@ -27,6 +27,7 @@ committing=0
 committed=0
 published_bins=""
 model_published=0
+runtime_published=0
 rollback_install() {
   [ "$committing" -eq 1 ] && [ "$committed" -eq 0 ] || return 0
   for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
@@ -44,6 +45,14 @@ rollback_install() {
     [ ! -e "$previous_model" ] || mv "$previous_model" "$model_dest/$model_name"
   elif [ -e "$previous_model" ]; then
     mv "$previous_model" "$model_dest/$model_name"
+  fi
+  if [ "${runtime_supported:-0}" -eq 1 ]; then
+    if [ "$runtime_published" -eq 1 ]; then
+      rm -rf "$runtime_dest"
+      [ ! -e "$previous_runtime" ] || mv "$previous_runtime" "$runtime_dest"
+    elif [ -e "$previous_runtime" ]; then
+      mv "$previous_runtime" "$runtime_dest"
+    fi
   fi
 }
 finish_install() {
@@ -76,6 +85,15 @@ for model in "$src"/models/*; do
   model_count=$((model_count + 1))
 done
 [ "$model_count" -eq 1 ] || { echo "install refused: archive must contain exactly one embedding model" >&2; exit 1; }
+runtime_supported=0
+case "$target" in
+  aarch64-apple-darwin|x86_64-unknown-linux-gnu) runtime_supported=1 ;;
+esac
+if [ "$runtime_supported" -eq 1 ]; then
+  [ -x "$src/standalone-runtime/redis-server" ] || { echo "install refused: archive has no standalone redis-server" >&2; exit 1; }
+  [ -f "$src/standalone-runtime/falkordb.so" ] || { echo "install refused: archive has no standalone FalkorDB module" >&2; exit 1; }
+  [ -f "$src/standalone-runtime/RUNTIME-MANIFEST.txt" ] || { echo "install refused: archive has no standalone runtime manifest" >&2; exit 1; }
+fi
 dest="${CARGO_HOME:-$HOME/.cargo}/bin"
 mkdir -p "$dest"
 model_dest="${CARGO_HOME:-$HOME/.cargo}/share/exocortex/models"
@@ -84,6 +102,17 @@ model_name="$(basename "$model")"
 staged_model="$model_dest/.$model_name.new.$$"
 previous_model="$model_dest/.$model_name.old.$$"
 cp -R "$model" "$staged_model"
+if [ "$runtime_supported" -eq 1 ]; then
+  runtime_dest="${CARGO_HOME:-$HOME/.cargo}/share/exocortex/standalone"
+  runtime_parent=$(dirname "$runtime_dest")
+  mkdir -p "$runtime_parent"
+  staged_runtime="$runtime_parent/.standalone.new.$$"
+  previous_runtime="$runtime_parent/.standalone.old.$$"
+  cp -R "$src/standalone-runtime" "$staged_runtime"
+  chmod 0755 "$staged_runtime/redis-server"
+  chmod 0555 "$staged_runtime/falkordb.so"
+  "$staged_runtime/redis-server" --version >/dev/null
+fi
 for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
   staged_bin="$dest/.$bin.new.$$"
   install -m 0755 "$src/$bin" "$staged_bin" 2>/dev/null || {
@@ -100,11 +129,18 @@ committing=1
 if [ -e "$model_dest/$model_name" ]; then
   mv "$model_dest/$model_name" "$previous_model"
 fi
+if [ "$runtime_supported" -eq 1 ] && [ -e "$runtime_dest" ]; then
+  mv "$runtime_dest" "$previous_runtime"
+fi
 for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
   [ ! -e "$dest/$bin" ] || mv "$dest/$bin" "$dest/.$bin.old.$$"
 done
 mv "$staged_model" "$model_dest/$model_name"
 model_published=1
+if [ "$runtime_supported" -eq 1 ]; then
+  mv "$staged_runtime" "$runtime_dest"
+  runtime_published=1
+fi
 for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
   mv "$dest/.$bin.new.$$" "$dest/$bin"
   published_bins="$published_bins $bin"
@@ -115,6 +151,9 @@ unset EXOCORTEX_BGE_SMALL_MODEL_DIR
 "$dest/exocortex-node" --verify-embedder >/dev/null
 committed=1
 rm -rf "$previous_model"
+if [ "$runtime_supported" -eq 1 ]; then
+  rm -rf "$previous_runtime"
+fi
 for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
   rm -f "$dest/.$bin.old.$$"
 done
@@ -122,5 +161,10 @@ case ":$PATH:" in
   *":$dest:"*) ;;
   *) echo "note: add $dest to PATH" ;;
 esac
-echo "installed: exocortex, exocortex-mcp-client, exocortex-node, exocortex-worker, verified model sidecar"
-echo "next: exocortex --mode mcp-standalone --org my-org --user me"
+if [ "$runtime_supported" -eq 1 ]; then
+  echo "installed: exocortex binaries, verified model sidecar, and standalone Redis/Falkor runtime"
+  echo "next: exocortex --mode mcp-standalone --org my-org --user me"
+else
+  echo "installed: exocortex binaries and verified model sidecar"
+  echo "note: mcp-standalone is unavailable on macOS Intel; use mcp-client or backend-node"
+fi

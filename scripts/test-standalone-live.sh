@@ -3,6 +3,11 @@
 # backend -> MCP write/read, then a full wrapper restart -> durable read.
 set -eu
 
+bin_dir=${EXOCORTEX_BIN_DIR:-"$(pwd)/target/debug"}
+installed_runtime="$bin_dir/../share/exocortex/standalone"
+: "${EXOCORTEX_REDIS_SERVER:=$installed_runtime/redis-server}"
+: "${EXOCORTEX_FALKORDB_MODULE:=$installed_runtime/falkordb.so}"
+export EXOCORTEX_REDIS_SERVER EXOCORTEX_FALKORDB_MODULE
 if [ -z "${EXOCORTEX_REDIS_SERVER:-}" ] || [ -z "${EXOCORTEX_FALKORDB_MODULE:-}" ]; then
   echo "UNEXECUTED: set EXOCORTEX_REDIS_SERVER and EXOCORTEX_FALKORDB_MODULE for live standalone validation" >&2
   exit 77
@@ -12,7 +17,6 @@ if [ ! -x "$EXOCORTEX_REDIS_SERVER" ] || [ ! -f "$EXOCORTEX_FALKORDB_MODULE" ]; 
   exit 77
 fi
 
-bin_dir=${EXOCORTEX_BIN_DIR:-"$(pwd)/target/debug"}
 for binary in exocortex-node exocortex-mcp-client; do
   [ -x "$bin_dir/$binary" ] || {
     echo "build $binary before live standalone validation" >&2
@@ -27,7 +31,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 invoke() {
-  EXOCORTEX_BIN_DIR=$bin_dir scripts/exocortex \
+  EXOCORTEX_BIN_DIR=$bin_dir "${EXOCORTEX_WRAPPER:-scripts/exocortex}" \
     --mode mcp-standalone \
     --org standalone-live \
     --user live-user \

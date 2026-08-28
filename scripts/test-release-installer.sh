@@ -18,6 +18,17 @@ mkdir -p "$release" "$payload" "$tmp/cargo"
 model_dir="Xenova_bge-small-en-v1.5-ea104dacec62c0de699686887e3f920caeb4f3e3"
 mkdir -p "$payload/models/$model_dir"
 printf 'sidecar fixture\n' > "$payload/models/$model_dir/model.marker"
+runtime_supported=0
+case "$artifact_target" in
+  aarch64-apple-darwin|x86_64-unknown-linux-gnu) runtime_supported=1 ;;
+esac
+if [ "$runtime_supported" -eq 1 ]; then
+  mkdir -p "$payload/standalone-runtime"
+  printf '#!/bin/sh\necho "Redis server v=8.2.3"\n' > "$payload/standalone-runtime/redis-server"
+  chmod +x "$payload/standalone-runtime/redis-server"
+  printf 'module fixture\n' > "$payload/standalone-runtime/falkordb.so"
+  printf 'runtime manifest fixture\n' > "$payload/standalone-runtime/RUNTIME-MANIFEST.txt"
+fi
 for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
   printf '#!/bin/sh\nexit 0\n' > "$payload/$bin"
   chmod +x "$payload/$bin"
@@ -100,6 +111,10 @@ CARGO_HOME="$tmp/cargo" \
 sh scripts/release-install.sh >/dev/null
 test -x "$tmp/cargo/bin/exocortex-node"
 test "$(cat "$tmp/cargo/share/exocortex/models/$model_dir/model.marker")" = "sidecar fixture"
+if [ "$runtime_supported" -eq 1 ]; then
+  test -x "$tmp/cargo/share/exocortex/standalone/redis-server"
+  test "$(cat "$tmp/cargo/share/exocortex/standalone/falkordb.so")" = "module fixture"
+fi
 test "$(wc -l < "$mock_log" | tr -d ' ')" -eq 2
 grep -q -- "--proto =https --tlsv1.2" "$mock_log"
 
@@ -118,6 +133,10 @@ for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
   chmod +x "$tmp/cargo/bin/$bin"
 done
 printf 'old-sidecar\n' > "$tmp/cargo/share/exocortex/models/$model_dir/model.marker"
+if [ "$runtime_supported" -eq 1 ]; then
+  chmod u+w "$tmp/cargo/share/exocortex/standalone/falkordb.so"
+  printf 'old-runtime\n' > "$tmp/cargo/share/exocortex/standalone/falkordb.so"
+fi
 if INSTALL_VERSION="$tag" \
    PATH="$tmp/mock-bin:$PATH" \
    MOCK_RELEASE_ROOT="$release" \
@@ -131,6 +150,9 @@ if INSTALL_VERSION="$tag" \
   exit 1
 fi
 test "$(cat "$tmp/cargo/share/exocortex/models/$model_dir/model.marker")" = "old-sidecar"
+if [ "$runtime_supported" -eq 1 ]; then
+  test "$(cat "$tmp/cargo/share/exocortex/standalone/falkordb.so")" = "old-runtime"
+fi
 for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
   grep -q 'old-' "$tmp/cargo/bin/$bin"
 done

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use exocortex_server::backend::{run_backend_node, BackendNodeArgs};
+use exocortex_server::backend::{run_backend_node, run_standalone_backend_node, BackendNodeArgs};
 use exocortex_storage::InMemoryStorage;
 use exocortex_storage::Storage;
 
@@ -54,6 +54,29 @@ async fn http_get(addr: std::net::SocketAddr, path: &str, bearer: Option<&str>) 
         status,
         text.split("\r\n\r\n").nth(1).unwrap_or("").to_string(),
     )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn standalone_uses_only_the_in_process_coordinator() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let mut config = args("127.0.0.1:0", 0, vec!["invalid-cluster-seed".into()]);
+    config.redis_url = Some("redis://standalone-must-not-connect.invalid:1".into());
+
+    let node = run_standalone_backend_node(storage, onto, config, [9; 32])
+        .await
+        .expect("standalone ignores distributed coordination transports");
+    assert!(!node.cluster_coordination_active());
+    assert!(node.gossip.is_none(), "standalone must not spawn gossip");
+    assert!(node.leader_gate.load(std::sync::atomic::Ordering::SeqCst));
+    let health = node.health.load();
+    assert_eq!(health.leader_node_id.as_deref(), Some("node-0"));
+    assert_eq!(
+        health.lease_epoch, 0,
+        "the in-process coordinator has no cluster epoch"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -431,8 +454,18 @@ async fn backend_nodes_serve_http_grpc_and_gossip_converges() {
     let expected_wire = exocortex_wire::WIRE_VERSION.to_string();
     let gossip_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
-        let a = node_a.gossip.with_chitchat(|c| c.state_snapshot()).await;
-        let b = node_b.gossip.with_chitchat(|c| c.state_snapshot()).await;
+        let a = node_a
+            .gossip
+            .as_ref()
+            .expect("clustered node has gossip")
+            .with_chitchat(|c| c.state_snapshot())
+            .await;
+        let b = node_b
+            .gossip
+            .as_ref()
+            .expect("clustered node has gossip")
+            .with_chitchat(|c| c.state_snapshot())
+            .await;
         let converged = [&a, &b].iter().all(|snapshot| {
             snapshot.node_states.len() == 2
                 && snapshot.node_states.iter().all(|state| {

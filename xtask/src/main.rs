@@ -133,7 +133,10 @@ fn deployment_acceptance() -> Result<()> {
     let chaos_script = std::fs::read_to_string("scripts/chaos-leader-kill.sh")?;
     let protoc_installer = std::fs::read_to_string("scripts/install-protoc.sh")?;
     let model_fetcher = std::fs::read_to_string("scripts/fetch-embedding-model.sh")?;
+    let standalone_fetcher = std::fs::read_to_string("scripts/fetch-standalone-runtime.sh")?;
     let release_installer = std::fs::read_to_string("scripts/release-install.sh")?;
+    let wrapper = std::fs::read_to_string("scripts/exocortex")?;
+    let standalone_live = std::fs::read_to_string("scripts/test-standalone-live.sh")?;
     let verify_release = std::fs::read_to_string("scripts/verify-release.sh")?;
     let embedding_source = std::fs::read_to_string("crates/exocortex-ingest/src/embedding.rs")?;
     let server_main = std::fs::read_to_string("crates/exocortex-server/src/main.rs")?;
@@ -151,6 +154,13 @@ fn deployment_acceptance() -> Result<()> {
         &release_installer,
         &embedding_source,
         &server_main,
+    )?;
+    validate_standalone_release(
+        &workflows,
+        &standalone_fetcher,
+        &release_installer,
+        &wrapper,
+        &standalone_live,
     )?;
     validate_fastembed_dependency_contract(&workspace_manifest, &ingest_manifest)?;
     validate_chaos_compose(&compose)?;
@@ -404,6 +414,57 @@ fn validate_fastembed_release(
             && server_main.contains("bge-small long-input truncation probe")
             && server_main.contains("repeat(400)"),
         "release probe must enforce the pinned model's known output and established input window"
+    );
+    Ok(())
+}
+
+fn validate_standalone_release(
+    workflows: &[(&str, &str)],
+    fetcher: &str,
+    installer: &str,
+    wrapper: &str,
+    live_test: &str,
+) -> Result<()> {
+    let release = workflows
+        .iter()
+        .find(|(path, _)| path.ends_with("release.yml") || path.ends_with("release.yaml"))
+        .map(|(_, source)| *source)
+        .ok_or_else(|| anyhow::anyhow!("release workflow is missing"))?;
+    anyhow::ensure!(
+        release.contains("scripts/fetch-standalone-runtime.sh")
+            && release.contains("sh scripts/test-standalone-live.sh")
+            && release.contains("standalone: true")
+            && release.contains("standalone: false")
+            && release.contains("macos-15-intel"),
+        "release workflow must package and live-test supported standalone runtimes without advertising macOS Intel"
+    );
+    for digest in [
+        "d17e0e95bde5067324c6f1ac4624d34f8abf48d4e40cf68d3c1196366f2a481a1691b63a571802b3d8c7464919581d75848ce32d125b7285528e31aeae85e9eb",
+        "c9299584a4e193c494ffdf414af4fbc3237bcf5e6b4bac63b7693c62c0e11d94b51fc57613100d5e33b2b68ee3df83b0ae7abb427e6b135f9e89a9675b3d8383",
+    ] {
+        anyhow::ensure!(fetcher.contains(digest), "standalone runtime digest is absent");
+    }
+    anyhow::ensure!(
+        fetcher.contains("x86_64-unknown-linux-gnu")
+            && fetcher.contains("aarch64-apple-darwin")
+            && !fetcher.contains("x86_64-apple-darwin)"),
+        "standalone fetcher must enumerate exactly the supported upstream runtime targets"
+    );
+    anyhow::ensure!(
+        installer.contains("standalone-runtime/redis-server")
+            && installer.contains("share/exocortex/standalone")
+            && installer.contains("mcp-standalone is unavailable on macOS Intel"),
+        "installer must atomically install supported runtimes and report the Intel limitation"
+    );
+    anyhow::ensure!(
+        wrapper.contains("installed_runtime=\"$bin_dir/../share/exocortex/standalone\"")
+            && wrapper.contains("EXOCORTEX_FALKORDB_MODULE"),
+        "installed wrapper must resolve the packaged standalone runtime"
+    );
+    anyhow::ensure!(
+        live_test.contains("EXOCORTEX_WRAPPER")
+            && live_test.contains("standalone live persistence validation passed"),
+        "release validation must execute the packaged wrapper write/read/restart target"
     );
     Ok(())
 }
@@ -1720,7 +1781,7 @@ mod metrics_hygiene_tests {
 mod release_hardening_tests {
     use super::{
         validate_chaos_compose, validate_chaos_script, validate_fastembed_dependency_contract,
-        validate_fastembed_release, validate_release_hardening,
+        validate_fastembed_release, validate_release_hardening, validate_standalone_release,
     };
 
     const SHA: &str = "11d5960a326750d5838078e36cf38b85af677262";
@@ -2034,6 +2095,47 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
                 "BGE_SMALL_MAX_LENGTH: usize = 384"
             ),
             server_main,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn standalone_release_contract_requires_verified_runtime_and_live_wrapper() {
+        let release = include_str!("../../.github/workflows/release.yml");
+        let fetcher = include_str!("../../scripts/fetch-standalone-runtime.sh");
+        let installer = include_str!("../../scripts/release-install.sh");
+        let wrapper = include_str!("../../scripts/exocortex");
+        let live = include_str!("../../scripts/test-standalone-live.sh");
+        assert!(validate_standalone_release(
+            &[(".github/workflows/release.yml", release)],
+            fetcher,
+            installer,
+            wrapper,
+            live,
+        )
+        .is_ok());
+        for broken in [
+            release.replace("sh scripts/test-standalone-live.sh", "cargo check"),
+            release.replace("standalone: false", "standalone: true"),
+        ] {
+            assert!(validate_standalone_release(
+                &[(".github/workflows/release.yml", broken.as_str())],
+                fetcher,
+                installer,
+                wrapper,
+                live,
+            )
+            .is_err());
+        }
+        assert!(validate_standalone_release(
+            &[(".github/workflows/release.yml", release)],
+            &fetcher.replace(
+                "d17e0e95bde5067324c6f1ac4624d34f8abf48d4e40cf68d3c1196366f2a481a1691b63a571802b3d8c7464919581d75848ce32d125b7285528e31aeae85e9eb",
+                "unchecked"
+            ),
+            installer,
+            wrapper,
+            live,
         )
         .is_err());
     }

@@ -146,8 +146,8 @@ pub struct BackendNode<S: Storage> {
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub reasoning: Arc<exocortex_reasoning::ReasoningEngine<S>>,
-    /// Live gossip handle retained for the backend process lifetime.
-    pub gossip: chitchat::ChitchatHandle,
+    /// Live gossip handle retained only by clustered backend processes.
+    pub gossip: Option<chitchat::ChitchatHandle>,
     cache_bridge: Option<tokio::task::JoinHandle<()>>,
     cluster_feed: Option<tokio::task::JoinHandle<()>>,
     post_ingest_effects: Option<tokio::task::JoinHandle<()>>,
@@ -157,6 +157,12 @@ pub struct BackendNode<S: Storage> {
 }
 
 impl<S: Storage> BackendNode<S> {
+    /// Whether distributed election and gossip are active. Standalone uses an
+    /// in-process coordinator and must report false.
+    #[doc(hidden)]
+    pub fn cluster_coordination_active(&self) -> bool {
+        self.gossip.is_some() && self.leader_election.is_some()
+    }
     /// Simulate leader process loss while leaving peer runtimes alive.
     pub fn stop_leader_election(&mut self) {
         mark_dreams_follower(&self.leader_gate, &self.health);
@@ -462,6 +468,7 @@ async fn run_backend_node_inner<S: Storage + 'static>(
     args: BackendNodeArgs,
     standalone_producer_key: Option<[u8; 32]>,
 ) -> anyhow::Result<BackendNode<S>> {
+    let standalone = standalone_producer_key.is_some();
     // Parse TLS material and bind before starting any background subsystem.
     // Bad transport configuration is a startup failure, never a node that
     // appears alive while its protected listener is absent.
@@ -690,24 +697,28 @@ async fn run_backend_node_inner<S: Storage + 'static>(
     // Shared Dreams transport uses separate Redis connections for blocking
     // drain and producer/ack traffic. A configured transport is mandatory:
     // startup fails rather than silently falling back to node-local fires.
-    let (distributed_fire, fire_drainer) = if let Some(redis_url) = &args.redis_url {
-        let client = redis::Client::open(redis_url.as_str())?;
-        let producer = client.get_multiplexed_async_connection().await?;
-        let drainer = client.get_multiplexed_async_connection().await?;
-        (
-            Some(Arc::new(tokio::sync::Mutex::new(
-                exocortex_dreams::fire::RedisFireQueue::new(
-                    producer,
+    let (distributed_fire, fire_drainer) = if !standalone {
+        if let Some(redis_url) = &args.redis_url {
+            let client = redis::Client::open(redis_url.as_str())?;
+            let producer = client.get_multiplexed_async_connection().await?;
+            let drainer = client.get_multiplexed_async_connection().await?;
+            (
+                Some(Arc::new(tokio::sync::Mutex::new(
+                    exocortex_dreams::fire::RedisFireQueue::new(
+                        producer,
+                        args.quiet_hours,
+                        args.org.clone(),
+                    ),
+                ))),
+                Some(exocortex_dreams::fire::RedisFireQueue::new(
+                    drainer,
                     args.quiet_hours,
                     args.org.clone(),
-                ),
-            ))),
-            Some(exocortex_dreams::fire::RedisFireQueue::new(
-                drainer,
-                args.quiet_hours,
-                args.org.clone(),
-            )),
-        )
+                )),
+            )
+        } else {
+            (None, None)
+        }
     } else {
         (None, None)
     };
@@ -715,7 +726,7 @@ async fn run_backend_node_inner<S: Storage + 'static>(
     // Dreams: the consolidation loop over the fire channel. CS4 (audit):
     // the elected leader gate makes the re-election lease fence something
     // real — consolidation runs only on the node that holds it.
-    let leader_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let leader_gate = Arc::new(std::sync::atomic::AtomicBool::new(standalone));
     let mut dreams_engine = exocortex_dreams::DreamsEngine::new(
         storage.clone(),
         exocortex_dreams::trigger::DreamsTrigger::default(),
@@ -835,14 +846,23 @@ async fn run_backend_node_inner<S: Storage + 'static>(
 
     // Lease re-election (§9.2): acquire, renew, re-acquire on loss. The
     // epoch check rides storage-side fencing (R-C3).
-    let leader_election = {
+    let leader_election = if standalone {
+        health.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.leader_node_id = Some(args.node_id.clone());
+            next.lease_epoch = 0;
+            next.last_lease_tick = Some(chrono::Utc::now());
+            Arc::new(next)
+        });
+        None
+    } else {
         let storage = storage.clone();
         let health = health.clone();
         let node_id = args.node_id.clone();
         let org = org.to_string();
         let elected = leader_gate.clone();
         let distributed_fire = distributed_fire.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let key = dreams_lease_key(&org);
             // §3 M5 AC: leader election converges within 2s of a
             // leader-kill — the lease TTL must be <= 2s for a surviving
@@ -903,12 +923,16 @@ async fn run_backend_node_inner<S: Storage + 'static>(
                     }
                 }
             }
-        })
+        }))
     };
 
     // Chitchat gossip (§9.1): member discovery carrying wire-version +
     // fingerprint so admission composes with failure detection (R-W2/R-W3).
-    let gossip = spawn_gossip(&args, &ontology.fingerprint).await?;
+    let gossip = if standalone {
+        None
+    } else {
+        Some(spawn_gossip(&args, &ontology.fingerprint).await?)
+    };
 
     Ok(BackendNode {
         health,
@@ -922,7 +946,7 @@ async fn run_backend_node_inner<S: Storage + 'static>(
         cache_bridge: Some(cache_bridge),
         cluster_feed: Some(cluster_feed),
         post_ingest_effects: Some(post_ingest_effects),
-        leader_election: Some(leader_election),
+        leader_election,
         ingress: Some(ingress),
         _background_tasks: background_tasks,
     })

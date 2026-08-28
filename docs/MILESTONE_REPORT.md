@@ -158,6 +158,17 @@ cross-cutting gates (§3). Commits: one per milestone, `M<n>: <what and why>`.
     with v2 ids. The core PRD already places migration of existing production
     data in a separate plan; this release does not guess or silently rewrite
     stored external identity.
+19. **Self-contained standalone excludes macOS Intel** (§4.3, §19.3): the
+    official FalkorDB embedded distribution publishes complete Redis/module
+    pairs for Linux x64 and macOS arm64, but explicitly requires a system
+    runtime on macOS x64. Supported release archives pin and SHA-512-verify
+    the official `@falkordblite` runtime, install it failure-atomically, and
+    execute the packaged wrapper's write/read/restart proof. The macOS Intel
+    archive remains native for MCP client and team/backend use, labels
+    standalone unavailable, and does not pretend an external prerequisite is
+    bundled. Operators needing local standalone on Intel must provide explicit
+    `EXOCORTEX_REDIS_SERVER` and `EXOCORTEX_FALKORDB_MODULE` paths; no network
+    download occurs at runtime.
 
 ## Post-review round 1 (2026-08-24)
 
@@ -458,9 +469,7 @@ proto-sync-guarded copy).
 ### Round 6 infrastructure-only validation
 
 - `scripts/test-standalone-live.sh` is the executable installed-wrapper
-  write/read/restart persistence target. On 2026-08-28 it reported
-  **UNEXECUTED** because this macOS host has `/opt/homebrew/bin/redis-server`
-  but no loadable macOS FalkorDB module and neither standalone module
-  environment variable was provisioned. The wrapper topology tests and
-  supervisor tests pass; this entry deliberately does not represent the live
-  persistence target as passed.
+  write/read/restart persistence target. Its prior **UNEXECUTED** host result
+  is superseded: the pinned official macOS-arm64 release runtime now supplies
+  both binaries, and the packaged-wrapper target passes locally and is a
+  mandatory release-matrix step for every supported standalone artifact.

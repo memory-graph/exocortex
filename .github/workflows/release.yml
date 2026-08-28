@@ -69,19 +69,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Both Apple targets build on macos-14 (arm64): rustc
-          # cross-compiles x86_64-apple-darwin natively there. The
-          # dedicated macos-13 (Intel) runners are being deprecated and
-          # queue for an hour+, which would stall every release.
           - os: macos-14
             target: aarch64-apple-darwin
             archive: tar.gz
-          - os: macos-14
+            standalone: true
+          # FalkorDB publishes no macOS-x64 embedded runtime. Keep the
+          # client/team binaries on GitHub's native Intel runner, but do not
+          # misrepresent this artifact as self-contained standalone.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
+            standalone: false
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
+            standalone: true
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -113,6 +115,10 @@ jobs:
           for bin in exocortex-mcp-client exocortex-node exocortex-worker; do
             cp "target/${{ matrix.target }}/release/$bin" "dist/$DIST/"
           done
+          if [ "${{ matrix.standalone }}" = true ]; then
+            bash scripts/fetch-standalone-runtime.sh \
+              "dist/$DIST/standalone-runtime" "${{ matrix.target }}"
+          fi
           sh scripts/fetch-embedding-model.sh "dist/$DIST/models"
           mkdir -p "dist/install-probe/bin" "dist/install-probe/share/exocortex"
           cp "dist/$DIST/exocortex-node" "dist/install-probe/bin/"
@@ -122,11 +128,20 @@ jobs:
           rm -rf "dist/install-probe"
           cp scripts/exocortex "dist/$DIST/exocortex"
           cp README.md LICENSE "dist/$DIST/"
+          if [ "${{ matrix.standalone }}" = true ]; then
+            model_dir=$(find "dist/$DIST/models" -mindepth 1 -maxdepth 1 -type d | head -1)
+            EXOCORTEX_BIN_DIR="dist/$DIST" \
+              EXOCORTEX_WRAPPER="dist/$DIST/exocortex" \
+              EXOCORTEX_REDIS_SERVER="dist/$DIST/standalone-runtime/redis-server" \
+              EXOCORTEX_FALKORDB_MODULE="dist/$DIST/standalone-runtime/falkordb.so" \
+              EXOCORTEX_BGE_SMALL_MODEL_DIR="$model_dir" \
+              sh scripts/test-standalone-live.sh
+          fi
           cat > "dist/$DIST/README-install.txt" <<EOF
           Exocortex $TAG (${{ matrix.target }})
 
           Binaries:
-            exocortex             one entrypoint: --mode mcp-client|mcp-standalone|backend-node
+            exocortex             one entrypoint: --mode mcp-client|backend-node
             exocortex-mcp-client  local MCP server (personal quickstart — see README)
             exocortex-node        backend node (team/org mode)
             exocortex-worker      adapter host (external sources)
@@ -134,6 +149,20 @@ jobs:
           Add to PATH (e.g. ~/.local/bin or /usr/local/bin) and run:
             exocortex-mcp-client --org my-org --user me
           EOF
+          if [ "${{ matrix.standalone }}" = true ]; then
+            cat >> "dist/$DIST/README-install.txt" <<EOF
+
+          This artifact includes the verified Redis/Falkor runtime. Run:
+            exocortex --mode mcp-standalone --org my-org --user me
+          EOF
+          else
+            cat >> "dist/$DIST/README-install.txt" <<EOF
+
+          mcp-standalone is unavailable in this macOS Intel artifact because
+          upstream FalkorDB publishes embedded runtimes only for Linux x64 and
+          macOS arm64. Client and backend-node modes remain supported.
+          EOF
+          fi
           cd dist
           if [ "${{ matrix.archive }}" = "tar.gz" ]; then
             tar -czf "$DIST.tar.gz" "$DIST"
