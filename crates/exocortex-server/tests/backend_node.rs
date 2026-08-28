@@ -257,8 +257,11 @@ async fn cache_bridge_stream_discontinuities_reseed_before_later_progress() {
             "org",
             &health,
             stream::iter(items),
-            Duration::from_millis(1),
-            Duration::from_millis(4),
+            exocortex_server::backend::CacheBridgeTiming {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(4),
+                reconcile_interval: Duration::from_secs(60),
+            },
         )
         .await;
 
@@ -282,6 +285,67 @@ async fn cache_bridge_stream_discontinuities_reseed_before_later_progress() {
         assert_eq!(health.load().sync_lsn, health.load().backend_lsn);
         writer.abort();
     }
+}
+
+#[tokio::test]
+async fn periodic_reconciliation_repairs_a_commit_with_no_published_event() {
+    use exocortex_storage::{Invalidation, StorageError};
+
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto));
+    let authoritative = acceptance_memory(62, false);
+    storage.upsert_memory(&authoritative).await.unwrap();
+    let (cache, writer_rx) = exocortex_cache::LocalCache::new(64 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let storage = storage.clone();
+        async move { cache.run(storage, writer_rx).await }
+    });
+    cache.seed_local("org", &[], &[], 0);
+    let health = Arc::new(arc_swap::ArcSwap::from_pointee(
+        exocortex_server::http_bind::HealthSnapshot::default(),
+    ));
+    let bridge = tokio::spawn({
+        let cache = cache.clone();
+        let storage = storage.clone();
+        let health = health.clone();
+        async move {
+            exocortex_server::backend::consume_cache_subscription(
+                &cache,
+                &*storage,
+                "org",
+                &health,
+                futures::stream::pending::<Result<Invalidation, StorageError>>(),
+                exocortex_server::backend::CacheBridgeTiming {
+                    initial_delay: Duration::from_millis(1),
+                    max_delay: Duration::from_millis(4),
+                    reconcile_interval: Duration::from_millis(20),
+                },
+            )
+            .await;
+        }
+    });
+    let visible =
+        exocortex_ops::operations::ops_vc("org", "test", exocortex_kernel::Visibility::Org);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while cache
+            .get_memory("org", &authoritative.id, &visible)
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("authoritative reconciliation repairs a lost publication");
+    assert!(
+        health.load().sync_lsn > 0,
+        "reseed acknowledged the durable frontier"
+    );
+    bridge.abort();
+    writer.abort();
 }
 
 #[tokio::test]

@@ -76,6 +76,19 @@ const LEASE_RENEW: Duration = Duration::from_millis(250);
 const CACHE_BRIDGE_BURST: usize = 256;
 const CACHE_RESEED_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const CACHE_RESEED_MAX_BACKOFF: Duration = Duration::from_secs(5);
+const CACHE_AUTHORITATIVE_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Cache-bridge recovery timing, injectable for deterministic regressions.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct CacheBridgeTiming {
+    /// Initial authoritative-reseed retry delay.
+    pub initial_delay: Duration,
+    /// Maximum authoritative-reseed retry delay.
+    pub max_delay: Duration,
+    /// Period between successful-stream authoritative reconciliations.
+    pub reconcile_interval: Duration,
+}
 
 #[derive(Default)]
 struct BackgroundTasks(Vec<tokio::task::JoinHandle<()>>);
@@ -308,14 +321,34 @@ pub async fn consume_cache_subscription<S, St>(
     org: &str,
     health: &arc_swap::ArcSwap<HealthSnapshot>,
     mut subscription: St,
-    initial_delay: Duration,
-    max_delay: Duration,
+    timing: CacheBridgeTiming,
 ) where
     S: Storage,
     St: Stream<Item = exocortex_storage::Result<exocortex_storage::Invalidation>> + Unpin,
 {
+    let mut reconciliation = tokio::time::interval_at(
+        tokio::time::Instant::now() + timing.reconcile_interval,
+        timing.reconcile_interval,
+    );
     loop {
-        let first = match subscription.next().await {
+        let next = tokio::select! {
+            item = subscription.next() => item,
+            _ = reconciliation.tick() => {
+                metrics::counter!("exocortex_backend_cache_reconciliations_total").increment(1);
+                reseed_cache_with_retry(
+                    cache,
+                    storage,
+                    org,
+                    health,
+                    timing.initial_delay,
+                    timing.max_delay,
+                    None,
+                )
+                .await;
+                continue;
+            }
+        };
+        let first = match next {
             Some(Ok(invalidation)) => invalidation,
             Some(Err(error)) => {
                 metrics::counter!("exocortex_cluster_invalidation_decode_errors_total")
@@ -326,8 +359,8 @@ pub async fn consume_cache_subscription<S, St>(
                     storage,
                     org,
                     health,
-                    initial_delay,
-                    max_delay,
+                    timing.initial_delay,
+                    timing.max_delay,
                     None,
                 )
                 .await;
@@ -340,8 +373,8 @@ pub async fn consume_cache_subscription<S, St>(
                     storage,
                     org,
                     health,
-                    initial_delay,
-                    max_delay,
+                    timing.initial_delay,
+                    timing.max_delay,
                     None,
                 )
                 .await;
@@ -363,8 +396,8 @@ pub async fn consume_cache_subscription<S, St>(
                         storage,
                         org,
                         health,
-                        initial_delay,
-                        max_delay,
+                        timing.initial_delay,
+                        timing.max_delay,
                         None,
                     )
                     .await;
@@ -377,8 +410,8 @@ pub async fn consume_cache_subscription<S, St>(
                         storage,
                         org,
                         health,
-                        initial_delay,
-                        max_delay,
+                        timing.initial_delay,
+                        timing.max_delay,
                         None,
                     )
                     .await;
@@ -393,8 +426,8 @@ pub async fn consume_cache_subscription<S, St>(
             org,
             health,
             burst,
-            initial_delay,
-            max_delay,
+            timing.initial_delay,
+            timing.max_delay,
         )
         .await;
     }
@@ -510,8 +543,11 @@ async fn run_backend_node_inner<S: Storage + 'static>(
                             &org,
                             &health,
                             sub,
-                            CACHE_RESEED_INITIAL_BACKOFF,
-                            CACHE_RESEED_MAX_BACKOFF,
+                            CacheBridgeTiming {
+                                initial_delay: CACHE_RESEED_INITIAL_BACKOFF,
+                                max_delay: CACHE_RESEED_MAX_BACKOFF,
+                                reconcile_interval: CACHE_AUTHORITATIVE_RECONCILE_INTERVAL,
+                            },
                         )
                         .await;
                     }
