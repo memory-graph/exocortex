@@ -19,9 +19,10 @@ fn args(bind: &str, gossip: u16, seeds: Vec<String>) -> BackendNodeArgs {
         node_id: format!("node-{gossip}"),
         cluster_secret: [7u8; 32],
         principals: Arc::new(
-            exocortex_server::principal::PrincipalRegistry::single(
+            exocortex_server::principal::PrincipalRegistry::single_with_audit_admin(
                 "test-only-backend-bearer-token-00000000".into(),
                 exocortex_ops::operations::ops_vc("org", "test", exocortex_kernel::Visibility::Org),
+                true,
             )
             .unwrap(),
         ),
@@ -421,9 +422,10 @@ async fn backend_node_threads_a_non_default_org_through_its_runtime() {
     let mut config = args("127.0.0.1:0", 41008, vec![]);
     config.org = "acme".into();
     config.principals = Arc::new(
-        exocortex_server::principal::PrincipalRegistry::single(
+        exocortex_server::principal::PrincipalRegistry::single_with_audit_admin(
             "test-only-acme-bearer-token-00000000".into(),
             exocortex_ops::operations::ops_vc("acme", "reader", exocortex_kernel::Visibility::Org),
+            true,
         )
         .unwrap(),
     );

@@ -229,7 +229,8 @@ async fn session_wrapup_enqueues_reasoning_derived_edge() {
         64,
         3,
     ));
-    let srv = server(storage.clone(), onto.clone()).with_reasoning(engine.clone());
+    let srv = Arc::new(server(storage.clone(), onto.clone()).with_reasoning(engine.clone()));
+    let effect_runner = tokio::spawn(srv.clone().run_post_ingest_effects());
     register(&srv, "session://reason").await;
 
     // Fix --Fixes--> Problem triggers D1 (ImpliedSolves).
@@ -301,6 +302,7 @@ async fn session_wrapup_enqueues_reasoning_derived_edge() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     runner.abort();
+    effect_runner.abort();
     assert!(
         derived_solves,
         "SessionWrapup enqueue landed a D1-derived Solves edge"
@@ -335,7 +337,8 @@ async fn write_counter_trigger_fires_a_cycle() {
         let engine = dreams.clone();
         tokio::spawn(async move { engine.run().await });
     }
-    let srv = srv.with_dreams(dreams.clone());
+    let srv = Arc::new(srv.with_dreams(dreams.clone()));
+    let effect_runner = tokio::spawn(srv.clone().run_post_ingest_effects());
 
     for i in 0..3 {
         let ack = submit(
@@ -379,4 +382,5 @@ async fn write_counter_trigger_fires_a_cycle() {
         completed,
         "IN4: a cycle ran and stamped the region clock (§12.2)"
     );
+    effect_runner.abort();
 }

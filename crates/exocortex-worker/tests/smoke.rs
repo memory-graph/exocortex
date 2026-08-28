@@ -1,5 +1,7 @@
 //! H1: `exocortex-worker --adapter noop` boots and idles without a live
 //! backend (M6 AC; the lazy channel must not dial on startup).
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::process::Command;
 
 #[test]
@@ -99,6 +101,8 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
         r#"[{"bearer_token":"test-only-fixture-bearer-token-00000000","org_id":"org","user_id":"fixture","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
     )
     .unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&principal_policy, std::fs::Permissions::from_mode(0o600)).unwrap();
     let mut node = Command::new(&node_bin)
         .args([
             "--mode",

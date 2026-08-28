@@ -70,6 +70,10 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
     }
     let response: serde_json::Value = serde_json::from_str(&response).unwrap();
     assert!(response.get("result").is_some(), "{response}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(marker.exists(), "standalone supervisor was not started");
     assert!(Command::new("kill")
         .args(["-TERM", &child.id().to_string()])

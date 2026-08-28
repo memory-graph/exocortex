@@ -7,6 +7,8 @@
 //! it runs unconditionally — if the binary fails to boot, this FAILS
 //! rather than skipping (the PRD's loud-gate rule).
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -50,6 +52,8 @@ fn spawn_node() -> Node {
         r#"[{"bearer_token":"test-only-oop-bearer-token-00000000","org_id":"org","user_id":"oop","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
     )
     .unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&principals, std::fs::Permissions::from_mode(0o600)).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_exocortex-node"))
         .args([
             "--mode",

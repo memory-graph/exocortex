@@ -441,3 +441,11 @@ implicit audit access; out-of-process fixtures wrote principal secrets with
 ambient permissions; and the installed standalone test used a timing-sensitive
 supervisor observation. These are harness defects, not permission to weaken the
 new runtime controls.
+
+R6-R144 is closed by executable lifecycle evidence. Both Round-1 effect tests
+pass with the same durable drainer retained by backend assembly; the complete
+backend-node target passes with audit permission granted explicitly; both
+out-of-process node fixtures pass with owner-only credential files; and the
+installed standalone supervisor/MCP test passes in five consecutive runs after
+using a bounded observation window. No production authorization, policy-mode,
+or durability check was weakened.
