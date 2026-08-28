@@ -336,27 +336,85 @@ fn inside_constant_false_block(body: &str, offset: usize) -> bool {
 }
 
 fn inside_uncalled_closure(body: &str, offset: usize) -> bool {
-    let statement_start = body[..offset].rfind(';').map_or(0, |at| at + 1);
-    let prefix = &body[statement_start..offset];
-    let Some(let_at) = prefix.rfind("let ") else {
-        return false;
-    };
-    let declaration = &prefix[let_at + 4..];
-    let Some((binding, value)) = declaration.split_once('=') else {
-        return false;
-    };
-    let binding = binding
-        .split_whitespace()
-        .find(|token| *token != "mut")
-        .unwrap_or_default()
-        .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_');
-    if binding.is_empty() || !value.contains('|') {
-        return false;
+    enclosing_let_closures(body, offset)
+        .into_iter()
+        .any(|(binding, close)| {
+            let suffix = &body[close + 1..];
+            !suffix.match_indices(&format!("{binding}(")).any(|(at, _)| {
+                is_call_to(suffix, at, Some(false)) && call_is_reachable_outside_closure(suffix, at)
+            })
+        })
+}
+
+fn enclosing_let_closures(body: &str, offset: usize) -> Vec<(String, usize)> {
+    let mut closures = Vec::new();
+    for (let_at, _) in body[..offset].match_indices("let ") {
+        if let_at > 0
+            && (body.as_bytes()[let_at - 1].is_ascii_alphanumeric()
+                || body.as_bytes()[let_at - 1] == b'_')
+        {
+            continue;
+        }
+        let declaration = &body[let_at + 4..];
+        let Some(equal_relative) = declaration.find('=') else {
+            continue;
+        };
+        if declaration[..equal_relative].contains(';') {
+            continue;
+        }
+        let binding = declaration[..equal_relative]
+            .trim()
+            .strip_prefix("mut ")
+            .unwrap_or(declaration[..equal_relative].trim())
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .next()
+            .unwrap_or_default();
+        if binding.is_empty() {
+            continue;
+        }
+        let mut value_at = let_at + 4 + equal_relative + 1;
+        while body
+            .as_bytes()
+            .get(value_at)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            value_at += 1;
+        }
+        for prefix in ["async ", "move "] {
+            if body[value_at..].starts_with(prefix) {
+                value_at += prefix.len();
+            }
+        }
+        if body.as_bytes().get(value_at) != Some(&b'|') {
+            continue;
+        }
+        let pipe_end = if body.as_bytes().get(value_at + 1) == Some(&b'|') {
+            value_at + 2
+        } else {
+            let Some(relative) = body[value_at + 1..].find('|') else {
+                continue;
+            };
+            value_at + 2 + relative
+        };
+        let mut open = pipe_end;
+        while body
+            .as_bytes()
+            .get(open)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            open += 1;
+        }
+        if body.as_bytes().get(open) != Some(&b'{') {
+            continue;
+        }
+        let Some(close) = matching_brace(body, open) else {
+            continue;
+        };
+        if offset > open && offset < close {
+            closures.push((binding.to_owned(), close));
+        }
     }
-    let suffix = &body[offset..];
-    !suffix.match_indices(&format!("{binding}(")).any(|(at, _)| {
-        is_call_to(suffix, at, Some(false)) && call_is_reachable_outside_closure(suffix, at)
-    })
+    closures
 }
 
 fn rust_functions(source: &str) -> Vec<RustFunction> {
@@ -1890,6 +1948,7 @@ mod tests {
         for source in [
             "pub fn root() { fn nested() { fence(); } } fn fence() {}\n",
             "pub fn root() { let unused = || { fence(); }; let _ = unused; } fn fence() {}\n",
+            "pub fn root() { let unused = || { let value = 1; let _ = value; fence(); }; let _ = unused; } fn fence() {}\n",
             "pub fn root() { let unused = || { fence(); }; #[cfg(any())] unused(); } fn fence() {}\n",
             "pub fn root() { let unused = || { fence(); }; if false { unused(); } } fn fence() {}\n",
         ] {
@@ -1910,6 +1969,18 @@ mod tests {
             &root,
             "crates/example/src/lib.rs",
             "pub fn root() { fn nested() { fence(); } nested(); } fn fence() {}\n",
+        );
+        assert!(dead_enforcement_violations(
+            &root,
+            &[("fence", "crates/example/src/lib.rs", None)],
+        )
+        .unwrap()
+        .is_empty());
+
+        write(
+            &root,
+            "crates/example/src/lib.rs",
+            "pub fn root() { let used = || { let value = 1; let _ = value; fence(); }; used(); } fn fence() {}\n",
         );
         assert!(dead_enforcement_violations(
             &root,
@@ -2356,6 +2427,7 @@ mod tests {
             "fn inspect() { #[cfg(any())] let _ = std::fs::read_to_string(\"scripts/check\"); }\n",
             "fn inspect() { if false { let _ = std::fs::read_to_string(\"scripts/check\"); } }\n",
             "fn inspect() { fn unused() { let _ = std::fs::read_to_string(\"scripts/check\"); } }\n",
+            "fn inspect() { let unused = || { let value = 1; let _ = value; let _ = std::fs::read_to_string(\"scripts/check\"); }; let _ = unused; }\n",
         ] {
             write(&root, "xtask/src/main.rs", inert_body);
             assert!(
@@ -2371,6 +2443,15 @@ mod tests {
         assert!(
             validate_acceptance_matrix(&root).is_ok(),
             "called nested I/O remains executable evidence"
+        );
+        write(
+            &root,
+            "xtask/src/main.rs",
+            "fn inspect() { let used = || { let value = 1; let _ = value; let _ = std::fs::read_to_string(\"scripts/check\"); }; used(); }\n",
+        );
+        assert!(
+            validate_acceptance_matrix(&root).is_ok(),
+            "called multi-statement closure I/O remains executable evidence"
         );
         write(&root, "docs/acceptance/section-23.tsv", &rows);
 
