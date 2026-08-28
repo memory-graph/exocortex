@@ -363,7 +363,7 @@ idea:
 | R6-R84 | Strict-review dependency cleanup: remove unused server-local HMAC development dependencies | Codex | In progress — server tests already use wire-owned signing |
 | R6-R85 | Strict-review cache naming cleanup: replace misleading `unsafe_blank`/ASCII rationale with the real UTF-8 boundary invariant | Codex | In progress — the helper is safe and its keys are Unicode-lowercased |
 | R6-R86 | Strict-review cluster evidence: make the gossip-convergence test assert two-node membership or narrow its claim | Codex | In progress — current executable assertions cover HTTP/health/SSE only |
-| R6-R87 | Strict-review release-gate structure: centralize mutable-package policy and split the monolithic validator by artifact | Codex | In progress — duplicated denylist and mixed responsibilities invite enforcement drift |
+| R6-R87 | Strict-review release-gate structure: centralize mutable-package policy and split the monolithic validator by artifact | Codex | Done — one immutable package-command policy feeds focused workflow, Dockerfile, protoc, and Compose validators; the deliberate release-hardening negative fixture passes |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence

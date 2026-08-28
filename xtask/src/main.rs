@@ -214,6 +214,30 @@ fn validate_release_hardening(
     protoc_installer: &str,
     compose_files: &[&str],
 ) -> Result<()> {
+    validate_workflows(workflows)?;
+    validate_dockerfile(dockerfile)?;
+    validate_protoc_installer(protoc_installer)?;
+    validate_compose_ports(compose_files)
+}
+
+const MUTABLE_PACKAGE_COMMANDS: &[&str] = &[
+    "apt-get ",
+    "apt install ",
+    "apk add ",
+    "brew install ",
+    "dnf install ",
+    "microdnf install ",
+    "yum install ",
+    "zypper install ",
+];
+
+fn rejects_mutable_package_resolution(source: &str) -> bool {
+    MUTABLE_PACKAGE_COMMANDS
+        .iter()
+        .any(|command| source.contains(command))
+}
+
+fn validate_workflows(workflows: &[(&str, &str)]) -> Result<()> {
     anyhow::ensure!(!workflows.is_empty(), "no GitHub workflows found");
     let mut saw_release = false;
     for (path, workflow) in workflows {
@@ -221,20 +245,8 @@ fn validate_release_hardening(
             workflow.contains("permissions:\n  contents: read\n"),
             "{path} must default to read-only repository permission"
         );
-        let mutable_package_commands = [
-            "apt-get ",
-            "apt install ",
-            "apk add ",
-            "brew install ",
-            "dnf install ",
-            "microdnf install ",
-            "yum install ",
-            "zypper install ",
-        ];
         anyhow::ensure!(
-            !mutable_package_commands
-                .iter()
-                .any(|command| workflow.contains(command)),
+            !rejects_mutable_package_resolution(workflow),
             "{path} must not install build inputs from a mutable package repository"
         );
         let required_installs = if path.ends_with("release.yml") || path.ends_with("release.yaml") {
@@ -283,6 +295,10 @@ fn validate_release_hardening(
         }
     }
     anyhow::ensure!(saw_release, "release workflow is missing");
+    Ok(())
+}
+
+fn validate_dockerfile(dockerfile: &str) -> Result<()> {
     let docker_bases = dockerfile
         .lines()
         .map(str::trim)
@@ -306,20 +322,8 @@ fn validate_release_hardening(
             "Dockerfile base image must be pinned to a full sha256 digest: {base}"
         );
     }
-    let mutable_package_commands = [
-        "apt-get ",
-        "apt install ",
-        "apk add ",
-        "brew install ",
-        "dnf install ",
-        "microdnf install ",
-        "yum install ",
-        "zypper install ",
-    ];
     anyhow::ensure!(
-        !mutable_package_commands
-            .iter()
-            .any(|command| dockerfile.contains(command)),
+        !rejects_mutable_package_resolution(dockerfile),
         "Dockerfile must not resolve build or runtime inputs through a mutable package repository"
     );
     anyhow::ensure!(
@@ -335,6 +339,10 @@ fn validate_release_hardening(
             .any(|line| line.trim() == "USER 65532:65532"),
         "runtime Dockerfile must select the unprivileged exocortex user"
     );
+    Ok(())
+}
+
+fn validate_protoc_installer(protoc_installer: &str) -> Result<()> {
     anyhow::ensure!(
         protoc_installer.contains("readonly PROTOC_VERSION=")
             && protoc_installer.contains(
@@ -359,6 +367,10 @@ fn validate_release_hardening(
             }),
         "protoc installer must pin a full sha256 checksum for every supported host"
     );
+    Ok(())
+}
+
+fn validate_compose_ports(compose_files: &[&str]) -> Result<()> {
     for compose in compose_files {
         for port in compose
             .lines()
