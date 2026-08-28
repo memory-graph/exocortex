@@ -952,6 +952,7 @@ async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
         cleanups[0].delivery_generation,
         reclaimed.delivery_generation
     );
+    assert!(!cleanups[0].retain_legacy_identity);
     assert!(
         store
             .claim_ingest_effect("worker-after-ack", 30_000)
@@ -1004,6 +1005,7 @@ async fn ingest_claims_serialize_distinct_effects_with_increasing_generations() 
         .unwrap()
         .unwrap();
     assert_eq!(first.effect.effect_id.as_str(), "effect-a");
+    assert!(!first.retain_legacy_identity);
     assert!(store
         .claim_ingest_effect("blocked-worker", 30_000)
         .await
@@ -1019,6 +1021,7 @@ async fn ingest_claims_serialize_distinct_effects_with_increasing_generations() 
         .unwrap()
         .unwrap();
     assert_eq!(second.effect.effect_id.as_str(), "effect-b");
+    assert!(!second.retain_legacy_identity);
     assert!(second.delivery_generation > first.delivery_generation);
 }
 

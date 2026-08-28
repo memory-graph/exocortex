@@ -1305,6 +1305,7 @@ itest!(
         assert_eq!(cleanups.len(), 1);
         assert_eq!(cleanups[0].effect, effect);
         assert!(cleanups[0].delivery_generation > reclaimed.delivery_generation);
+        assert!(cleanups[0].retain_legacy_identity);
         assert!(restarted
             .claim_ingest_effect("worker-after-ack", 30_000)
             .await
@@ -1350,6 +1351,7 @@ itest!(distinct_ingest_effect_claims_are_globally_serialized, {
         .unwrap()
         .unwrap();
     assert_eq!(first.effect.effect_id.as_str(), "effect-a");
+    assert!(!first.retain_legacy_identity);
     assert!(store
         .claim_ingest_effect("blocked-worker", 30_000)
         .await
@@ -1365,6 +1367,7 @@ itest!(distinct_ingest_effect_claims_are_globally_serialized, {
         .unwrap()
         .unwrap();
     assert_eq!(second.effect.effect_id.as_str(), "effect-b");
+    assert!(!second.retain_legacy_identity);
     assert!(second.delivery_generation > first.delivery_generation);
 });
 

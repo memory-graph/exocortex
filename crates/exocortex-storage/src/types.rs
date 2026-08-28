@@ -73,6 +73,9 @@ pub struct ClaimedPostIngestEffect {
     pub effect: PostIngestEffect,
     /// Monotonic claim generation used to reject delayed stale side effects.
     pub delivery_generation: u64,
+    /// Preserve the finite pre-generation Redis marker because an old command
+    /// cannot observe the generation high-water fence.
+    pub retain_legacy_identity: bool,
 }
 
 /// Result of the atomic dedup-claim plus graph commit boundary.

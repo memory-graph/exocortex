@@ -907,8 +907,9 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             WITH d, clock.generation AS delivery_generation
             SET d.effect_claim_token = $claim_token,
                 d.effect_claim_until_ms = timestamp() + $lease_ms,
-                d.effect_delivery_generation = delivery_generation
-            RETURN d.effect_json, delivery_generation
+                d.effect_delivery_generation = delivery_generation,
+                d.effect_cleanup_retain_identity = false
+            RETURN d.effect_json, delivery_generation, false
         "#,
     });
 
@@ -950,7 +951,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             WHERE d.state = 'settled' AND d.effect_json IS NOT NULL
               AND d.effect_acknowledged = true
               AND coalesce(d.effect_cleanup_complete, false) = false
-            WITH d ORDER BY d.effect_id ASC LIMIT $limit
+            WITH d, d.effect_delivery_generation IS NULL AS legacy_identity
+            ORDER BY d.effect_id ASC LIMIT $limit
             MERGE (clock:_IngestEffectClaimClock {id: 'global'})
             SET clock.generation = CASE
                 WHEN d.effect_delivery_generation IS NULL
@@ -959,10 +961,14 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                     THEN d.effect_delivery_generation
                 ELSE clock.generation
             END
-            WITH d, clock.generation AS adoption_generation
+            WITH d, legacy_identity, clock.generation AS adoption_generation
             SET d.effect_delivery_generation =
-                coalesce(d.effect_delivery_generation, adoption_generation)
-            RETURN d.effect_json, d.effect_delivery_generation
+                    coalesce(d.effect_delivery_generation, adoption_generation),
+                d.effect_cleanup_retain_identity =
+                    coalesce(d.effect_cleanup_retain_identity, false)
+                    OR legacy_identity
+            RETURN d.effect_json, d.effect_delivery_generation,
+                d.effect_cleanup_retain_identity
         "#,
     });
 

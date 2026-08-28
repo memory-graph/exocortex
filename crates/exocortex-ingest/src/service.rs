@@ -1589,7 +1589,7 @@ impl<S: Storage + 'static> IngestServer<S> {
         if !acknowledged {
             return Err("post-ingest outbox acknowledgement lost its pending effect".into());
         }
-        self.reclaim_ingest_effect(effect, delivery_generation)
+        self.reclaim_ingest_effect(effect, delivery_generation, false)
             .await
     }
 
@@ -1597,12 +1597,14 @@ impl<S: Storage + 'static> IngestServer<S> {
         &self,
         effect: &PostIngestEffect,
         delivery_generation: u64,
+        retain_legacy_identity: bool,
     ) -> Result<(), String> {
         if let Some(dreams) = &self.dreams {
             dreams
                 .settle_writes_once(
                     effect.effect_id.as_str(),
                     delivery_generation,
+                    retain_legacy_identity,
                     effect
                         .region_deltas
                         .iter()
@@ -1639,7 +1641,11 @@ impl<S: Storage + 'static> IngestServer<S> {
                     let claimed = &cleanups[0];
                     let effect = &claimed.effect;
                     match self
-                        .reclaim_ingest_effect(effect, claimed.delivery_generation)
+                        .reclaim_ingest_effect(
+                            effect,
+                            claimed.delivery_generation,
+                            claimed.retain_legacy_identity,
+                        )
                         .await
                     {
                         Ok(()) => delay = std::time::Duration::from_millis(25),

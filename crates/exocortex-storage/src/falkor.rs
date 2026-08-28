@@ -192,9 +192,19 @@ fn decode_claimed_ingest_effect(
             })
         }
     };
+    let retain_legacy_identity = match row.get(2) {
+        Some(FalkorValue::Bool(value)) => *value,
+        other => {
+            return Err(StorageError::CorruptMetadata {
+                key: "ingest_effect_cleanup_retain_identity",
+                detail: format!("expected boolean, found {other:?}"),
+            })
+        }
+    };
     Ok(crate::ClaimedPostIngestEffect {
         effect,
         delivery_generation,
+        retain_legacy_identity,
     })
 }
 

@@ -537,6 +537,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         &self,
         event_id: &str,
         delivery_generation: u64,
+        retain_legacy_identity: bool,
         regions: Vec<RegionKey>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -547,7 +548,12 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             let mut queue = queue.lock().await;
             for region in regions {
                 queue
-                    .forget_write_once(&region, event_id, delivery_generation)
+                    .forget_write_once(
+                        &region,
+                        event_id,
+                        delivery_generation,
+                        retain_legacy_identity,
+                    )
                     .await?;
             }
             return Ok(());

@@ -119,7 +119,9 @@ local settled = tonumber(ARGV[2])
 if settled > current then
     redis.call('HSET', counters, 'settled_generation', settled)
 end
-redis.call('SREM', processed_events, ARGV[1])
+if ARGV[3] ~= '1' then
+    redis.call('SREM', processed_events, ARGV[1])
+end
 return 1
 "#;
 
@@ -577,6 +579,7 @@ impl RedisFireQueue {
         region: &RegionKey,
         event_id: &str,
         delivery_generation: u64,
+        retain_legacy_identity: bool,
     ) -> anyhow::Result<()> {
         self.ensure_region(region)?;
         anyhow::ensure!(
@@ -592,6 +595,7 @@ impl RedisFireQueue {
             .key(processed_event_key(region))
             .arg(event_id)
             .arg(delivery_generation)
+            .arg(u8::from(retain_legacy_identity))
             .invoke_async(&mut self.conn)
             .await?;
         Ok(())

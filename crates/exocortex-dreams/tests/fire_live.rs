@@ -605,7 +605,7 @@ async fn interleaved_effect_retry_is_counted_once() {
     assert_eq!(processed, 2);
 
     queue
-        .forget_write_once(&region, &event_a, 1)
+        .forget_write_once(&region, &event_a, 1, false)
         .await
         .expect("authoritatively settled effect is reclaimable");
     assert!(matches!(
@@ -676,7 +676,7 @@ async fn high_cardinality_settled_effects_do_not_accumulate_identities() {
             .await
             .unwrap();
         queue
-            .forget_write_once(&region, &event, sequence + 1)
+            .forget_write_once(&region, &event, sequence + 1, false)
             .await
             .unwrap();
     }
@@ -754,7 +754,7 @@ async fn partial_multi_region_cleanup_resumes_after_restart_without_reapplying()
             .unwrap();
     }
     queue
-        .forget_write_once(&regions[0], &event, 1)
+        .forget_write_once(&regions[0], &event, 1, false)
         .await
         .unwrap();
     drop(queue); // crash after cleaning only the first region
@@ -771,7 +771,7 @@ async fn partial_multi_region_cleanup_resumes_after_restart_without_reapplying()
     );
     for region in &regions {
         restarted
-            .forget_write_once(region, &event, 1)
+            .forget_write_once(region, &event, 1, false)
             .await
             .unwrap();
     }
@@ -845,7 +845,10 @@ async fn delayed_stale_generation_cannot_reapply_after_cleanup() {
         )
         .await
         .unwrap();
-    queue.forget_write_once(&region, &event, 2).await.unwrap();
+    queue
+        .forget_write_once(&region, &event, 2, false)
+        .await
+        .unwrap();
     let stale = queue
         .record_write_once(
             &region,
@@ -893,6 +896,82 @@ async fn delayed_stale_generation_cannot_reapply_after_cleanup() {
         .arg(format!("{key}:processing"))
         .arg(&counter_key)
         .arg(format!("{counter_key}:processed-events"))
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn adopted_legacy_cleanup_retains_marker_against_old_lua_replay() {
+    let Some((client, mut queue, key)) = isolated_queue("legacy-marker-org").await else {
+        return;
+    };
+    let region = RegionKey {
+        org: "legacy-marker-org".into(),
+        project: "project".into(),
+        memory_type: 3,
+    };
+    let counter_key = format!(
+        "exocortex:dreams:counters:{}",
+        serde_json::to_string(&region).unwrap()
+    );
+    let processed_key = format!("{counter_key}:processed-events");
+    let event = format!("legacy-effect:{}", uuid::Uuid::new_v4());
+    let mut legacy_conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("legacy command connection");
+    let legacy_script = redis::Script::new(
+        r#"
+        if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then
+            return tonumber(redis.call('HGET', KEYS[1], 'memories') or '0')
+        end
+        redis.call('SADD', KEYS[2], ARGV[1])
+        return redis.call('HINCRBY', KEYS[1], 'memories', 1)
+        "#,
+    );
+    let first: u32 = legacy_script
+        .key(&counter_key)
+        .key(&processed_key)
+        .arg(&event)
+        .invoke_async(&mut legacy_conn)
+        .await
+        .unwrap();
+    assert_eq!(first, 1);
+
+    queue
+        .forget_write_once(&region, &event, 2, true)
+        .await
+        .unwrap();
+    let delayed: u32 = legacy_script
+        .key(&counter_key)
+        .key(&processed_key)
+        .arg(&event)
+        .invoke_async(&mut legacy_conn)
+        .await
+        .unwrap();
+    assert_eq!(delayed, 1, "retained marker rejects delayed legacy Lua");
+
+    let mut inspect = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("inspection connection");
+    let (processed, settled): (u64, u64) = redis::pipe()
+        .cmd("SCARD")
+        .arg(&processed_key)
+        .cmd("HGET")
+        .arg(&counter_key)
+        .arg("settled_generation")
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+    assert_eq!((processed, settled), (1, 2));
+    let _: u64 = redis::cmd("DEL")
+        .arg(&key)
+        .arg(format!("{key}:deferred"))
+        .arg(format!("{key}:processing"))
+        .arg(&counter_key)
+        .arg(&processed_key)
         .query_async(&mut inspect)
         .await
         .unwrap();

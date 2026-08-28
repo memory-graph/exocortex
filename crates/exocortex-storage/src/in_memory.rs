@@ -868,6 +868,7 @@ impl Storage for InMemoryStorage {
         Ok(Some(crate::ClaimedPostIngestEffect {
             effect: row.effect.clone(),
             delivery_generation,
+            retain_legacy_identity: false,
         }))
     }
     async fn renew_ingest_effect_claim(
@@ -927,6 +928,7 @@ impl Storage for InMemoryStorage {
                     .map(|delivery_generation| crate::ClaimedPostIngestEffect {
                         effect: row.effect.clone(),
                         delivery_generation,
+                        retain_legacy_identity: false,
                     })
             })
             .collect::<Vec<_>>();
