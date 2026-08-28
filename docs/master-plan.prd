@@ -329,6 +329,7 @@ idea:
 | R6-R50 | Full-gate checksum migration: regenerate the adapter protocol goldens for the deliberate v2 canonical checksum boundary | Codex | Done — all three binary fixtures were regenerated only through the ignored authoritative generator and the normal golden comparison passes |
 | R6-R51 | Full-gate SSE readiness: recognize the first successfully parsed SSE item when the client library omits a distinct `Connected` item | Codex | Done — readiness reflects a parsed authenticated SSE response; scheduler-tolerant harness startup is separate from the unchanged 500 ms post-write deadline |
 | R6-R52 | Full-gate worker fixture: provision the now-required exact producer key and fail if its backend never becomes reachable | Codex | Done — the out-of-process fixture carries the exact policy key and asserts listener readiness before launching the producer |
+| R6-R53 | Full-gate enforcement witness: track the production exact-source-policy constructor after removal of the ceiling-only builder | Codex | Done — `dead-enforcement` now requires the fail-closed `new_with_admin_policies` call in backend assembly and retains its unreachable/configured-out negative fixtures |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence
@@ -445,6 +446,7 @@ idea:
 | R6-R50 | **Done** — checksum v2 intentionally changes the signed batch bytes, so the adapter's byte-stability corpus now pins the v2 values rather than stale v1 checksums | ignored `regenerate` target followed by normal `batches_match_the_golden_files` comparison |
 | R6-R51 | **Done** — `connection_ready` is emitted by the first successfully parsed SSE item because `eventsource-client` may begin with an event rather than a distinct transport marker; invalid HTTP/status/framing errors still cannot signal readiness. Harness startup allows loaded CI scheduling independently of the acceptance clock | server `wrapup_chain_grpc_to_sse_to_sibling_client` and `mcp_wal_sync_backend_sse_sibling_is_one_chain_under_500ms`; client sync suite retains the exact 500 ms post-write observation checks |
 | R6-R52 | **Done** — the executable worker fixture uses the administrator policy's required 64-hex `hmac_key` and verifies the backend listener accepted a connection instead of exhausting its poll loop silently | worker `fixture_adapter_binary_submits_to_real_backend`; full workspace suite |
+| R6-R53 | **Done** — the live-enforcement catalogue follows the renamed and strengthened producer-auth boundary instead of requiring a deleted ceiling-only method | xtask negative `dead_enforcement_rejects_unreachable_configured_out_and_uncalled_witnesses`; `cargo xtask dead-enforcement` |
 
 ## Done
 

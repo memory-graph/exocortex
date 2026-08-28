@@ -6,7 +6,7 @@ pub(crate) const DEAD_CONTROLS: &[(&str, &str)] = &[
     ("check_deadline", "crates/exocortex-ops/src/operations.rs"),
     ("on_write", "crates/exocortex-ingest/src/service.rs"),
     (
-        "with_admin_ceilings",
+        "new_with_admin_policies",
         "crates/exocortex-server/src/backend.rs",
     ),
     ("drain_all", "crates/exocortex-client/src/main.rs"),
