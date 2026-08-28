@@ -659,7 +659,7 @@ fn kernel_purity() -> Result<()> {
         "exocortex-worker",
     ] {
         let out = std::process::Command::new(cargo())
-            .args(["tree", "-p", crate_name, "-e", "no-dev"])
+            .args(["tree", "-p", crate_name, "--all-features", "-e", "no-dev"])
             .output()?;
         anyhow::ensure!(
             out.status.success(),

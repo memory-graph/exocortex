@@ -498,7 +498,9 @@ pub(crate) fn kernel_boundary_violations(root: &Path) -> Result<Vec<String>> {
             }
         }
         for statement in source.split(';').map(str::trim) {
-            if (statement.starts_with("use std") || statement.starts_with("extern crate std"))
+            if (statement.starts_with("use std")
+                || statement.starts_with("use ::std")
+                || statement.starts_with("extern crate std"))
                 && statement
                     .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
                     .any(|token| ["fs", "io", "net", "process"].contains(&token))
@@ -525,6 +527,7 @@ pub(crate) fn cypher_outside_storage_violations(root: &Path) -> Result<Vec<Strin
         let source = std::fs::read_to_string(&path)?;
         let query = rust_string_literals(&source)
             .into_iter()
+            .chain(composed_rust_string_literals(&source))
             .any(|literal| looks_like_cypher(&literal));
         if query {
             violations.push(format!(
@@ -534,6 +537,44 @@ pub(crate) fn cypher_outside_storage_violations(root: &Path) -> Result<Vec<Strin
         }
     }
     Ok(violations)
+}
+
+/// Return strings assembled by the standard literal-composition macros. A
+/// query split across `concat!`/`format!` arguments is still executable code;
+/// unrelated literals elsewhere in the file must remain independent.
+fn composed_rust_string_literals(source: &str) -> Vec<String> {
+    let mut composed = Vec::new();
+    for macro_name in ["concat!", "format!"] {
+        let mut cursor = 0usize;
+        while let Some(relative) = source[cursor..].find(macro_name) {
+            let at = cursor + relative + macro_name.len();
+            let Some(open_relative) = source[at..].find('(') else {
+                break;
+            };
+            let open = at + open_relative;
+            let Some(close) = matching_delimiter(source, open, b'(', b')') else {
+                break;
+            };
+            composed.push(rust_string_literals(&source[open + 1..close]).join(""));
+            cursor = close + 1;
+        }
+    }
+    composed
+}
+
+fn matching_delimiter(source: &str, open: usize, opening: u8, closing: u8) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+        if *byte == opening {
+            depth += 1;
+        } else if *byte == closing {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(open + offset);
+            }
+        }
+    }
+    None
 }
 
 fn looks_like_cypher(literal: &str) -> bool {
@@ -767,13 +808,35 @@ pub(crate) fn signing_hygiene_violations(root: &Path) -> Result<Vec<String>> {
                 violations.push(format!("{rel}: local batch-signing function `{name}`"));
             }
         }
-        if code.contains("checksum: String::new()")
-            && !code.contains("prepare_batch")
-            && !code.contains("canonical_checksum")
-        {
-            violations.push(format!(
-                "{rel}: constructs a blank batch checksum without a canonical signer"
-            ));
+        let functions = rust_functions(&code);
+        let signer_functions: std::collections::BTreeSet<_> = functions
+            .iter()
+            .filter(|function| {
+                let body = &code[function.body_start..function.body_end];
+                body.contains("prepare_batch(")
+                    || body.contains("canonical_checksum(")
+                    || body.contains("sign_batch(")
+            })
+            .map(|function| function.name.as_str())
+            .collect();
+        for function in &functions {
+            let body = &code[function.body_start..function.body_end];
+            let constructs_blank = body.contains("checksum: String::new()");
+            let submits_batch = [".submit(", "submit_batch(", "commit_ingest("]
+                .iter()
+                .any(|call| body.contains(call));
+            let signs_batch = body.contains("prepare_batch(")
+                || body.contains("canonical_checksum(")
+                || body.contains("sign_batch(")
+                || signer_functions
+                    .iter()
+                    .any(|name| body.contains(&format!("{name}(")));
+            if constructs_blank && submits_batch && !signs_batch {
+                violations.push(format!(
+                    "{rel}: function `{}` submits a blank batch checksum without a canonical signer",
+                    function.name
+                ));
+            }
         }
     }
     let mut manifests = Vec::new();
@@ -1128,6 +1191,14 @@ mod tests {
         );
         let violations = kernel_boundary_violations(&root).unwrap();
         assert_eq!(violations.len(), 2, "{violations:?}");
+
+        write(
+            &root,
+            "crates/exocortex-kernel/src/lib.rs",
+            "use ::std::fs as disk; fn leak() { let _ = disk::read(\"x\"); }\n",
+        );
+        let violations = kernel_boundary_violations(&root).unwrap();
+        assert_eq!(violations.len(), 2, "{violations:?}");
     }
 
     #[test]
@@ -1142,6 +1213,12 @@ mod tests {
             &root,
             "crates/exocortex-client/src/lib.rs",
             "// MATCH ( is documentation; unrelated strings must not combine.\nconst A: &str = \"MATCH (\"; const B: &str = \" RETURN \";\n",
+        );
+        assert_eq!(cypher_outside_storage_violations(&root).unwrap().len(), 1);
+        write(
+            &root,
+            "crates/exocortex-server/src/lib.rs",
+            "fn query() -> &'static str { concat!(\"MATCH (n)\", \" RETURN n\") }\n",
         );
         assert_eq!(cypher_outside_storage_violations(&root).unwrap().len(), 1);
         write(
@@ -1209,6 +1286,17 @@ mod tests {
             &root,
             "crates/example/Cargo.toml",
             "[dependencies]\ncrypto = { package = \"hmac\", version = \"1\" }\n",
+        );
+        assert_eq!(signing_hygiene_violations(&root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn signing_hygiene_does_not_accept_an_unrelated_signer() {
+        let root = fixture("signing-control-flow");
+        write(
+            &root,
+            "crates/example/src/lib.rs",
+            "fn submit(client: Client) { let batch = IngestBatch { checksum: String::new() }; client.submit(batch); } fn unrelated(mut batch: IngestBatch) { prepare_batch(&[0; 32], &mut batch); }",
         );
         assert_eq!(signing_hygiene_violations(&root).unwrap().len(), 1);
     }
