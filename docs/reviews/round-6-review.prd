@@ -449,3 +449,9 @@ out-of-process node fixtures pass with owner-only credential files; and the
 installed standalone supervisor/MCP test passes in five consecutive runs after
 using a bounded observation window. No production authorization, policy-mode,
 or durability check was weakened.
+
+The subsequent mandatory `dead-enforcement` run promoted R6-R145: its Dreams
+control manifest still named the pre-outbox `on_writes` call at the ingest
+boundary. The production boundary now deliberately calls `on_writes_once` so
+ambiguous durable-effect retries cannot double-count. The gate must track that
+exact entrypoint and retain an executable manifest regression.
