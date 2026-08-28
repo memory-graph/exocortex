@@ -87,6 +87,9 @@ inventory   = "0.3"
 
 # --- embedding runtime (backend default) ---
 fastembed   = "3"
+# fastembed 3.14 pins `ort` rc.4 but its loose `ort-sys` edge otherwise
+# resolves to rc.13, whose MSRV exceeds the workspace's pinned Rust 1.85.
+ort-sys     = "=2.0.0-rc.4"
 
 # --- time / rand ---
 chrono      = { version = "0.4", features = ["serde"] }

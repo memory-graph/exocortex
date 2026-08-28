@@ -16,6 +16,18 @@ use std::sync::Arc;
 pub trait Embedder: Send + Sync {
     /// Embed one `title + "\n" + content` document.
     fn embed(&self, text: &str) -> Result<Vec<f32>, String>;
+    /// Embed one admitted ingest batch in a single model invocation. Test
+    /// doubles that only implement [`Self::embed`] retain their existing
+    /// ergonomics through this deterministic fallback.
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        texts.iter().map(|text| self.embed(text)).collect()
+    }
+    /// Maximum number of model invocations that may execute concurrently.
+    /// Stateful embedders default to one; implementations may explicitly
+    /// advertise safe parallelism.
+    fn max_concurrency(&self) -> usize {
+        1
+    }
     /// Stable model name (R-Mcr1/R-Dr5).
     fn model_id(&self) -> &'static str;
     /// Exact model revision stamped beside every stored vector.
@@ -90,10 +102,11 @@ pub struct FastEmbedder {
 impl FastEmbedder {
     /// Load the default bge-small model.
     pub fn bge_small() -> Result<Self, String> {
-        let model = fastembed::TextEmbedding::try_new(
-            fastembed::InitOptions::new(fastembed::EmbeddingModel::BGESmallENV15)
-                .with_show_download_progress(false),
-        )
+        let model = fastembed::TextEmbedding::try_new(fastembed::InitOptions {
+            model_name: fastembed::EmbeddingModel::BGESmallENV15,
+            show_download_progress: false,
+            ..Default::default()
+        })
         .map_err(|e| e.to_string())?;
         Ok(Self {
             model: std::sync::Mutex::new(model),
@@ -104,13 +117,17 @@ impl FastEmbedder {
 #[cfg(feature = "fastembed")]
 impl Embedder for FastEmbedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
-        let mut model = self.model.lock().map_err(|e| e.to_string())?;
-        let out = model
-            .embed(vec![text], None)
-            .map_err(|e: fastembed::Error| e.to_string())?;
-        out.into_iter()
+        self.embed_batch(&[text.to_owned()])?
+            .into_iter()
             .next()
             .ok_or_else(|| "empty embedding".to_string())
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        let model = self.model.lock().map_err(|e| e.to_string())?;
+        model
+            .embed(texts.to_vec(), None)
+            .map_err(|e: fastembed::Error| e.to_string())
     }
 
     fn model_id(&self) -> &'static str {

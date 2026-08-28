@@ -79,12 +79,10 @@ impl RoaringLsb for roaring::RoaringBitmap {
     }
 }
 
-/// Blank a byte range with spaces (same length — no UTF-8 boundary moves).
-fn unsafe_blank(s: &mut String, from: usize, to: usize) -> usize {
-    // SAFETY-free approach: operate on bytes via Vec conversion is costly;
-    // instead rebuild via as_mut_vec would be unsafe. Use safe replacement:
-    // the arena keys are ASCII lowercased text + spaces, so per-byte ' '
-    // substitution through a safe interface:
+/// Blank a byte range with spaces while preserving later arena offsets.
+fn blank_search_key_range(s: &mut String, from: usize, to: usize) -> usize {
+    // `from` and `to` are UTF-8 boundaries; one ASCII byte per removed byte
+    // preserves every subsequent byte offset.
     let mut out = String::with_capacity(s.len());
     out.push_str(&s[..from]);
     for _ in from..to {
@@ -217,7 +215,7 @@ impl GraphSnapshot {
                 .copied()
                 .unwrap_or(self.search_arena.len() as u32) as usize;
             if from < to && to <= self.search_arena.len() {
-                let _ = unsafe_blank(&mut self.search_arena, from, to);
+                let _ = blank_search_key_range(&mut self.search_arena, from, to);
             }
         }
     }

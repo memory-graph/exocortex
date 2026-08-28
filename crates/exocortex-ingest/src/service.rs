@@ -94,6 +94,9 @@ pub struct IngestServer<S: Storage> {
     /// Backend-assigned embeddings (§7.5); `None` disables the embedding
     /// step (backend config flag, R-Lat3).
     pub embedder: Option<EmbedderRef>,
+    /// Admission for synchronous model work. Permits are held inside Tokio's
+    /// dedicated blocking pool and match the configured model's concurrency.
+    embedding_permits: Arc<tokio::sync::Semaphore>,
     /// Entity extraction (server-side only, R-T18).
     pub extractor: EntityExtractor,
     /// Reasoning enrichment: after a successful commit, enqueue
@@ -163,6 +166,7 @@ impl<S: Storage> Clone for IngestServer<S> {
             sources_file: self.sources_file.clone(),
             seen_batches: self.seen_batches.clone(),
             embedder: self.embedder.clone(),
+            embedding_permits: self.embedding_permits.clone(),
             extractor: self.extractor.clone(),
             reasoning: self.reasoning.clone(),
             dreams: self.dreams.clone(),
@@ -192,6 +196,7 @@ impl<S: Storage> IngestServer<S> {
                 std::num::NonZeroUsize::new(REGISTRY_LRU_CAP).unwrap(),
             ))),
             embedder: None,
+            embedding_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             extractor: EntityExtractor::new(&org),
             reasoning: None,
             dreams: None,
@@ -226,6 +231,9 @@ impl<S: Storage> IngestServer<S> {
 
     /// Backend config flag: enable the embedding step (§7.5).
     pub fn with_embedder(mut self, embedder: EmbedderRef) -> Self {
+        self.embedding_permits = Arc::new(tokio::sync::Semaphore::new(
+            embedder.max_concurrency().max(1),
+        ));
         self.embedder = Some(embedder);
         self
     }
@@ -576,22 +584,6 @@ impl<S: Storage> IngestServer<S> {
         }
         // Server-side entity extraction (R-T18).
         crate::entities::attach_entities(&mut mem, &self.extractor);
-        // Backend-assigned embedding (§7.5): embed `title + content` after
-        // entity extraction, on the commit path only (R-Lat3). Failures
-        // degrade to `embedding: None` — Dreams skips the row, ingest never
-        // rejects on embedder health.
-        if let Some(embedder) = &self.embedder {
-            if let Ok(v) = embedder.embed(&format!("{}\n{}", m.title, m.content)) {
-                metrics::counter!("exocortex_ingest_embeddings_total").increment(1);
-                mem.embedding = Some(exocortex_kernel::Embedding {
-                    model: exocortex_kernel::EmbeddingModel {
-                        name: embedder.model_id().into(),
-                        version: embedder.model_version().into(),
-                    },
-                    vector: v,
-                });
-            }
-        }
         Ok(mem)
     }
 
@@ -957,6 +949,58 @@ impl<S: Storage + 'static> IngestServer<S> {
         Ok(source)
     }
 
+    async fn embed_memories(&self, memories: &mut [Memory]) {
+        let Some(embedder) = self.embedder.clone() else {
+            return;
+        };
+        if memories.is_empty() {
+            return;
+        }
+        let texts = memories
+            .iter()
+            .map(|memory| format!("{}\n{}", memory.title, memory.content))
+            .collect::<Vec<_>>();
+        let model_id = embedder.model_id();
+        let model_version = embedder.model_version();
+        let Ok(permit) = self.embedding_permits.clone().acquire_owned().await else {
+            return;
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            embedder.embed_batch(&texts)
+        })
+        .await;
+        let vectors = match result {
+            Ok(Ok(vectors)) if vectors.len() == memories.len() => vectors,
+            Ok(Ok(vectors)) => {
+                tracing::warn!(
+                    expected = memories.len(),
+                    actual = vectors.len(),
+                    "embedder returned the wrong batch cardinality"
+                );
+                return;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "embedding batch failed; committing without vectors");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "embedding blocking task failed; committing without vectors");
+                return;
+            }
+        };
+        for (memory, vector) in memories.iter_mut().zip(vectors) {
+            memory.embedding = Some(exocortex_kernel::Embedding {
+                model: exocortex_kernel::EmbeddingModel {
+                    name: model_id.into(),
+                    version: model_version.into(),
+                },
+                vector,
+            });
+        }
+        metrics::counter!("exocortex_ingest_embeddings_total").increment(memories.len() as u64);
+    }
+
     fn replay_ack(&self, batch: &IngestBatch) -> Option<IngestAck> {
         self.seen_batches
             .lock()
@@ -1096,6 +1140,7 @@ impl<S: Storage + 'static> IngestServer<S> {
         if !rejections.is_empty() {
             return Ok(Err(Self::reject_rows(batch, rejections)));
         }
+        self.embed_memories(&mut memories).await;
         Ok(Ok(ValidatedBatch {
             memories,
             relationships,

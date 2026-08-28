@@ -204,6 +204,61 @@ async fn ten_k_dataset_reduces_cardinality_and_keeps_mcr2() {
 }
 
 #[tokio::test]
+async fn region_cycle_reuses_one_working_set_across_merge_candidates() {
+    let storage = InMemoryStorage::new(ontology());
+
+    // Several interchangeable anchors force the merge loop to process more
+    // than one candidate. A larger foreign tenant makes any repeated org-wide
+    // scan visible through the storage double's query counters.
+    for index in 0..8usize {
+        storage
+            .upsert_memory(&mem_with_embedding(110_000 + index, Some(77), unit(0)))
+            .await
+            .unwrap();
+    }
+    for index in 0..256usize {
+        let mut foreign = mem_with_embedding(120_000 + index, None, unit(index + 1));
+        foreign.context.tenant_id = Some("other-org".into());
+        foreign.context.project_id = Some("other-project".into());
+        storage.upsert_memory(&foreign).await.unwrap();
+    }
+
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        false,
+        "bounded-working-set".into(),
+    );
+    let result = engine
+        .try_consolidate(&RegionKey {
+            org: "o".into(),
+            project: "p".into(),
+            memory_type: 3,
+        })
+        .await
+        .expect("cycle");
+
+    assert!(
+        result.merged.len() >= 2,
+        "the regression must exercise multiple merge candidates"
+    );
+    let (memory_streams, relationship_streams, frontier_reads, attribute_reads) =
+        storage.reasoning_query_counts();
+    assert_eq!(
+        memory_streams, 2,
+        "one pre-lease region validation plus one memory snapshot per cycle"
+    );
+    assert_eq!(
+        relationship_streams, 1,
+        "one relationship snapshot per region cycle"
+    );
+    assert_eq!(frontier_reads, 0);
+    assert_eq!(attribute_reads, 0);
+}
+
+#[tokio::test]
 async fn poison_consolidation_flags_regression_and_rolls_back() {
     let storage = InMemoryStorage::new(ontology());
     // A negative tolerance turns the R-Mcr3 guard into a tripwire: ANY

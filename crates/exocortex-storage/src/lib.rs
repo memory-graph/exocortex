@@ -4,6 +4,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
 
+/// Bounded JSON and crash-durable private-file replacement utilities.
+pub mod bounded_io;
 /// The compile-time Cypher template catalogue (§6.4, CR-10).
 pub mod cypher;
 /// The FalkorDB adapter (§6.5).

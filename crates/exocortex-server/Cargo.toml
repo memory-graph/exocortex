@@ -64,5 +64,3 @@ exocortex-client = { workspace = true }
 exocortex-cache = { workspace = true }
 prost-types = { workspace = true }
 chitchat = { workspace = true }
-hmac = { workspace = true }
-sha2 = { workspace = true }

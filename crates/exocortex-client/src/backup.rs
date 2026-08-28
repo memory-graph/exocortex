@@ -11,8 +11,9 @@
 //! the drain).
 
 use anyhow::{Context, Result};
-use std::io::Read as _;
-use std::io::Write as _;
+use exocortex_storage::bounded_io::{
+    atomic_write_private, read_bounded, serialize_json_pretty_bounded,
+};
 
 use crate::wal::{Wal, WalEntry};
 
@@ -26,6 +27,7 @@ pub const VERSION: u32 = 1;
 /// input byte to six output bytes, so 640 MiB preserves exportability of every
 /// valid WAL while still placing a strict ceiling on serialization and parsing.
 pub const MAX_BACKUP_BYTES: u64 = 640 * 1024 * 1024;
+const BACKUP_NOUN: &str = "backup";
 
 /// One backup document.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -54,8 +56,9 @@ pub fn export(wal: &Wal, fingerprint: &str, path: &std::path::Path) -> Result<us
         entries,
     };
     let n = doc.entries.len();
-    let json = serialize_bounded(&doc, MAX_BACKUP_BYTES).context("serialize backup")?;
-    atomic_write_private(path, &json)
+    let json = serialize_json_pretty_bounded(&doc, MAX_BACKUP_BYTES, BACKUP_NOUN)
+        .context("serialize backup")?;
+    atomic_write_private(path, &json, BACKUP_NOUN)
         .with_context(|| format!("write backup {}", path.display()))?;
     Ok(n)
 }
@@ -81,7 +84,7 @@ pub fn import(
     ontology: &exocortex_kernel::Ontology,
     path: &std::path::Path,
 ) -> Result<ImportReport> {
-    let raw = read_bounded(path, MAX_BACKUP_BYTES)?;
+    let raw = read_bounded(path, MAX_BACKUP_BYTES, BACKUP_NOUN)?;
     let doc: Backup = serde_json::from_slice(&raw).context("parse backup")?;
     anyhow::ensure!(
         doc.format == FORMAT,
@@ -128,69 +131,6 @@ pub fn import(
     })
 }
 
-fn ensure_backup_size(size: u64, limit: u64) -> Result<()> {
-    anyhow::ensure!(
-        size <= limit,
-        "backup is {size} bytes; maximum supported size is {limit} bytes"
-    );
-    Ok(())
-}
-
-fn serialize_bounded<T: serde::Serialize>(value: &T, limit: u64) -> Result<Vec<u8>> {
-    let mut output = BoundedOutput::new(limit);
-    serde_json::to_writer_pretty(&mut output, value)?;
-    Ok(output.bytes)
-}
-
-struct BoundedOutput {
-    bytes: Vec<u8>,
-    limit: u64,
-}
-
-impl BoundedOutput {
-    fn new(limit: u64) -> Self {
-        Self {
-            bytes: Vec::new(),
-            limit,
-        }
-    }
-}
-
-impl std::io::Write for BoundedOutput {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if (self.bytes.len() as u64).saturating_add(bytes.len() as u64) > self.limit {
-            return Err(std::io::Error::other(format!(
-                "backup exceeds maximum supported size of {} bytes",
-                self.limit
-            )));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn read_bounded(path: &std::path::Path, limit: u64) -> Result<Vec<u8>> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("read backup {}", path.display()))?;
-    ensure_backup_size(
-        file.metadata()
-            .with_context(|| format!("inspect backup {}", path.display()))?
-            .len(),
-        limit,
-    )?;
-    let mut raw = Vec::new();
-    std::io::Read::by_ref(&mut file)
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut raw)
-        .with_context(|| format!("read backup {}", path.display()))?;
-    ensure_backup_size(raw.len() as u64, limit)?;
-    Ok(raw)
-}
-
 fn hex(b: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(b.len() * 2);
@@ -200,79 +140,27 @@ fn hex(b: &[u8]) -> String {
     s
 }
 
-fn atomic_write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    atomic_write_private_with(path, bytes, |_| Ok(()))
-}
-
-fn atomic_write_private_with(
-    path: &std::path::Path,
-    bytes: &[u8],
-    before_rename: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("backup");
-    let mut opened = None;
-    for attempt in 0..100u32 {
-        let candidate = parent.join(format!(".{name}.tmp-{}-{attempt}", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        match options.open(&candidate) {
-            Ok(file) => {
-                opened = Some((candidate, file));
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    let (temporary, mut file) = opened.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not allocate backup temporary file",
-        )
-    })?;
-    let result = (|| {
-        file.write_all(bytes)?;
-        file.flush()?;
-        file.sync_all()?;
-        before_rename(&temporary)?;
-        std::fs::rename(&temporary, path)?;
-        #[cfg(unix)]
-        std::fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{atomic_write_private_with, ensure_backup_size, read_bounded, serialize_bounded};
+    use super::BACKUP_NOUN;
+    use exocortex_storage::bounded_io::{
+        atomic_write_private_with, ensure_size, read_bounded, serialize_json_pretty_bounded,
+    };
 
     #[test]
     fn backup_size_boundary_is_inclusive_and_file_reads_are_bounded() {
-        assert!(ensure_backup_size(7, 7).is_ok());
-        assert!(ensure_backup_size(8, 7).is_err());
+        assert!(ensure_size(7, 7, BACKUP_NOUN).is_ok());
+        assert!(ensure_size(8, 7, BACKUP_NOUN).is_err());
 
         let dir =
             std::env::temp_dir().join(format!("exocortex-bounded-backup-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("backup.json");
         std::fs::write(&path, b"1234567").unwrap();
-        assert_eq!(read_bounded(&path, 7).unwrap(), b"1234567");
-        assert!(read_bounded(&path, 6).is_err());
-        assert!(serialize_bounded(&"x", 3).is_ok());
-        assert!(serialize_bounded(&"x", 2).is_err());
+        assert_eq!(read_bounded(&path, 7, BACKUP_NOUN).unwrap(), b"1234567");
+        assert!(read_bounded(&path, 6, BACKUP_NOUN).is_err());
+        assert!(serialize_json_pretty_bounded(&"x", 3, BACKUP_NOUN).is_ok());
+        assert!(serialize_json_pretty_bounded(&"x", 2, BACKUP_NOUN).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -283,14 +171,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("backup.json");
         std::fs::write(&path, b"previous").unwrap();
-        let error = atomic_write_private_with(&path, b"replacement", |_| {
+        let error = atomic_write_private_with(&path, b"replacement", BACKUP_NOUN, |_| {
             Err(std::io::Error::other("injected before rename"))
         })
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert_eq!(std::fs::read(&path).unwrap(), b"previous");
 
-        atomic_write_private_with(&path, b"replacement", |_| Ok(())).unwrap();
+        atomic_write_private_with(&path, b"replacement", BACKUP_NOUN, |_| Ok(())).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
         #[cfg(unix)]
         {

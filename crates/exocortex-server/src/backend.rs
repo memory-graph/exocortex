@@ -95,6 +95,8 @@ pub struct BackendNode<S: Storage> {
     pub leader_gate: Arc<std::sync::atomic::AtomicBool>,
     /// Production Dreams engine, exposed for lifecycle readiness and health.
     pub dreams: Arc<exocortex_dreams::DreamsEngine<S>>,
+    /// Live gossip handle retained for the backend process lifetime.
+    pub gossip: chitchat::ChitchatHandle,
     leader_election: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -655,7 +657,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
 
     // Chitchat gossip (§9.1): member discovery carrying wire-version +
     // fingerprint so admission composes with failure detection (R-W2/R-W3).
-    spawn_gossip(&args, &ontology.fingerprint).await?;
+    let gossip = spawn_gossip(&args, &ontology.fingerprint).await?;
 
     Ok(BackendNode {
         health,
@@ -663,6 +665,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
         cache,
         leader_gate,
         dreams,
+        gossip,
         leader_election: Some(leader_election),
     })
 }
@@ -731,7 +734,10 @@ impl BoundIngress {
 
 /// Chitchat membership: `wire_version` and `ontology_fingerprint` ride the
 /// gossip state (peers gate admission on both).
-async fn spawn_gossip(args: &BackendNodeArgs, fp: &OntologyFingerprint) -> anyhow::Result<()> {
+async fn spawn_gossip(
+    args: &BackendNodeArgs,
+    fp: &OntologyFingerprint,
+) -> anyhow::Result<chitchat::ChitchatHandle> {
     use chitchat::{ChitchatConfig, ChitchatId, FailureDetectorConfig};
     let config = ChitchatConfig {
         chitchat_id: ChitchatId::new(
@@ -757,13 +763,7 @@ async fn spawn_gossip(args: &BackendNodeArgs, fp: &OntologyFingerprint) -> anyho
         ("http_addr".to_string(), args.bind.clone()),
     ];
     let transport = chitchat::transport::UdpTransport;
-    let handle = chitchat::spawn_chitchat(config, initial, &transport).await?;
-    tokio::spawn(async move {
-        // Hold the handle; aborting it stops gossip.
-        std::future::pending::<()>().await;
-        let _ = handle;
-    });
-    Ok(())
+    chitchat::spawn_chitchat(config, initial, &transport).await
 }
 
 fn hex(b: &[u8; 32]) -> String {

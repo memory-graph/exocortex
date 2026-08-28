@@ -317,6 +317,30 @@ async fn backend_nodes_serve_http_grpc_and_gossip_converges() {
     .await
     .expect("node-b boots");
 
+    let expected_wire = exocortex_wire::WIRE_VERSION.to_string();
+    let gossip_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let a = node_a.gossip.with_chitchat(|c| c.state_snapshot()).await;
+        let b = node_b.gossip.with_chitchat(|c| c.state_snapshot()).await;
+        let converged = [&a, &b].iter().all(|snapshot| {
+            snapshot.node_states.len() == 2
+                && snapshot.node_states.iter().all(|state| {
+                    state.get("wire_version") == Some(expected_wire.as_str())
+                        && state
+                            .get("ontology_fingerprint")
+                            .is_some_and(|fingerprint| fingerprint.len() == 64)
+                })
+        });
+        if converged {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < gossip_deadline,
+            "both production gossip handles converge on two compatible members"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     // HTTP parity surface answers with auth on both nodes.
     for (addr, name) in [(node_a.local_addr, "a"), (node_b.local_addr, "b")] {
         let (status, _) = http_get(

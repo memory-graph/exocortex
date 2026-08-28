@@ -106,3 +106,10 @@ reimplementing certificate parsing and HTTP/2 negotiation.
 provider before constructing that listener. Transitive workspace consumers
 enable both supported providers, so Rustls cannot infer one from the unified
 feature set at runtime.
+
+The optional `exocortex-ingest/fastembed` feature directly pins `ort-sys`
+2.0.0-rc.4 because fastembed 3.14 pins the matching `ort` rc.4 API while its
+transitive system-crate range otherwise selects a newer, API-incompatible
+release whose MSRV also exceeds the workspace's Rust 1.85 contract. This direct
+constraint enforces dependency resolution; application code uses fastembed,
+not `ort-sys`.
