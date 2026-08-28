@@ -30,20 +30,132 @@ fn hex(bytes: &[u8; 16]) -> String {
 
 async fn falkor(tag: &str) -> FalkorStorage {
     let url = falkor_url().expect("FALKOR_URL set (checked by the itest gate)");
+    falkor_on_graph(
+        &url,
+        &format!("fencing_live_{tag}_{}", std::process::id()),
+        "fence-node",
+    )
+    .await
+}
+
+async fn falkor_on_graph(url: &str, graph_name: &str, node_id: &str) -> FalkorStorage {
     let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
     let redis = url.replacen("falkor://", "redis://", 1);
     FalkorStorage::connect(
         exocortex_storage::FalkorConfig {
-            falkor_url: url,
+            falkor_url: url.to_owned(),
             redis_url: redis,
-            graph_name: format!("fencing_live_{tag}_{}", std::process::id()),
+            graph_name: graph_name.to_owned(),
             org_id: "org".into(),
-            node_id: "fence-node".into(),
+            node_id: node_id.into(),
         },
         onto,
     )
     .await
     .expect("connect")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inflight_stale_dreams_write_is_fenced_after_takeover_live() {
+    let Some(url) = falkor_url() else {
+        eprintln!(
+            "skipping inflight_stale_dreams_write_is_fenced_after_takeover_live: FALKOR_URL not set"
+        );
+        return;
+    };
+    let old_owner = std::env::var("CHAOS_OLD_OWNER").unwrap_or_else(|_| "old-owner".into());
+    let new_owner = std::env::var("CHAOS_NEW_OWNER").unwrap_or_else(|_| "new-owner".into());
+    assert_ne!(
+        old_owner, new_owner,
+        "takeover must change the owner identity"
+    );
+    let graph = format!(
+        "fencing_live_dreams_takeover_{}_{}",
+        std::process::id(),
+        Utc::now().timestamp_micros()
+    );
+    let old = Arc::new(falkor_on_graph(&url, &graph, &old_owner).await);
+    let successor = falkor_on_graph(&url, &graph, &new_owner).await;
+    let key = LeaseKey::Dreams {
+        org: "org".into(),
+        region: "chaos-probe:3".into(),
+    };
+    let stale_lease = old
+        .acquire_lease(&key, std::time::Duration::ZERO)
+        .await
+        .expect("old Dreams owner acquires the probe epoch");
+    let probe = mem(91);
+    let prepared = FencedRestore {
+        created_memories: vec![probe.clone()],
+        ..FencedRestore::default()
+    };
+
+    old.pause_next_lsn_for_testing();
+    let stale_attempt = {
+        let old = old.clone();
+        let stale_lease = stale_lease.clone();
+        let probe = probe.clone();
+        tokio::spawn(async move {
+            old.upsert_batch_fenced_journaled(
+                &[probe],
+                &[],
+                &prepared,
+                "chaos-stale-cycle",
+                &stale_lease,
+            )
+            .await
+        })
+    };
+    old.wait_for_paused_lsn_for_testing().await;
+
+    let current_lease = successor
+        .acquire_lease(&key, std::time::Duration::from_secs(60))
+        .await
+        .expect("successor acquires a newer Dreams epoch while the stale write is paused");
+    assert!(current_lease.epoch > stale_lease.epoch);
+    assert_eq!(current_lease.owner_node_id.as_str(), new_owner);
+
+    old.release_paused_lsn_for_testing();
+    let stale_result = stale_attempt.await.expect("stale task joins");
+    assert!(
+        matches!(
+            stale_result,
+            Err(StorageError::FencedWriteRejected { lease_epoch })
+                if lease_epoch == stale_lease.epoch
+        ),
+        "paused old-owner write must be rejected after takeover, got {stale_result:?}"
+    );
+    assert!(successor.get_memory(&probe.id).await.unwrap().is_none());
+    assert!(
+        successor
+            .valid_at(&probe.id, Utc::now())
+            .await
+            .unwrap()
+            .is_none(),
+        "no historical version may leak from the stale Dreams write"
+    );
+    let assertions = successor
+        .query_cypher(&CypherQuery {
+            template_id: "integration_memory_assertion_count",
+            params: serde_json::json!({ "id": hex(&probe.id.0) }),
+            read_only: true,
+            deadline: Utc::now() + chrono::Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+    assert_eq!(assertions.rows, vec![serde_json::json!([0])]);
+    assert!(
+        successor
+            .get_active_cycle_journal(&key)
+            .await
+            .unwrap()
+            .is_none(),
+        "no stale cycle journal may survive the rejected write"
+    );
+    successor.release_lease(current_lease).await.unwrap();
+    println!(
+        "no-zombie-write PASS: paused {old_owner} Dreams mutation rejected after {new_owner} takeover; current/history/journal residue=0"
+    );
 }
 
 fn mem(seed: u8) -> Memory {

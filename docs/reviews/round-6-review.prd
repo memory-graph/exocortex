@@ -646,6 +646,14 @@ successor acquisition, release of the stale attempt, and an authoritative
 assertion that no stale-epoch version committed; the deployment gate must
 reject loss of that proof.
 
+R6-R180 is closed by a composed live proof. The harness first kills the actual
+elected container and observes authenticated node3-to-node1 takeover in 1,383
+ms. It then pauses the old owner's real `upsert_batch_fenced_journaled` path
+after LSN allocation, acquires a newer live Falkor Dreams epoch, and releases
+the stale attempt. Falkor returns `FencedWriteRejected`, while current memory,
+assertion history, and active-cycle journal checks all remain empty. A negative
+deployment gate rejects removal or reordering of this probe before PASS.
+
 ### R6-R181 — Release embedding model content is mutable and unstamped
 
 FastEmbed 5.2 resolves `Xenova/bge-small-en-v1.5` from the repository's mutable

@@ -594,12 +594,28 @@ fn validate_chaos_compose(compose: &str) -> Result<()> {
 }
 
 fn validate_chaos_script(script: &str) -> Result<()> {
+    let probe = "--test fencing_live inflight_stale_dreams_write_is_fenced_after_takeover_live";
     anyhow::ensure!(
         script.contains("PRINCIPAL_POLICY=crates/exocortex-cluster/tests/principal-policy.dev.json")
             && script.contains("AUTH_TOKEN=$(jq -er")
             && script.contains("-H \"Authorization: Bearer $AUTH_TOKEN\"")
             && script.matches("cluster_health \"$port\"").count() == 2,
         "chaos leader polling must authenticate both protected health loops from the dev principal policy"
+    );
+    let probe_position = script.find(probe).ok_or_else(|| {
+        anyhow::anyhow!("chaos harness must run the live in-flight Dreams fence probe")
+    })?;
+    let pass_position = script
+        .find("PASS: authenticated takeover and no-zombie Dreams write fencing")
+        .ok_or_else(|| {
+            anyhow::anyhow!("chaos harness must report combined takeover/fencing success")
+        })?;
+    anyhow::ensure!(
+        script.contains("CHAOS_OLD_OWNER=\"$leader\" CHAOS_NEW_OWNER=\"$new_leader\"")
+            && script.contains("FALKOR_URL=falkor://127.0.0.1:16379")
+            && script.contains("--features integration")
+            && probe_position < pass_position,
+        "chaos success must follow a live stale Dreams mutation and authoritative no-residue probe"
     );
     Ok(())
 }
@@ -1848,5 +1864,21 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
         assert!(
             validate_chaos_script(&script.replacen("cluster_health \"$port\"", "curl", 1)).is_err()
         );
+    }
+
+    #[test]
+    fn chaos_script_requires_live_inflight_fence_probe_before_success() {
+        let script = include_str!("../../scripts/chaos-leader-kill.sh");
+        assert!(validate_chaos_script(script).is_ok());
+        assert!(validate_chaos_script(&script.replace(
+            "inflight_stale_dreams_write_is_fenced_after_takeover_live",
+            "stale_lease_write_is_fenced_live"
+        ))
+        .is_err());
+        let reordered = script.replace(
+            "echo \"PASS: authenticated takeover and no-zombie Dreams write fencing\"",
+            "true",
+        );
+        assert!(validate_chaos_script(&reordered).is_err());
     }
 }
