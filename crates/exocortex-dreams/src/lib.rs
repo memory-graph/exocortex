@@ -491,6 +491,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     pub async fn on_writes_once(
         &self,
         event_id: &str,
+        delivery_generation: u64,
         region: RegionKey,
         memories: u32,
         edges: u32,
@@ -509,7 +510,10 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                     edges,
                     self.dreams_trigger,
                     self.node_id.as_str(),
-                    event_id,
+                    fire::DeliveryFence {
+                        event_id,
+                        generation: delivery_generation,
+                    },
                 )
                 .await?;
             return Ok(());
@@ -532,6 +536,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     pub async fn settle_writes_once(
         &self,
         event_id: &str,
+        delivery_generation: u64,
         regions: Vec<RegionKey>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -541,7 +546,9 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         if let Some(queue) = &self.distributed_fire {
             let mut queue = queue.lock().await;
             for region in regions {
-                queue.forget_write_once(&region, event_id).await?;
+                queue
+                    .forget_write_once(&region, event_id, delivery_generation)
+                    .await?;
             }
             return Ok(());
         }
@@ -1817,11 +1824,11 @@ mod cycle_scheduling_tests {
         let engine = engine(&storage);
         let region = region();
         engine
-            .on_writes_once("batch:region", region.clone(), 2, 3)
+            .on_writes_once("batch:region", 1, region.clone(), 2, 3)
             .await
             .unwrap();
         engine
-            .on_writes_once("batch:region", region.clone(), 2, 3)
+            .on_writes_once("batch:region", 1, region.clone(), 2, 3)
             .await
             .unwrap();
         let counters = *engine.counters.get(&region).unwrap();

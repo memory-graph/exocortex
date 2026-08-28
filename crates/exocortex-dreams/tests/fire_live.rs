@@ -3,8 +3,8 @@
 use std::{sync::Arc, time::Duration};
 
 use exocortex_dreams::fire::{
-    AcknowledgeOutcome, DrainResult, FireMessage, FireOutcome, QuietHours, RecordWriteOutcome,
-    RedisFireQueue, DREAMS_QUEUE_MAX,
+    AcknowledgeOutcome, DeliveryFence, DrainResult, FireMessage, FireOutcome, QuietHours,
+    RecordWriteOutcome, RedisFireQueue, DREAMS_QUEUE_MAX,
 };
 use exocortex_dreams::trigger::DreamsTrigger;
 use exocortex_dreams::DreamsEngine;
@@ -474,11 +474,31 @@ async fn stable_write_event_is_counted_once_after_an_ambiguous_retry() {
     };
     let event_id = format!("batch:{}", uuid::Uuid::new_v4());
     let first = queue
-        .record_write_once(&region, 3, 2, trigger, "node", &event_id)
+        .record_write_once(
+            &region,
+            3,
+            2,
+            trigger,
+            "node",
+            DeliveryFence {
+                event_id: &event_id,
+                generation: 1,
+            },
+        )
         .await
         .unwrap();
     let retry = queue
-        .record_write_once(&region, 3, 2, trigger, "node", &event_id)
+        .record_write_once(
+            &region,
+            3,
+            2,
+            trigger,
+            "node",
+            DeliveryFence {
+                event_id: &event_id,
+                generation: 1,
+            },
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -544,7 +564,17 @@ async fn interleaved_effect_retry_is_counted_once() {
     for (event, memories, edges) in [(&event_a, 3, 2), (&event_b, 1, 1), (&event_a, 3, 2)] {
         assert!(matches!(
             queue
-                .record_write_once(&region, memories, edges, trigger, "node", event)
+                .record_write_once(
+                    &region,
+                    memories,
+                    edges,
+                    trigger,
+                    "node",
+                    DeliveryFence {
+                        event_id: event,
+                        generation: if event == &event_a { 1 } else { 2 },
+                    },
+                )
                 .await
                 .unwrap(),
             RecordWriteOutcome::Accumulated(_)
@@ -575,12 +605,19 @@ async fn interleaved_effect_retry_is_counted_once() {
     assert_eq!(processed, 2);
 
     queue
-        .forget_write_once(&region, &event_a)
+        .forget_write_once(&region, &event_a, 1)
         .await
         .expect("authoritatively settled effect is reclaimable");
     assert!(matches!(
         queue
-            .record_write_once(&region, 1, 1, trigger, "node", &event_b)
+            .record_write_once(
+                &region,
+                1,
+                1,
+                trigger,
+                "node",
+                DeliveryFence { event_id: &event_b, generation: 2 },
+            )
             .await
             .unwrap(),
         RecordWriteOutcome::Accumulated(c)
@@ -625,10 +662,23 @@ async fn high_cardinality_settled_effects_do_not_accumulate_identities() {
     for sequence in 0..2_000 {
         let event = format!("settled-effect:{sequence}");
         queue
-            .record_write_once(&region, 1, 0, trigger, "node", &event)
+            .record_write_once(
+                &region,
+                1,
+                0,
+                trigger,
+                "node",
+                DeliveryFence {
+                    event_id: &event,
+                    generation: sequence + 1,
+                },
+            )
             .await
             .unwrap();
-        queue.forget_write_once(&region, &event).await.unwrap();
+        queue
+            .forget_write_once(&region, &event, sequence + 1)
+            .await
+            .unwrap();
     }
 
     let counter_key = format!(
@@ -689,11 +739,24 @@ async fn partial_multi_region_cleanup_resumes_after_restart_without_reapplying()
     let event = format!("recoverable-cleanup:{}", uuid::Uuid::new_v4());
     for region in &regions {
         queue
-            .record_write_once(region, 1, 0, trigger, "node", &event)
+            .record_write_once(
+                region,
+                1,
+                0,
+                trigger,
+                "node",
+                DeliveryFence {
+                    event_id: &event,
+                    generation: 1,
+                },
+            )
             .await
             .unwrap();
     }
-    queue.forget_write_once(&regions[0], &event).await.unwrap();
+    queue
+        .forget_write_once(&regions[0], &event, 1)
+        .await
+        .unwrap();
     drop(queue); // crash after cleaning only the first region
 
     let conn = client
@@ -707,7 +770,10 @@ async fn partial_multi_region_cleanup_resumes_after_restart_without_reapplying()
         key.clone(),
     );
     for region in &regions {
-        restarted.forget_write_once(region, &event).await.unwrap();
+        restarted
+            .forget_write_once(region, &event, 1)
+            .await
+            .unwrap();
     }
 
     let mut inspect = client
@@ -748,12 +814,98 @@ async fn partial_multi_region_cleanup_resumes_after_restart_without_reapplying()
 }
 
 #[tokio::test]
-async fn counters_and_failed_cycle_survive_standalone_queue_restarts() {
-    let Some((client, mut first_process, key)) = isolated_queue("restart-org").await else {
+async fn delayed_stale_generation_cannot_reapply_after_cleanup() {
+    let Some((client, mut queue, key)) = isolated_queue("stale-generation-org").await else {
         return;
     };
     let region = RegionKey {
-        org: "restart-org".into(),
+        org: "stale-generation-org".into(),
+        project: "project".into(),
+        memory_type: 3,
+    };
+    let trigger = DreamsTrigger {
+        memory_threshold: u32::MAX,
+        edge_threshold: u32::MAX,
+        age_floor_days: u32::MAX,
+        min_interval_hours: 0,
+    };
+    let event = format!("stale-generation:{}", uuid::Uuid::new_v4());
+
+    queue
+        .record_write_once(
+            &region,
+            1,
+            0,
+            trigger,
+            "current",
+            DeliveryFence {
+                event_id: &event,
+                generation: 2,
+            },
+        )
+        .await
+        .unwrap();
+    queue.forget_write_once(&region, &event, 2).await.unwrap();
+    let stale = queue
+        .record_write_once(
+            &region,
+            1,
+            0,
+            trigger,
+            "stale",
+            DeliveryFence {
+                event_id: &event,
+                generation: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        stale,
+        RecordWriteOutcome::Accumulated(c) if c.memories_since_last_cycle == 1
+    ));
+
+    let counter_key = format!(
+        "exocortex:dreams:counters:{}",
+        serde_json::to_string(&region).unwrap()
+    );
+    let mut inspect = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("inspection connection");
+    let (memories, settled_generation): (u32, u64) = redis::cmd("HMGET")
+        .arg(&counter_key)
+        .arg("memories")
+        .arg("settled_generation")
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+    assert_eq!((memories, settled_generation), (1, 2));
+    let processed: u64 = redis::cmd("SCARD")
+        .arg(format!("{counter_key}:processed-events"))
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+    assert_eq!(processed, 0, "stale delivery cannot resurrect its identity");
+    let _: u64 = redis::cmd("DEL")
+        .arg(&key)
+        .arg(format!("{key}:deferred"))
+        .arg(format!("{key}:processing"))
+        .arg(&counter_key)
+        .arg(format!("{counter_key}:processed-events"))
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn counters_and_failed_cycle_survive_standalone_queue_restarts() {
+    let org = format!("restart-org-{}", uuid::Uuid::new_v4());
+    let Some((client, mut first_process, key)) = isolated_queue(&org).await else {
+        return;
+    };
+    let region = RegionKey {
+        org: org.clone().into(),
         project: "standalone".into(),
         memory_type: 3,
     };
@@ -765,7 +917,14 @@ async fn counters_and_failed_cycle_survive_standalone_queue_restarts() {
     };
     assert!(matches!(
         first_process
-            .record_write_once(&region, 1, 0, trigger, "standalone", "effect:one")
+            .record_write_once(
+                &region,
+                1,
+                0,
+                trigger,
+                "standalone",
+                DeliveryFence { event_id: "effect:one", generation: 1 },
+            )
             .await
             .unwrap(),
         RecordWriteOutcome::Accumulated(c) if c.memories_since_last_cycle == 1
@@ -776,12 +935,19 @@ async fn counters_and_failed_cycle_survive_standalone_queue_restarts() {
     let mut second_process = RedisFireQueue::new_with_queue_key(
         second_connection,
         QuietHours::none(),
-        "restart-org",
+        &org,
         key.clone(),
     );
     assert!(matches!(
         second_process
-            .record_write_once(&region, 1, 0, trigger, "standalone", "effect:two")
+            .record_write_once(
+                &region,
+                1,
+                0,
+                trigger,
+                "standalone",
+                DeliveryFence { event_id: "effect:two", generation: 2 },
+            )
             .await
             .unwrap(),
         RecordWriteOutcome::Queued(c) if c.memories_since_last_cycle == 2
@@ -794,12 +960,8 @@ async fn counters_and_failed_cycle_survive_standalone_queue_restarts() {
     drop(second_process);
 
     let third_connection = client.get_multiplexed_async_connection().await.unwrap();
-    let mut third_process = RedisFireQueue::new_with_queue_key(
-        third_connection,
-        QuietHours::none(),
-        "restart-org",
-        key.clone(),
-    );
+    let mut third_process =
+        RedisFireQueue::new_with_queue_key(third_connection, QuietHours::none(), &org, key.clone());
     assert_eq!(third_process.recover_inflight().await.unwrap(), 1);
     let recovered = match third_process.drain(Duration::from_secs(1)).await.unwrap() {
         DrainResult::Ready(notification) => notification,
@@ -819,7 +981,7 @@ async fn counters_and_failed_cycle_survive_standalone_queue_restarts() {
     let mut fourth_process = RedisFireQueue::new_with_queue_key(
         fourth_connection,
         QuietHours::none(),
-        "restart-org",
+        &org,
         key.clone(),
     );
     let retry = match fourth_process.drain(Duration::from_secs(1)).await.unwrap() {

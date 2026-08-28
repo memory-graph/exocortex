@@ -1235,14 +1235,14 @@ itest!(
             restarted.claim_ingest_effect("worker-a", 2_000),
             contender.claim_ingest_effect("worker-b", 2_000),
         );
-        let (winner, loser) = match (claim_a.unwrap(), claim_b.unwrap()) {
+        let (winner, loser, first_generation) = match (claim_a.unwrap(), claim_b.unwrap()) {
             (Some(claimed), None) => {
-                assert_eq!(claimed, effect);
-                ("worker-a", "worker-b")
+                assert_eq!(claimed.effect, effect);
+                ("worker-a", "worker-b", claimed.delivery_generation)
             }
             (None, Some(claimed)) => {
-                assert_eq!(claimed, effect);
-                ("worker-b", "worker-a")
+                assert_eq!(claimed.effect, effect);
+                ("worker-b", "worker-a", claimed.delivery_generation)
             }
             claims => panic!("exactly one simultaneous live claimant must win: {claims:?}"),
         };
@@ -1272,11 +1272,13 @@ itest!(
                 .unwrap(),
             "an expired live owner cannot acknowledge before reclaim"
         );
-        assert_eq!(
-            contender.claim_ingest_effect(loser, 30_000).await.unwrap(),
-            Some(effect.clone()),
-            "an abandoned claim becomes retryable after its deadline"
-        );
+        let reclaimed = contender
+            .claim_ingest_effect(loser, 30_000)
+            .await
+            .unwrap()
+            .expect("an abandoned claim becomes retryable after its deadline");
+        assert_eq!(reclaimed.effect, effect);
+        assert!(reclaimed.delivery_generation > first_generation);
         assert!(!restarted
             .acknowledge_ingest_effect(effect.effect_id.as_str(), winner)
             .await
@@ -1290,10 +1292,12 @@ itest!(
             .await
             .unwrap()
             .is_empty());
+        let cleanups = restarted.pending_ingest_effect_cleanups(10).await.unwrap();
+        assert_eq!(cleanups.len(), 1);
+        assert_eq!(cleanups[0].effect, effect);
         assert_eq!(
-            restarted.pending_ingest_effect_cleanups(10).await.unwrap(),
-            [effect.clone()],
-            "live acknowledgement durably exposes cleanup after restart"
+            cleanups[0].delivery_generation,
+            reclaimed.delivery_generation
         );
         assert!(restarted
             .claim_ingest_effect("worker-after-ack", 30_000)

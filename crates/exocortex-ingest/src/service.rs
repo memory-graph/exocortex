@@ -1553,6 +1553,7 @@ impl<S: Storage + 'static> IngestServer<S> {
     async fn deliver_post_ingest_effect(
         &self,
         effect: &PostIngestEffect,
+        delivery_generation: u64,
         claim_token: &str,
     ) -> Result<(), String> {
         if let Some(dreams) = &self.dreams {
@@ -1560,6 +1561,7 @@ impl<S: Storage + 'static> IngestServer<S> {
                 dreams
                     .on_writes_once(
                         effect.effect_id.as_str(),
+                        delivery_generation,
                         delta.region.clone(),
                         delta.memories,
                         delta.relationships,
@@ -1587,14 +1589,20 @@ impl<S: Storage + 'static> IngestServer<S> {
         if !acknowledged {
             return Err("post-ingest outbox acknowledgement lost its pending effect".into());
         }
-        self.reclaim_ingest_effect(effect).await
+        self.reclaim_ingest_effect(effect, delivery_generation)
+            .await
     }
 
-    async fn reclaim_ingest_effect(&self, effect: &PostIngestEffect) -> Result<(), String> {
+    async fn reclaim_ingest_effect(
+        &self,
+        effect: &PostIngestEffect,
+        delivery_generation: u64,
+    ) -> Result<(), String> {
         if let Some(dreams) = &self.dreams {
             dreams
                 .settle_writes_once(
                     effect.effect_id.as_str(),
+                    delivery_generation,
                     effect
                         .region_deltas
                         .iter()
@@ -1628,8 +1636,12 @@ impl<S: Storage + 'static> IngestServer<S> {
         loop {
             match self.storage.pending_ingest_effect_cleanups(1).await {
                 Ok(cleanups) if !cleanups.is_empty() => {
-                    let effect = &cleanups[0];
-                    match self.reclaim_ingest_effect(effect).await {
+                    let claimed = &cleanups[0];
+                    let effect = &claimed.effect;
+                    match self
+                        .reclaim_ingest_effect(effect, claimed.delivery_generation)
+                        .await
+                    {
                         Ok(()) => delay = std::time::Duration::from_millis(25),
                         Err(error) => {
                             tracing::warn!(%error, effect_id = %effect.effect_id, "post-ingest cleanup retrying");
@@ -1663,11 +1675,14 @@ impl<S: Storage + 'static> IngestServer<S> {
                     }
                     delay = (delay * 2).min(std::time::Duration::from_secs(1));
                 }
-                Ok(Some(effect)) => {
+                Ok(Some(claimed)) => {
+                    let effect = claimed.effect;
+                    let delivery_generation = claimed.delivery_generation;
                     let mut renewal = tokio::time::interval(std::time::Duration::from_secs(10));
                     renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     renewal.tick().await;
-                    let delivery = self.deliver_post_ingest_effect(&effect, &claim_token);
+                    let delivery =
+                        self.deliver_post_ingest_effect(&effect, delivery_generation, &claim_token);
                     tokio::pin!(delivery);
                     let result = loop {
                         tokio::select! {

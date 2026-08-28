@@ -21,11 +21,11 @@ pub use falkor::{FalkorConfig, FalkorStorage};
 pub use in_memory::InMemoryStorage;
 pub use trait_::{Storage, StorageError};
 pub use types::{
-    memory_visible, relationship_visible, AuditEvent, CommitRecord, CycleJournalRecord,
-    CycleJournalState, CypherQuery, Direction, DiscoveryAcceptance, DiscoveryProposal,
-    DiscoveryRecord, Embedding, FencedBatchCommit, FencedRestore, GraphSnapshot, IngestBatchKey,
-    IngestCommitOutcome, IngestRegionDelta, Invalidation, LeaseKey, MemoryFilter, OwnerLease,
-    PostIngestEffect, RegionKey, ResultSet, SettledIngestBatch, StorageBackendId,
+    memory_visible, relationship_visible, AuditEvent, ClaimedPostIngestEffect, CommitRecord,
+    CycleJournalRecord, CycleJournalState, CypherQuery, Direction, DiscoveryAcceptance,
+    DiscoveryProposal, DiscoveryRecord, Embedding, FencedBatchCommit, FencedRestore, GraphSnapshot,
+    IngestBatchKey, IngestCommitOutcome, IngestRegionDelta, Invalidation, LeaseKey, MemoryFilter,
+    OwnerLease, PostIngestEffect, RegionKey, ResultSet, SettledIngestBatch, StorageBackendId,
     StorageCapabilities, TraversalSpec, VisibilityContext,
 };
 

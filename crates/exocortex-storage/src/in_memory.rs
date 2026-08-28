@@ -48,6 +48,7 @@ struct InMemoryInner {
     region_relationship_calls: AtomicU64,
     settled_ingest: Mutex<HashMap<IngestBatchKey, SettledIngestBatch>>,
     ingest_effects: Mutex<HashMap<smol_str::SmolStr, InMemoryIngestEffect>>,
+    ingest_effect_generation: AtomicU64,
     #[cfg(feature = "testing")]
     pending_ingest_effect_reads: AtomicU64,
     governed_imports: Mutex<std::collections::HashSet<String>>,
@@ -60,6 +61,8 @@ struct InMemoryInner {
     batch_reads: AtomicU64,
     fail_next_batch_read: AtomicBool,
     fail_next_ingest_commit: AtomicBool,
+    #[cfg(feature = "testing")]
+    fail_next_ingest_cleanup: AtomicBool,
     #[cfg(test)]
     fence_checkpoint: Mutex<Option<std::sync::Arc<FenceCheckpoint>>>,
     #[cfg(test)]
@@ -90,6 +93,7 @@ struct InMemoryIngestEffect {
     effect: PostIngestEffect,
     acknowledged: bool,
     cleanup_complete: bool,
+    delivery_generation: Option<u64>,
     claim: Option<(smol_str::SmolStr, std::time::Instant)>,
 }
 
@@ -152,6 +156,7 @@ impl InMemoryStorage {
                 region_relationship_calls: AtomicU64::new(0),
                 settled_ingest: Default::default(),
                 ingest_effects: Default::default(),
+                ingest_effect_generation: AtomicU64::new(0),
                 #[cfg(feature = "testing")]
                 pending_ingest_effect_reads: AtomicU64::new(0),
                 governed_imports: Default::default(),
@@ -161,6 +166,8 @@ impl InMemoryStorage {
                 batch_reads: Default::default(),
                 fail_next_batch_read: AtomicBool::new(false),
                 fail_next_ingest_commit: AtomicBool::new(false),
+                #[cfg(feature = "testing")]
+                fail_next_ingest_cleanup: AtomicBool::new(false),
                 mutation_gate: Default::default(),
                 #[cfg(test)]
                 fence_checkpoint: Default::default(),
@@ -198,6 +205,14 @@ impl InMemoryStorage {
     pub fn fail_next_ingest_commit(&self) {
         self.inner
             .fail_next_ingest_commit
+            .store(true, Ordering::SeqCst);
+    }
+    /// Inject one cleanup-completion failure after external reclamation.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn fail_next_ingest_cleanup(&self) {
+        self.inner
+            .fail_next_ingest_cleanup
             .store(true, Ordering::SeqCst);
     }
     /// Fail the next bulk stream after `after` valid rows (Dreams/cache fault tests).
@@ -568,6 +583,7 @@ impl InMemoryStorage {
                     effect: effect.clone(),
                     acknowledged: false,
                     cleanup_complete: false,
+                    delivery_generation: None,
                     claim: None,
                 },
             );
@@ -818,17 +834,19 @@ impl Storage for InMemoryStorage {
         &self,
         claim_token: &str,
         lease_ms: i64,
-    ) -> Result<Option<PostIngestEffect>, StorageError> {
+    ) -> Result<Option<crate::ClaimedPostIngestEffect>, StorageError> {
         let _gate = self.inner.mutation_gate.lock().unwrap();
         let mut effects = self.inner.ingest_effects.lock().unwrap();
+        let now = std::time::Instant::now();
+        if effects.values().any(|row| {
+            !row.acknowledged && row.claim.as_ref().is_some_and(|(_, until)| *until > now)
+        }) {
+            return Ok(None);
+        }
         let mut eligible = effects
             .iter()
             .filter(|(_, row)| {
-                !row.acknowledged
-                    && row
-                        .claim
-                        .as_ref()
-                        .is_none_or(|(_, until)| *until <= std::time::Instant::now())
+                !row.acknowledged && row.claim.as_ref().is_none_or(|(_, until)| *until <= now)
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
@@ -839,10 +857,18 @@ impl Storage for InMemoryStorage {
         let row = effects.get_mut(effect_id).expect("selected effect exists");
         row.claim = Some((
             claim_token.into(),
-            std::time::Instant::now()
-                + std::time::Duration::from_millis(lease_ms.try_into().unwrap_or(0)),
+            now + std::time::Duration::from_millis(lease_ms.try_into().unwrap_or(0)),
         ));
-        Ok(Some(row.effect.clone()))
+        let delivery_generation = self
+            .inner
+            .ingest_effect_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        row.delivery_generation = Some(delivery_generation);
+        Ok(Some(crate::ClaimedPostIngestEffect {
+            effect: row.effect.clone(),
+            delivery_generation,
+        }))
     }
     async fn renew_ingest_effect_claim(
         &self,
@@ -888,7 +914,7 @@ impl Storage for InMemoryStorage {
     async fn pending_ingest_effect_cleanups(
         &self,
         limit: u32,
-    ) -> Result<Vec<PostIngestEffect>, StorageError> {
+    ) -> Result<Vec<crate::ClaimedPostIngestEffect>, StorageError> {
         let mut rows = self
             .inner
             .ingest_effects
@@ -896,13 +922,29 @@ impl Storage for InMemoryStorage {
             .unwrap()
             .values()
             .filter(|row| row.acknowledged && !row.cleanup_complete)
-            .map(|row| row.effect.clone())
+            .filter_map(|row| {
+                row.delivery_generation
+                    .map(|delivery_generation| crate::ClaimedPostIngestEffect {
+                        effect: row.effect.clone(),
+                        delivery_generation,
+                    })
+            })
             .collect::<Vec<_>>();
-        rows.sort_by(|left, right| left.effect_id.cmp(&right.effect_id));
+        rows.sort_by(|left, right| left.effect.effect_id.cmp(&right.effect.effect_id));
         rows.truncate(limit as usize);
         Ok(rows)
     }
     async fn complete_ingest_effect_cleanup(&self, effect_id: &str) -> Result<bool, StorageError> {
+        #[cfg(feature = "testing")]
+        if self
+            .inner
+            .fail_next_ingest_cleanup
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(StorageError::Backend(
+                "injected ingest cleanup completion failure".into(),
+            ));
+        }
         let _gate = self.inner.mutation_gate.lock().unwrap();
         let mut effects = self.inner.ingest_effects.lock().unwrap();
         let Some(row) = effects.get_mut(effect_id) else {

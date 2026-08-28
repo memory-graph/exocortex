@@ -894,11 +894,21 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             MATCH (d:_IngestBatch)
             WHERE d.state = 'settled' AND d.effect_json IS NOT NULL
               AND d.effect_acknowledged = false
-              AND (d.effect_claim_until_ms IS NULL OR d.effect_claim_until_ms <= timestamp())
             WITH d ORDER BY d.effect_id ASC LIMIT 1
+            OPTIONAL MATCH (active:_IngestBatch)
+            WHERE active.state = 'settled' AND active.effect_json IS NOT NULL
+              AND active.effect_acknowledged = false
+              AND active.effect_claim_until_ms > timestamp()
+            WITH d, count(active) AS active_claims
+            WHERE active_claims = 0
+              AND (d.effect_claim_until_ms IS NULL OR d.effect_claim_until_ms <= timestamp())
+            MERGE (clock:_IngestEffectClaimClock {id: 'global'})
+            SET clock.generation = coalesce(clock.generation, 0) + 1
+            WITH d, clock.generation AS delivery_generation
             SET d.effect_claim_token = $claim_token,
-                d.effect_claim_until_ms = timestamp() + $lease_ms
-            RETURN d.effect_json
+                d.effect_claim_until_ms = timestamp() + $lease_ms,
+                d.effect_delivery_generation = delivery_generation
+            RETURN d.effect_json, delivery_generation
         "#,
     });
 
@@ -940,7 +950,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             WHERE d.state = 'settled' AND d.effect_json IS NOT NULL
               AND d.effect_acknowledged = true
               AND coalesce(d.effect_cleanup_complete, false) = false
-            RETURN d.effect_json ORDER BY d.effect_id ASC LIMIT $limit
+            RETURN d.effect_json, d.effect_delivery_generation
+            ORDER BY d.effect_id ASC LIMIT $limit
         "#,
     });
 

@@ -1134,6 +1134,109 @@ async fn durable_post_ingest_effects_release_admission_and_drain_once() {
 }
 
 #[tokio::test]
+async fn production_drainer_recovers_acknowledged_cleanup_after_failure() {
+    let base = server();
+    let dreams = Arc::new(exocortex_dreams::DreamsEngine::new(
+        base.storage.clone(),
+        exocortex_dreams::trigger::DreamsTrigger {
+            memory_threshold: u32::MAX,
+            edge_threshold: u32::MAX,
+            age_floor_days: u32::MAX,
+            min_interval_hours: 0,
+        },
+        0.01,
+        0.05,
+        false,
+        "cleanup-recovery".into(),
+    ));
+    let srv = Arc::new(base.with_dreams(dreams.clone()));
+    registered(&srv, 3).await;
+
+    let mut submitted = batch(vec![draft("cleanup", "Fix", 1)]);
+    submitted.batch_id = "cleanup-recovery".into();
+    submitted.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    assert_eq!(
+        srv.submit(tonic::Request::new(sign(submitted, [5; 32])))
+            .await
+            .unwrap()
+            .into_inner()
+            .accepted,
+        1
+    );
+    let effect = srv.storage.pending_ingest_effects(1).await.unwrap()[0].clone();
+    let claimed = srv
+        .storage
+        .claim_ingest_effect("crashed-worker", 30_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.effect, effect);
+    for delta in &effect.region_deltas {
+        dreams
+            .on_writes_once(
+                effect.effect_id.as_str(),
+                claimed.delivery_generation,
+                delta.region.clone(),
+                delta.memories,
+                delta.relationships,
+            )
+            .await
+            .unwrap();
+    }
+    assert!(srv
+        .storage
+        .acknowledge_ingest_effect(effect.effect_id.as_str(), "crashed-worker")
+        .await
+        .unwrap());
+    assert_eq!(
+        srv.storage
+            .pending_ingest_effect_cleanups(1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(srv
+        .storage
+        .claim_ingest_effect("must-not-reexecute", 30_000)
+        .await
+        .unwrap()
+        .is_none());
+
+    srv.storage.fail_next_ingest_cleanup();
+    let drainer = tokio::spawn(srv.clone().run_post_ingest_effects());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if srv
+                .storage
+                .pending_ingest_effect_cleanups(1)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("production drainer retries cleanup to completion");
+    assert!(srv
+        .storage
+        .claim_ingest_effect("still-must-not-reexecute", 30_000)
+        .await
+        .unwrap()
+        .is_none());
+    let memories: u32 = dreams
+        .counters
+        .iter()
+        .map(|entry| entry.memories_since_last_cycle)
+        .sum();
+    assert_eq!(memories, 1, "cleanup recovery must not replay the effect");
+    drainer.abort();
+}
+
+#[tokio::test]
 async fn durable_reasoning_effect_remains_pending_while_worker_queue_is_saturated() {
     let base = server();
     let reasoning = Arc::new(exocortex_reasoning::ReasoningEngine::new(

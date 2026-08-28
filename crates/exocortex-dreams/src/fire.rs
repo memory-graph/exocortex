@@ -52,12 +52,17 @@ require_type(processed_events, 'set')
 local memory_raw = redis.call('HGET', counters, 'memories')
 local edge_raw = redis.call('HGET', counters, 'edges')
 local success_raw = redis.call('HGET', counters, 'last_success')
+local settled_generation_raw = redis.call('HGET', counters, 'settled_generation')
 if (memory_raw and not tonumber(memory_raw))
     or (edge_raw and not tonumber(edge_raw))
-    or (success_raw and not tonumber(success_raw)) then
+    or (success_raw and not tonumber(success_raw))
+    or (settled_generation_raw and not tonumber(settled_generation_raw)) then
     return redis.error_reply('Dreams counter metadata is not numeric')
 end
-if redis.call('SISMEMBER', processed_events, ARGV[14]) == 1 then
+local delivery_generation = tonumber(ARGV[15])
+local settled_generation = tonumber(settled_generation_raw or '0')
+if delivery_generation > 0 and (delivery_generation <= settled_generation
+    or redis.call('SISMEMBER', processed_events, ARGV[14]) == 1) then
     return {
         tonumber(redis.call('HGET', counters, 'memories') or '0'),
         tonumber(redis.call('HGET', counters, 'edges') or '0'),
@@ -66,7 +71,9 @@ if redis.call('SISMEMBER', processed_events, ARGV[14]) == 1 then
 end
 local memories = math.min(4294967295, tonumber(memory_raw or '0') + tonumber(ARGV[2]))
 local edges = math.min(4294967295, tonumber(edge_raw or '0') + tonumber(ARGV[3]))
-redis.call('SADD', processed_events, ARGV[14])
+if delivery_generation > 0 then
+    redis.call('SADD', processed_events, ARGV[14])
+end
 redis.call('HSET', counters, 'memories', memories, 'edges', edges)
 redis.call('HSETNX', counters, 'last_success', ARGV[6])
 local elapsed = math.max(0, tonumber(ARGV[6]) - tonumber(redis.call('HGET', counters, 'last_success')))
@@ -90,6 +97,30 @@ local payload = cjson.encode({
 })
 redis.call('RPUSH', queue, payload)
 return {memories, edges, 1}
+"#;
+
+const SETTLE_WRITE_LUA: &str = r#"
+local counters = KEYS[1]
+local processed_events = KEYS[2]
+local function require_type(key, expected)
+    local actual = redis.call('TYPE', key)['ok']
+    if actual ~= 'none' and actual ~= expected then
+        error('Dreams key has wrong type: expected ' .. expected)
+    end
+end
+require_type(counters, 'hash')
+require_type(processed_events, 'set')
+local current_raw = redis.call('HGET', counters, 'settled_generation')
+if current_raw and not tonumber(current_raw) then
+    return redis.error_reply('Dreams settled generation is not numeric')
+end
+local current = tonumber(current_raw or '0')
+local settled = tonumber(ARGV[2])
+if settled > current then
+    redis.call('HSET', counters, 'settled_generation', settled)
+end
+redis.call('SREM', processed_events, ARGV[1])
+return 1
 "#;
 
 const ACKNOWLEDGE_LUA: &str = r#"
@@ -209,6 +240,15 @@ pub enum RecordWriteOutcome {
     Queued(RegionWriteCounters),
     /// The queue was full; counters remain durable and the newest fire dropped.
     Dropped(RegionWriteCounters),
+}
+
+/// Stable effect identity paired with its authoritative delivery generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeliveryFence<'a> {
+    /// Durable outbox effect identity.
+    pub event_id: &'a str,
+    /// Monotonic claim generation assigned by storage.
+    pub generation: u64,
 }
 
 /// Result of acknowledging an owner notification.
@@ -438,8 +478,18 @@ impl RedisFireQueue {
         fired_by: &str,
     ) -> anyhow::Result<RecordWriteOutcome> {
         let event_id = uuid::Uuid::new_v4().to_string();
-        self.record_write_once(region, memories, edges, trigger, fired_by, &event_id)
-            .await
+        self.record_write_once_inner(
+            region,
+            memories,
+            edges,
+            trigger,
+            fired_by,
+            DeliveryFence {
+                event_id: &event_id,
+                generation: 0,
+            },
+        )
+        .await
     }
 
     /// Record one stable durable ingest effect. Identities remain until the
@@ -452,11 +502,28 @@ impl RedisFireQueue {
         edges: u32,
         trigger: DreamsTrigger,
         fired_by: &str,
-        event_id: &str,
+        delivery: DeliveryFence<'_>,
+    ) -> anyhow::Result<RecordWriteOutcome> {
+        anyhow::ensure!(
+            delivery.generation > 0,
+            "Dreams delivery generation must be positive"
+        );
+        self.record_write_once_inner(region, memories, edges, trigger, fired_by, delivery)
+            .await
+    }
+
+    async fn record_write_once_inner(
+        &mut self,
+        region: &RegionKey,
+        memories: u32,
+        edges: u32,
+        trigger: DreamsTrigger,
+        fired_by: &str,
+        delivery: DeliveryFence<'_>,
     ) -> anyhow::Result<RecordWriteOutcome> {
         self.ensure_region(region)?;
         anyhow::ensure!(
-            !event_id.is_empty(),
+            !delivery.event_id.is_empty(),
             "Dreams write event id must not be empty"
         );
         let now = chrono::Utc::now().timestamp().max(0) as u64;
@@ -480,7 +547,8 @@ impl RedisFireQueue {
             .arg(region.memory_type)
             .arg(fired_by)
             .arg(fire_id)
-            .arg(event_id)
+            .arg(delivery.event_id)
+            .arg(delivery.generation)
             .invoke_async(&mut self.conn)
             .await?;
         let snapshot = RegionWriteCounters {
@@ -508,16 +576,23 @@ impl RedisFireQueue {
         &mut self,
         region: &RegionKey,
         event_id: &str,
+        delivery_generation: u64,
     ) -> anyhow::Result<()> {
         self.ensure_region(region)?;
         anyhow::ensure!(
             !event_id.is_empty(),
             "Dreams write event id must not be empty"
         );
-        let _: u64 = redis::cmd("SREM")
-            .arg(processed_event_key(region))
+        anyhow::ensure!(
+            delivery_generation > 0,
+            "Dreams delivery generation must be positive"
+        );
+        let _: u64 = redis::Script::new(SETTLE_WRITE_LUA)
+            .key(counter_key(region))
+            .key(processed_event_key(region))
             .arg(event_id)
-            .query_async(&mut self.conn)
+            .arg(delivery_generation)
+            .invoke_async(&mut self.conn)
             .await?;
         Ok(())
     }

@@ -66,6 +66,15 @@ pub struct PostIngestEffect {
     pub region_deltas: Vec<IngestRegionDelta>,
 }
 
+/// One leased post-ingest effect with its monotonic delivery fence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimedPostIngestEffect {
+    /// Immutable effect payload.
+    pub effect: PostIngestEffect,
+    /// Monotonic claim generation used to reject delayed stale side effects.
+    pub delivery_generation: u64,
+}
+
 /// Result of the atomic dedup-claim plus graph commit boundary.
 #[derive(Clone, Debug)]
 pub enum IngestCommitOutcome {

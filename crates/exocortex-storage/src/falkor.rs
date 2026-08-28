@@ -166,6 +166,38 @@ fn falkor_value_to_json(v: &FalkorValue) -> serde_json::Value {
     }
 }
 
+fn decode_claimed_ingest_effect(
+    row: &[FalkorValue],
+) -> Result<crate::ClaimedPostIngestEffect, StorageError> {
+    let effect = match row.first() {
+        Some(FalkorValue::String(json)) => {
+            serde_json::from_str(json).map_err(|error| StorageError::CorruptMetadata {
+                key: "ingest_effect",
+                detail: error.to_string(),
+            })?
+        }
+        other => {
+            return Err(StorageError::CorruptMetadata {
+                key: "ingest_effect",
+                detail: format!("expected string, found {other:?}"),
+            })
+        }
+    };
+    let delivery_generation = match row.get(1) {
+        Some(FalkorValue::I64(value)) if *value > 0 => *value as u64,
+        other => {
+            return Err(StorageError::CorruptMetadata {
+                key: "ingest_effect_delivery_generation",
+                detail: format!("expected positive integer, found {other:?}"),
+            })
+        }
+    };
+    Ok(crate::ClaimedPostIngestEffect {
+        effect,
+        delivery_generation,
+    })
+}
+
 /// Pull the full `Memory` out of a returned `Memory` node's `props_json`.
 fn memory_from_value(v: &FalkorValue) -> Result<Memory, StorageError> {
     let FalkorValue::Node(n) = v else {
@@ -2276,7 +2308,7 @@ impl Storage for FalkorStorage {
         &self,
         claim_token: &str,
         lease_ms: i64,
-    ) -> Result<Option<PostIngestEffect>, StorageError> {
+    ) -> Result<Option<crate::ClaimedPostIngestEffect>, StorageError> {
         let rows = self
             .run_template(
                 "ingest_effect_claim",
@@ -2287,21 +2319,9 @@ impl Storage for FalkorStorage {
                 false,
             )
             .await?;
-        match rows.first().and_then(|row| row.first()) {
-            None => Ok(None),
-            Some(FalkorValue::String(json)) => {
-                serde_json::from_str(json).map(Some).map_err(|error| {
-                    StorageError::CorruptMetadata {
-                        key: "ingest_effect",
-                        detail: error.to_string(),
-                    }
-                })
-            }
-            other => Err(StorageError::CorruptMetadata {
-                key: "ingest_effect",
-                detail: format!("expected string, found {other:?}"),
-            }),
-        }
+        rows.first()
+            .map(|row| decode_claimed_ingest_effect(row))
+            .transpose()
     }
 
     async fn renew_ingest_effect_claim(
@@ -2345,7 +2365,7 @@ impl Storage for FalkorStorage {
     async fn pending_ingest_effect_cleanups(
         &self,
         limit: u32,
-    ) -> Result<Vec<PostIngestEffect>, StorageError> {
+    ) -> Result<Vec<crate::ClaimedPostIngestEffect>, StorageError> {
         let rows = self
             .run_template(
                 "ingest_effect_cleanups_pending",
@@ -2354,18 +2374,7 @@ impl Storage for FalkorStorage {
             )
             .await?;
         rows.iter()
-            .map(|row| match row.first() {
-                Some(FalkorValue::String(json)) => {
-                    serde_json::from_str(json).map_err(|error| StorageError::CorruptMetadata {
-                        key: "ingest_effect_cleanup",
-                        detail: error.to_string(),
-                    })
-                }
-                other => Err(StorageError::CorruptMetadata {
-                    key: "ingest_effect_cleanup",
-                    detail: format!("expected string, found {other:?}"),
-                }),
-            })
+            .map(|row| decode_claimed_ingest_effect(row))
             .collect()
     }
 

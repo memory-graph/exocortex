@@ -162,7 +162,7 @@ pub trait Storage: Send + Sync + 'static {
         &self,
         claim_token: &str,
         lease_ms: i64,
-    ) -> crate::Result<Option<PostIngestEffect>> {
+    ) -> crate::Result<Option<crate::ClaimedPostIngestEffect>> {
         let _ = (claim_token, lease_ms);
         Err(StorageError::Backend(
             "ingest effect claiming unsupported".into(),
@@ -197,7 +197,7 @@ pub trait Storage: Send + Sync + 'static {
     async fn pending_ingest_effect_cleanups(
         &self,
         limit: u32,
-    ) -> crate::Result<Vec<PostIngestEffect>> {
+    ) -> crate::Result<Vec<crate::ClaimedPostIngestEffect>> {
         let _ = limit;
         Err(StorageError::Backend(
             "ingest effect cleanup unsupported".into(),

@@ -892,14 +892,14 @@ async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
         store.claim_ingest_effect("worker-a", 1_000),
         store.claim_ingest_effect("worker-b", 1_000),
     );
-    let (winner, loser) = match (claim_a.unwrap(), claim_b.unwrap()) {
+    let (winner, loser, first_generation) = match (claim_a.unwrap(), claim_b.unwrap()) {
         (Some(claimed), None) => {
-            assert_eq!(claimed, effect);
-            ("worker-a", "worker-b")
+            assert_eq!(claimed.effect, effect);
+            ("worker-a", "worker-b", claimed.delivery_generation)
         }
         (None, Some(claimed)) => {
-            assert_eq!(claimed, effect);
-            ("worker-b", "worker-a")
+            assert_eq!(claimed.effect, effect);
+            ("worker-b", "worker-a", claimed.delivery_generation)
         }
         claims => panic!("exactly one simultaneous claimant must win: {claims:?}"),
     };
@@ -929,11 +929,13 @@ async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
             .unwrap(),
         "an expired owner cannot acknowledge before reclaim"
     );
-    assert_eq!(
-        store.claim_ingest_effect(loser, 30_000).await.unwrap(),
-        Some(effect.clone()),
-        "an abandoned claim becomes retryable after its deadline"
-    );
+    let reclaimed = store
+        .claim_ingest_effect(loser, 30_000)
+        .await
+        .unwrap()
+        .expect("an abandoned claim becomes retryable after its deadline");
+    assert_eq!(reclaimed.effect, effect);
+    assert!(reclaimed.delivery_generation > first_generation);
     assert!(!store
         .acknowledge_ingest_effect(effect.effect_id.as_str(), winner)
         .await
@@ -943,10 +945,12 @@ async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
         .await
         .unwrap());
     assert!(store.pending_ingest_effects(10).await.unwrap().is_empty());
+    let cleanups = store.pending_ingest_effect_cleanups(10).await.unwrap();
+    assert_eq!(cleanups.len(), 1);
+    assert_eq!(cleanups[0].effect, effect);
     assert_eq!(
-        store.pending_ingest_effect_cleanups(10).await.unwrap(),
-        [effect.clone()],
-        "acknowledgement leaves durable cleanup work after a crash window"
+        cleanups[0].delivery_generation,
+        reclaimed.delivery_generation
     );
     assert!(
         store
