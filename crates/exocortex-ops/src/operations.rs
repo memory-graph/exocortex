@@ -419,7 +419,7 @@ impl Operation for PromoteVisibilityOp {
         };
         let commit = ctx
             .storage
-            .upsert_memory_audited(&m, &record)
+            .promote_memory_visibility_audited(&m, &record)
             .await
             .map_err(|e| OpError::Storage(e.to_string()))?;
         let audit_lsn = commit.lsn;

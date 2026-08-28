@@ -265,7 +265,7 @@ async fn audited_memory_and_discovery_edges_append_history() {
     promoted.title = "after".into();
     promoted.recorded_at += Duration::seconds(1);
     storage
-        .upsert_memory_audited(&promoted, &audit("promote_visibility"))
+        .promote_memory_visibility_audited(&promoted, &audit("promote_visibility"))
         .await
         .unwrap();
     let memory_history = storage.memory_history(&memory.id);
@@ -326,6 +326,40 @@ async fn audited_memory_and_discovery_edges_append_history() {
     assert_eq!(relationship_history.len(), 2);
     assert_eq!(relationship_history[0].properties.evidence_count, 1);
     assert_eq!(relationship_history[1].properties.evidence_count, 2);
+}
+
+#[tokio::test]
+async fn stale_visibility_promotion_cannot_narrow_a_newer_current_row() {
+    let storage = InMemoryStorage::new(ontology());
+    let mut memory = base_memory("private".into(), "content".into(), 3, 3);
+    memory.visibility = Visibility::Private;
+    memory.context.user_id = Some("user".into());
+    storage.upsert_memory(&memory).await.unwrap();
+
+    let mut to_org = memory.clone();
+    to_org.visibility = Visibility::Org;
+    let mut stale_to_team = memory.clone();
+    stale_to_team.visibility = Visibility::Team;
+    storage
+        .promote_memory_visibility_audited(&to_org, &audit("promote_visibility"))
+        .await
+        .unwrap();
+    let error = storage
+        .promote_memory_visibility_audited(&stale_to_team, &audit("promote_visibility"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("would narrow"), "{error}");
+    assert_eq!(
+        storage
+            .get_memory(&memory.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .visibility,
+        Visibility::Org
+    );
+    assert_eq!(storage.memory_history(&memory.id).len(), 2);
+    assert_eq!(storage.audit_range("org", 0, 10).await.unwrap().len(), 1);
 }
 
 #[tokio::test]

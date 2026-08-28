@@ -114,6 +114,56 @@ fn mem(title: &str, mt: u8, vis: Visibility) -> Memory {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_visibility_promotion_cannot_narrow_live_current_row() {
+    if falkor_url().is_none() {
+        eprintln!("SKIP: FALKOR_URL not set");
+        return;
+    }
+    let graph = format!("exocortex_test_{}", graph_suffix());
+    let first = connect_graph("promotion-a", graph.clone()).await;
+    let second = connect_graph("promotion-b", graph).await;
+    let mut memory = mem("private", 3, Visibility::Private);
+    memory.context.tenant_id = Some("test-org".into());
+    first.upsert_memory(&memory).await.unwrap();
+    let audit = || AuditEvent {
+        action: "promote_visibility".into(),
+        actor: "user".into(),
+        org_id: "test-org".into(),
+        input_digest: [7; 32],
+        output_ids: Default::default(),
+        fingerprint: first.ontology_fingerprint(),
+        lease_epoch: None,
+        recorded_at: Utc::now(),
+    };
+    let mut to_org = memory.clone();
+    to_org.visibility = Visibility::Org;
+    let mut stale_to_team = memory.clone();
+    stale_to_team.visibility = Visibility::Team;
+    first
+        .promote_memory_visibility_audited(&to_org, &audit())
+        .await
+        .unwrap();
+    let error = second
+        .promote_memory_visibility_audited(&stale_to_team, &audit())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("would narrow"), "{error}");
+    assert_eq!(
+        second
+            .get_memory(&memory.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .visibility,
+        Visibility::Org
+    );
+    assert_eq!(
+        second.audit_range("test-org", 0, 10).await.unwrap().len(),
+        1
+    );
+}
+
 fn rel(from: MemoryId, to: MemoryId, kind: u32) -> Relationship {
     Relationship {
         id: RelationshipId::derive(from, exocortex_kernel::RelKindId(kind), to, None),

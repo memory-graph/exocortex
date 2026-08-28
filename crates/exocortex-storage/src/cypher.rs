@@ -96,6 +96,16 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     // adapter. They intentionally omit RETURN so a WITH boundary can join
     // every row mutation into the query engine's single atomic unit.
     reg!(Template {
+        id: "batch_promote_visibility_guard",
+        read_only: false,
+        required_params: &["id", "visibility"],
+        cypher: r#"
+            MATCH (m:Memory {id: $id})
+            WHERE m.visibility <= $visibility
+        "#,
+    });
+
+    reg!(Template {
         id: "batch_upsert_memory",
         read_only: false,
         required_params: &[

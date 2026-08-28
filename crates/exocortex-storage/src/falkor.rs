@@ -1916,7 +1916,7 @@ impl Storage for FalkorStorage {
         })
     }
 
-    async fn upsert_memory_audited(
+    async fn promote_memory_visibility_audited(
         &self,
         memory: &Memory,
         audit: &AuditEvent,
@@ -1932,6 +1932,13 @@ impl Storage for FalkorStorage {
             })?;
         let parts = [
             (
+                "batch_promote_visibility_guard",
+                serde_json::json!({
+                    "id": hex(&memory.id.0),
+                    "visibility": memory.visibility as u8,
+                }),
+            ),
+            (
                 "batch_upsert_memory",
                 self.memory_params(memory, lsn, label),
             ),
@@ -1939,7 +1946,7 @@ impl Storage for FalkorStorage {
         ];
         if !self.run_atomic_parts(&parts).await? {
             return Err(StorageError::Backend(
-                "audited memory mutation produced no commit".into(),
+                "promotion would narrow current visibility or target disappeared".into(),
             ));
         }
         self.publish(Invalidation::MemoryUpserted { id: memory.id, lsn })

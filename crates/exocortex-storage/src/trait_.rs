@@ -178,7 +178,7 @@ pub trait Storage: Send + Sync + 'static {
     }
     /// Atomically upsert a protected memory mutation and its required audit
     /// event. Neither may commit without the other (R6-B18).
-    async fn upsert_memory_audited(
+    async fn promote_memory_visibility_audited(
         &self,
         memory: &Memory,
         audit: &AuditEvent,

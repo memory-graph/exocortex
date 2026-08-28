@@ -850,7 +850,7 @@ impl Storage for InMemoryStorage {
         row.claim = None;
         Ok(true)
     }
-    async fn upsert_memory_audited(
+    async fn promote_memory_visibility_audited(
         &self,
         memory: &Memory,
         audit: &AuditEvent,
@@ -859,6 +859,15 @@ impl Storage for InMemoryStorage {
             let _gate = self.inner.mutation_gate.lock().unwrap();
             let mut memories = self.inner.memories.lock().unwrap().clone();
             let mut audits = self.inner.audits.lock().unwrap().clone();
+            let current = memories
+                .get(&memory.id)
+                .and_then(|history| history.last())
+                .ok_or_else(|| StorageError::Backend("promotion target disappeared".into()))?;
+            if memory.visibility < current.visibility {
+                return Err(StorageError::Backend(
+                    "promotion would narrow current visibility".into(),
+                ));
+            }
             let lsn = self.lsn.load(Ordering::SeqCst) + 1;
             let now = Utc::now();
             let mut row = memory.clone();
@@ -2191,7 +2200,7 @@ mod atomic_fence_tests {
             };
             *storage.inner.atomic_fault.lock().unwrap() = Some(fault);
             assert!(storage
-                .upsert_memory_audited(&promoted, &audit)
+                .promote_memory_visibility_audited(&promoted, &audit)
                 .await
                 .is_err());
             assert_eq!(
