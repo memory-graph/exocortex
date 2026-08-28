@@ -825,37 +825,56 @@ async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
         store.pending_ingest_effects(10).await.unwrap(),
         [effect.clone()]
     );
-    assert_eq!(
-        store
-            .claim_ingest_effect("worker-a", 1_000, 2_000)
-            .await
-            .unwrap(),
-        Some(effect.clone())
+    let (claim_a, claim_b) = tokio::join!(
+        store.claim_ingest_effect("worker-a", 20),
+        store.claim_ingest_effect("worker-b", 20),
     );
+    let (winner, loser) = match (claim_a.unwrap(), claim_b.unwrap()) {
+        (Some(claimed), None) => {
+            assert_eq!(claimed, effect);
+            ("worker-a", "worker-b")
+        }
+        (None, Some(claimed)) => {
+            assert_eq!(claimed, effect);
+            ("worker-b", "worker-a")
+        }
+        claims => panic!("exactly one simultaneous claimant must win: {claims:?}"),
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     assert!(store
-        .claim_ingest_effect("worker-b", 1_000, 2_000)
+        .renew_ingest_effect_claim(effect.effect_id.as_str(), winner, 50)
         .await
-        .unwrap()
-        .is_none());
-    assert_eq!(
+        .unwrap());
+    assert!(!store
+        .renew_ingest_effect_claim(effect.effect_id.as_str(), loser, 50)
+        .await
+        .unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert!(
         store
-            .claim_ingest_effect("worker-b", 2_001, 32_001)
+            .claim_ingest_effect(loser, 30_000)
             .await
-            .unwrap(),
+            .unwrap()
+            .is_none(),
+        "renewal must exclude contenders beyond the original lease"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(45)).await;
+    assert_eq!(
+        store.claim_ingest_effect(loser, 30_000).await.unwrap(),
         Some(effect.clone()),
         "an abandoned claim becomes retryable after its deadline"
     );
     assert!(!store
-        .acknowledge_ingest_effect(effect.effect_id.as_str(), "worker-a")
+        .acknowledge_ingest_effect(effect.effect_id.as_str(), winner)
         .await
         .unwrap());
     assert!(store
-        .acknowledge_ingest_effect(effect.effect_id.as_str(), "worker-b")
+        .acknowledge_ingest_effect(effect.effect_id.as_str(), loser)
         .await
         .unwrap());
     assert!(store.pending_ingest_effects(10).await.unwrap().is_empty());
     assert!(store
-        .acknowledge_ingest_effect(effect.effect_id.as_str(), "worker-b")
+        .acknowledge_ingest_effect(effect.effect_id.as_str(), loser)
         .await
         .unwrap());
 }

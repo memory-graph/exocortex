@@ -243,18 +243,9 @@ impl<S: Storage> IngestServer<S> {
         let mut server = Self::new(storage, ontology, [0; 32]);
         server.default_producer_key = None;
         server.admin_policies = policies.into_iter().collect();
-        {
-            let mut sources = server.sources.lock().unwrap();
-            for (key, policy) in &server.admin_policies {
-                sources.put(
-                    key.clone(),
-                    SourceEntry {
-                        ceiling: policy.ceiling,
-                        kind: policy.kind,
-                    },
-                );
-            }
-        }
+        // Immutable policy is deliberately not copied into the bounded
+        // runtime LRU: registration consults `admin_policies` directly, so
+        // policy authority cannot be evicted or replaced by persisted state.
         server.require_admin_policy = true;
         server
     }
@@ -1474,13 +1465,13 @@ impl<S: Storage + 'static> IngestServer<S> {
     /// task so dependency outages delay effects without retaining submit
     /// permits or losing crash-recovery state.
     pub async fn run_post_ingest_effects(self: Arc<Self>) {
+        const CLAIM_LEASE_MS: i64 = 30_000;
         let mut delay = std::time::Duration::from_millis(25);
         loop {
-            let now_ms = chrono::Utc::now().timestamp_millis();
             let claim_token = uuid::Uuid::now_v7().to_string();
             match self
                 .storage
-                .claim_ingest_effect(&claim_token, now_ms, now_ms + 30_000)
+                .claim_ingest_effect(&claim_token, CLAIM_LEASE_MS)
                 .await
             {
                 Ok(None) => {
@@ -1494,7 +1485,29 @@ impl<S: Storage + 'static> IngestServer<S> {
                     delay = (delay * 2).min(std::time::Duration::from_secs(1));
                 }
                 Ok(Some(effect)) => {
-                    match self.deliver_post_ingest_effect(&effect, &claim_token).await {
+                    let mut renewal = tokio::time::interval(std::time::Duration::from_secs(10));
+                    renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    renewal.tick().await;
+                    let delivery = self.deliver_post_ingest_effect(&effect, &claim_token);
+                    tokio::pin!(delivery);
+                    let result = loop {
+                        tokio::select! {
+                            biased;
+                            _ = renewal.tick() => {
+                                match self.storage.renew_ingest_effect_claim(
+                                    effect.effect_id.as_str(),
+                                    &claim_token,
+                                    CLAIM_LEASE_MS,
+                                ).await {
+                                    Ok(true) => {}
+                                    Ok(false) => break Err("post-ingest claim ownership was lost".into()),
+                                    Err(error) => break Err(format!("post-ingest claim renewal failed: {error}")),
+                                }
+                            }
+                            delivered = &mut delivery => break delivered,
+                        }
+                    };
+                    match result {
                         Ok(()) => delay = std::time::Duration::from_millis(25),
                         Err(error) => {
                             tracing::warn!(%error, effect_id = %effect.effect_id, "post-ingest effect delivery retrying after claim expiry");
@@ -1771,7 +1784,10 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                     existing.map(|entry| entry.ceiling).unwrap_or(requested)
                 }
             };
-            let kind = existing.map(|e| e.kind).unwrap_or(declared_kind);
+            let kind = admin
+                .map(|policy| policy.kind)
+                .or_else(|| existing.map(|entry| entry.kind))
+                .unwrap_or(declared_kind);
             let entry = SourceEntry { ceiling, kind };
             candidate.put(key, entry);
             let rows = Self::source_rows(&candidate);

@@ -595,7 +595,29 @@ pub async fn run_backend_node<S: Storage + 'static>(
     ));
     {
         let engine = reasoning.clone();
-        background_tasks.push(tokio::spawn(async move { engine.run().await }));
+        let reasoning_health = health.clone();
+        background_tasks.push(tokio::spawn(async move {
+            loop {
+                reasoning_health.rcu(|snapshot| {
+                    let mut next = (**snapshot).clone();
+                    next.reasoning_alive = true;
+                    Arc::new(next)
+                });
+                let outcome = std::panic::AssertUnwindSafe(engine.clone().run())
+                    .catch_unwind()
+                    .await;
+                reasoning_health.rcu(|snapshot| {
+                    let mut next = (**snapshot).clone();
+                    next.reasoning_alive = false;
+                    Arc::new(next)
+                });
+                match outcome {
+                    Ok(()) => tracing::error!("reasoning worker exited; restarting"),
+                    Err(_) => tracing::error!("reasoning worker panicked; restarting"),
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }));
     }
 
     // Shared Dreams transport uses separate Redis connections for blocking

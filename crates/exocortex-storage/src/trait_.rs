@@ -129,16 +129,27 @@ pub trait Storage: Send + Sync + 'static {
             "ingest effect outbox unsupported".into(),
         ))
     }
-    /// Atomically claim the oldest retryable post-ingest effect until the
-    /// supplied Unix-millisecond deadline. An active claim is invisible to
-    /// other workers and becomes retryable after expiry.
+    /// Atomically claim the oldest retryable post-ingest effect for a
+    /// storage-clock lease. An active claim is invisible to other workers.
     async fn claim_ingest_effect(
         &self,
         claim_token: &str,
-        now_ms: i64,
-        claim_until_ms: i64,
+        lease_ms: i64,
     ) -> crate::Result<Option<PostIngestEffect>> {
-        let _ = (claim_token, now_ms, claim_until_ms);
+        let _ = (claim_token, lease_ms);
+        Err(StorageError::Backend(
+            "ingest effect claiming unsupported".into(),
+        ))
+    }
+    /// Extend a live claim using the storage clock. False means ownership was
+    /// lost and the caller must cancel delivery before performing more work.
+    async fn renew_ingest_effect_claim(
+        &self,
+        effect_id: &str,
+        claim_token: &str,
+        lease_ms: i64,
+    ) -> crate::Result<bool> {
+        let _ = (effect_id, claim_token, lease_ms);
         Err(StorageError::Backend(
             "ingest effect claiming unsupported".into(),
         ))

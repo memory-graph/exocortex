@@ -377,9 +377,14 @@ principal protects HTTP operations, SSE, metrics, and every gRPC method; a
 caller-supplied org or project/team scope never overrides this policy.
 
 `sources.json` is also administrator-owned. Each row contains `org_id`,
-`source_uri`, `producer_id`, `ceiling`, and a 64-hex `hmac_key`. The key is
+`source_uri`, `producer_id`, `ceiling`, `producer_kind`, and a 64-hex
+`hmac_key`. `producer_kind` is the protobuf numeric enum value (1 coding
+agent, 2 research agent, 3 docs adapter, 4 analytics adapter, or 5 custom); zero and
+unknown values fail closed. The key is
 unique producer authentication material for that exact identity; it is not
 the cluster secret and cannot authenticate a different source or producer.
+Existing policy files must add `producer_kind` before upgrading; a missing
+value intentionally prevents backend startup.
 
 Back up and restore the org's durable graph (disaster recovery —
 byte-faithful rows modulo storage-assigned LSNs, fingerprint-gated):

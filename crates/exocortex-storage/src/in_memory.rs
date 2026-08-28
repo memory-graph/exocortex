@@ -83,7 +83,7 @@ struct InMemoryInner {
 struct InMemoryIngestEffect {
     effect: PostIngestEffect,
     acknowledged: bool,
-    claim: Option<(smol_str::SmolStr, i64)>,
+    claim: Option<(smol_str::SmolStr, std::time::Instant)>,
 }
 
 #[derive(Clone)]
@@ -774,15 +774,18 @@ impl Storage for InMemoryStorage {
     async fn claim_ingest_effect(
         &self,
         claim_token: &str,
-        now_ms: i64,
-        claim_until_ms: i64,
+        lease_ms: i64,
     ) -> Result<Option<PostIngestEffect>, StorageError> {
         let _gate = self.inner.mutation_gate.lock().unwrap();
         let mut effects = self.inner.ingest_effects.lock().unwrap();
         let mut eligible = effects
             .iter()
             .filter(|(_, row)| {
-                !row.acknowledged && row.claim.as_ref().is_none_or(|(_, until)| *until <= now_ms)
+                !row.acknowledged
+                    && row
+                        .claim
+                        .as_ref()
+                        .is_none_or(|(_, until)| *until <= std::time::Instant::now())
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
@@ -791,8 +794,34 @@ impl Storage for InMemoryStorage {
             return Ok(None);
         };
         let row = effects.get_mut(effect_id).expect("selected effect exists");
-        row.claim = Some((claim_token.into(), claim_until_ms));
+        row.claim = Some((
+            claim_token.into(),
+            std::time::Instant::now()
+                + std::time::Duration::from_millis(lease_ms.try_into().unwrap_or(0)),
+        ));
         Ok(Some(row.effect.clone()))
+    }
+    async fn renew_ingest_effect_claim(
+        &self,
+        effect_id: &str,
+        claim_token: &str,
+        lease_ms: i64,
+    ) -> Result<bool, StorageError> {
+        let _gate = self.inner.mutation_gate.lock().unwrap();
+        let mut effects = self.inner.ingest_effects.lock().unwrap();
+        let Some(row) = effects.get_mut(effect_id) else {
+            return Ok(false);
+        };
+        let now = std::time::Instant::now();
+        if !matches!(&row.claim, Some((token, until)) if token.as_str() == claim_token && *until > now)
+        {
+            return Ok(false);
+        }
+        row.claim = Some((
+            claim_token.into(),
+            now + std::time::Duration::from_millis(lease_ms.try_into().unwrap_or(0)),
+        ));
+        Ok(true)
     }
     async fn acknowledge_ingest_effect(
         &self,

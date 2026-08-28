@@ -39,7 +39,7 @@ pub enum ReasoningWork {
 pub struct ReasoningEngine<S: Storage> {
     storage: Arc<S>,
     tx_work: mpsc::Sender<ReasoningWork>,
-    rx_work: tokio::sync::Mutex<Option<mpsc::Receiver<ReasoningWork>>>,
+    rx_work: tokio::sync::Mutex<mpsc::Receiver<ReasoningWork>>,
     k_hop: u8,
 }
 
@@ -51,7 +51,7 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
         Self {
             storage,
             tx_work: tx,
-            rx_work: tokio::sync::Mutex::new(Some(rx)),
+            rx_work: tokio::sync::Mutex::new(rx),
             k_hop,
         }
     }
@@ -66,11 +66,13 @@ impl<S: Storage + 'static> ReasoningEngine<S> {
 
     /// The consumer loop.
     pub async fn run(self: Arc<Self>) {
-        let Some(mut receiver) = self.rx_work.lock().await.take() else {
-            warn!("reasoning worker already started");
-            return;
-        };
-        while let Some(w) = receiver.recv().await {
+        loop {
+            // The receiver remains engine-owned. Cancelling or panicking this
+            // worker releases the guard, allowing its supervisor to restart
+            // without losing queued durable work.
+            let Some(w) = self.rx_work.lock().await.recv().await else {
+                return;
+            };
             match w {
                 ReasoningWork::KHopOver { seed, k } => self.k_hop_reason(seed, k).await,
                 ReasoningWork::SessionWrapup { memories } => {

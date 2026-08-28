@@ -539,3 +539,14 @@ administrator source policy pins and preloads producer kind on every fresh
 production server, so restart-local registration cannot change provenance.
 Focused in-memory/live Falkor, reasoning, ingest, backend lifecycle, and
 workspace clippy evidence passes.
+## Strict convergence follow-up (R6-R163–R6-R167)
+
+A fresh whole-project strict pass after `3f11e41` found that the initial
+30-second post-ingest claim could expire during valid unbounded processing,
+administrator producer-kind authority could be evicted from the 1,000-entry
+runtime LRU, reasoning-worker failure was not restarted, simultaneous claimant
+coverage was sequential, and the new policy field was absent from operator
+documentation. R6-R163 through R6-R167 close those findings with
+storage-clock lease renewal plus cancellation on ownership loss, direct
+immutable-policy selection, a cancellation-safe supervised reasoning receiver,
+simultaneous cross-client claim regressions, and a fail-closed migration note.

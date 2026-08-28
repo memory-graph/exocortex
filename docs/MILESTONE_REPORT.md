@@ -405,3 +405,7 @@ proto-sync-guarded copy).
   the cluster peer secret is no longer accepted as an ingest fallback. MCP
   clients also receive a separately provisioned `EXOCORTEX_SSE_KEY`, so their
   producer signing key is never reused as cluster/SSE verification material.
+- **Producer-kind authority is a fail-closed source-policy migration.** Each
+  source-policy row also requires numeric `producer_kind` (1–5). Missing,
+  unspecified, or unknown values stop startup; the administrator value, not a
+  producer registration or restart-local LRU entry, controls provenance.

@@ -1572,16 +1572,14 @@ impl Storage for FalkorStorage {
     async fn claim_ingest_effect(
         &self,
         claim_token: &str,
-        now_ms: i64,
-        claim_until_ms: i64,
+        lease_ms: i64,
     ) -> Result<Option<PostIngestEffect>, StorageError> {
         let rows = self
             .run_template(
                 "ingest_effect_claim",
                 &serde_json::json!({
                     "claim_token": claim_token,
-                    "now_ms": now_ms,
-                    "claim_until_ms": claim_until_ms,
+                    "lease_ms": lease_ms,
                 }),
                 false,
             )
@@ -1601,6 +1599,26 @@ impl Storage for FalkorStorage {
                 detail: format!("expected string, found {other:?}"),
             }),
         }
+    }
+
+    async fn renew_ingest_effect_claim(
+        &self,
+        effect_id: &str,
+        claim_token: &str,
+        lease_ms: i64,
+    ) -> Result<bool, StorageError> {
+        Ok(!self
+            .run_template(
+                "ingest_effect_claim_renew",
+                &serde_json::json!({
+                    "effect_id": effect_id,
+                    "claim_token": claim_token,
+                    "lease_ms": lease_ms,
+                }),
+                false,
+            )
+            .await?
+            .is_empty())
     }
 
     async fn acknowledge_ingest_effect(
