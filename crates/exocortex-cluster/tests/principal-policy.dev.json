@@ -1,6 +1,6 @@
 [
   {
-    "bearer_token": "dev-bearer",
+    "bearer_token": "test-only-dev-bearer-token-00000000",
     "org_id": "org",
     "user_id": "chaos-harness",
     "project_ids": ["default"],

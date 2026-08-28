@@ -4,7 +4,14 @@ set -eu
 
 repo="memory-graph/exocortex"
 tag="${INSTALL_VERSION:-latest}"
-[ "$tag" = "latest" ] && tag=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
+if [ "${EXOCORTEX_RELEASE_BASE_URL+x}" = x ]; then
+  echo "install refused: release origin is fixed by the shipped installer" >&2
+  exit 1
+fi
+curl_https() {
+  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location "$@"
+}
+[ "$tag" = "latest" ] && tag=$(curl_https "https://api.github.com/repos/$repo/releases/latest" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)  target="aarch64-apple-darwin" ;;
   Darwin-x86_64) target="x86_64-apple-darwin" ;;
@@ -13,13 +20,13 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 archive="exocortex-${tag#v}-$target.tar.gz"
-base="${EXOCORTEX_RELEASE_BASE_URL:-https://github.com/$repo/releases/download}"
+base="https://github.com/$repo/releases/download"
 url="$base/$tag/$archive"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 echo "downloading $url"
-curl -fsSL "$url" -o "$tmp/$archive"
-curl -fsSL "$url.sha256" -o "$tmp/$archive.sha256"
+curl_https "$url" -o "$tmp/$archive"
+curl_https "$url.sha256" -o "$tmp/$archive.sha256"
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$tmp" && sha256sum -c "$archive.sha256")
 elif command -v shasum >/dev/null 2>&1; then

@@ -169,8 +169,11 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
         ontology: Some(ontology.clone()),
     });
-    let router = exocortex_server::http_bind::HttpBind::new(context, "valid-bearer".into())
-        .router(Some(exocortex_server::sse::sse_router(cluster)));
+    let router = exocortex_server::http_bind::HttpBind::new(
+        context,
+        "test-only-valid-bearer-token-00000000".into(),
+    )
+    .router(Some(exocortex_server::sse::sse_router(cluster)));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -204,7 +207,7 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
             cluster_secret: [7; 32],
             principals: Arc::new(
                 exocortex_server::principal::PrincipalRegistry::single(
-                    "valid-bearer".into(),
+                    "test-only-valid-bearer-token-00000000".into(),
                     exocortex_ops::operations::ops_vc(
                         "org",
                         "user",
@@ -244,7 +247,7 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
     let source_policy = policy_dir.path().join("sources.json");
     std::fs::write(
         &principal_policy,
-        r#"[{"bearer_token":"valid-bearer","org_id":"org","user_id":"user","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
+        r#"[{"bearer_token":"test-only-valid-bearer-token-00000000","org_id":"org","user_id":"user","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
     )
     .unwrap();
     std::fs::write(

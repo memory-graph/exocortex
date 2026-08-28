@@ -593,6 +593,14 @@ pub enum CacheWrite {
         /// Completion result after the containing microbatch is published.
         ack: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Apply a bounded feed burst in one atomic snapshot publication and
+    /// acknowledge the whole burst only after that publication completes.
+    ApplyBatchAcknowledged {
+        /// Ordered change-feed events covered by the publication.
+        invalidations: Vec<Invalidation>,
+        /// Completion result for the entire atomic microbatch.
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Publish a freshly rebuilt snapshot for an org.
     Reseed {
         /// Target org.
@@ -672,6 +680,21 @@ impl LocalCache {
                             invalidation,
                             ack: Some(ack),
                         });
+                        continue;
+                    }
+                    CacheWrite::ApplyBatchAcknowledged { invalidations, ack } => {
+                        if invalidations.is_empty() {
+                            let _ = ack.send(Ok(()));
+                        } else {
+                            let last = invalidations.len() - 1;
+                            let mut ack = Some(ack);
+                            pending.extend(invalidations.into_iter().enumerate().map(
+                                |(index, invalidation)| PendingApply {
+                                    invalidation,
+                                    ack: if index == last { ack.take() } else { None },
+                                },
+                            ));
+                        }
                         continue;
                     }
                     CacheWrite::Reseed { org, snapshot, ack } => {
@@ -1269,9 +1292,18 @@ impl LocalCache {
     /// covers it. A failed storage hydration is returned to the caller for
     /// retry/reseed instead of consuming the feed item as successful.
     pub async fn apply_invalidation(&self, invalidation: Invalidation) -> Result<(), String> {
+        self.apply_invalidations(vec![invalidation]).await
+    }
+
+    /// Apply an ordered invalidation burst and wait for its single atomic
+    /// publication. The writer never acknowledges a partially applied burst.
+    pub async fn apply_invalidations(
+        &self,
+        invalidations: Vec<Invalidation>,
+    ) -> Result<(), String> {
         let (ack, done) = tokio::sync::oneshot::channel();
         self.writer
-            .send(CacheWrite::ApplyAcknowledged { invalidation, ack })
+            .send(CacheWrite::ApplyBatchAcknowledged { invalidations, ack })
             .await
             .map_err(|_| "cache writer stopped before invalidation enqueue".to_string())?;
         done.await

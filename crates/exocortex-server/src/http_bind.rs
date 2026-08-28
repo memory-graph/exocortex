@@ -64,7 +64,7 @@ impl HttpBind {
     /// identity-free readiness probe remains unauthenticated.
     pub fn new(ctx: Arc<OpContext>, bearer: String) -> Self {
         let principals = PrincipalRegistry::single(bearer, ctx.visibility_ctx.clone())
-            .expect("HttpBind bearer must be non-empty");
+            .expect("HttpBind bearer must contain at least 32 bytes");
         Self::with_principals(ctx, Arc::new(principals))
     }
 
@@ -401,7 +401,12 @@ mod tests {
             max_visibility: exocortex_kernel::Visibility::Project,
         };
         let principals = Arc::new(
-            PrincipalRegistry::single_with_audit_admin("bob-token".into(), bob, false).unwrap(),
+            PrincipalRegistry::single_with_audit_admin(
+                "test-only-bob-bearer-token-00000000".into(),
+                bob,
+                false,
+            )
+            .unwrap(),
         );
         let who = Router::new().route(
             "/who",
@@ -418,7 +423,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/who")
-                    .header(axum::http::header::AUTHORIZATION, "Bearer bob-token")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        "Bearer test-only-bob-bearer-token-00000000",
+                    )
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -434,7 +442,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/v1/audit?since_lsn=0")
-                    .header(axum::http::header::AUTHORIZATION, "Bearer bob-token")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        "Bearer test-only-bob-bearer-token-00000000",
+                    )
                     .body(Body::empty())
                     .unwrap(),
             )

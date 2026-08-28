@@ -6,6 +6,18 @@ use std::net::IpAddr;
 /// plaintext exception. This must run before credentials are attached or
 /// connection retries begin.
 pub fn validate_backend_url(url: &str) -> Result<(), String> {
+    if url
+        .split_once("://")
+        .map(|(_, remainder)| {
+            remainder
+                .split(['/', '?', '#'])
+                .next()
+                .is_some_and(|authority| authority.contains('@'))
+        })
+        .unwrap_or(false)
+    {
+        return Err("backend URL must not contain userinfo".into());
+    }
     let endpoint = tonic::transport::Endpoint::from_shared(url.to_owned())
         .map_err(|error| format!("invalid backend URL: {error}"))?;
     let uri = endpoint.uri();
@@ -60,6 +72,19 @@ mod tests {
             "http://localhost.example:50051",
         ] {
             assert!(validate_backend_url(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn userinfo_is_rejected_without_reflecting_credentials() {
+        for url in [
+            "https://sentinel-user:sentinel-password@backend.example:50051",
+            "http://sentinel-user:sentinel-password@localhost:50051",
+        ] {
+            let error = validate_backend_url(url).unwrap_err();
+            assert_eq!(error, "backend URL must not contain userinfo");
+            assert!(!error.contains("sentinel-user"));
+            assert!(!error.contains("sentinel-password"));
         }
     }
 }

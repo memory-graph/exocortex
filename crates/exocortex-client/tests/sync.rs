@@ -515,7 +515,10 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
         ontology: Some(onto.clone()),
     });
-    let bind = exocortex_server::http_bind::HttpBind::new(ctx, "feed-bearer".into());
+    let bind = exocortex_server::http_bind::HttpBind::new(
+        ctx,
+        "test-only-feed-bearer-token-00000000".into(),
+    );
     let app = bind.router(Some(exocortex_server::sse::sse_router(cluster.clone())));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -532,10 +535,10 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
     let cfg = {
         let mut c = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
         c.backoff = Duration::from_millis(50);
-        c.bearer = Some("feed-bearer".into());
+        c.bearer = Some("test-only-feed-bearer-token-00000000".into());
         c.client_key = Some(exocortex_wire::signing::derive_sse_client_key(
             &HMAC_KEY,
-            "feed-bearer",
+            "test-only-feed-bearer-token-00000000",
         ));
         c.hydration_ready = Some(hydrated.clone());
         c
@@ -787,6 +790,54 @@ fn test_memory(title: &str, n: u8) -> exocortex_kernel::Memory {
     }
 }
 
+#[tokio::test]
+async fn seed_ignorant_server_fails_initial_hydration_promptly() {
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::get;
+    use std::convert::Infallible;
+
+    let app = axum::Router::new().route(
+        "/v1/changes",
+        get(|| async {
+            let stream = async_stream::stream! {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    yield Ok::<Event, Infallible>(Event::default().comment("legacy-heartbeat"));
+                }
+            };
+            Sse::new(stream)
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (cache, writer_rx) = LocalCache::new(1024 * 1024);
+    let cache = Arc::new(cache);
+    let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, [1; 32]);
+    cfg.initial_hydration_timeout = Duration::from_millis(40);
+    cfg.stall_timeout = Duration::from_secs(5);
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(250),
+        exocortex_client::sync::hydrate_and_start_backend_sync(cfg, cache.clone(), writer_rx),
+    )
+    .await
+    .expect("legacy incompatibility is bounded");
+    assert!(matches!(
+        result,
+        Err(exocortex_client::sync::SyncError::InitialHydrationTimeout(timeout))
+            if timeout == Duration::from_millis(40)
+    ));
+    assert_eq!(
+        cache.resident_orgs(),
+        0,
+        "empty state is never declared ready"
+    );
+    server.abort();
+}
+
 /// R6-B06: exercise the exact production lifecycle helper. It must not return
 /// before an authenticated full image is visible, and its retained writer/SSE
 /// tasks must continue applying later commits.
@@ -816,7 +867,10 @@ async fn production_backend_sync_hydrates_before_ready_and_stays_live() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
         ontology: Some(onto.clone()),
     });
-    let bind = exocortex_server::http_bind::HttpBind::new(ctx, "sync-bearer".into());
+    let bind = exocortex_server::http_bind::HttpBind::new(
+        ctx,
+        "test-only-sync-bearer-token-00000000".into(),
+    );
     let app = bind.router(Some(exocortex_server::sse::sse_router(cluster.clone())));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -827,10 +881,10 @@ async fn production_backend_sync_hydrates_before_ready_and_stays_live() {
     let (cache, writer_rx) = LocalCache::new(16 * 1024 * 1024);
     let cache = Arc::new(cache);
     let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
-    cfg.bearer = Some("sync-bearer".into());
+    cfg.bearer = Some("test-only-sync-bearer-token-00000000".into());
     cfg.client_key = Some(exocortex_wire::signing::derive_sse_client_key(
         &HMAC_KEY,
-        "sync-bearer",
+        "test-only-sync-bearer-token-00000000",
     ));
     cfg.backoff = Duration::from_millis(20);
     let sync = tokio::time::timeout(
@@ -838,7 +892,8 @@ async fn production_backend_sync_hydrates_before_ready_and_stays_live() {
         exocortex_client::sync::hydrate_and_start_backend_sync(cfg, cache.clone(), writer_rx),
     )
     .await
-    .expect("production lifecycle reaches hydrated readiness");
+    .expect("production lifecycle reaches hydrated readiness")
+    .expect("compatible server supplies an initial seed");
     assert!(
         cache.get_memory("org", &initial.id, &principal).is_some(),
         "initial backend image is visible before readiness returns"

@@ -87,8 +87,8 @@ struct Args {
     /// Chitchat gossip listen address (backend-node).
     #[arg(long, default_value = "0.0.0.0:8100")]
     gossip_addr: String,
-    /// Administrator-owned JSON mapping bearer credentials to org/user,
-    /// project/team memberships, and maximum visibility.
+    /// Administrator-owned JSON mapping bearer credentials of at least 32
+    /// bytes to org/user, project/team memberships, and maximum visibility.
     #[arg(long)]
     principal_policy: Option<std::path::PathBuf>,
     /// Administrator-owned JSON source policy. Required in backend-node

@@ -288,7 +288,7 @@ fn main() -> anyhow::Result<()> {
                 cache.clone(),
                 writer_rx,
             )
-            .await;
+            .await?;
 
             let endpoint = tonic::transport::Endpoint::from_shared(backend.clone())
                 .map_err(|e| anyhow::anyhow!("bad --backend {backend}: {e}"))?;

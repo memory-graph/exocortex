@@ -502,7 +502,10 @@ async fn backend_router_rejects_token_query_without_bearer() {
 
         ontology: None,
     });
-    let bind = exocortex_server::http_bind::HttpBind::new(ctx, "secret-bearer".into());
+    let bind = exocortex_server::http_bind::HttpBind::new(
+        ctx,
+        "test-only-secret-bearer-token-00000000".into(),
+    );
     let sse = exocortex_server::sse::sse_router(cluster.clone());
     let app = bind.router(Some(sse));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -526,7 +529,7 @@ async fn backend_router_rejects_token_query_without_bearer() {
     let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     sock.write_all(
-        format!("GET /v1/changes?token=t&since_lsn=0 HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer secret-bearer\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n").as_bytes(),
+        format!("GET /v1/changes?token=t&since_lsn=0 HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer test-only-secret-bearer-token-00000000\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n").as_bytes(),
     )
     .await
     .unwrap();

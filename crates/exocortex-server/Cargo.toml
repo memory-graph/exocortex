@@ -56,6 +56,8 @@ http = { workspace = true }
 redis = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+exocortex-storage = { workspace = true, features = ["testing"] }
 exocortex-adapter-sdk = { workspace = true }
 tempfile = "3"
 exocortex-client = { workspace = true }

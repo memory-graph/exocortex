@@ -33,6 +33,24 @@ fn remote_plaintext_backend_is_rejected_before_worker_startup() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("loopback"));
 }
 
+#[test]
+fn backend_userinfo_is_rejected_without_reaching_startup_tracing() {
+    let out = Command::new(env!("CARGO_BIN_EXE_exocortex-worker"))
+        .args([
+            "--adapter",
+            "noop",
+            "--backend",
+            "https://sentinel-user:sentinel-password@backend.example:50051",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("must not contain userinfo"));
+    assert!(!stderr.contains("sentinel-user"));
+    assert!(!stderr.contains("sentinel-password"));
+}
+
 /// Round-3 C2 + PRD R16's second verify clause: the worker BINARY runs
 /// `--adapter fixture` end-to-end against a real backend-node process
 /// and its batches authenticate (default dev key matches the server's).
@@ -78,7 +96,7 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
     let principal_policy = policy_dir.path().join("principals.json");
     std::fs::write(
         &principal_policy,
-        r#"[{"bearer_token":"fixture-e2e","org_id":"org","user_id":"fixture","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
+        r#"[{"bearer_token":"test-only-fixture-bearer-token-00000000","org_id":"org","user_id":"fixture","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
     )
     .unwrap();
     let mut node = Command::new(&node_bin)
@@ -157,7 +175,10 @@ async fn fixture_adapter_binary_submits_to_real_backend() {
             "EXOCORTEX_HMAC_KEY",
             "4242424242424242424242424242424242424242424242424242424242424242",
         )
-        .env("EXOCORTEX_AUTH_TOKEN", "fixture-e2e")
+        .env(
+            "EXOCORTEX_AUTH_TOKEN",
+            "test-only-fixture-bearer-token-00000000",
+        )
         .output()
         .expect("run exocortex-worker fixture");
     let _ = node.kill();

@@ -42,6 +42,10 @@ pub enum SyncError {
     /// Envelope failed admission (wire version / fingerprint / HMAC).
     #[error("envelope rejected: {0}")]
     Rejected(String),
+    /// The peer accepted SSE but did not implement the required initial seed
+    /// contract, so exposing an empty backend cache would be unsafe.
+    #[error("backend did not provide an initial graph seed within {0:?}")]
+    InitialHydrationTimeout(Duration),
 }
 
 /// Configuration for the SSE subscriber.
@@ -71,6 +75,9 @@ pub struct SseSyncConfig {
     /// replacement image. This repairs durable commits whose best-effort
     /// change-feed publication was lost.
     pub reconcile_interval: Duration,
+    /// Maximum startup wait for the authenticated initial graph image. This
+    /// bounds incompatibility with older servers that ignore `seed=true`.
+    pub initial_hydration_timeout: Duration,
     /// Optional first-connection signal for supervisors and deterministic
     /// integration tests. A permit is emitted after the SSE handshake.
     pub connection_ready: Option<Arc<tokio::sync::Notify>>,
@@ -93,6 +100,7 @@ impl SseSyncConfig {
             gap_timeout: Duration::from_secs(2),
             backoff: Duration::from_secs(1),
             reconcile_interval: Duration::from_secs(60),
+            initial_hydration_timeout: Duration::from_secs(15),
             connection_ready: None,
             hydration_ready: None,
             org: "org".into(),
@@ -112,9 +120,10 @@ pub async fn hydrate_and_start_backend_sync(
     mut cfg: SseSyncConfig,
     cache: Arc<LocalCache>,
     writer_rx: tokio::sync::mpsc::Receiver<CacheWrite>,
-) -> tokio::task::JoinHandle<()> {
+) -> Result<tokio::task::JoinHandle<()>, SyncError> {
+    let hydration_timeout = cfg.initial_hydration_timeout;
     let writer_cache = cache.clone();
-    tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         writer_cache
             .run(Arc::new(crate::no_backend::NoBackendStorage), writer_rx)
             .await;
@@ -122,8 +131,14 @@ pub async fn hydrate_and_start_backend_sync(
     let hydrated = Arc::new(tokio::sync::Notify::new());
     cfg.hydration_ready = Some(hydrated.clone());
     let sync = tokio::spawn(run_sse_sync(cfg, cache, 0, None));
-    hydrated.notified().await;
-    sync
+    match tokio::time::timeout(hydration_timeout, hydrated.notified()).await {
+        Ok(()) => Ok(sync),
+        Err(_) => {
+            sync.abort();
+            writer.abort();
+            Err(SyncError::InitialHydrationTimeout(hydration_timeout))
+        }
+    }
 }
 
 /// Verify an envelope: wire version, fingerprint, HMAC-SHA256 over fields

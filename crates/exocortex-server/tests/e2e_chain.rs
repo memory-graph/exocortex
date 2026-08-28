@@ -78,9 +78,12 @@ const HARNESS_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 fn authed<T>(message: T) -> tonic::Request<T> {
     let mut request = tonic::Request::new(message);
-    request
-        .metadata_mut()
-        .insert("authorization", "Bearer e2e-bearer".parse().unwrap());
+    request.metadata_mut().insert(
+        "authorization",
+        "Bearer test-only-e2e-bearer-token-00000000"
+            .parse()
+            .unwrap(),
+    );
     request
 }
 
@@ -102,7 +105,7 @@ async fn boot() -> (
             cluster_secret: CLUSTER_KEY,
             principals: Arc::new(
                 exocortex_server::principal::PrincipalRegistry::single(
-                    "e2e-bearer".into(),
+                    "test-only-e2e-bearer-token-00000000".into(),
                     exocortex_ops::operations::ops_vc(
                         "org",
                         "e2e",
@@ -222,10 +225,10 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
     let mut cfg = SseSyncConfig::new(format!("http://{addr}"), CLUSTER_KEY, onto.fingerprint.0);
     cfg.backoff = std::time::Duration::from_millis(50);
     // CS1: /v1/changes sits behind the same bearer layer as the op surface.
-    cfg.bearer = Some("e2e-bearer".into());
+    cfg.bearer = Some("test-only-e2e-bearer-token-00000000".into());
     cfg.client_key = Some(exocortex_server::sse::derive_client_sse_key(
         &CLUSTER_KEY,
-        "e2e-bearer",
+        "test-only-e2e-bearer-token-00000000",
     ));
     let connection_ready = Arc::new(tokio::sync::Notify::new());
     cfg.connection_ready = Some(connection_ready.clone());
@@ -369,10 +372,10 @@ async fn mcp_wal_sync_backend_sse_sibling_is_one_chain_under_500ms() {
 
     let mut sync_cfg =
         SseSyncConfig::new(format!("http://{addr}"), CLUSTER_KEY, onto.fingerprint.0);
-    sync_cfg.bearer = Some("e2e-bearer".into());
+    sync_cfg.bearer = Some("test-only-e2e-bearer-token-00000000".into());
     sync_cfg.client_key = Some(exocortex_server::sse::derive_client_sse_key(
         &CLUSTER_KEY,
-        "e2e-bearer",
+        "test-only-e2e-bearer-token-00000000",
     ));
     let live = Arc::new(tokio::sync::Notify::new());
     sync_cfg.connection_ready = Some(live.clone());
@@ -440,7 +443,7 @@ async fn mcp_wal_sync_backend_sse_sibling_is_one_chain_under_500ms() {
         &PRODUCER_KEY,
         onto.fingerprint.0,
         "org",
-        Some("e2e-bearer"),
+        Some("test-only-e2e-bearer-token-00000000"),
         &onto,
         "literal-chain-client",
     )

@@ -7,6 +7,9 @@ use exocortex_kernel::Visibility;
 use exocortex_storage::VisibilityContext;
 use serde::Deserialize;
 
+/// Minimum entropy-bearing credential width accepted at any server boundary.
+pub const MIN_BEARER_TOKEN_BYTES: usize = 32;
+
 /// One administrator provisioned credential and its complete read/write scope.
 #[derive(Deserialize)]
 struct PrincipalPolicyRow {
@@ -60,7 +63,7 @@ impl PrincipalRegistry {
         principal: VisibilityContext,
         audit_admin: bool,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(!token.is_empty(), "bearer token must be non-empty");
+        validate_bearer_token(&token)?;
         Ok(Self {
             entries: vec![(
                 token.into_bytes(),
@@ -78,9 +81,10 @@ impl PrincipalRegistry {
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
             anyhow::ensure!(
-                !row.bearer_token.is_empty() && !row.org_id.is_empty() && !row.user_id.is_empty(),
-                "principal token, org_id, and user_id must be non-empty"
+                !row.org_id.is_empty() && !row.user_id.is_empty(),
+                "principal org_id and user_id must be non-empty"
             );
+            validate_bearer_token(&row.bearer_token)?;
             anyhow::ensure!(
                 row.project_ids.iter().all(|id| !id.is_empty())
                     && row.team_ids.iter().all(|id| !id.is_empty()),
@@ -137,6 +141,14 @@ impl PrincipalRegistry {
     }
 }
 
+fn validate_bearer_token(token: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        token.len() >= MIN_BEARER_TOKEN_BYTES,
+        "bearer token must contain at least {MIN_BEARER_TOKEN_BYTES} bytes"
+    );
+    Ok(())
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let max_len = a.len().max(b.len());
     let mut diff = a.len() ^ b.len();
@@ -151,17 +163,19 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    const TEST_BEARER: &str = "test-bearer-token-32-bytes-long!";
+
     #[test]
     fn policy_maps_credentials_to_exact_scopes_and_rejects_bad_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("principals.json");
         std::fs::write(
             &path,
-            r#"[{"bearer_token":"secret","org_id":"o","user_id":"u","project_ids":["p"],"team_ids":["t"],"max_visibility":2,"audit_admin":true}]"#,
+            format!(r#"[{{"bearer_token":"{TEST_BEARER}","org_id":"o","user_id":"u","project_ids":["p"],"team_ids":["t"],"max_visibility":2,"audit_admin":true}}]"#),
         )
         .unwrap();
         let registry = PrincipalRegistry::load(&path).unwrap();
-        let principal = registry.authenticate(b"secret").unwrap();
+        let principal = registry.authenticate(TEST_BEARER.as_bytes()).unwrap();
         assert_eq!(principal.visibility.org_id.as_str(), "o");
         assert_eq!(principal.visibility.user_id.as_str(), "u");
         assert_eq!(principal.visibility.project_ids[0].as_str(), "p");
@@ -180,5 +194,27 @@ mod tests {
         )
         .unwrap();
         assert!(PrincipalRegistry::load(&path).is_err());
+    }
+
+    #[test]
+    fn production_and_embedded_registries_reject_short_bearers() {
+        let visibility = VisibilityContext {
+            user_id: "user".into(),
+            org_id: "org".into(),
+            project_ids: vec![].into(),
+            team_ids: vec![].into(),
+            max_visibility: Visibility::Org,
+        };
+        assert!(PrincipalRegistry::single("short".into(), visibility).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("principals.json");
+        std::fs::write(
+            &path,
+            r#"[{"bearer_token":"short","org_id":"org","user_id":"user","max_visibility":3}]"#,
+        )
+        .unwrap();
+        let error = PrincipalRegistry::load(&path).err().unwrap().to_string();
+        assert!(error.contains("at least 32 bytes"));
     }
 }

@@ -47,7 +47,7 @@ fn spawn_node() -> Node {
     let principals = policy_dir.path().join("principals.json");
     std::fs::write(
         &principals,
-        r#"[{"bearer_token":"oop-test-bearer","org_id":"org","user_id":"oop","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
+        r#"[{"bearer_token":"test-only-oop-bearer-token-00000000","org_id":"org","user_id":"oop","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
     )
     .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_exocortex-node"))
@@ -122,7 +122,7 @@ async fn fixture_adapter_completes_the_protocol_out_of_process() {
         producer_kind: exocortex_wire::ingest::v1::ProducerKind::Custom,
         ceiling: 3,
         backend_url: format!("http://{}", node.addr),
-        auth_token: "oop-test-bearer".into(),
+        auth_token: "test-only-oop-bearer-token-00000000".into(),
         hmac_key: [0x42u8; 32],
         max_batch_bytes: 4 * 1024 * 1024,
         cursor_path: dir.path().join("oop.cursor"),
@@ -201,7 +201,7 @@ async fn search_http(addr: std::net::SocketAddr, query: &str) -> String {
     let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
     let body = format!("{{\"query\":\"{query}\",\"limit\":10}}");
     let req = format!(
-        "POST /v1/search_memories HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer oop-test-bearer\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /v1/search_memories HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer test-only-oop-bearer-token-00000000\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     sock.write_all(req.as_bytes()).await.unwrap();

@@ -14,6 +14,7 @@ use exocortex_ingest::IngestServer;
 use exocortex_kernel::{Ontology, OntologyFingerprint};
 use exocortex_ops::OpContext;
 use exocortex_storage::{LeaseKey, Storage};
+use futures::{FutureExt, Stream, StreamExt};
 
 use crate::http_bind::{HealthSnapshot, HttpBind};
 use crate::principal::PrincipalRegistry;
@@ -70,6 +71,9 @@ pub struct BackendNodeArgs {
 const LEASE_TTL: Duration = Duration::from_millis(1200);
 /// Renewal cadence: a healthy holder extends well before expiry.
 const LEASE_RENEW: Duration = Duration::from_millis(250);
+const CACHE_BRIDGE_BURST: usize = 256;
+const CACHE_RESEED_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const CACHE_RESEED_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// The Dreams lease every backend node re-elects for (§9.2).
 fn dreams_lease_key(org: &str) -> LeaseKey {
@@ -118,13 +122,103 @@ pub async fn apply_cache_invalidation_with_retry<S: Storage>(
     invalidation: exocortex_storage::Invalidation,
     retry_delay: Duration,
 ) {
-    let lsn = exocortex_storage::Invalidation::lsn_of(&invalidation);
+    apply_cache_invalidations_with_retry(
+        cache,
+        storage,
+        org,
+        health,
+        vec![invalidation],
+        retry_delay,
+        retry_delay,
+    )
+    .await;
+}
+
+async fn retry_with_capped_backoff<F, Fut, T, E>(
+    mut operation: F,
+    initial_delay: Duration,
+    max_delay: Duration,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let ceiling = max_delay;
+    let mut delay = initial_delay.min(ceiling);
+    loop {
+        match operation().await {
+            Ok(value) => return value,
+            Err(error) => {
+                tracing::warn!(%error, ?delay, "cache reseed failed; retrying");
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(ceiling);
+            }
+        }
+    }
+}
+
+async fn reseed_cache_with_retry<S: Storage>(
+    cache: &LocalCache,
+    storage: &S,
+    org: &str,
+    health: &arc_swap::ArcSwap<HealthSnapshot>,
+    initial_delay: Duration,
+    max_delay: Duration,
+    observed_lsn: Option<u64>,
+) {
+    let org_id = org.to_owned();
+    retry_with_capped_backoff(
+        || {
+            let org_id = org_id.clone();
+            async move {
+                cache
+                    .reseed_from_storage(storage, &org_id.as_str().into())
+                    .await
+            }
+        },
+        initial_delay,
+        max_delay,
+    )
+    .await;
+    let published_lsn = cache
+        .graphs_snapshot(org)
+        .map_or(0, |snapshot| snapshot.last_backend_lsn);
+    let synchronized_lsn = observed_lsn.map_or(published_lsn, |lsn| lsn.max(published_lsn));
+    health.rcu(|current| {
+        let mut next = (**current).clone();
+        next.backend_lsn = next.backend_lsn.max(synchronized_lsn);
+        next.sync_lsn = next.sync_lsn.max(synchronized_lsn);
+        Arc::new(next)
+    });
+}
+
+/// Apply a bounded observed feed burst as one acknowledged cache generation.
+/// A point-hydration failure is repaired by an authoritative reseed before the
+/// bridge acknowledges any event in the burst.
+#[doc(hidden)]
+pub async fn apply_cache_invalidations_with_retry<S: Storage>(
+    cache: &LocalCache,
+    storage: &S,
+    org: &str,
+    health: &arc_swap::ArcSwap<HealthSnapshot>,
+    invalidations: Vec<exocortex_storage::Invalidation>,
+    initial_delay: Duration,
+    max_delay: Duration,
+) {
+    let Some(lsn) = invalidations
+        .iter()
+        .map(exocortex_storage::Invalidation::lsn_of)
+        .max()
+    else {
+        return;
+    };
     health.rcu(|current| {
         let mut next = (**current).clone();
         next.backend_lsn = next.backend_lsn.max(lsn);
         Arc::new(next)
     });
-    match cache.apply_invalidation(invalidation).await {
+    match cache.apply_invalidations(invalidations).await {
         Ok(()) => {
             health.rcu(|current| {
                 let mut next = (**current).clone();
@@ -133,23 +227,120 @@ pub async fn apply_cache_invalidation_with_retry<S: Storage>(
             });
         }
         Err(error) => {
-            tracing::warn!(%error, lsn, "cache invalidation apply failed; reseeding");
-            loop {
-                let org = org.into();
-                match cache.reseed_from_storage(storage, &org).await {
-                    Ok(()) => break,
-                    Err(error) => {
-                        tracing::warn!(%error, lsn, "cache reseed failed; retrying");
-                        tokio::time::sleep(retry_delay).await;
-                    }
-                }
-            }
-            health.rcu(|current| {
-                let mut next = (**current).clone();
-                next.sync_lsn = next.sync_lsn.max(lsn);
-                Arc::new(next)
-            });
+            tracing::warn!(%error, lsn, "cache invalidation burst failed; reseeding");
+            reseed_cache_with_retry(
+                cache,
+                storage,
+                org,
+                health,
+                initial_delay,
+                max_delay,
+                Some(lsn),
+            )
+            .await;
         }
+    }
+}
+
+/// Consume one subscription epoch. Any decode error or clean termination is a
+/// discontinuity: this returns only after an authoritative reseed succeeds, so
+/// the caller cannot subscribe to and progress a later epoch from stale state.
+#[doc(hidden)]
+pub async fn consume_cache_subscription<S, St>(
+    cache: &LocalCache,
+    storage: &S,
+    org: &str,
+    health: &arc_swap::ArcSwap<HealthSnapshot>,
+    mut subscription: St,
+    initial_delay: Duration,
+    max_delay: Duration,
+) where
+    S: Storage,
+    St: Stream<Item = exocortex_storage::Result<exocortex_storage::Invalidation>> + Unpin,
+{
+    loop {
+        let first = match subscription.next().await {
+            Some(Ok(invalidation)) => invalidation,
+            Some(Err(error)) => {
+                metrics::counter!("exocortex_cluster_invalidation_decode_errors_total")
+                    .increment(1);
+                tracing::warn!(%error, "cache bridge stream failed; reseeding");
+                reseed_cache_with_retry(
+                    cache,
+                    storage,
+                    org,
+                    health,
+                    initial_delay,
+                    max_delay,
+                    None,
+                )
+                .await;
+                return;
+            }
+            None => {
+                tracing::warn!("cache bridge stream terminated; reseeding");
+                reseed_cache_with_retry(
+                    cache,
+                    storage,
+                    org,
+                    health,
+                    initial_delay,
+                    max_delay,
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+
+        let mut burst = Vec::with_capacity(CACHE_BRIDGE_BURST);
+        burst.push(first);
+        while burst.len() < CACHE_BRIDGE_BURST {
+            match subscription.next().now_or_never() {
+                Some(Some(Ok(invalidation))) => burst.push(invalidation),
+                Some(Some(Err(error))) => {
+                    metrics::counter!("exocortex_cluster_invalidation_decode_errors_total")
+                        .increment(1);
+                    tracing::warn!(%error, "cache bridge burst failed; reseeding");
+                    reseed_cache_with_retry(
+                        cache,
+                        storage,
+                        org,
+                        health,
+                        initial_delay,
+                        max_delay,
+                        None,
+                    )
+                    .await;
+                    return;
+                }
+                Some(None) => {
+                    tracing::warn!("cache bridge stream terminated during burst; reseeding");
+                    reseed_cache_with_retry(
+                        cache,
+                        storage,
+                        org,
+                        health,
+                        initial_delay,
+                        max_delay,
+                        None,
+                    )
+                    .await;
+                    return;
+                }
+                None => break,
+            }
+        }
+        apply_cache_invalidations_with_retry(
+            cache,
+            storage,
+            org,
+            health,
+            burst,
+            initial_delay,
+            max_delay,
+        )
+        .await;
     }
 }
 
@@ -231,36 +422,17 @@ pub async fn run_backend_node<S: Storage + 'static>(
             };
             loop {
                 match storage.subscribe_invalidations(&region).await {
-                    Ok(mut sub) => {
-                        use futures::StreamExt;
-                        while let Some(item) = sub.next().await {
-                            match item {
-                                Ok(inv) => {
-                                    apply_cache_invalidation_with_retry(
-                                        &cache,
-                                        &*storage,
-                                        &org,
-                                        &health,
-                                        inv,
-                                        Duration::from_millis(100),
-                                    )
-                                    .await;
-                                }
-                                // CS7 (audit): a decode failure is a known
-                                // hole in this node's LSN sequence — count
-                                // it and log it, never swallow silently.
-                                Err(e) => {
-                                    metrics::counter!(
-                                        "exocortex_cluster_invalidation_decode_errors_total"
-                                    )
-                                    .increment(1);
-                                    tracing::warn!(
-                                        %e,
-                                        "cache bridge: invalidation decode failed; change lost"
-                                    );
-                                }
-                            }
-                        }
+                    Ok(sub) => {
+                        consume_cache_subscription(
+                            &cache,
+                            &*storage,
+                            &org,
+                            &health,
+                            sub,
+                            CACHE_RESEED_INITIAL_BACKOFF,
+                            CACHE_RESEED_MAX_BACKOFF,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::warn!(%e, "cache change-feed subscribe failed; retrying");
@@ -601,4 +773,50 @@ fn hex(b: &[u8; 32]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+#[cfg(test)]
+mod cache_bridge_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_reseeds_back_off_exponentially_and_cap() {
+        let ontology = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = Arc::new(exocortex_storage::InMemoryStorage::new(ontology));
+        let (cache, writer_rx) = LocalCache::new(1024 * 1024);
+        let cache = Arc::new(cache);
+        let writer = tokio::spawn({
+            let cache = cache.clone();
+            let storage = storage.clone();
+            async move { cache.run(storage, writer_rx).await }
+        });
+        let attempts = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        retry_with_capped_backoff(
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                let cache = cache.clone();
+                let storage = storage.clone();
+                async move {
+                    if attempt < 4 {
+                        storage.fail_next_stream_after(Some(0), None);
+                    }
+                    cache.reseed_from_storage(&*storage, &"org".into()).await
+                }
+            },
+            Duration::from_millis(10),
+            Duration::from_millis(25),
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        assert_eq!(started.elapsed(), Duration::from_millis(80));
+        assert_eq!(cache.resident_orgs(), 1);
+        writer.abort();
+    }
 }

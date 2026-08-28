@@ -146,7 +146,7 @@ async fn every_operation_answers_over_http_with_auth() {
         ontology: Some(ontology()),
     });
 
-    let bind = HttpBind::new(ctx.clone(), "secret-token".into());
+    let bind = HttpBind::new(ctx.clone(), "test-only-secret-bearer-token-00000000".into());
     let app = bind.router(None);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -297,7 +297,7 @@ async fn every_operation_answers_over_http_with_auth() {
                 addr,
                 "GET",
                 &format!("{}?{}", entry.http_path, qs),
-                Some("secret-token"),
+                Some("test-only-secret-bearer-token-00000000"),
                 None,
             )
             .await
@@ -306,7 +306,7 @@ async fn every_operation_answers_over_http_with_auth() {
                 addr,
                 "POST",
                 entry.http_path,
-                Some("secret-token"),
+                Some("test-only-secret-bearer-token-00000000"),
                 Some(&http_input),
             )
             .await
@@ -336,7 +336,14 @@ async fn every_operation_answers_over_http_with_auth() {
     assert_eq!(status, 401, "wrong bearer rejected");
 
     // H4: observability endpoints.
-    let (status, body, text) = http(addr, "GET", "/metrics", Some("secret-token"), None).await;
+    let (status, body, text) = http(
+        addr,
+        "GET",
+        "/metrics",
+        Some("test-only-secret-bearer-token-00000000"),
+        None,
+    )
+    .await;
     assert_eq!(status, 200);
     assert!(body.is_null(), "metrics is text, not JSON");
     assert!(text.contains("exocortex"), "prometheus text format: {text}");
@@ -346,7 +353,14 @@ async fn every_operation_answers_over_http_with_auth() {
     for path in ["/health/cluster", "/health/sync", "/health/hydration"] {
         let (status, _, _) = http(addr, "GET", path, None, None).await;
         assert_eq!(status, 401, "{path} rejects unauthenticated callers");
-        let (status, body, _) = http(addr, "GET", path, Some("secret-token"), None).await;
+        let (status, body, _) = http(
+            addr,
+            "GET",
+            path,
+            Some("test-only-secret-bearer-token-00000000"),
+            None,
+        )
+        .await;
         assert_eq!(status, 200, "{path} answers");
         assert!(body.is_object(), "{path} returns JSON");
     }

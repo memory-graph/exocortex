@@ -306,18 +306,14 @@ impl<S: Storage> IngestServer<S> {
             })
     }
 
-    fn verify_hmac(&self, b: &IngestBatch) -> Result<(), Status> {
+    fn producer_auth_key(&self, b: &IngestBatch) -> Result<[u8; 32], Status> {
         let Some(producer) = &b.producer else {
             return Err(Status::unauthenticated("no producer"));
         };
         if producer.hmac_signature.is_empty() {
             return Err(Status::unauthenticated("missing hmac"));
         }
-        let key = self.producer_key(&b.org_id, &b.source_uri, &b.producer_id)?;
-        if !exocortex_wire::signing::verify_signature(&key, b) {
-            return Err(Status::unauthenticated("hmac verification failed"));
-        }
-        Ok(())
+        self.producer_key(&b.org_id, &b.source_uri, &b.producer_id)
     }
 
     fn ontology_matches(&self, b: &IngestBatch) -> bool {
@@ -849,20 +845,32 @@ impl<S: Storage + 'static> IngestServer<S> {
         &self,
         batch: &IngestBatch,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, IngestAck> {
-        if let Err(error) = self.verify_hmac(batch) {
-            return Err(ack_reject_all(
-                batch,
-                RejectCode::Unauthorized,
-                error.message(),
-            ));
-        }
-        if batch.checksum != exocortex_wire::signing::canonical_checksum(batch) {
-            return Err(ack_reject_all(
-                batch,
-                RejectCode::BadChecksum,
-                "checksum mismatch",
-            ));
-        }
+        self.admit_batch_with(
+            batch,
+            |key, candidate| {
+                if exocortex_wire::signing::verify_signature(&key, candidate) {
+                    Ok(())
+                } else {
+                    Err(Status::unauthenticated("hmac verification failed"))
+                }
+            },
+            exocortex_wire::signing::canonical_checksum,
+        )
+    }
+
+    fn admit_batch_with<V, C>(
+        &self,
+        batch: &IngestBatch,
+        verify_hmac: V,
+        canonical_checksum: C,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, IngestAck>
+    where
+        V: FnOnce([u8; 32], &IngestBatch) -> Result<(), Status>,
+        C: FnOnce(&IngestBatch) -> String,
+    {
+        let producer_key = self
+            .producer_auth_key(batch)
+            .map_err(|error| ack_reject_all(batch, RejectCode::Unauthorized, error.message()))?;
         if let Err(detail) =
             exocortex_wire::limits::validate_batch_resources(&batch.memories, &batch.relationships)
         {
@@ -883,6 +891,20 @@ impl<S: Storage + 'static> IngestServer<S> {
                     "concurrent ingestion limit reached",
                 )
             })?;
+        if let Err(error) = verify_hmac(producer_key, batch) {
+            return Err(ack_reject_all(
+                batch,
+                RejectCode::Unauthorized,
+                error.message(),
+            ));
+        }
+        if batch.checksum != canonical_checksum(batch) {
+            return Err(ack_reject_all(
+                batch,
+                RejectCode::BadChecksum,
+                "checksum mismatch",
+            ));
+        }
         if !self.ontology_matches(batch) {
             return Err(ack_reject_all(
                 batch,
@@ -1589,3 +1611,7 @@ fn kernel_error_to_reject(e: &exocortex_kernel::KernelError) -> RejectCode {
         | KernelError::UnboundKernelConstant(_) => RejectCode::Unknown,
     }
 }
+
+#[cfg(test)]
+#[path = "service_admission_tests.rs"]
+mod admission_order_tests;

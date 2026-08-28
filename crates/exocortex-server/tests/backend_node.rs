@@ -19,7 +19,7 @@ fn args(bind: &str, gossip: u16, seeds: Vec<String>) -> BackendNodeArgs {
         cluster_secret: [7u8; 32],
         principals: Arc::new(
             exocortex_server::principal::PrincipalRegistry::single(
-                "test-bearer".into(),
+                "test-only-backend-bearer-token-00000000".into(),
                 exocortex_ops::operations::ops_vc("org", "test", exocortex_kernel::Visibility::Org),
             )
             .unwrap(),
@@ -167,6 +167,132 @@ async fn cache_bridge_reseeds_past_an_upsert_whose_row_was_already_deleted() {
     writer.abort();
 }
 
+#[tokio::test]
+async fn cache_bridge_stream_discontinuities_reseed_before_later_progress() {
+    use exocortex_storage::{Invalidation, StorageError};
+    use futures::stream;
+
+    for terminates_cleanly in [false, true] {
+        let onto = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = Arc::new(InMemoryStorage::new(onto));
+        let authoritative = acceptance_memory(if terminates_cleanly { 61 } else { 60 }, false);
+        storage.upsert_memory(&authoritative).await.unwrap();
+        let (cache, writer_rx) = exocortex_cache::LocalCache::new(64 * 1024 * 1024);
+        let cache = Arc::new(cache);
+        let writer = tokio::spawn({
+            let cache = cache.clone();
+            let storage = storage.clone();
+            async move { cache.run(storage, writer_rx).await }
+        });
+        cache.seed_local("org", &[], &[], 0);
+        let health = Arc::new(arc_swap::ArcSwap::from_pointee(
+            exocortex_server::http_bind::HealthSnapshot::default(),
+        ));
+        let later = Invalidation::MemoryDeleted {
+            id: authoritative.id,
+            lsn: 999,
+        };
+        let items = if terminates_cleanly {
+            Vec::new()
+        } else {
+            vec![
+                Err(StorageError::Backend("injected stream fault".into())),
+                Ok(later),
+            ]
+        };
+
+        exocortex_server::backend::consume_cache_subscription(
+            &cache,
+            &*storage,
+            "org",
+            &health,
+            stream::iter(items),
+            Duration::from_millis(1),
+            Duration::from_millis(4),
+        )
+        .await;
+
+        let visible =
+            exocortex_ops::operations::ops_vc("org", "test", exocortex_kernel::Visibility::Org);
+        assert!(
+            cache
+                .get_memory("org", &authoritative.id, &visible)
+                .is_some(),
+            "an authoritative reseed repairs a {} stream",
+            if terminates_cleanly {
+                "terminated"
+            } else {
+                "failed"
+            }
+        );
+        assert!(
+            health.load().backend_lsn < 999,
+            "the post-fault feed item must not progress before reseed/resubscribe"
+        );
+        assert_eq!(health.load().sync_lsn, health.load().backend_lsn);
+        writer.abort();
+    }
+}
+
+#[tokio::test]
+async fn cache_bridge_burst_has_one_acknowledged_atomic_publication() {
+    use exocortex_storage::Invalidation;
+
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto));
+    let first = acceptance_memory(62, false);
+    let second = acceptance_memory(63, false);
+    let (cache, writer_rx) = exocortex_cache::LocalCache::new(64 * 1024 * 1024);
+    let cache = Arc::new(cache);
+    let writer = tokio::spawn({
+        let cache = cache.clone();
+        let storage = storage.clone();
+        async move { cache.run(storage, writer_rx).await }
+    });
+    cache.seed_local("org", &[], &[], 0);
+    storage
+        .upsert_batch(&[first.clone(), second.clone()], &[])
+        .await
+        .unwrap();
+    let before = cache.snapshot_publications();
+    let health = Arc::new(arc_swap::ArcSwap::from_pointee(
+        exocortex_server::http_bind::HealthSnapshot::default(),
+    ));
+
+    exocortex_server::backend::apply_cache_invalidations_with_retry(
+        &cache,
+        &*storage,
+        "org",
+        &health,
+        vec![
+            Invalidation::MemoryUpserted {
+                id: first.id,
+                lsn: 70,
+            },
+            Invalidation::MemoryUpserted {
+                id: second.id,
+                lsn: 71,
+            },
+        ],
+        Duration::from_millis(1),
+        Duration::from_millis(4),
+    )
+    .await;
+
+    assert_eq!(cache.snapshot_publications(), before + 1);
+    assert_eq!(health.load().sync_lsn, 71);
+    let visible =
+        exocortex_ops::operations::ops_vc("org", "test", exocortex_kernel::Visibility::Org);
+    assert!(cache.get_memory("org", &first.id, &visible).is_some());
+    assert!(cache.get_memory("org", &second.id, &visible).is_some());
+    writer.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn backend_nodes_serve_http_grpc_and_gossip_converges() {
     let onto = Arc::new(
@@ -193,7 +319,12 @@ async fn backend_nodes_serve_http_grpc_and_gossip_converges() {
 
     // HTTP parity surface answers with auth on both nodes.
     for (addr, name) in [(node_a.local_addr, "a"), (node_b.local_addr, "b")] {
-        let (status, _) = http_get(addr, "/v1/audit?since_lsn=0", Some("test-bearer")).await;
+        let (status, _) = http_get(
+            addr,
+            "/v1/audit?since_lsn=0",
+            Some("test-only-backend-bearer-token-00000000"),
+        )
+        .await;
         assert_eq!(status, 200, "node {name} serves ops over HTTP");
         let (status, _) = http_get(addr, "/v1/audit?since_lsn=0", None).await;
         assert_eq!(status, 401, "node {name} enforces bearer auth");
@@ -230,7 +361,7 @@ async fn backend_nodes_serve_http_grpc_and_gossip_converges() {
             .await
             .unwrap();
         let req = format!(
-            "GET /v1/changes?token=test-bearer HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer test-bearer\r\nConnection: close\r\n\r\n",
+            "GET /v1/changes?token=test-only-backend-bearer-token-00000000 HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer test-only-backend-bearer-token-00000000\r\nConnection: close\r\n\r\n",
             node_a.local_addr
         );
         sock.write_all(req.as_bytes()).await.unwrap();
@@ -726,9 +857,12 @@ async fn shared_listener_uses_tls_and_refuses_plaintext() {
     assert_eq!(unauthenticated.code(), tonic::Code::Unauthenticated);
 
     let mut request = tonic::Request::new(FingerprintRequest {});
-    request
-        .metadata_mut()
-        .insert("authorization", "Bearer test-bearer".parse().unwrap());
+    request.metadata_mut().insert(
+        "authorization",
+        "Bearer test-only-backend-bearer-token-00000000"
+            .parse()
+            .unwrap(),
+    );
     let response = client
         .fingerprint(request)
         .await
