@@ -187,6 +187,8 @@ pub struct DreamsEngine<S: Storage> {
     #[cfg(feature = "testing")]
     cycle_pause_after: Option<(usize, Duration)>,
     #[cfg(feature = "testing")]
+    rollback_pause: Option<Duration>,
+    #[cfg(feature = "testing")]
     renewal_failure_after: Option<usize>,
 }
 
@@ -228,6 +230,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             #[cfg(feature = "testing")]
             cycle_pause_after: None,
             #[cfg(feature = "testing")]
+            rollback_pause: None,
+            #[cfg(feature = "testing")]
             renewal_failure_after: None,
         }
     }
@@ -255,6 +259,15 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     #[cfg(feature = "testing")]
     pub fn with_cycle_pause_after(mut self, mutation: usize, pause: Duration) -> Self {
         self.cycle_pause_after = Some((mutation, pause));
+        self
+    }
+
+    /// Pause inside rollback so tests can prove the lease remains renewed for
+    /// the complete compensation phase.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn with_rollback_pause(mut self, pause: Duration) -> Self {
+        self.rollback_pause = Some(pause);
         self
     }
 
@@ -359,23 +372,61 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         // its fence and strands a partial cycle.
         let mut renewal = self.spawn_lease_renewal(lease.clone());
         let mut journal = CycleJournal::default();
+        let mut renewal_stopped = false;
         let outcome = {
             let consolidation = self.consolidate_under_tracked(&lease, region, &mut journal);
             tokio::pin!(consolidation);
             tokio::select! {
                 biased;
-                renewal_outcome = &mut renewal => match renewal_outcome {
-                    Ok(Err(error)) => Err(error),
-                    Ok(Ok(())) => Err(anyhow::anyhow!("Dreams lease renewal stopped unexpectedly")),
-                    Err(error) => Err(anyhow::anyhow!("Dreams lease renewal task failed: {error}")),
-                },
+                renewal_outcome = &mut renewal => {
+                    renewal_stopped = true;
+                    Err(Self::renewal_task_error(renewal_outcome))
+                }
                 outcome = &mut consolidation => outcome,
             }
         };
-        renewal.abort();
-        let outcome = self.finish_cycle(outcome, &journal, &lease).await;
-        let _ = self.storage.release_lease(lease).await;
-        outcome
+        let outcome = if renewal_stopped {
+            self.finish_cycle(outcome, &journal, &lease).await
+        } else {
+            let finishing = self.finish_cycle(outcome, &journal, &lease);
+            tokio::pin!(finishing);
+            tokio::select! {
+                renewal_outcome = &mut renewal => {
+                    renewal_stopped = true;
+                    let renewal_error = Self::renewal_task_error(renewal_outcome);
+                    match finishing.await {
+                        Ok(_) => Err(renewal_error),
+                        Err(cycle_error) => Err(anyhow::anyhow!(
+                            "cycle failed ({cycle_error}); lease renewal also failed ({renewal_error})"
+                        )),
+                    }
+                }
+                outcome = &mut finishing => outcome,
+            }
+        };
+        if !renewal_stopped {
+            renewal.abort();
+            let _ = renewal.await;
+        }
+        let release = self.storage.release_lease(lease).await;
+        match (outcome, release) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(release)) => Err(anyhow::anyhow!("release Dreams lease: {release}")),
+            (Err(error), Err(release)) => Err(anyhow::anyhow!(
+                "cycle failed ({error}); lease release also failed ({release})"
+            )),
+        }
+    }
+
+    fn renewal_task_error(
+        outcome: Result<anyhow::Result<()>, tokio::task::JoinError>,
+    ) -> anyhow::Error {
+        match outcome {
+            Ok(Err(error)) => error,
+            Ok(Ok(())) => anyhow::anyhow!("Dreams lease renewal stopped unexpectedly"),
+            Err(error) => anyhow::anyhow!("Dreams lease renewal task failed: {error}"),
+        }
     }
 
     fn spawn_lease_renewal(
@@ -968,6 +1019,10 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         journal: &CycleJournal,
         lease: &exocortex_storage::OwnerLease,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "testing")]
+        if let Some(pause) = self.rollback_pause {
+            tokio::time::sleep(pause).await;
+        }
         self.storage
             .restore_fenced(&journal.restore(), lease)
             .await

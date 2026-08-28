@@ -300,7 +300,7 @@ async fn injected_mid_cycle_failure_restores_exact_mixed_preimage() {
     )
     .with_cycle_fault_after(1)
     .with_lease_ttl(std::time::Duration::from_millis(60))
-    .with_cycle_pause_after(1, std::time::Duration::from_millis(180));
+    .with_rollback_pause(std::time::Duration::from_millis(180));
     let region = RegionKey {
         org: "o".into(),
         project: "p".into(),
