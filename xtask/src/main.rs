@@ -898,8 +898,9 @@ fn storage_test_listing(target: &str) -> Result<String> {
         .map_err(|error| anyhow::anyhow!("storage-conformance: non-UTF-8 test listing: {error}"))
 }
 
-/// §2.1: the storage suite against the double, plus the live Falkor
-/// integration suite when FALKOR_URL is present.
+/// V1 storage-target umbrella: the in-memory crate suite, plus the distinct
+/// live Falkor integration targets when FALKOR_URL is present. This is not the
+/// post-v1 PX3 shared corpus against every `Storage` implementation.
 fn storage_conformance() -> Result<()> {
     gates::validate_storage_targets(std::path::Path::new("."))?;
     for (target, canary) in gates::STORAGE_LIVE_CANARIES {
@@ -931,7 +932,9 @@ fn storage_conformance() -> Result<()> {
             "storage-conformance: live Falkor suite UNEXECUTED — FALKOR_URL is unset or empty"
         );
     }
-    println!("storage-conformance: available suites complete");
+    println!(
+        "storage-conformance: available target suites complete (PX3 shared corpus is post-v1)"
+    );
     Ok(())
 }
 

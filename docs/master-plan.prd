@@ -12,9 +12,9 @@ none start while Round 6 is open**; they are recorded here so the plan
 reflects accepted scope rather than living only in a PRD. PX1 closes the
 long-standing v2 deferral D2 ("second-pack demo"). PX3 is the one item
 with a bearing on current work: it found that the existing
-`storage-conformance` gate does not do what its name implies (see PX3's
-note), which is a live weakness in the gate set Round 6 is being verified
-against.
+`storage-conformance` command is an umbrella over distinct in-memory and live
+Falkor targets, not PX3's future shared corpus. Round 6 now labels that scope
+truthfully and deviation 20 records the retained post-v1 contract boundary.
 
 **Status:** BR-PRD shipped. **[2026-08-27]** Memory backup/restore
 landed as `exocortex-client 0.2.2`: `--export`/`--import` one-shot
@@ -516,7 +516,7 @@ idea:
 | R6-R244 | Strict review: prevent a crash after successful Dreams mutation but before Redis acknowledgement from replaying a non-idempotent cycle | Codex | In progress — couple the durable fire identity to graph-side cycle settlement and add the exact success-before-ack restart regression through production startup recovery |
 | R6-R245 | Strict review: make release live validation discover the extracted archive runtime instead of exiting on installed-layout prerequisites | Codex | Done — the harness recognizes archive and installed layouts without exporting archive paths, the exact release environment fixture proves wrapper-owned sibling discovery, and publishing/milestone evidence now distinguishes archive-native CI from installer-layout coverage (this commit) |
 | R6-R246 | Strict review advisories: close executable-evidence raw-string/filter collisions and dead-enforcement method-call collisions | Codex | Done — acceptance evidence strips arbitrary-hash raw/byte strings and requires exact package/target/filter selection; dead-enforcement rejects same-named method calls, and all three exact false-pass fixtures plus both live gates and focused lint pass (this commit) |
-| R6-R247 | Strict review advisory: disposition the accepted storage-conformance naming/coverage discrepancy without overstating the v1 gate | Codex | In progress — retain the required command while documenting its two explicit backend targets and the post-v1 shared-corpus/seam-inventory deferral |
+| R6-R247 | Strict review advisory: disposition the accepted storage-conformance naming/coverage discrepancy without overstating the v1 gate | Codex | Done with recorded contract deviation — the required command now describes itself as an umbrella over distinct in-memory and live-Falkor target suites; AGENTS and runtime output no longer claim one shared corpus, while PX3 remains the accepted post-v1 all-implementation corpus/seam-inventory work and milestone deviation 20 records the §2.1 boundary (this commit) |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence

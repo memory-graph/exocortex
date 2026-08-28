@@ -465,6 +465,16 @@ proto-sync-guarded copy).
   cardinality contract. The implementation reports `reason="capacity"` and
   keeps region identity in protected operational state, so dashboards must
   aggregate overflow rather than group it by raw region.
+- **The v1 `storage-conformance` command is a target-suite umbrella, not the
+  bug-PRD §2.1 shared corpus.** It always runs the in-memory storage crate suite
+  and, when `FALKOR_URL` is present, separately executes the live Falkor
+  `integration` and `fencing_live` targets with non-empty canaries. That closes
+  Round 6's order-dependent assertion, configured-out live-target, and loud
+  UNEXECUTED defects, but it does not run one identical corpus against Falkor,
+  InMemory, and client `NoBackendStorage`. The accepted PX3 post-v1 work owns
+  that larger three-implementation corpus and seam-inventory bijection. The
+  command name remains for CI/operator compatibility; its AGENTS description
+  and runtime summary state the narrower v1 contract explicitly.
 
 ### Round 6 infrastructure-only validation
 
