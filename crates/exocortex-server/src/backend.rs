@@ -102,6 +102,20 @@ fn dreams_lease_key(org: &str) -> LeaseKey {
     }
 }
 
+fn mark_dreams_follower(
+    elected: &std::sync::atomic::AtomicBool,
+    health: &arc_swap::ArcSwap<HealthSnapshot>,
+) {
+    elected.store(false, std::sync::atomic::Ordering::SeqCst);
+    health.rcu(|snapshot| {
+        let mut next = (**snapshot).clone();
+        next.leader_node_id = None;
+        next.lease_epoch = 0;
+        next.last_lease_tick = Some(chrono::Utc::now());
+        Arc::new(next)
+    });
+}
+
 /// A running backend node's handles (tests abort these).
 pub struct BackendNode<S: Storage> {
     /// The shared health snapshot (R-O5/R-O6).
@@ -131,8 +145,7 @@ pub struct BackendNode<S: Storage> {
 impl<S: Storage> BackendNode<S> {
     /// Simulate leader process loss while leaving peer runtimes alive.
     pub fn stop_leader_election(&mut self) {
-        self.leader_gate
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        mark_dreams_follower(&self.leader_gate, &self.health);
         if let Some(task) = self.leader_election.take() {
             task.abort();
         }
@@ -796,7 +809,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
                                 }
                                 Err(e) => {
                                     tracing::warn!(%e, "dreams lease lost; re-electing");
-                                    elected.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    mark_dreams_follower(&elected, &health);
                                     break;
                                 }
                             }
@@ -805,12 +818,7 @@ pub async fn run_backend_node<S: Storage + 'static>(
                     Err(_) => {
                         // Another node holds it; this node is a follower —
                         // no Dreams work (CS4).
-                        elected.store(false, std::sync::atomic::Ordering::SeqCst);
-                        health.rcu(|h| {
-                            let mut next = (**h).clone();
-                            next.last_lease_tick = Some(chrono::Utc::now());
-                            Arc::new(next)
-                        });
+                        mark_dreams_follower(&elected, &health);
                         tokio::time::sleep(LEASE_RENEW).await;
                     }
                 }

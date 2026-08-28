@@ -619,6 +619,8 @@ async fn three_node_p95_handoff_no_duplicate_and_stale_fence() {
         .unwrap();
     let old_epoch = nodes[old_owner].health.load().lease_epoch;
     nodes[old_owner].stop_leader_election();
+    assert_eq!(nodes[old_owner].health.load().leader_node_id, None);
+    assert_eq!(nodes[old_owner].health.load().lease_epoch, 0);
     let new_owner = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let owners: Vec<_> = nodes

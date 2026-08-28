@@ -723,6 +723,25 @@ retained in failures. Ten focused repetitions pass, followed by the exact
 mandatory workspace feature matrix with no serialization or weakened
 assertion (this commit).
 
+### Coupled production Dreams failover closure (R6-R197/R205/R206)
+
+The current-image Docker harness now pauses the elected production node only
+after its real journaled Dreams mutation commits, kills that exact container,
+and requires the successor to restore and complete the durable queued fire.
+The authoritative run paused node3 at epoch 3 with LSN interval `[8,9)`, killed
+node3, and observed node1 take over in 1,680 ms. Falkor then reported zero
+memory or relationship assertions in the killed owner's interval, zero active
+old-epoch journals, and exactly one successor-owned duplicate close; the Redis
+ready and processing queues were both empty.
+
+The live investigation also closed both defects it promoted. Production
+Falkor lease identity now uses the configured backend node id, Falkor-backed
+nodes enable their shared Redis Dreams transport by default, and every
+lease-loss path clears the leader identity and epoch together with the leader
+gate. Focused server, storage integration compile, xtask negative-gate, and
+three-node stale-health regressions pass. R6-R182 remains open until the full
+mandatory matrix and a subsequent fresh strict whole-project review are clean.
+
 ### Historical pre-R176 closure evidence (superseded)
 
 At the earlier closure point, the complete mandatory gate matrix passed:

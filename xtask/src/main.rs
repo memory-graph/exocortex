@@ -654,6 +654,13 @@ fn validate_chaos_compose(compose: &str) -> Result<()> {
         "every chaos node must wait for and mount the owner-only staged policy volume"
     );
     anyhow::ensure!(
+        compose
+            .matches("EXOCORTEX_CHAOS_DREAMS_BARRIER_KEY: \"exocortex:chaos:dreams-r6\"")
+            .count()
+            == 3,
+        "every chaos node must enable the same one-shot production Dreams barrier"
+    );
+    anyhow::ensure!(
         !compose.contains("source-policy.empty.json:/etc/exocortex")
             && !compose.contains("principal-policy.dev.json:/etc/exocortex"),
         "chaos nodes must not bind-mount repository credential policies with host-controlled modes"
@@ -662,7 +669,6 @@ fn validate_chaos_compose(compose: &str) -> Result<()> {
 }
 
 fn validate_chaos_script(script: &str) -> Result<()> {
-    let probe = "--test fencing_live inflight_stale_dreams_write_is_fenced_after_takeover_live";
     anyhow::ensure!(
         script.contains("PRINCIPAL_POLICY=crates/exocortex-cluster/tests/principal-policy.dev.json")
             && script.contains("AUTH_TOKEN=$(jq -er")
@@ -670,20 +676,36 @@ fn validate_chaos_script(script: &str) -> Result<()> {
             && script.matches("cluster_health \"$port\"").count() == 2,
         "chaos leader polling must authenticate both protected health loops from the dev principal policy"
     );
-    let probe_position = script.find(probe).ok_or_else(|| {
-        anyhow::anyhow!("chaos harness must run the live in-flight Dreams fence probe")
-    })?;
+    let seed_position = script
+        .find("seed_actual_production_dreams_barrier_fixture")
+        .ok_or_else(|| anyhow::anyhow!("chaos harness must seed an actual production cycle"))?;
+    let barrier_position = script
+        .find("GET \"$BARRIER_KEY:reached\"")
+        .ok_or_else(|| anyhow::anyhow!("chaos harness must observe the production-node barrier"))?;
+    let kill_position = script
+        .find("kill \"$leader\"")
+        .ok_or_else(|| anyhow::anyhow!("chaos harness must kill the barrier owner"))?;
+    let assertion_position = script
+        .find("assert_actual_production_dreams_barrier_fixture")
+        .ok_or_else(|| {
+            anyhow::anyhow!("chaos harness must inspect authoritative successor state")
+        })?;
     let pass_position = script
-        .find("PASS: authenticated takeover and no-zombie Dreams write fencing")
+        .find("PASS: killed production Dreams owner left no old-LSN residue")
         .ok_or_else(|| {
             anyhow::anyhow!("chaos harness must report combined takeover/fencing success")
         })?;
     anyhow::ensure!(
-        script.contains("CHAOS_OLD_OWNER=\"$leader\" CHAOS_NEW_OWNER=\"$new_leader\"")
+        script.contains("CHAOS_OLD_LSN_START=\"$old_lsn_start\"")
+            && script.contains("CHAOS_OLD_LSN_END=\"$old_lsn_end\"")
+            && script.contains("CHAOS_OLD_EPOCH=\"$old_epoch\"")
             && script.contains("FALKOR_URL=falkor://127.0.0.1:16379")
             && script.contains("--features integration")
-            && probe_position < pass_position,
-        "chaos success must follow a live stale Dreams mutation and authoritative no-residue probe"
+            && seed_position < barrier_position
+            && barrier_position < kill_position
+            && kill_position < assertion_position
+            && assertion_position < pass_position,
+        "chaos success must follow a killed production-node mutation barrier, takeover, and authoritative no-residue proof"
     );
     Ok(())
 }
@@ -2023,16 +2045,21 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
     }
 
     #[test]
-    fn chaos_script_requires_live_inflight_fence_probe_before_success() {
+    fn chaos_script_requires_production_barrier_and_authoritative_successor_proof() {
         let script = include_str!("../../scripts/chaos-leader-kill.sh");
         assert!(validate_chaos_script(script).is_ok());
         assert!(validate_chaos_script(&script.replace(
-            "inflight_stale_dreams_write_is_fenced_after_takeover_live",
-            "stale_lease_write_is_fenced_live"
+            "seed_actual_production_dreams_barrier_fixture",
+            "roundtrip_memory"
+        ))
+        .is_err());
+        assert!(validate_chaos_script(&script.replace(
+            "assert_actual_production_dreams_barrier_fixture",
+            "roundtrip_memory"
         ))
         .is_err());
         let reordered = script.replace(
-            "echo \"PASS: authenticated takeover and no-zombie Dreams write fencing\"",
+            "echo \"PASS: killed production Dreams owner left no old-LSN residue; successor completed recovery\"",
             "true",
         );
         assert!(validate_chaos_script(&reordered).is_err());

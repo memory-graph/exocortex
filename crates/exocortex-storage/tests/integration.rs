@@ -10,8 +10,8 @@
 
 use chrono::{Duration, Utc};
 use exocortex_kernel::{
-    EntityId, Memory, MemoryContext, MemoryId, Provenance, Relationship, RelationshipId,
-    Visibility, LSN,
+    Embedding, EmbeddingModel, EntityId, Memory, MemoryContext, MemoryId, Provenance, Relationship,
+    RelationshipId, Visibility, LSN,
 };
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{
@@ -223,6 +223,206 @@ macro_rules! itest {
             $body
         }
     };
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn seed_actual_production_dreams_barrier_fixture() {
+    if std::env::var("CHAOS_DREAMS_SEED").as_deref() != Ok("1") {
+        eprintln!("SKIP: CHAOS_DREAMS_SEED=1 is required for the deployment-only fixture");
+        return;
+    }
+    let url = falkor_url().expect("FALKOR_URL set by the chaos harness");
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1));
+    let storage = FalkorStorage::connect(
+        FalkorConfig {
+            falkor_url: url,
+            redis_url: redis_url.clone(),
+            graph_name: "exocortex-org".into(),
+            org_id: "org".into(),
+            node_id: "chaos-seeder".into(),
+        },
+        ontology(),
+    )
+    .await
+    .expect("connect to the production-node graph");
+    let mut first = mem("chaos-duplicate-a", 3, Visibility::Org);
+    first.id = MemoryId([0xd1; 16]);
+    first.context.tenant_id = Some("org".into());
+    first.context.project_id = Some("chaos-r6".into());
+    first.embedding = Some(Embedding {
+        model: EmbeddingModel {
+            name: "chaos-model".into(),
+            version: "v1".into(),
+        },
+        vector: vec![1.0, 0.0, 0.0],
+    });
+    let mut second = first.clone();
+    second.id = MemoryId([0xd2; 16]);
+    second.title = "chaos-duplicate-b".into();
+    storage
+        .upsert_batch(&[first, second], &[])
+        .await
+        .expect("seed two mergeable production Dreams anchors");
+
+    let client = redis::Client::open(redis_url).unwrap();
+    let mut redis = client.get_multiplexed_async_connection().await.unwrap();
+    let barrier = "exocortex:chaos:dreams-r6";
+    redis::cmd("DEL")
+        .arg(format!("{barrier}:claimed"))
+        .arg(format!("{barrier}:reached"))
+        .arg(format!("{barrier}:successor"))
+        .arg(format!("{barrier}:release"))
+        .query_async::<()>(&mut redis)
+        .await
+        .unwrap();
+    let region = RegionKey {
+        org: "org".into(),
+        project: "chaos-r6".into(),
+        memory_type: 3,
+    };
+    let queue = format!(
+        "exocortex:dreams:queue:org:{}",
+        serde_json::to_string("org").unwrap()
+    );
+    let counters = format!(
+        "exocortex:dreams:counters:{}",
+        serde_json::to_string(&region).unwrap()
+    );
+    redis::cmd("DEL")
+        .arg(&queue)
+        .arg(format!("{queue}:processing"))
+        .arg(format!("{queue}:deferred"))
+        .arg(&counters)
+        .query_async::<()>(&mut redis)
+        .await
+        .unwrap();
+    let fire_id = "round-6-production-barrier";
+    redis::cmd("HSET")
+        .arg(&counters)
+        .arg("memories")
+        .arg(1)
+        .arg("edges")
+        .arg(0)
+        .arg("last_success")
+        .arg(0)
+        .arg("pending")
+        .arg(fire_id)
+        .query_async::<u64>(&mut redis)
+        .await
+        .expect("seed production Dreams counters and pending token");
+    let fire = serde_json::json!({
+        "region": region,
+        "fired_by": "round-6-chaos",
+        "fired_at": {
+            "memories_since_last_cycle": 1,
+            "edges_since_last_cycle": 0,
+            "seconds_since_last_cycle": 0
+        },
+        "fire_id": fire_id,
+        "quiet_deferred": false,
+    });
+    redis::cmd("RPUSH")
+        .arg(queue)
+        .arg(fire.to_string())
+        .query_async::<i64>(&mut redis)
+        .await
+        .expect("enqueue production Dreams fire");
+    eprintln!(
+        "CHAOS_FIXTURE_READY ids={} {}",
+        "d1".repeat(16),
+        "d2".repeat(16)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn assert_actual_production_dreams_barrier_fixture() {
+    if std::env::var("CHAOS_DREAMS_ASSERT").as_deref() != Ok("1") {
+        eprintln!("SKIP: CHAOS_DREAMS_ASSERT=1 is required for the deployment-only assertion");
+        return;
+    }
+    let url = falkor_url().expect("FALKOR_URL set by the chaos harness");
+    let storage = FalkorStorage::connect(
+        FalkorConfig {
+            falkor_url: url.clone(),
+            redis_url: std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+            graph_name: "exocortex-org".into(),
+            org_id: "org".into(),
+            node_id: "chaos-assertion".into(),
+        },
+        ontology(),
+    )
+    .await
+    .expect("connect to the production-node graph");
+    let lsn_start = std::env::var("CHAOS_OLD_LSN_START")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let lsn_end = std::env::var("CHAOS_OLD_LSN_END")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let old_epoch = std::env::var("CHAOS_OLD_EPOCH")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1));
+    let client = redis::Client::open(redis_url).unwrap();
+    let mut redis = client.get_multiplexed_async_connection().await.unwrap();
+    let barrier = "exocortex:chaos:dreams-r6";
+    let reached: String = redis::cmd("GET")
+        .arg(format!("{barrier}:reached"))
+        .query_async(&mut redis)
+        .await
+        .expect("read killed-owner barrier evidence");
+    let successor: String = redis::cmd("GET")
+        .arg(format!("{barrier}:successor"))
+        .query_async(&mut redis)
+        .await
+        .expect("read successor mutation evidence");
+    let reached: serde_json::Value = serde_json::from_str(&reached).unwrap();
+    let successor: serde_json::Value = serde_json::from_str(&successor).unwrap();
+    assert_ne!(successor["node_id"], reached["node_id"]);
+    assert!(successor["lease_epoch"].as_u64().unwrap() > old_epoch);
+    assert!(successor["lsn_start"].as_u64().unwrap() >= lsn_end);
+    let queue = format!(
+        "exocortex:dreams:queue:org:{}",
+        serde_json::to_string("org").unwrap()
+    );
+    let (ready, processing): (u64, u64) = redis::pipe()
+        .cmd("LLEN")
+        .arg(&queue)
+        .cmd("LLEN")
+        .arg(format!("{queue}:processing"))
+        .query_async(&mut redis)
+        .await
+        .expect("read durable Dreams queue completion state");
+    assert_eq!(
+        (ready, processing),
+        (0, 0),
+        "the successor must acknowledge the recovered fire only after a successful cycle"
+    );
+    let evidence = storage
+        .query_cypher(&CypherQuery {
+            template_id: "integration_production_dreams_barrier_evidence",
+            params: serde_json::json!({
+                "lsn_start": lsn_start,
+                "lsn_end": lsn_end,
+                "old_epoch": old_epoch,
+                "fixture_ids": ["d1".repeat(16), "d2".repeat(16)],
+            }),
+            read_only: true,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .expect("read authoritative old-LSN and successor state");
+    assert_eq!(
+        evidence.rows,
+        vec![serde_json::json!([0, 0, 0, 1])],
+        "the killed node's reserved LSNs must leave no assertion/journal residue, and the successor must complete the recovered duplicate merge"
+    );
 }
 
 itest!(roundtrip_memory, {

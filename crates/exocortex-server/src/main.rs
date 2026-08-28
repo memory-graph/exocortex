@@ -378,7 +378,12 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
             .graph_name
             .clone()
             .unwrap_or_else(|| format!("exocortex-{}", args.org));
-        if let Some(redis_url) = args.redis_url.as_deref() {
+        let resolved_storage = resolve_falkor_urls(
+            &args.storage,
+            args.allow_private_network_plaintext_data_plane,
+        )?;
+        let redis_url = backend_redis_url(args.redis_url.as_deref(), resolved_storage.as_ref());
+        if let Some(redis_url) = redis_url.as_deref() {
             validate_redis_url(
                 redis_url,
                 args.allow_private_network_plaintext_data_plane,
@@ -388,7 +393,7 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
             org: args.org.clone(),
             bind: args.bind.clone(),
             transport,
-            node_id,
+            node_id: node_id.clone(),
             cluster_secret,
             principals,
             gossip_listen: SocketAddr::from_str(&args.gossip_addr)
@@ -397,16 +402,13 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
                 .cluster_endpoints
                 .map(|eps| eps.split(',').map(str::to_string).collect())
                 .unwrap_or_default(),
-            redis_url: args.redis_url.clone(),
+            redis_url,
             quiet_hours: args
                 .quiet_hours
                 .with_utc_offset_minutes(args.quiet_hours_utc_offset_minutes)?,
             admin_source_policies,
         };
-        if let Some((falkor_url, redis_url)) = resolve_falkor_urls(
-            &args.storage,
-            args.allow_private_network_plaintext_data_plane,
-        )? {
+        if let Some((falkor_url, redis_url)) = resolved_storage {
             let storage = std::sync::Arc::new(
                 exocortex_storage::FalkorStorage::connect(
                     exocortex_storage::FalkorConfig {
@@ -414,7 +416,7 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
                         redis_url,
                         graph_name,
                         org_id: args.org.clone().into(),
-                        node_id: format!("node-{}", std::process::id()).into(),
+                        node_id: node_id.into(),
                     },
                     ontology.clone(),
                 )
@@ -511,6 +513,15 @@ fn resolve_falkor_urls(
         "remote plaintext Falkor requires --allow-private-network-plaintext-data-plane; prefer falkors://"
     );
     Ok(Some((storage.to_owned(), format!("redis://{endpoint}"))))
+}
+
+fn backend_redis_url(
+    explicit: Option<&str>,
+    storage_urls: Option<&(String, String)>,
+) -> Option<String> {
+    explicit
+        .map(str::to_owned)
+        .or_else(|| storage_urls.map(|(_, redis_url)| redis_url.clone()))
 }
 
 fn validate_redis_url(url: &str, allow_private_plaintext: bool) -> anyhow::Result<()> {
@@ -683,8 +694,8 @@ fn data_home() -> anyhow::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_source_policy_org, load_source_policy, resolve_cluster_secret, resolve_falkor_urls,
-        resolve_transport, validate_redis_url, Args,
+        backend_redis_url, ensure_source_policy_org, load_source_policy, resolve_cluster_secret,
+        resolve_falkor_urls, resolve_transport, validate_redis_url, Args,
     };
     use clap::Parser;
 
@@ -815,5 +826,21 @@ mod tests {
         assert!(validate_redis_url("rediss://queue.example:6379", false).is_ok());
         assert!(validate_redis_url("redis://queue.example:6379", false).is_err());
         assert!(validate_redis_url("redis://queue.example:6379", true).is_ok());
+    }
+
+    #[test]
+    fn falkor_backend_enables_its_shared_dreams_transport_by_default() {
+        let storage_urls = resolve_falkor_urls("falkors://db.example:6379", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            backend_redis_url(None, Some(&storage_urls)).as_deref(),
+            Some("rediss://db.example:6379")
+        );
+        assert_eq!(
+            backend_redis_url(Some("rediss://queue.example:6380"), Some(&storage_urls)).as_deref(),
+            Some("rediss://queue.example:6380")
+        );
+        assert_eq!(backend_redis_url(None, None), None);
     }
 }

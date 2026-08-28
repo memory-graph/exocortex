@@ -1326,6 +1326,104 @@ impl FalkorStorage {
         Ok(block)
     }
 
+    /// Opt-in deployment-chaos barrier. The production binary crosses this
+    /// point only for a real journaled Dreams mutation after its atomic Falkor
+    /// query commits and before the engine can complete the cycle. `SET NX`
+    /// makes the barrier one-shot across replicas so a successor must recover
+    /// both the active journal and the durable fire.
+    async fn chaos_pause_journaled_write_after_commit(
+        &self,
+        block: &std::ops::Range<u64>,
+        cycle_id: &str,
+        lease: &OwnerLease,
+    ) -> Result<(), StorageError> {
+        let Ok(key) = std::env::var("EXOCORTEX_CHAOS_DREAMS_BARRIER_KEY") else {
+            return Ok(());
+        };
+        if !key.starts_with("exocortex:chaos:") || key.len() > 200 {
+            return Err(StorageError::Backend(
+                "EXOCORTEX_CHAOS_DREAMS_BARRIER_KEY must use the exocortex:chaos: namespace".into(),
+            ));
+        }
+        let claimed_key = format!("{key}:claimed");
+        let mut redis = self.redis.clone();
+        let claimed: bool = redis
+            .set_nx(&claimed_key, format!("{}:{}", self.node_id, lease.epoch))
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        if !claimed {
+            return Ok(());
+        }
+        let reached = serde_json::json!({
+            "node_id": self.node_id,
+            "lease_epoch": lease.epoch,
+            "cycle_id": cycle_id,
+            "lsn_start": block.start,
+            "lsn_end_exclusive": block.end,
+        });
+        redis
+            .set::<_, _, ()>(format!("{key}:reached"), reached.to_string())
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        tracing::warn!(
+            node = %self.node_id,
+            epoch = lease.epoch,
+            "production Dreams mutation reached configured chaos barrier"
+        );
+        loop {
+            let released: Option<String> = redis
+                .get(format!("{key}:release"))
+                .await
+                .map_err(|error| StorageError::Backend(error.to_string()))?;
+            if released.as_deref() == Some("1") {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn chaos_record_successor_restore(
+        &self,
+        block: &std::ops::Range<u64>,
+        lease: &OwnerLease,
+    ) -> Result<(), StorageError> {
+        let Ok(key) = std::env::var("EXOCORTEX_CHAOS_DREAMS_BARRIER_KEY") else {
+            return Ok(());
+        };
+        if !key.starts_with("exocortex:chaos:") || key.len() > 200 {
+            return Err(StorageError::Backend(
+                "EXOCORTEX_CHAOS_DREAMS_BARRIER_KEY must use the exocortex:chaos: namespace".into(),
+            ));
+        }
+        let mut redis = self.redis.clone();
+        let reached: Option<String> = redis
+            .get(format!("{key}:reached"))
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        let Some(reached) = reached else {
+            return Ok(());
+        };
+        let reached: serde_json::Value = serde_json::from_str(&reached)
+            .map_err(|error| StorageError::Backend(error.to_string()))?;
+        if reached["node_id"].as_str() == Some(self.node_id.as_str())
+            || reached["lease_epoch"]
+                .as_u64()
+                .is_some_and(|epoch| lease.epoch <= epoch)
+        {
+            return Ok(());
+        }
+        let successor = serde_json::json!({
+            "node_id": self.node_id,
+            "lease_epoch": lease.epoch,
+            "lsn_start": block.start,
+            "lsn_end_exclusive": block.end,
+        });
+        redis
+            .set::<_, _, ()>(format!("{key}:successor"), successor.to_string())
+            .await
+            .map_err(|error| StorageError::Backend(error.to_string()))
+    }
+
     /// Every row, inverse companion, endpoint guard, and optional lease
     /// guard is one compound GRAPH.QUERY. FalkorDB makes a modifying query
     /// atomic; Redis MULTI/EXEC does not roll back an earlier command when a
@@ -1541,6 +1639,11 @@ impl FalkorStorage {
                     "atomic batch rejected: relationship endpoint missing".into(),
                 )),
             };
+        }
+
+        if let (Some((_, cycle_id)), Some(lease)) = (journal, lease) {
+            self.chaos_pause_journaled_write_after_commit(&block, cycle_id, lease)
+                .await?;
         }
 
         if let Some(operation_key) = import_key {
@@ -3492,6 +3595,7 @@ impl Storage for FalkorStorage {
                 lease_epoch: lease.epoch,
             });
         }
+        self.chaos_record_successor_restore(&block, lease).await?;
         self.publish_batch(&invalidations).await;
         Ok(records)
     }

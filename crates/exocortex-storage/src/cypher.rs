@@ -1846,6 +1846,29 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         "#,
     });
 
+    reg!(Template {
+        id: "integration_production_dreams_barrier_evidence",
+        read_only: true,
+        required_params: &["lsn_start", "lsn_end", "old_epoch", "fixture_ids"],
+        cypher: r#"
+            OPTIONAL MATCH (old_memory:_MemoryAssertion)
+            WHERE old_memory.lsn >= $lsn_start AND old_memory.lsn < $lsn_end
+            WITH count(old_memory) AS old_memories
+            OPTIONAL MATCH (old_relationship:_RelationshipAssertion)
+            WHERE old_relationship.lsn >= $lsn_start AND old_relationship.lsn < $lsn_end
+            WITH old_memories, count(old_relationship) AS old_relationships
+            OPTIONAL MATCH (old_journal:_CycleJournal {state: 'Active'})
+            WHERE old_journal.lease_epoch = $old_epoch
+            WITH old_memories, old_relationships, count(old_journal) AS old_journals
+            OPTIONAL MATCH (closed:Memory)
+            WHERE closed.id IN $fixture_ids
+              AND closed.valid_until IS NOT NULL
+              AND closed.lsn >= $lsn_end
+            RETURN old_memories, old_relationships, old_journals,
+                   count(closed) AS successor_closed_memories
+        "#,
+    });
+
     #[cfg(feature = "integration")]
     reg!(Template {
         id: "integration_idempotent_publication_payload_count",
