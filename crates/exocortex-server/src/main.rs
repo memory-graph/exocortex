@@ -434,10 +434,29 @@ type SourcePolicyEntry = (
 );
 
 fn load_source_policy(path: Option<&std::path::Path>) -> anyhow::Result<Vec<SourcePolicyEntry>> {
+    use std::io::Read as _;
+
     let path = path.ok_or_else(|| {
         anyhow::anyhow!("--source-policy is required for backend-node (use [] for no producers)")
     })?;
-    let raw = std::fs::read_to_string(path)
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("open --source-policy {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = file
+            .metadata()
+            .map_err(|e| anyhow::anyhow!("inspect --source-policy {}: {e}", path.display()))?
+            .permissions()
+            .mode();
+        anyhow::ensure!(
+            mode & 0o077 == 0,
+            "source policy {} must be owner-only (mode 0600 or stricter)",
+            path.display()
+        );
+    }
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
         .map_err(|e| anyhow::anyhow!("read --source-policy {}: {e}", path.display()))?;
     let rows: Vec<SourcePolicyRow> = serde_json::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("parse --source-policy {}: {e}", path.display()))?;
@@ -555,6 +574,14 @@ mod tests {
             r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":3,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let error = load_source_policy(Some(&path)).unwrap_err().to_string();
+            assert!(error.contains("owner-only"), "{error}");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let rows = load_source_policy(Some(&path)).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.signing_key, [0x42; 32]);

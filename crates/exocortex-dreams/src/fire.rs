@@ -394,7 +394,7 @@ impl RedisFireQueue {
         } else {
             metrics::counter!(
                 "exocortex_dreams_queue_dropped_total",
-                "region" => format!("{}:{}:{}", region.org, region.project, region.memory_type)
+                "reason" => "capacity"
             )
             .increment(1);
             Ok(FireOutcome::Dropped)
@@ -467,7 +467,7 @@ impl RedisFireQueue {
             2 => {
                 metrics::counter!(
                     "exocortex_dreams_queue_dropped_total",
-                    "region" => format!("{}:{}:{}", region.org, region.project, region.memory_type)
+                    "reason" => "capacity"
                 )
                 .increment(1);
                 RecordWriteOutcome::Dropped(snapshot)
@@ -546,12 +546,7 @@ impl RedisFireQueue {
             3 => {
                 metrics::counter!(
                     "exocortex_dreams_queue_dropped_total",
-                    "region" => format!(
-                        "{}:{}:{}",
-                        notification.region.org,
-                        notification.region.project,
-                        notification.region.memory_type
-                    )
+                    "reason" => "capacity"
                 )
                 .increment(1);
                 AcknowledgeOutcome::Dropped(counters)
