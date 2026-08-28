@@ -404,3 +404,8 @@ The full workspace run then exposed hash-order dependence in the backup
 fixture's ontology selection: it could choose a self-inverse or bidirectional
 kind while asserting that storage materialized two rows. R6-R116 constrains
 the fixture to a non-computed kind with a distinct inverse companion.
+
+The mandatory dead-enforcement gate then correctly rejected its stale
+singular Dreams witness after ingestion moved to exact batched deltas.
+R6-R117 binds the gate to the production `on_writes` entrypoint instead of a
+now-unused compatibility wrapper.

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 pub(crate) const DEAD_CONTROLS: &[(&str, &str)] = &[
     ("admit_and_publish", "crates/exocortex-cluster/src/node.rs"),
     ("check_deadline", "crates/exocortex-ops/src/operations.rs"),
-    ("on_write", "crates/exocortex-ingest/src/service.rs"),
+    ("on_writes", "crates/exocortex-ingest/src/service.rs"),
     (
         "new_with_admin_policies",
         "crates/exocortex-server/src/backend.rs",
