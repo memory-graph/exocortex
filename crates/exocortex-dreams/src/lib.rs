@@ -248,6 +248,9 @@ pub struct DreamsEngine<S: Storage> {
     /// Optional shared Redis transport used by every node to record committed
     /// writes and by the elected owner to acknowledge completed cycles.
     distributed_fire: Option<Arc<tokio::sync::Mutex<fire::RedisFireQueue>>>,
+    /// Last durably delivered local write event per region. Production uses
+    /// Redis for the same immediate-retry idempotency contract.
+    last_local_write_event: DashMap<RegionKey, SmolStr>,
     /// Distributed notification metadata retained until owner completion.
     distributed_notifications: DashMap<RegionKey, fire::FireMessage>,
     /// IN4 (audit): per-region last-cycle timestamp — the source
@@ -315,6 +318,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             counters: DashMap::new(),
             pending_regions: DashMap::new(),
             distributed_fire: None,
+            last_local_write_event: DashMap::new(),
             distributed_notifications: DashMap::new(),
             last_cycle_at: DashMap::new(),
             dreams_trigger,
@@ -481,6 +485,47 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         Ok(())
     }
 
+    /// Deliver one stable post-ingest effect. The durable outbox drains in
+    /// order, so retaining the last event per region is sufficient to make an
+    /// ambiguous response retry idempotent without an unbounded processed set.
+    pub async fn on_writes_once(
+        &self,
+        event_id: &str,
+        region: RegionKey,
+        memories: u32,
+        edges: u32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !event_id.is_empty(),
+            "Dreams write event id must not be empty"
+        );
+        if let Some(queue) = &self.distributed_fire {
+            queue
+                .lock()
+                .await
+                .record_write_once(
+                    &region,
+                    memories,
+                    edges,
+                    self.dreams_trigger,
+                    self.node_id.as_str(),
+                    event_id,
+                )
+                .await?;
+            return Ok(());
+        }
+        if self
+            .last_local_write_event
+            .get(&region)
+            .is_some_and(|seen| seen.as_str() == event_id)
+        {
+            return Ok(());
+        }
+        self.on_writes(region.clone(), memories, edges).await?;
+        self.last_local_write_event.insert(region, event_id.into());
+        Ok(())
+    }
+
     /// Fire a region explicitly (Redis fire-queue drainer side).
     pub fn notify(&self, region: RegionKey) {
         if !self.is_leader() {
@@ -631,7 +676,14 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             let _ = self.storage.release_lease(lease).await;
             return Err(error);
         }
-        if let Err(error) = self.validate_region(region).await {
+        let working_set = match self.load_region_working_set(region).await {
+            Ok(working_set) => working_set,
+            Err(error) => {
+                let _ = self.storage.release_lease(lease).await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.validate_loaded_region(region, &working_set) {
             let _ = self.storage.release_lease(lease).await;
             return Err(error);
         }
@@ -643,7 +695,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let mut journal = CycleJournal::new();
         let mut renewal_stopped = false;
         let outcome = {
-            let consolidation = self.consolidate_under_tracked(&lease, region, &mut journal);
+            let consolidation =
+                self.consolidate_under_tracked(&lease, region, &mut journal, working_set);
             tokio::pin!(consolidation);
             tokio::select! {
                 biased;
@@ -826,9 +879,9 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         lease: &exocortex_storage::OwnerLease,
         region: &RegionKey,
         journal: &mut CycleJournal,
+        mut working_set: RegionWorkingSet,
     ) -> anyhow::Result<ConsolidationResult> {
         let mut mutations = 0usize;
-        let mut working_set = self.load_region_working_set(region).await?;
         let anchors = self.select_anchors(&working_set);
         // IN5 (audit): a region with fewer than two anchors cannot be
         // scored — that is a no-op cycle, not an error (erroring here
@@ -996,36 +1049,20 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         &self,
         region: &RegionKey,
     ) -> anyhow::Result<RegionWorkingSet> {
-        use futures::StreamExt;
-        let mut memories = std::collections::HashMap::new();
-        let mut memory_rows = self.storage.stream_all_memories().await;
-        while let Some(row) = memory_rows.next().await {
-            let memory = row?;
-            if in_region(&memory, region) {
-                if memories.len() >= MAX_REGION_MEMORIES {
-                    anyhow::bail!(
-                        "Dreams region exceeds {MAX_REGION_MEMORIES} current memory rows"
-                    );
-                }
-                memories.insert(memory.id, memory);
-            }
-        }
-        drop(memory_rows);
-
-        let mut relationships = std::collections::HashMap::new();
-        let mut relationship_rows = self.storage.stream_all_relationships().await;
-        while let Some(row) = relationship_rows.next().await {
-            let relationship = row?;
-            if memories.contains_key(&relationship.from) && memories.contains_key(&relationship.to)
-            {
-                if relationships.len() >= MAX_REGION_RELATIONSHIPS {
-                    anyhow::bail!(
-                        "Dreams region exceeds {MAX_REGION_RELATIONSHIPS} current relationship rows"
-                    );
-                }
-                relationships.insert(relationship.id, relationship);
-            }
-        }
+        let memories = self
+            .storage
+            .memories_in_region(region, MAX_REGION_MEMORIES as u32)
+            .await?
+            .into_iter()
+            .map(|memory| (memory.id, memory))
+            .collect();
+        let relationships = self
+            .storage
+            .current_relationships_in_region(region, MAX_REGION_RELATIONSHIPS as u32)
+            .await?
+            .into_iter()
+            .map(|relationship| (relationship.id, relationship))
+            .collect();
         Ok(RegionWorkingSet {
             memories,
             relationships,
@@ -1390,6 +1427,24 @@ impl<S: Storage + 'static> DreamsEngine<S> {
 }
 
 impl<S: Storage + 'static> DreamsEngine<S> {
+    fn validate_loaded_region(
+        &self,
+        region: &RegionKey,
+        working_set: &RegionWorkingSet,
+    ) -> anyhow::Result<()> {
+        if region.org == "*" || region.project == "*" {
+            return Ok(());
+        }
+        if working_set
+            .memories
+            .values()
+            .any(|memory| memory.valid_until.is_none())
+        {
+            return Ok(());
+        }
+        anyhow::bail!("unknown project region {}/{}", region.org, region.project)
+    }
+
     /// Reject forged/stale named region keys before lease acquisition. A
     /// named project exists for this org only when storage contains an active
     /// memory carrying that exact tenant/project scope; wildcard regions are
@@ -1398,18 +1453,18 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         if region.org == "*" || region.project == "*" {
             return Ok(());
         }
-        use futures::StreamExt;
-        let mut memories = self.storage.stream_all_memories().await;
-        while let Some(row) = memories.next().await {
-            let memory = row?;
-            if memory.valid_until.is_none()
-                && memory.context.tenant_id.as_deref() == Some(region.org.as_str())
-                && memory.context.project_id.as_deref() == Some(region.project.as_str())
-            {
-                return Ok(());
-            }
-        }
-        anyhow::bail!("unknown project region {}/{}", region.org, region.project)
+        let memories = self
+            .storage
+            .memories_in_region(region, MAX_REGION_MEMORIES as u32)
+            .await?;
+        let working_set = RegionWorkingSet {
+            memories: memories
+                .into_iter()
+                .map(|memory| (memory.id, memory))
+                .collect(),
+            relationships: Default::default(),
+        };
+        self.validate_loaded_region(region, &working_set)
     }
 
     /// §12.1 discovery pass — the Transitive finder (§23 #12): two-hop
@@ -1623,6 +1678,24 @@ mod cycle_scheduling_tests {
             0
         );
         assert!(engine.pending_regions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stable_local_write_event_is_counted_once() {
+        let storage = storage();
+        let engine = engine(&storage);
+        let region = region();
+        engine
+            .on_writes_once("batch:region", region.clone(), 2, 3)
+            .await
+            .unwrap();
+        engine
+            .on_writes_once("batch:region", region.clone(), 2, 3)
+            .await
+            .unwrap();
+        let counters = *engine.counters.get(&region).unwrap();
+        assert_eq!(counters.memories_since_last_cycle, 2);
+        assert_eq!(counters.edges_since_last_cycle, 3);
     }
 
     #[tokio::test]
@@ -1871,22 +1944,6 @@ fn similar_to_kind() -> Option<exocortex_kernel::RelKindId> {
             .ok()
             .and_then(|onto| onto.kind_id("SimilarTo"))
     })
-}
-
-/// IN1 (audit): a memory belongs to the region when its type matches AND
-/// its tenant scope matches (org; project when the region pins one —
-/// `*` means unconstrained).
-fn in_region(m: &exocortex_kernel::Memory, region: &RegionKey) -> bool {
-    if m.memory_type != region.memory_type {
-        return false;
-    }
-    if region.org != "*" && m.context.tenant_id.as_deref() != Some(region.org.as_str()) {
-        return false;
-    }
-    if region.project != "*" && m.context.project_id.as_deref() != Some(region.project.as_str()) {
-        return false;
-    }
-    true
 }
 
 /// The §14.3 age-decay factor alone (IN8: un-decay the stored base).

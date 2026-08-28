@@ -247,15 +247,20 @@ async fn region_cycle_reuses_one_working_set_across_merge_candidates() {
     let (memory_streams, relationship_streams, frontier_reads, attribute_reads) =
         storage.reasoning_query_counts();
     assert_eq!(
-        memory_streams, 2,
-        "one pre-lease region validation plus one memory snapshot per cycle"
+        memory_streams, 0,
+        "a bounded region cycle must not fall back to full-store memory streams"
     );
     assert_eq!(
-        relationship_streams, 1,
-        "one relationship snapshot per region cycle"
+        relationship_streams, 0,
+        "a bounded region cycle must not fall back to full-store relationship streams"
     );
     assert_eq!(frontier_reads, 0);
     assert_eq!(attribute_reads, 0);
+    assert_eq!(
+        storage.region_query_counts(),
+        (1, 1),
+        "all merge candidates must reuse one bounded regional working set"
+    );
 }
 
 #[tokio::test]

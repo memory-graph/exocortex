@@ -781,6 +781,105 @@ async fn duplicate_batch_is_idempotent_replay() {
     );
 }
 
+#[tokio::test]
+async fn durable_post_ingest_effects_release_admission_and_drain_once() {
+    let base = server().with_submit_concurrency_limit(1);
+    let dreams = Arc::new(exocortex_dreams::DreamsEngine::new(
+        base.storage.clone(),
+        exocortex_dreams::trigger::DreamsTrigger {
+            memory_threshold: u32::MAX,
+            edge_threshold: u32::MAX,
+            age_floor_days: u32::MAX,
+            min_interval_hours: 0,
+        },
+        0.01,
+        0.05,
+        false,
+        "outbox-test".into(),
+    ));
+    let srv = Arc::new(base.with_dreams(dreams.clone()));
+    registered(&srv, 3).await;
+
+    let mut first = batch(vec![draft("first", "Fix", 1)]);
+    first.batch_id = "outbox-first".into();
+    first.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    let first = sign(first, [5; 32]);
+    let mut second = batch(vec![draft("second", "Fix", 1)]);
+    second.batch_id = "outbox-second".into();
+    second.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+    let second = sign(second, [5; 32]);
+
+    assert!(
+        srv.submit(tonic::Request::new(first.clone()))
+            .await
+            .unwrap()
+            .into_inner()
+            .accepted
+            > 0
+    );
+    assert!(
+        srv.submit(tonic::Request::new(second))
+            .await
+            .unwrap()
+            .into_inner()
+            .accepted
+            > 0
+    );
+    assert_eq!(
+        srv.storage.pending_ingest_effects(10).await.unwrap().len(),
+        2,
+        "submit completion leaves durable effects for the supervised drainer"
+    );
+
+    let drainer = tokio::spawn(srv.clone().run_post_ingest_effects());
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if srv
+                .storage
+                .pending_ingest_effects(10)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable effects drain");
+    let memories: u32 = dreams
+        .counters
+        .iter()
+        .map(|entry| entry.memories_since_last_cycle)
+        .sum();
+    assert_eq!(memories, 2);
+
+    let duplicate = srv
+        .submit(tonic::Request::new(first))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(duplicate
+        .rejections
+        .iter()
+        .any(|row| row.code == RejectCode::DuplicateBatch as i32));
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    assert!(srv
+        .storage
+        .pending_ingest_effects(10)
+        .await
+        .unwrap()
+        .is_empty());
+    let memories_after_retry: u32 = dreams
+        .counters
+        .iter()
+        .map(|entry| entry.memories_since_last_cycle)
+        .sum();
+    assert_eq!(memories_after_retry, 2);
+    drainer.abort();
+}
+
 /// H2 (§18.8.5): the ceiling registry persists across restarts — a source
 /// registered with ceiling 1 in one process is still ceiling-limited in a
 /// fresh process booted from the same sources file.

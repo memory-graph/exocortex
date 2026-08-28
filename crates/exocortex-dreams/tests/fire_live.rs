@@ -371,3 +371,64 @@ async fn engine_on_write_uses_shared_transport_even_as_follower() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn stable_write_event_is_counted_once_after_an_ambiguous_retry() {
+    let Some((client, mut queue, key)) = isolated_queue("event-org").await else {
+        return;
+    };
+    let region = RegionKey {
+        org: "event-org".into(),
+        project: "project".into(),
+        memory_type: 3,
+    };
+    let trigger = DreamsTrigger {
+        memory_threshold: u32::MAX,
+        edge_threshold: u32::MAX,
+        age_floor_days: u32::MAX,
+        min_interval_hours: 0,
+    };
+    let first = queue
+        .record_write_once(&region, 3, 2, trigger, "node", "batch:event")
+        .await
+        .unwrap();
+    let retry = queue
+        .record_write_once(&region, 3, 2, trigger, "node", "batch:event")
+        .await
+        .unwrap();
+    assert!(matches!(
+        first,
+        RecordWriteOutcome::Accumulated(c)
+            if c.memories_since_last_cycle == 3 && c.edges_since_last_cycle == 2
+    ));
+    assert!(matches!(
+        retry,
+        RecordWriteOutcome::Accumulated(c)
+            if c.memories_since_last_cycle == 3 && c.edges_since_last_cycle == 2
+    ));
+
+    let mut inspect = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("second Redis connection");
+    let counter_key = format!(
+        "exocortex:dreams:counters:{}",
+        serde_json::to_string(&region).unwrap()
+    );
+    let values: (u32, u32) = redis::cmd("HMGET")
+        .arg(&counter_key)
+        .arg("memories")
+        .arg("edges")
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+    assert_eq!(values, (3, 2));
+    let _: u64 = redis::cmd("DEL")
+        .arg(&key)
+        .arg(format!("{key}:deferred"))
+        .arg(format!("{key}:processing"))
+        .arg(counter_key)
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+}

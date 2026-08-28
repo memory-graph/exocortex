@@ -5,7 +5,7 @@
 #   FALKOR_URL=falkor://127.0.0.1:16379 cargo test -p exocortex-cluster --features integration
 services:
   falkordb:
-    image: falkordb/falkordb:latest
+    image: falkordb/falkordb@sha256:adbddd418916c25618564ff8597a919b08bc76452ebeb74eb985c38d7281df62
     ports:
       - "127.0.0.1:16379:6379"
     healthcheck:

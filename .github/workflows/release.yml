@@ -101,7 +101,8 @@ jobs:
       - name: Build release binaries
         run: |
           cargo build --release --target ${{ matrix.target }} \
-            -p exocortex-client -p exocortex-server -p exocortex-worker
+            -p exocortex-client -p exocortex-server -p exocortex-worker \
+            --features exocortex-server/fastembed
 
       - name: Package
         id: package

@@ -9,8 +9,8 @@ use exocortex_kernel::{
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{
     memory_visible, AuditEvent, DiscoveryAcceptance, DiscoveryProposal, DiscoveryRecord,
-    FencedRestore, InMemoryStorage, IngestBatchKey, IngestCommitOutcome, LeaseKey, MemoryFilter,
-    RegionKey, Storage, StorageError, VisibilityContext,
+    FencedRestore, InMemoryStorage, IngestBatchKey, IngestCommitOutcome, IngestRegionDelta,
+    LeaseKey, MemoryFilter, PostIngestEffect, RegionKey, Storage, StorageError, VisibilityContext,
 };
 use proptest::prelude::*;
 use std::sync::Arc;
@@ -422,6 +422,37 @@ async fn discovery_persistence_precedes_one_available_invalidation() {
 }
 
 #[tokio::test]
+async fn paused_invalidation_subscriber_observes_overflow_as_an_error() {
+    use futures::StreamExt;
+
+    let storage = InMemoryStorage::new(ontology());
+    let region = RegionKey {
+        org: "*".into(),
+        project: "*".into(),
+        memory_type: 0,
+    };
+    let mut feed = storage.subscribe_invalidations(&region).await.unwrap();
+
+    // The in-memory feed holds 4096 entries. Do not poll the subscriber while
+    // overflowing it: this models a paused production consumer precisely.
+    for sequence in 0..=4096 {
+        let mut memory = base_memory(format!("lag-{sequence}"), "payload".into(), 0, 3);
+        memory.id = MemoryId::new_v7();
+        storage.upsert_batch(&[memory], &[]).await.unwrap();
+    }
+
+    let error = feed
+        .next()
+        .await
+        .expect("lagged feed remains open")
+        .expect_err("overflow must force a subscriber resync");
+    assert!(
+        matches!(error, StorageError::Backend(message) if message.contains("lagged")),
+        "lag must be surfaced as a storage-feed error"
+    );
+}
+
+#[tokio::test]
 async fn relationships_in_region_is_exact_ordered_and_fail_closed_at_limit() {
     let storage = InMemoryStorage::new(ontology());
     let mut a = base_memory("a".into(), "content".into(), 3, 3);
@@ -741,6 +772,58 @@ async fn failed_ingest_commit_leaves_key_retryable() {
 }
 
 #[tokio::test]
+async fn ingest_settlement_persists_one_immutable_acknowledgeable_effect() {
+    let store = InMemoryStorage::new(ontology());
+    let key = IngestBatchKey {
+        org_id: "org".into(),
+        producer_id: "producer".into(),
+        batch_id: "outbox".into(),
+    };
+    let memory = base_memory("outbox".into(), "payload".into(), 1, 3);
+    let effect = PostIngestEffect {
+        effect_id: "org/producer/outbox".into(),
+        session_memory_ids: vec![memory.id],
+        region_deltas: vec![IngestRegionDelta {
+            region: RegionKey {
+                org: "org".into(),
+                project: "*".into(),
+                memory_type: memory.memory_type,
+            },
+            memories: 1,
+            relationships: 0,
+        }],
+    };
+
+    assert!(matches!(
+        store
+            .commit_ingest_batch_with_effect(&key, &[memory.clone()], &[], 1, &effect)
+            .await
+            .unwrap(),
+        IngestCommitOutcome::Committed { .. }
+    ));
+    assert!(matches!(
+        store
+            .commit_ingest_batch_with_effect(&key, &[memory], &[], 1, &effect)
+            .await
+            .unwrap(),
+        IngestCommitOutcome::Duplicate(_)
+    ));
+    assert_eq!(
+        store.pending_ingest_effects(10).await.unwrap(),
+        [effect.clone()]
+    );
+    assert!(store
+        .acknowledge_ingest_effect(effect.effect_id.as_str())
+        .await
+        .unwrap());
+    assert!(store.pending_ingest_effects(10).await.unwrap().is_empty());
+    assert!(store
+        .acknowledge_ingest_effect(effect.effect_id.as_str())
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
 async fn find_by_entity_uses_canonical_memory_context() {
     let store = InMemoryStorage::new(ontology());
     let entity = EntityId([7; 16]);
@@ -805,4 +888,71 @@ async fn find_by_entity_filters_tenant_before_limit() {
         rows.iter().map(|memory| memory.id).collect::<Vec<_>>(),
         [matching.id]
     );
+}
+
+#[tokio::test]
+async fn bounded_region_seams_filter_before_limit_and_keep_closed_relationships() {
+    let store = InMemoryStorage::new(ontology());
+    let mut from = base_memory("region-from".into(), "from".into(), 3, 3);
+    from.context.project_id = Some("project".into());
+    let mut to = base_memory("region-to".into(), "to".into(), 3, 3);
+    to.context.project_id = Some("project".into());
+    let mut foreign = base_memory("foreign".into(), "foreign".into(), 3, 3);
+    foreign.context.tenant_id = Some("other-org".into());
+    foreign.context.project_id = Some("project".into());
+    let relationship = Relationship {
+        id: RelationshipId::derive(from.id, RelKindId(0), to.id, Some("regional")),
+        kind: RelKindId(0),
+        from: from.id,
+        to: to.id,
+        visibility: Visibility::Org,
+        provenance: Provenance::Asserted {
+            author: "test".into(),
+            producer_kind: None,
+        },
+        properties: RelationshipProperties {
+            strength: 0.8,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: Utc::now(),
+        valid_until: Some(Utc::now()),
+        recorded_at: Utc::now(),
+        invalidated_by: None,
+        lsn: LSN::new_local(0),
+    };
+    store
+        .upsert_batch(
+            &[from.clone(), to.clone(), foreign],
+            &[relationship.clone()],
+        )
+        .await
+        .unwrap();
+    let region = RegionKey {
+        org: "org".into(),
+        project: "project".into(),
+        memory_type: 3,
+    };
+    let memories = store.memories_in_region(&region, 2).await.unwrap();
+    assert_eq!(
+        memories.iter().map(|memory| memory.id).collect::<Vec<_>>(),
+        {
+            let mut ids = vec![from.id, to.id];
+            ids.sort();
+            ids
+        }
+    );
+    let relationships = store
+        .current_relationships_in_region(&region, 10)
+        .await
+        .unwrap();
+    assert!(relationships.iter().any(|row| row.id == relationship.id));
+    assert!(store.memories_in_region(&region, 1).await.is_err());
 }

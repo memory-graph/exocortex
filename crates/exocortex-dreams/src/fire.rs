@@ -37,9 +37,16 @@ local queue = KEYS[1]
 local counters = KEYS[2]
 local deferred = KEYS[3]
 local processing = KEYS[4]
+if redis.call('HGET', counters, 'last_write_event') == ARGV[14] then
+    return {
+        tonumber(redis.call('HGET', counters, 'memories') or '0'),
+        tonumber(redis.call('HGET', counters, 'edges') or '0'),
+        0
+    }
+end
 local memories = math.min(4294967295, redis.call('HINCRBY', counters, 'memories', ARGV[2]))
 local edges = math.min(4294967295, redis.call('HINCRBY', counters, 'edges', ARGV[3]))
-redis.call('HSET', counters, 'memories', memories, 'edges', edges)
+redis.call('HSET', counters, 'memories', memories, 'edges', edges, 'last_write_event', ARGV[14])
 redis.call('HSETNX', counters, 'last_success', ARGV[6])
 local elapsed = math.max(0, tonumber(ARGV[6]) - tonumber(redis.call('HGET', counters, 'last_success')))
 local threshold = memories >= tonumber(ARGV[4]) or edges >= tonumber(ARGV[5]) or elapsed >= tonumber(ARGV[8])
@@ -405,7 +412,28 @@ impl RedisFireQueue {
         trigger: DreamsTrigger,
         fired_by: &str,
     ) -> anyhow::Result<RecordWriteOutcome> {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        self.record_write_once(region, memories, edges, trigger, fired_by, &event_id)
+            .await
+    }
+
+    /// Record one stable durable ingest effect. Retrying the immediately
+    /// pending effect after an ambiguous Redis response returns the retained
+    /// counters without applying its deltas again.
+    pub async fn record_write_once(
+        &mut self,
+        region: &RegionKey,
+        memories: u32,
+        edges: u32,
+        trigger: DreamsTrigger,
+        fired_by: &str,
+        event_id: &str,
+    ) -> anyhow::Result<RecordWriteOutcome> {
         self.ensure_region(region)?;
+        anyhow::ensure!(
+            !event_id.is_empty(),
+            "Dreams write event id must not be empty"
+        );
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         let fire_id = uuid::Uuid::new_v4().to_string();
         let values: (u32, u32, u8) = redis::Script::new(RECORD_WRITE_LUA)
@@ -426,6 +454,7 @@ impl RedisFireQueue {
             .arg(region.memory_type)
             .arg(fired_by)
             .arg(fire_id)
+            .arg(event_id)
             .invoke_async(&mut self.conn)
             .await?;
         let snapshot = RegionWriteCounters {

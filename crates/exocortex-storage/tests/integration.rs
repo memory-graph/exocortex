@@ -16,8 +16,9 @@ use exocortex_kernel::{
 use exocortex_pack_dev_v1::pack_def;
 use exocortex_storage::{
     AuditEvent, CypherQuery, DiscoveryAcceptance, DiscoveryProposal, DiscoveryRecord, FalkorConfig,
-    FalkorStorage, IngestBatchKey, IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter,
-    OwnerLease, RegionKey, Storage, StorageError, TraversalSpec, VisibilityContext,
+    FalkorStorage, IngestBatchKey, IngestCommitOutcome, IngestRegionDelta, Invalidation, LeaseKey,
+    MemoryFilter, OwnerLease, PostIngestEffect, RegionKey, Storage, StorageError, TraversalSpec,
+    VisibilityContext,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -186,6 +187,148 @@ itest!(roundtrip_memory, {
     assert_eq!(got.context.project_id, m.context.project_id);
     assert_eq!(got.provenance, m.provenance);
 });
+
+itest!(governed_import_is_durable_and_does_not_duplicate_history, {
+    let first = connect("governed-import-a").await;
+    let graph = first.graph_name_clone();
+    let memory = mem("governed-import", 3, Visibility::Org);
+    let import_key = format!("backup:{}", graph_suffix());
+    assert!(first
+        .import_batch_once(&import_key, &[memory.clone()], &[])
+        .await
+        .unwrap());
+    drop(first);
+
+    let url = falkor_url().unwrap();
+    let restarted = FalkorStorage::connect(
+        FalkorConfig {
+            falkor_url: url.clone(),
+            redis_url: std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+            graph_name: graph,
+            org_id: "test-org".into(),
+            node_id: "governed-import-b".into(),
+        },
+        ontology(),
+    )
+    .await
+    .unwrap();
+    assert!(!restarted
+        .import_batch_once(&import_key, &[memory.clone()], &[])
+        .await
+        .unwrap());
+    let assertions = restarted
+        .query_cypher(&CypherQuery {
+            template_id: "integration_memory_assertion_count",
+            params: serde_json::json!({ "id": id_hex(&memory.id.0) }),
+            read_only: true,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+    assert_eq!(assertions.rows, vec![serde_json::json!([1])]);
+    assert_eq!(
+        restarted.get_memory(&memory.id).await.unwrap().unwrap().id,
+        memory.id
+    );
+});
+
+itest!(
+    migration_compare_and_set_preserves_a_concurrent_current_write,
+    {
+        let storage = connect("migration-cas").await;
+        let memory = mem("migration-old", 3, Visibility::Org);
+        storage.upsert_memory(&memory).await.unwrap();
+        let captured = storage.get_memory(&memory.id).await.unwrap().unwrap();
+        let captured_lsn = captured.lsn.value;
+
+        let mut concurrent = captured.clone();
+        concurrent.title = "migration-concurrent".into();
+        storage.upsert_memory(&concurrent).await.unwrap();
+        let migration = storage
+        .query_cypher(&CypherQuery {
+            template_id: "migrate_memory_schema_v1",
+            params: serde_json::json!({
+                "id": id_hex(&captured.id.0),
+                "memory_type_label": ontology().memory_type_names[captured.memory_type as usize],
+                "memory_type_id": captured.memory_type,
+                "props_json": serde_json::to_string(&captured).unwrap(),
+                "tags": Vec::<String>::new(),
+                "entity_ids": Vec::<String>::new(),
+                "tenant_id": captured.context.tenant_id,
+                "user_id": captured.context.user_id,
+                "project_id": captured.context.project_id,
+                "team_id": captured.context.team_id,
+                "visibility": captured.visibility as u8,
+                "valid_from": captured.valid_from.to_rfc3339(),
+                "valid_until": captured.valid_until.map(|time| time.to_rfc3339()),
+                "invalidated_by": captured.invalidated_by.map(|id| id_hex(&id.0)),
+                "recorded_at": captured.recorded_at.to_rfc3339(),
+                "lsn": captured_lsn,
+            }),
+            read_only: false,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+        assert!(
+            migration.rows.is_empty(),
+            "stale captured LSN must lose the CAS"
+        );
+        let current = storage.get_memory(&memory.id).await.unwrap().unwrap();
+        assert_eq!(current.title.as_str(), "migration-concurrent");
+        assert!(current.lsn.value > captured_lsn);
+    }
+);
+
+itest!(
+    regional_relationship_order_uses_persisted_relationship_id_tiebreaker,
+    {
+        let storage = connect("regional-order").await;
+        let mut from = mem("regional-from", 3, Visibility::Org);
+        from.id = MemoryId([1; 16]);
+        let mut to = mem("regional-to", 3, Visibility::Org);
+        to.id = MemoryId([2; 16]);
+        storage
+            .upsert_batch(&[from.clone(), to.clone()], &[])
+            .await
+            .unwrap();
+        let kind = exocortex_kernel::kinds::FIXES;
+        let mut left = rel(from.id, to.id, kind.0);
+        left.id = RelationshipId::derive(from.id, kind, to.id, Some("left"));
+        let mut right = left.clone();
+        right.id = RelationshipId::derive(from.id, kind, to.id, Some("right"));
+        storage
+            .upsert_batch(&[], &[right.clone(), left.clone()])
+            .await
+            .unwrap();
+
+        let rows = storage
+            .relationships_in_region(
+                &RegionKey {
+                    org: "test-org".into(),
+                    project: "proj".into(),
+                    memory_type: 3,
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        let tuples: Vec<_> = rows
+            .iter()
+            .map(|row| (row.from, row.to, row.kind, row.id))
+            .collect();
+        assert!(tuples.windows(2).all(|pair| pair[0] < pair[1]));
+        let forward: Vec<_> = rows
+            .iter()
+            .filter(|row| row.from == from.id && row.to == to.id && row.kind == kind)
+            .map(|row| row.id)
+            .collect();
+        let mut expected = vec![left.id, right.id];
+        expected.sort();
+        assert_eq!(forward, expected);
+    }
+);
 
 itest!(
     soft_delete_serializes_the_new_recorded_time_for_both_row_kinds,
@@ -399,6 +542,80 @@ itest!(ingest_settlement_survives_backend_reconnect, {
         .is_none());
 });
 
+itest!(
+    ingest_effect_outbox_survives_reconnect_and_acknowledges_once,
+    {
+        let first = connect("ingest-outbox-a").await;
+        let graph = first.graph_name_clone();
+        let key = IngestBatchKey {
+            org_id: "test-org".into(),
+            producer_id: "producer".into(),
+            batch_id: format!("outbox-{}", graph_suffix()).into(),
+        };
+        let memory = mem("outbox-memory", 3, Visibility::Org);
+        let effect = PostIngestEffect {
+            effect_id: format!("{}/{}/{}", key.org_id, key.producer_id, key.batch_id).into(),
+            session_memory_ids: vec![memory.id],
+            region_deltas: vec![IngestRegionDelta {
+                region: RegionKey {
+                    org: "test-org".into(),
+                    project: "proj".into(),
+                    memory_type: memory.memory_type,
+                },
+                memories: 1,
+                relationships: 0,
+            }],
+        };
+        assert!(matches!(
+            first
+                .commit_ingest_batch_with_effect(&key, &[memory.clone()], &[], 1, &effect)
+                .await
+                .unwrap(),
+            IngestCommitOutcome::Committed { .. }
+        ));
+        drop(first);
+
+        let url = falkor_url().unwrap();
+        let restarted = FalkorStorage::connect(
+            FalkorConfig {
+                falkor_url: url.clone(),
+                redis_url: std::env::var("REDIS_URL")
+                    .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+                graph_name: graph,
+                org_id: "test-org".into(),
+                node_id: "ingest-outbox-b".into(),
+            },
+            ontology(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restarted.pending_ingest_effects(10).await.unwrap(),
+            [effect.clone()]
+        );
+        assert!(matches!(
+            restarted
+                .commit_ingest_batch_with_effect(&key, &[memory], &[], 1, &effect)
+                .await
+                .unwrap(),
+            IngestCommitOutcome::Duplicate(_)
+        ));
+        assert_eq!(
+            restarted.pending_ingest_effects(10).await.unwrap(),
+            [effect.clone()]
+        );
+        assert!(restarted
+            .acknowledge_ingest_effect(effect.effect_id.as_str())
+            .await
+            .unwrap());
+        assert!(restarted
+            .pending_ingest_effects(10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+);
+
 itest!(corrupt_ingest_settlement_fails_closed_on_retry, {
     for (case, accepted, rejected, assigned_lsn) in [
         (
@@ -548,9 +765,44 @@ itest!(fingerprint_mismatch_aborts_startup, {
 });
 
 itest!(
-    post_migration_legacy_write_is_repaired_without_widening_current_null_tenant,
+    concurrent_initializers_cannot_overwrite_the_winning_fingerprint,
+    {
+        let url = falkor_url().unwrap();
+        let graph_name = format!("fingerprint-cas-{}", graph_suffix());
+        let config = |node: &str| FalkorConfig {
+            falkor_url: url.clone(),
+            redis_url: std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+            graph_name: graph_name.clone(),
+            org_id: "test-org".into(),
+            node_id: node.into(),
+        };
+        let first_ontology = ontology();
+        let mut incompatible = exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap();
+        incompatible.fingerprint.0[0] ^= 0xff;
+        let incompatible = Arc::new(incompatible);
+        let (first, second) = tokio::join!(
+            FalkorStorage::connect(config("fingerprint-cas-a"), first_ontology),
+            FalkorStorage::connect(config("fingerprint-cas-b"), incompatible),
+        );
+        assert_eq!(
+            usize::from(first.is_ok()) + usize::from(second.is_ok()),
+            1,
+            "exactly one incompatible initializer may pin the empty graph"
+        );
+        let loser = match (first, second) {
+            (Err(error), Ok(_)) | (Ok(_), Err(error)) => error,
+            _ => unreachable!("success count checked above"),
+        };
+        assert!(matches!(loser, StorageError::FingerprintMismatch { .. }));
+    }
+);
+
+itest!(
+    reconnect_repairs_post_migration_legacy_write_without_steady_read_queries,
     {
         let s = connect("legacy-after-migration").await;
+        let graph = s.graph_name_clone();
         let mut legacy = mem("legacy-after-v1", 3, Visibility::Org);
         legacy.context.tenant_id = None;
         s.upsert_memory(&legacy).await.unwrap();
@@ -574,12 +826,54 @@ itest!(
         })
         .await
         .unwrap();
-        let repaired = s
+        drop(s);
+        let url = falkor_url().unwrap();
+        let restarted = FalkorStorage::connect(
+            FalkorConfig {
+                falkor_url: url.clone(),
+                redis_url: std::env::var("REDIS_URL")
+                    .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+                graph_name: graph,
+                org_id: "test-org".into(),
+                node_id: "legacy-after-migration-restart".into(),
+            },
+            ontology(),
+        )
+        .await
+        .expect("connect-time compatibility repair");
+        assert!(
+            restarted.take_legacy_repair_query_count() > 0,
+            "compatibility probes execute during connection"
+        );
+        let repaired = restarted
             .get_memory_for(&legacy.id, &vc)
             .await
             .unwrap()
-            .expect("legacy-shaped row is repaired before exposure");
+            .expect("legacy-shaped row is repaired during reconnect");
         assert_eq!(repaired.context.tenant_id.as_deref(), Some("test-org"));
+        restarted.get_memories(&[legacy.id]).await.unwrap();
+        restarted
+            .find_by_entity(
+                &EntityId([99; 16]),
+                &MemoryFilter {
+                    limit: 1,
+                    visibility_ctx: vc.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut memory_stream = restarted.stream_all_memories().await;
+        while memory_stream.next().await.is_some() {}
+        drop(memory_stream);
+        let mut relationship_stream = restarted.stream_all_relationships().await;
+        while relationship_stream.next().await.is_some() {}
+        drop(relationship_stream);
+        assert_eq!(
+            restarted.take_legacy_repair_query_count(),
+            0,
+            "canonical point reads must not run compatibility repair templates"
+        );
     }
 );
 

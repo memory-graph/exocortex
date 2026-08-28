@@ -461,7 +461,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                 kind_label: $kind_label,
                 visibility: $visibility, valid_from: $valid_from,
                 valid_until: $valid_until, recorded_at: $recorded_at,
-                props_json: $props_json, lsn: $lsn})
+                invalidated_by: $invalidated_by, props_json: $props_json, lsn: $lsn})
             RETURN id(r) AS edge_id
         "#,
     });
@@ -510,13 +510,25 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                 kind_label: $kind_label,
                 visibility: $visibility, valid_from: $valid_from,
                 valid_until: $valid_until, recorded_at: $recorded_at,
-                props_json: $props_json, lsn: $lsn})
+                invalidated_by: $invalidated_by, props_json: $props_json, lsn: $lsn})
         "#,
     });
 
     // Graph-resident leases are the authoritative Falkor fencing state.
     // Keeping the guard and owner mutation in one GRAPH.QUERY makes the
     // query engine's atomic transaction the R-C3 linearization point.
+    reg!(Template {
+        id: "governed_import_guard",
+        read_only: false,
+        required_params: &["import_key"],
+        cypher: r#"
+            MERGE (i:_GovernedImport {key: $import_key})
+            ON CREATE SET i.applied = false
+            WITH i WHERE i.applied = false
+            SET i.applied = true
+        "#,
+    });
+
     reg!(Template {
         id: "lease_acquire",
         read_only: false,
@@ -621,15 +633,43 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             "claim_token",
             "accepted",
             "rejected",
-            "assigned_lsn"
+            "assigned_lsn",
+            "effect_id",
+            "effect_json"
         ],
         cypher: r#"
             MATCH (d:_IngestBatch {
                 org_id: $org_id, producer_id: $producer_id, batch_id: $batch_id})
             WHERE d.claim_token = $claim_token AND d.state = 'claiming'
             SET d.state = 'settled', d.accepted = $accepted,
-                d.rejected = $rejected, d.assigned_lsn = $assigned_lsn
+                d.rejected = $rejected, d.assigned_lsn = $assigned_lsn,
+                d.effect_id = $effect_id, d.effect_json = $effect_json,
+                d.effect_acknowledged = CASE WHEN $effect_json IS NULL THEN true ELSE false END
             REMOVE d.claim_token
+        "#,
+    });
+
+    reg!(Template {
+        id: "ingest_effects_pending",
+        read_only: true,
+        required_params: &["limit"],
+        cypher: r#"
+            MATCH (d:_IngestBatch)
+            WHERE d.state = 'settled' AND d.effect_json IS NOT NULL
+              AND d.effect_acknowledged = false
+            RETURN d.effect_json ORDER BY d.effect_id ASC LIMIT $limit
+        "#,
+    });
+
+    reg!(Template {
+        id: "ingest_effect_acknowledge",
+        read_only: false,
+        required_params: &["effect_id"],
+        cypher: r#"
+            MATCH (d:_IngestBatch {effect_id: $effect_id})
+            WHERE d.state = 'settled' AND d.effect_json IS NOT NULL
+            SET d.effect_acknowledged = true
+            RETURN d.effect_id
         "#,
     });
 
@@ -717,6 +757,37 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "memories_in_region",
+        read_only: true,
+        required_params: &["org_id", "project_id", "memory_type", "limit"],
+        cypher: r#"
+            MATCH (m:Memory)
+            WHERE m.memory_type_id = $memory_type
+              AND ($org_id = '*' OR m.tenant_id = $org_id)
+              AND ($project_id = '*' OR m.project_id = $project_id)
+            RETURN m ORDER BY m.id ASC LIMIT $limit
+        "#,
+    });
+
+    reg!(Template {
+        id: "current_relationships_in_region",
+        read_only: true,
+        required_params: &["org_id", "project_id", "memory_type", "limit"],
+        cypher: r#"
+            MATCH (a:Memory)-[r]->(b:Memory)
+            WHERE r.lsn IS NOT NULL
+              AND a.memory_type_id = $memory_type
+              AND b.memory_type_id = $memory_type
+              AND ($org_id = '*' OR (a.tenant_id = $org_id AND b.tenant_id = $org_id))
+              AND ($project_id = '*' OR
+                   (a.project_id = $project_id AND b.project_id = $project_id))
+            RETURN r
+            ORDER BY a.id ASC, b.id ASC, type(r) ASC, r.id ASC
+            LIMIT $limit
+        "#,
+    });
+
+    reg!(Template {
         id: "relationships_in_region",
         read_only: true,
         required_params: &["org_id", "project_id", "memory_type", "limit"],
@@ -730,7 +801,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
               AND ($project_id = '*' OR
                    (a.project_id = $project_id AND b.project_id = $project_id))
             RETURN r
-            ORDER BY a.id ASC, b.id ASC, type(r) ASC, r.rel_id ASC
+            ORDER BY a.id ASC, b.id ASC, type(r) ASC, r.id ASC
             LIMIT $limit
         "#,
     });
@@ -927,7 +998,8 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             ON CREATE SET v.value = 0
             WITH v WHERE v.value <= toInteger($max_schema)
             MERGE (m:_ExocortexMeta {key: 'ontology_fingerprint'})
-            SET m.value = $fp
+            ON CREATE SET m.value = $fp
+            WITH m WHERE m.value = $fp
             RETURN m.value
         "#,
     });
@@ -998,6 +1070,7 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         ],
         cypher: r#"
             MATCH (m:Memory {id: $id})
+            WHERE m.lsn = $lsn
             SET m.memory_type_label = $memory_type_label,
                 m.memory_type_id = $memory_type_id,
                 m.props_json = $props_json,
@@ -1093,10 +1166,14 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MATCH ()-[r]->() WHERE r.id = $rel_id
             MERGE (h:_RelationshipAssertion {id: r.id, lsn: r.lsn})
-            ON CREATE SET h.visibility = r.visibility,
+            ON CREATE SET h.from = startNode(r).id,
+                          h.to = endNode(r).id,
+                          h.kind_label = r.kind_label,
+                          h.visibility = r.visibility,
                           h.valid_from = r.valid_from,
                           h.valid_until = r.valid_until,
                           h.recorded_at = r.recorded_at,
+                          h.invalidated_by = r.invalidated_by,
                           h.props_json = r.props_json
             RETURN r.id
         "#,
@@ -1149,8 +1226,12 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             SET m.valid_until = $now, m.recorded_at = $now,
                 m.lsn = $lsn, m.props_json = $props_json
             CREATE (h:_MemoryAssertion {id: $id, visibility: m.visibility,
-                valid_from: m.valid_from, valid_until: $now,
-                recorded_at: $now, props_json: $props_json, lsn: $lsn})
+                memory_type_label: m.memory_type_label, memory_type_id: m.memory_type_id,
+                valid_from: m.valid_from, valid_until: $now, recorded_at: $now,
+                invalidated_by: m.invalidated_by, props_json: $props_json,
+                tags: m.tags, entity_ids: m.entity_ids, tenant_id: m.tenant_id,
+                user_id: m.user_id, project_id: m.project_id, team_id: m.team_id,
+                lsn: $lsn})
             RETURN id(m) AS node_id
         "#,
     });
@@ -1166,8 +1247,12 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
                 m.lsn = $lsn,
                 m.props_json = $props_json
             CREATE (h:_MemoryAssertion {id: $id, visibility: m.visibility,
-                valid_from: m.valid_from, valid_until: $now,
-                recorded_at: $now, props_json: $props_json, lsn: $lsn})
+                memory_type_label: m.memory_type_label, memory_type_id: m.memory_type_id,
+                valid_from: m.valid_from, valid_until: $now, recorded_at: $now,
+                invalidated_by: m.invalidated_by, props_json: $props_json,
+                tags: m.tags, entity_ids: m.entity_ids, tenant_id: m.tenant_id,
+                user_id: m.user_id, project_id: m.project_id, team_id: m.team_id,
+                lsn: $lsn})
         "#,
     });
 
@@ -1184,9 +1269,10 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
             SET r.valid_until = $now, r.recorded_at = $now,
                 r.lsn = $lsn, r.props_json = $props_json
             CREATE (h:_RelationshipAssertion {id: $rel_id,
+                from: startNode(r).id, to: endNode(r).id, kind_label: r.kind_label,
                 visibility: r.visibility, valid_from: r.valid_from,
                 valid_until: $now, recorded_at: $now,
-                props_json: $props_json, lsn: $lsn})
+                invalidated_by: r.invalidated_by, props_json: $props_json, lsn: $lsn})
             RETURN id(r) AS edge_id
         "#,
     });
@@ -1516,6 +1602,17 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         cypher: r#"
             MATCH ()-[r]->() WHERE r.id = $rel_id
             SET r.lsn = $lsn RETURN r.id
+        "#,
+    });
+
+    #[cfg(feature = "integration")]
+    reg!(Template {
+        id: "integration_memory_assertion_count",
+        read_only: true,
+        required_params: &["id"],
+        cypher: r#"
+            MATCH (h:_MemoryAssertion {id: $id})
+            RETURN count(h)
         "#,
     });
 

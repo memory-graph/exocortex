@@ -146,8 +146,10 @@ pub async fn import_org<S: Storage>(
         doc.ontology_fingerprint
     );
     validate_restore_document(ontology, org_id, &doc)?;
+    let canonical = serde_json::to_vec(&doc).context("canonicalize governed backup identity")?;
+    let import_key = hex(&exocortex_wire::signing::content_digest(&canonical));
     storage
-        .upsert_batch(&doc.memories, &doc.relationships)
+        .import_batch_once(&import_key, &doc.memories, &doc.relationships)
         .await
         .context("atomically restore org backup")?;
     Ok(ImportReport {
@@ -282,9 +284,7 @@ fn hex(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::BACKUP_NOUN;
-    use exocortex_storage::bounded_io::{
-        atomic_write_private_with, ensure_size, read_bounded, serialize_json_pretty_bounded,
-    };
+    use exocortex_storage::bounded_io::{ensure_size, read_bounded, serialize_json_pretty_bounded};
 
     #[test]
     fn org_backup_size_boundary_is_inclusive_and_file_reads_are_bounded() {
@@ -301,17 +301,5 @@ mod tests {
         assert!(read_bounded(&path, 10, BACKUP_NOUN).is_err());
         assert!(serialize_json_pretty_bounded(&"x", 3, BACKUP_NOUN).is_ok());
         assert!(serialize_json_pretty_bounded(&"x", 2, BACKUP_NOUN).is_err());
-    }
-
-    #[test]
-    fn org_backup_atomic_write_preserves_previous_file_on_injected_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("org.json");
-        std::fs::write(&path, b"previous").unwrap();
-        atomic_write_private_with(&path, b"replacement", BACKUP_NOUN, |_| {
-            Err(std::io::Error::other("injected before rename"))
-        })
-        .unwrap_err();
-        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
     }
 }

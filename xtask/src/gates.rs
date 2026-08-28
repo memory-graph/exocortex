@@ -811,6 +811,34 @@ fn validate_executable_evidence(
         !attribute_window.contains("#[ignore"),
         "criterion {criterion} evidence `{relative}::{needle}` is ignored"
     );
+    let function_attributes = prefix
+        .lines()
+        .rev()
+        .skip_while(|line| line.trim().is_empty())
+        .take_while(|line| line.trim_start().starts_with("#["))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let file_attributes = source
+        .lines()
+        .take_while(|line| {
+            let line = line.trim_start();
+            line.is_empty() || line.starts_with("//") || line.starts_with("#![")
+        })
+        .filter(|line| line.trim_start().starts_with("#![cfg"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for configuration in [file_attributes.as_str(), function_attributes.as_str()]
+        .into_iter()
+        .filter(|attributes| attributes.contains("cfg"))
+    {
+        anyhow::ensure!(
+            command_enables_configuration(command, configuration),
+            "criterion {criterion} evidence `{relative}::{needle}` is configured out by `{configuration}`"
+        );
+    }
     let target = std::path::Path::new(relative)
         .file_stem()
         .and_then(std::ffi::OsStr::to_str)
@@ -820,6 +848,60 @@ fn validate_executable_evidence(
         "criterion {criterion} command does not execute evidence `{relative}::{needle}`"
     );
     Ok(())
+}
+
+fn command_enables_configuration(command: &str, configuration: &str) -> bool {
+    if configuration.contains("cfg(test)") && !command.contains("cargo test") {
+        return false;
+    }
+    let mut remainder = configuration;
+    let mut saw_known_condition = configuration.contains("cfg(test)");
+    while let Some(feature_start) = remainder.find("feature") {
+        remainder = &remainder[feature_start + "feature".len()..];
+        let Some(quote) = remainder.find('"') else {
+            return false;
+        };
+        remainder = &remainder[quote + 1..];
+        let Some(end_quote) = remainder.find('"') else {
+            return false;
+        };
+        let feature = &remainder[..end_quote];
+        saw_known_condition = true;
+        if !command_enables_feature(command, feature) {
+            return false;
+        }
+        remainder = &remainder[end_quote + 1..];
+    }
+    // Platform, negated, and arbitrary predicate gates cannot be proved by a
+    // cargo-test command string, so acceptance evidence fails closed.
+    saw_known_condition
+        && !configuration.contains("not(")
+        && !["target_", "unix", "windows", "debug_assertions"]
+            .iter()
+            .any(|predicate| configuration.contains(predicate))
+}
+
+fn command_enables_feature(command: &str, expected: &str) -> bool {
+    if command
+        .split_whitespace()
+        .any(|token| token == "--all-features")
+    {
+        return true;
+    }
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    tokens.iter().enumerate().any(|(index, token)| {
+        let selected = token.strip_prefix("--features=").or_else(|| {
+            (*token == "--features")
+                .then(|| tokens.get(index + 1).copied())
+                .flatten()
+        });
+        selected.is_some_and(|features| {
+            features
+                .split(',')
+                .flat_map(str::split_whitespace)
+                .any(|feature| feature == expected)
+        })
+    })
 }
 
 fn package_line_is(line: &str, expected: &str) -> bool {
@@ -1394,5 +1476,22 @@ mod tests {
         let mismatched = rows.replace("cargo test direct_case", "cargo test unrelated");
         write(&root, "docs/acceptance/section-23.tsv", &mismatched);
         assert!(validate_acceptance_matrix(&root).is_err());
+
+        write(
+            &root,
+            "tests/direct.rs",
+            "#![cfg(feature = \"disabled-evidence\")]\n#[test]\nfn direct_case() {}\n",
+        );
+        write(&root, "docs/acceptance/section-23.tsv", &rows);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "a symbol compiled out by the recorded command is not executable evidence"
+        );
+        let enabled = rows.replace(
+            "cargo test direct_case",
+            "cargo test --features disabled-evidence direct_case",
+        );
+        write(&root, "docs/acceptance/section-23.tsv", &enabled);
+        assert!(validate_acceptance_matrix(&root).is_ok());
     }
 }

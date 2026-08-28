@@ -216,6 +216,51 @@ fn envelope_decode_verifies_hmac_fingerprint_and_wire_version() {
 }
 
 #[test]
+fn live_memory_snapshot_strips_embedding_before_client_cache_use() {
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let node = ClusterNode::new(
+        Arc::new(InMemoryStorage::new(onto.clone())),
+        "embedding-wire".into(),
+        onto.fingerprint,
+        HMAC_KEY,
+    );
+    let mut memory = test_memory("embedding-wire", 33);
+    memory.embedding = Some(exocortex_kernel::Embedding {
+        model: exocortex_kernel::EmbeddingModel {
+            name: "test-model".into(),
+            version: "v1".into(),
+        },
+        vector: vec![0.1, 0.2, 0.3],
+    });
+    let env = node.envelope(Invalidation::MemorySnapshotUpserted {
+        memory: Box::new(memory),
+        lsn: 9,
+    });
+    let payload = b64_encode(&env.encode_to_vec());
+
+    let (decoded, _) = decode_envelope(&HMAC_KEY, &onto.fingerprint.0, &payload).unwrap();
+    let Invalidation::MemorySnapshotUpserted { memory, .. } = decoded else {
+        panic!("expected memory snapshot")
+    };
+    assert!(memory.embedding.is_none());
+
+    let (cache, _writer) = LocalCache::new(1024 * 1024);
+    cache.apply_local("org", std::slice::from_ref(memory.as_ref()), &[], 9);
+    let visibility =
+        exocortex_ops::operations::ops_vc("org", "reader", exocortex_kernel::Visibility::Org);
+    assert!(
+        cache
+            .get_memory("org", &memory.id, &visibility)
+            .unwrap()
+            .embedding
+            .is_none(),
+        "decoded live snapshots cannot populate vectors in the cache"
+    );
+}
+
+#[test]
 fn visibility_advance_decodes_and_keeps_the_lsn_gate_gap_free() {
     let onto = Arc::new(
         exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
@@ -470,6 +515,119 @@ async fn discovery_available_decodes_advances_cache_frontier_and_rejects_malform
     )
     .expect_err("a valid signature does not admit a malformed discovery record");
     assert!(error.to_string().contains("discovery record"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn eof_and_transport_error_force_authoritative_reseed_after_unpublished_commit() {
+    use axum::body::Body;
+    use axum::extract::RawQuery;
+    use axum::response::Response;
+    use axum::routing::get;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let _harness = NETWORK_HARNESS.lock().await;
+    for fail_with_body_error in [false, true] {
+        let onto = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+        let durable = test_memory("committed-before-sse-publication", 81);
+        let commit = storage.upsert_memory(&durable).await.unwrap();
+        let node = ClusterNode::new(
+            storage.clone(),
+            "eof-reseed".into(),
+            onto.fingerprint,
+            HMAC_KEY,
+        );
+        let reseed = node.envelope(Invalidation::GraphReseed {
+            snapshot_json: serde_json::to_vec(&serde_json::json!({
+                "memories": [durable],
+                "relationships": []
+            }))
+            .unwrap(),
+            lsn: commit.lsn,
+        });
+        let payload = b64_encode(&reseed.encode_to_vec());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seeded = Arc::new(AtomicBool::new(false));
+        let app = axum::Router::new().route(
+            "/v1/changes",
+            get({
+                let attempts = attempts.clone();
+                let seeded = seeded.clone();
+                move |RawQuery(query): RawQuery| {
+                    let payload = payload.clone();
+                    let attempts = attempts.clone();
+                    let seeded = seeded.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        let asks_for_seed = query
+                            .as_deref()
+                            .is_some_and(|query| query.contains("seed=true"));
+                        if attempt > 0 && asks_for_seed {
+                            seeded.store(true, Ordering::SeqCst);
+                            let body = format!("event: inv\ndata: {payload}\n\n");
+                            return Response::builder()
+                                .header(http::header::CONTENT_TYPE, "text/event-stream")
+                                .body(Body::from(body))
+                                .unwrap();
+                        }
+                        assert!(
+                            !asks_for_seed,
+                            "first reconnect begins from the known frontier"
+                        );
+                        let body = if fail_with_body_error {
+                            Body::from_stream(futures::stream::once(async {
+                                Err::<axum::body::Bytes, std::io::Error>(std::io::Error::other(
+                                    "simulated SSE transport crash",
+                                ))
+                            }))
+                        } else {
+                            Body::empty()
+                        };
+                        Response::builder()
+                            .header(http::header::CONTENT_TYPE, "text/event-stream")
+                            .body(body)
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (cache, rx) = LocalCache::new(1024 * 1024);
+        let cache = Arc::new(cache);
+        let writer = {
+            let cache = cache.clone();
+            let storage = storage.clone();
+            tokio::spawn(async move { cache.run(storage, rx).await })
+        };
+        let hydrated = Arc::new(tokio::sync::Notify::new());
+        let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, onto.fingerprint.0);
+        cfg.hydration_ready = Some(hydrated.clone());
+        cfg.backoff = Duration::from_millis(1);
+        cfg.reconcile_interval = Duration::from_secs(30);
+        cfg.stall_timeout = Duration::from_secs(30);
+        let sync = tokio::spawn(run_sse_sync(cfg, cache.clone(), 1, None));
+
+        tokio::time::timeout(Duration::from_secs(3), hydrated.notified())
+            .await
+            .expect("failed stream is followed by an authoritative graph seed");
+        assert!(seeded.load(Ordering::SeqCst));
+        let visibility =
+            exocortex_ops::operations::ops_vc("org", "reader", exocortex_kernel::Visibility::Org);
+        assert!(cache
+            .get_memory("org", &MemoryId([81; 16]), &visibility)
+            .is_some());
+        sync.abort();
+        writer.abort();
+        server.abort();
+    }
 }
 
 /// Live server + SSE + cache: a committed upsert reaches the client cache

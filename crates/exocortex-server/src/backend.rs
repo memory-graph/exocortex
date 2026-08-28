@@ -99,7 +99,9 @@ pub struct BackendNode<S: Storage> {
     pub dreams: Arc<exocortex_dreams::DreamsEngine<S>>,
     /// Live gossip handle retained for the backend process lifetime.
     pub gossip: chitchat::ChitchatHandle,
+    cache_bridge: Option<tokio::task::JoinHandle<()>>,
     cluster_feed: Option<tokio::task::JoinHandle<()>>,
+    post_ingest_effects: Option<tokio::task::JoinHandle<()>>,
     leader_election: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -116,7 +118,13 @@ impl<S: Storage> BackendNode<S> {
 
 impl<S: Storage> Drop for BackendNode<S> {
     fn drop(&mut self) {
+        if let Some(task) = self.cache_bridge.take() {
+            task.abort();
+        }
         if let Some(task) = self.cluster_feed.take() {
+            task.abort();
+        }
+        if let Some(task) = self.post_ingest_effects.take() {
             task.abort();
         }
         if let Some(task) = self.leader_election.take() {
@@ -383,22 +391,8 @@ pub async fn run_backend_node<S: Storage + 'static>(
         let storage = storage.clone();
         tokio::spawn(async move { cache.run(storage, writer_rx).await });
     }
-    cache
-        .reseed_from_storage(&*storage, &org.to_string().into())
-        .await?;
-    // R-O4: hydration completes when the org graph is actually resident
-    // (the reseed flowed through the writer), not at spawn time.
-    let mut hydrated = false;
-    for _ in 0..200 {
-        if cache.resident_orgs() > 0 {
-            hydrated = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-
-    // Op context + HTTP bind (needed early: the change-feed bridge stamps
-    // the health snapshot, CS6).
+    // Op context + HTTP bind are created before hydration because the
+    // change-feed bridge stamps its acknowledged publication frontier here.
     let ctx = Arc::new(OpContext {
         visibility_ctx: exocortex_ops::operations::ops_vc(
             &org,
@@ -417,7 +411,6 @@ pub async fn run_backend_node<S: Storage + 'static>(
     let health = bind.health_handle();
     health.store(Arc::new(HealthSnapshot {
         node_id: args.node_id.clone(),
-        hydrated,
         ..Default::default()
     }));
 
@@ -425,7 +418,9 @@ pub async fn run_backend_node<S: Storage + 'static>(
     // node's own cache writer, so the ops surface serves CURRENT data —
     // without this the backend's cache would be frozen at boot while
     // SSE clients stayed live (found by the R17 out-of-process test).
-    {
+    let (subscription_ready_tx, subscription_ready_rx) = tokio::sync::oneshot::channel();
+    let (start_consuming_tx, start_consuming_rx) = tokio::sync::oneshot::channel();
+    let cache_bridge = {
         let cache = cache.clone();
         let storage = storage.clone();
         let health = health.clone();
@@ -436,9 +431,23 @@ pub async fn run_backend_node<S: Storage + 'static>(
                 project: "*".into(),
                 memory_type: 0,
             };
+            let mut subscription_ready = Some(subscription_ready_tx);
+            let mut start_consuming = Some(start_consuming_rx);
             loop {
                 match storage.subscribe_invalidations(&region).await {
                     Ok(sub) => {
+                        if let Some(ready) = subscription_ready.take() {
+                            let _ = ready.send(());
+                        }
+                        // Retain the established subscription while the main
+                        // startup path installs its authoritative image. Any
+                        // concurrent deltas buffer behind this boundary and
+                        // are drained immediately afterward.
+                        if let Some(start) = start_consuming.take() {
+                            if start.await.is_err() {
+                                return;
+                            }
+                        }
                         consume_cache_subscription(
                             &cache,
                             &*storage,
@@ -456,8 +465,35 @@ pub async fn run_backend_node<S: Storage + 'static>(
                     }
                 }
             }
-        });
+        })
+    };
+    if subscription_ready_rx.await.is_err() {
+        cache_bridge.abort();
+        anyhow::bail!("cache change-feed supervisor stopped before subscription");
     }
+    if let Err(error) = cache
+        .reseed_from_storage(&*storage, &org.to_string().into())
+        .await
+    {
+        cache_bridge.abort();
+        return Err(error.into());
+    }
+    // R-O4: hydration completes when the org graph is actually resident
+    // (the reseed flowed through the writer), not at spawn time.
+    let mut hydrated = false;
+    for _ in 0..200 {
+        if cache.resident_orgs() > 0 {
+            hydrated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    health.rcu(|snapshot| {
+        let mut next = (**snapshot).clone();
+        next.hydrated = hydrated;
+        Arc::new(next)
+    });
+    let _ = start_consuming_tx.send(());
 
     // Cluster: envelope signing + SSE fan-out.
     let cluster = Arc::new(ClusterNode::new(
@@ -607,8 +643,13 @@ pub async fn run_backend_node<S: Storage + 'static>(
     .require_request_principal();
     #[cfg(feature = "fastembed")]
     let ingest = ingest.with_embedder(Arc::new(
-        exocortex_ingest::embedding::FastEmbedder::bge_small()?,
+        exocortex_ingest::embedding::FastEmbedder::bge_small()
+            .map_err(|error| anyhow::anyhow!("initialize bge-small embedder: {error}"))?,
     ));
+    let post_ingest_effects = {
+        let ingest = Arc::new(ingest.clone());
+        tokio::spawn(async move { ingest.run_post_ingest_effects().await })
+    };
 
     // One listener: gRPC routes + HTTP ops + SSE + observability.
 
@@ -749,7 +790,9 @@ pub async fn run_backend_node<S: Storage + 'static>(
         leader_gate,
         dreams,
         gossip,
+        cache_bridge: Some(cache_bridge),
         cluster_feed: Some(cluster_feed),
+        post_ingest_effects: Some(post_ingest_effects),
         leader_election: Some(leader_election),
     })
 }

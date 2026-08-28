@@ -146,7 +146,15 @@ async fn every_operation_answers_over_http_with_auth() {
         ontology: Some(ontology()),
     });
 
-    let bind = HttpBind::new(ctx.clone(), "test-only-secret-bearer-token-00000000".into());
+    let principals = Arc::new(
+        exocortex_server::principal::PrincipalRegistry::single_with_audit_admin(
+            "test-only-secret-bearer-token-00000000".into(),
+            ctx.visibility_ctx.clone(),
+            true,
+        )
+        .unwrap(),
+    );
+    let bind = HttpBind::with_principals(ctx.clone(), principals);
     let app = bind.router(None);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await

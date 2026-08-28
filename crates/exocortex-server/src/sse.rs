@@ -33,11 +33,56 @@ struct ClientGraphSnapshot {
 const MAX_RESEED_ROWS: usize = 50_000;
 const MAX_RESEED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CONCURRENT_RESEEDS: usize = 2;
+const MAX_LIVE_STREAMS_GLOBAL: usize = 256;
+const MAX_LIVE_STREAMS_PER_PRINCIPAL: usize = 8;
 
 struct SseState<S: Storage> {
     cluster: Arc<ClusterNode<S>>,
     reseeds: Arc<tokio::sync::Semaphore>,
+    live_streams: LiveStreamAdmission,
     hydration: SharedEventHydration,
+}
+
+#[derive(Clone)]
+struct LiveStreamAdmission {
+    global: Arc<tokio::sync::Semaphore>,
+    per_principal:
+        Arc<std::sync::Mutex<std::collections::BTreeMap<[u8; 32], Arc<tokio::sync::Semaphore>>>>,
+    per_principal_limit: usize,
+}
+
+struct LiveStreamPermits {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _principal: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl LiveStreamAdmission {
+    fn new(global_limit: usize, per_principal_limit: usize) -> Self {
+        Self {
+            global: Arc::new(tokio::sync::Semaphore::new(global_limit)),
+            per_principal: Arc::new(std::sync::Mutex::new(Default::default())),
+            per_principal_limit,
+        }
+    }
+
+    fn try_admit(&self, principal_key: [u8; 32]) -> Result<LiveStreamPermits, ()> {
+        let global = self.global.clone().try_acquire_owned().map_err(|_| ())?;
+        let principal = {
+            let mut entries = self
+                .per_principal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries
+                .entry(principal_key)
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.per_principal_limit)))
+                .clone()
+        };
+        let principal = principal.try_acquire_owned().map_err(|_| ())?;
+        Ok(LiveStreamPermits {
+            _global: global,
+            _principal: principal,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -64,11 +109,27 @@ type HydrationEntries = std::collections::BTreeMap<HydrationKey, HydrationCell>;
 
 /// The `/v1/changes` SSE router over a cluster node's local hub.
 pub fn sse_router<S: Storage + 'static>(cluster: Arc<ClusterNode<S>>) -> axum::Router {
+    sse_router_with_limits(
+        cluster,
+        MAX_LIVE_STREAMS_GLOBAL,
+        MAX_LIVE_STREAMS_PER_PRINCIPAL,
+    )
+}
+
+/// Build the SSE router with explicit live-stream limits for deterministic
+/// admission/cancellation tests. Production callers use [`sse_router`].
+#[doc(hidden)]
+pub fn sse_router_with_limits<S: Storage + 'static>(
+    cluster: Arc<ClusterNode<S>>,
+    global_limit: usize,
+    per_principal_limit: usize,
+) -> axum::Router {
     axum::Router::new()
         .route("/v1/changes", axum::routing::get(handler))
         .with_state(Arc::new(SseState {
             cluster,
             reseeds: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESEEDS)),
+            live_streams: LiveStreamAdmission::new(global_limit, per_principal_limit),
             hydration: SharedEventHydration::default(),
         }))
 }
@@ -110,9 +171,28 @@ async fn handler<S: Storage + 'static>(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u32>().ok())
         .is_some_and(|version| version >= exocortex_wire::SSE_EVENT_VERSION);
-    if principal.is_none() {
+    if principal.is_none() || bearer.is_none() {
         return (http::StatusCode::UNAUTHORIZED, "missing SSE credentials").into_response();
     }
+    let principal_visibility = &principal.as_ref().expect("checked principal").0;
+    let principal_identity = format!(
+        "{}:{}{}:{}",
+        principal_visibility.org_id.len(),
+        principal_visibility.org_id,
+        principal_visibility.user_id.len(),
+        principal_visibility.user_id
+    );
+    let principal_key = derive_client_sse_key(&cluster.hmac_key, &principal_identity);
+    let live_permits = match state.live_streams.try_admit(principal_key) {
+        Ok(permits) => permits,
+        Err(()) => {
+            return (
+                http::StatusCode::TOO_MANY_REQUESTS,
+                "SSE live-stream concurrency limit reached",
+            )
+                .into_response();
+        }
+    };
     // Subscribe before building an initial image so commits concurrent with
     // hydration are buffered for delivery immediately after the snapshot.
     let rx = cluster.subscribe_local();
@@ -168,6 +248,9 @@ async fn handler<S: Storage + 'static>(
     // R-Sec5: token → per-client key; envelopes re-sign with it.
     let client_key = bearer.map(|token| derive_client_sse_key(&cluster.hmac_key, token));
     let stream = async_stream::stream! {
+        // Owned permits live exactly as long as the response stream. Client
+        // cancellation drops the stream and releases both limits immediately.
+        let _live_permits = live_permits;
         let mut rx = tokio_stream::wrappers::BroadcastStream::new(rx);
         // Initial comment anchors the connection before the first delta.
         yield Ok::<Event, Infallible>(Event::default().comment(format!("exocortex {node_id}")));
@@ -347,10 +430,17 @@ async fn prepare_for_subscriber<S: Storage + 'static>(
                 .as_ref()
                 .filter(|memory| visibility.is_none_or(|vc| memory_visible(memory, vc)))
             {
-                Some(memory) => Ok(cluster.envelope(Invalidation::MemorySnapshotUpserted {
-                    memory: Box::new(memory.clone()),
-                    lsn,
-                })),
+                Some(memory) => {
+                    let mut memory = memory.clone();
+                    // Embeddings are a storage/search implementation detail.
+                    // They are intentionally absent from both initial seeds
+                    // and live snapshots so client caches never retain them.
+                    memory.embedding = None;
+                    Ok(cluster.envelope(Invalidation::MemorySnapshotUpserted {
+                        memory: Box::new(memory),
+                        lsn,
+                    }))
+                }
                 None => Ok(cluster.envelope(Invalidation::VisibilityAdvance { lsn })),
             }
         }
@@ -686,26 +776,49 @@ async fn graph_reseed_envelope_at<S: Storage + 'static>(
     }))
 }
 
-fn encoded_json_len<T: serde::Serialize>(value: &T) -> Result<usize, StorageError> {
-    struct CountingWriter(usize);
+#[derive(Default)]
+struct CountingWriter {
+    len: usize,
+    largest_external_write: usize,
+    borrowed_range: Option<(usize, usize)>,
+}
 
-    impl std::io::Write for CountingWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::FileTooLarge, "JSON length overflow")
-            })?;
-            Ok(bytes.len())
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.len = self.len.checked_add(bytes.len()).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::FileTooLarge, "JSON length overflow")
+        })?;
+        let start = bytes.as_ptr() as usize;
+        let end = start.saturating_add(bytes.len());
+        let borrowed = self
+            .borrowed_range
+            .is_some_and(|(source_start, source_end)| start >= source_start && end <= source_end);
+        if !borrowed {
+            self.largest_external_write = self.largest_external_write.max(bytes.len());
         }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+        Ok(bytes.len())
     }
 
-    let mut counter = CountingWriter(0);
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encoded_json_metrics<T: serde::Serialize>(
+    value: &T,
+    borrowed_range: Option<(usize, usize)>,
+) -> Result<(usize, usize), StorageError> {
+    let mut counter = CountingWriter {
+        borrowed_range,
+        ..CountingWriter::default()
+    };
     serde_json::to_writer(&mut counter, value)
         .map_err(|error| StorageError::Backend(error.to_string()))?;
-    Ok(counter.0)
+    Ok((counter.len, counter.largest_external_write))
+}
+
+fn encoded_json_len<T: serde::Serialize>(value: &T) -> Result<usize, StorageError> {
+    encoded_json_metrics(value, None).map(|(len, _)| len)
 }
 
 fn ensure_reseed_budget(rows: usize, bytes: usize) -> Result<(), StorageError> {
@@ -792,8 +905,8 @@ fn prost_encode(env: &exocortex_wire::cluster::v1::InvalidationEnvelope) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::{
-        encoded_json_len, ensure_reseed_budget, finalize_for_subscriber, graph_reseed_envelope_at,
-        prost_encode, MAX_RESEED_BYTES, MAX_RESEED_ROWS,
+        ensure_reseed_budget, finalize_for_subscriber, graph_reseed_envelope_at, prost_encode,
+        MAX_RESEED_BYTES, MAX_RESEED_ROWS,
     };
     use exocortex_cluster::ClusterNode;
     use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
@@ -949,10 +1062,20 @@ mod tests {
 
     #[test]
     fn reseed_byte_counter_matches_serialized_output_without_retaining_it() {
-        let value = serde_json::json!({"memories": ["a", "b"], "relationships": []});
-        assert_eq!(
-            encoded_json_len(&value).unwrap(),
-            serde_json::to_vec(&value).unwrap().len()
+        let payload = "x".repeat(512 * 1024);
+        let value = serde_json::json!({"memories": [payload], "relationships": []});
+        let encoded = serde_json::to_vec(&value).unwrap();
+        let source = value["memories"][0].as_str().unwrap();
+        let source_start = source.as_ptr() as usize;
+        let (measured, largest_external_write) =
+            super::encoded_json_metrics(&value, Some((source_start, source_start + source.len())))
+                .unwrap();
+
+        assert_eq!(measured, encoded.len());
+        assert!(
+            largest_external_write < encoded.len() / 8,
+            "length-only encoding materialized a {largest_external_write}-byte output chunk outside the borrowed source for a {}-byte payload",
+            encoded.len()
         );
     }
 
@@ -1129,7 +1252,14 @@ mod tests {
             embedding: None,
             lsn: LSN::new_local(0),
         };
-        let from = make_memory("from");
+        let mut from = make_memory("from");
+        from.embedding = Some(exocortex_kernel::Embedding {
+            model: exocortex_kernel::EmbeddingModel {
+                name: "test-model".into(),
+                version: "v1".into(),
+            },
+            vector: vec![0.25, 0.75],
+        });
         let to = make_memory("to");
         storage
             .upsert_batch(&[from.clone(), to.clone()], &[])
@@ -1175,9 +1305,24 @@ mod tests {
             lsn: 20,
         });
         for _ in 0..2 {
-            super::prepare_for_subscriber(&cluster, &hydration, memory_env.clone(), Some(&visible))
-                .await
-                .unwrap();
+            let delivered = super::prepare_for_subscriber(
+                &cluster,
+                &hydration,
+                memory_env.clone(),
+                Some(&visible),
+            )
+            .await
+            .unwrap();
+            let Some(exocortex_wire::sse::v1::invalidation::Kind::MemoryUpserted(snapshot)) =
+                delivered.inv.unwrap().kind
+            else {
+                panic!("visible memory must be delivered as a snapshot")
+            };
+            let delivered_memory: Memory = serde_json::from_slice(&snapshot.snapshot_json).unwrap();
+            assert!(
+                delivered_memory.embedding.is_none(),
+                "live SSE snapshots must strip stored embeddings before serialization"
+            );
         }
         assert_eq!(
             storage.take_read_counts(),
@@ -1233,5 +1378,26 @@ mod tests {
             second.is_ok(),
             "a transient lookup failure must not poison reconnects"
         );
+    }
+
+    #[test]
+    fn live_stream_caps_are_per_principal_global_and_release_on_cancellation() {
+        let admission = super::LiveStreamAdmission::new(2, 1);
+        let first = admission.try_admit([1; 32]).unwrap();
+        assert!(
+            admission.try_admit([1; 32]).is_err(),
+            "one credential cannot consume a second live stream"
+        );
+        let second = admission.try_admit([2; 32]).unwrap();
+        assert!(
+            admission.try_admit([3; 32]).is_err(),
+            "the global cap applies across credentials"
+        );
+
+        drop(first); // models cancellation dropping the response body/stream.
+        let replacement = admission.try_admit([1; 32]).unwrap();
+        drop(second);
+        drop(replacement);
+        assert!(admission.try_admit([3; 32]).is_ok());
     }
 }

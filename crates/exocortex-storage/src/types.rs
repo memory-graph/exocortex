@@ -42,6 +42,30 @@ pub struct SettledIngestBatch {
     pub assigned_lsn: u64,
 }
 
+/// One region's durable post-ingest work delta.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IngestRegionDelta {
+    /// Exact Dreams region affected by the committed batch.
+    pub region: RegionKey,
+    /// Newly committed session memories in this region.
+    pub memories: u32,
+    /// Newly committed relationship rows in this region.
+    pub relationships: u32,
+}
+
+/// Durable post-commit work emitted atomically with ingest settlement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PostIngestEffect {
+    /// Stable retry identity derived from the ingest batch identity.
+    pub effect_id: SmolStr,
+    /// Session-memory identities reasoning must evaluate.
+    #[serde(default)]
+    pub session_memory_ids: Vec<MemoryId>,
+    /// Exact regional write deltas delivered to Dreams.
+    #[serde(default)]
+    pub region_deltas: Vec<IngestRegionDelta>,
+}
+
 /// Result of the atomic dedup-claim plus graph commit boundary.
 #[derive(Clone, Debug)]
 pub enum IngestCommitOutcome {

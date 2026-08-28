@@ -9,7 +9,7 @@ use crate::types::{
     AuditEvent, CommitRecord, CycleJournalRecord, CypherQuery, DiscoveryAcceptance,
     DiscoveryProposal, DiscoveryRecord, Embedding, FencedBatchCommit, FencedRestore, GraphSnapshot,
     IngestBatchKey, IngestCommitOutcome, Invalidation, LeaseKey, MemoryFilter, OwnerLease,
-    RegionKey, ResultSet, StorageBackendId, StorageCapabilities, TraversalSpec,
+    PostIngestEffect, RegionKey, ResultSet, StorageBackendId, StorageCapabilities, TraversalSpec,
 };
 
 /// Errors surfaced by every `Storage` implementation.
@@ -72,6 +72,20 @@ pub trait Storage: Send + Sync + 'static {
         ms: &[Memory],
         rs: &[Relationship],
     ) -> crate::Result<Vec<CommitRecord>>;
+    /// Atomically import a governed backup exactly once. `import_key` is a
+    /// stable digest of the validated backup document. A repeated key is a
+    /// durable no-op: it appends no assertion history and publishes nothing.
+    async fn import_batch_once(
+        &self,
+        import_key: &str,
+        ms: &[Memory],
+        rs: &[Relationship],
+    ) -> crate::Result<bool> {
+        let _ = (import_key, ms, rs);
+        Err(StorageError::Backend(
+            "idempotent governed import unsupported".into(),
+        ))
+    }
     /// Soft-delete a memory: close `valid_until`, never remove the node.
     async fn delete_memory(&self, id: &MemoryId) -> crate::Result<CommitRecord>;
     /// Upsert one relationship row (DELETE-then-CREATE, R-S2).
@@ -91,6 +105,36 @@ pub trait Storage: Send + Sync + 'static {
     ) -> crate::Result<IngestCommitOutcome> {
         let _ = (key, memories, relationships, accepted);
         Err(StorageError::Backend("atomic ingest unsupported".into()))
+    }
+    /// Commit and settle ingest while atomically creating its durable
+    /// post-commit work item. Retries return the original settlement and must
+    /// not replace or duplicate the effect.
+    async fn commit_ingest_batch_with_effect(
+        &self,
+        key: &IngestBatchKey,
+        memories: &[Memory],
+        relationships: &[Relationship],
+        accepted: u32,
+        effect: &PostIngestEffect,
+    ) -> crate::Result<IngestCommitOutcome> {
+        let _ = (key, memories, relationships, accepted, effect);
+        Err(StorageError::Backend(
+            "atomic ingest effect outbox unsupported".into(),
+        ))
+    }
+    /// Oldest pending post-ingest effects, in stable effect-id order.
+    async fn pending_ingest_effects(&self, limit: u32) -> crate::Result<Vec<PostIngestEffect>> {
+        let _ = limit;
+        Err(StorageError::Backend(
+            "ingest effect outbox unsupported".into(),
+        ))
+    }
+    /// Idempotently acknowledge one delivered post-ingest effect.
+    async fn acknowledge_ingest_effect(&self, effect_id: &str) -> crate::Result<bool> {
+        let _ = effect_id;
+        Err(StorageError::Backend(
+            "ingest effect outbox unsupported".into(),
+        ))
     }
     /// Atomically upsert a protected memory mutation and its required audit
     /// event. Neither may commit without the other (R6-B18).
@@ -292,6 +336,73 @@ pub trait Storage: Send + Sync + 'static {
             )));
         }
         Ok(candidates)
+    }
+    /// Bounded current memory rows in one exact Dreams region, in canonical
+    /// id order. Implementations inspect at most `limit + 1` matching rows.
+    async fn memories_in_region(
+        &self,
+        region: &RegionKey,
+        limit: u32,
+    ) -> crate::Result<Vec<Memory>> {
+        use futures::StreamExt;
+        let mut stream = self.stream_all_memories().await;
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await {
+            let memory = row?;
+            let matches = memory.memory_type == region.memory_type
+                && (region.org == "*"
+                    || memory.context.tenant_id.as_deref() == Some(region.org.as_str()))
+                && (region.project == "*"
+                    || memory.context.project_id.as_deref() == Some(region.project.as_str()));
+            if matches {
+                rows.push(memory);
+            }
+        }
+        rows.sort_by_key(|memory| memory.id);
+        if rows.len() > limit as usize {
+            return Err(StorageError::Backend(format!(
+                "region memory budget exceeded: more than {limit} rows"
+            )));
+        }
+        Ok(rows)
+    }
+    /// Bounded current relationship rows whose endpoints are both in one exact
+    /// Dreams region. Unlike [`Storage::relationships_in_region`], this retains
+    /// closed rows needed by consolidation and rollback diagnostics.
+    async fn current_relationships_in_region(
+        &self,
+        region: &RegionKey,
+        limit: u32,
+    ) -> crate::Result<Vec<Relationship>> {
+        use futures::StreamExt;
+        let memories: std::collections::HashSet<_> = self
+            .memories_in_region(region, limit)
+            .await?
+            .into_iter()
+            .map(|memory| memory.id)
+            .collect();
+        let mut stream = self.stream_all_relationships().await;
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await {
+            let relationship = row?;
+            if memories.contains(&relationship.from) && memories.contains(&relationship.to) {
+                rows.push(relationship);
+            }
+        }
+        rows.sort_by_key(|relationship| {
+            (
+                relationship.from,
+                relationship.to,
+                relationship.kind,
+                relationship.id,
+            )
+        });
+        if rows.len() > limit as usize {
+            return Err(StorageError::Backend(format!(
+                "region relationship budget exceeded: more than {limit} rows"
+            )));
+        }
+        Ok(rows)
     }
     /// Bounded attribute-posting expansion for reasoning rules R7/R9.
     async fn memories_sharing_attributes(

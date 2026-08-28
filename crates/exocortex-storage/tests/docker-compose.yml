@@ -4,7 +4,7 @@ version: "3.8"
 # the plain `redis` service exists for auxiliary tooling only.
 services:
   falkordb:
-    image: falkordb/falkordb:latest
+    image: falkordb/falkordb@sha256:adbddd418916c25618564ff8597a919b08bc76452ebeb74eb985c38d7281df62
     ports:
       - "127.0.0.1:16379:6379"
     healthcheck:
@@ -13,6 +13,6 @@ services:
       timeout: 3s
       retries: 30
   redis:
-    image: redis:7-alpine
+    image: redis@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065
     ports:
       - "127.0.0.1:6380:6379"

@@ -251,6 +251,12 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
         r#"[{"bearer_token":"test-only-valid-bearer-token-00000000","org_id":"org","user_id":"user","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
     )
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&principal_policy, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
     std::fs::write(
         &source_policy,
         r#"[{"org_id":"org","source_uri":"session://redaction","producer_id":"redaction","ceiling":3}]"#,

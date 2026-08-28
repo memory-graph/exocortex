@@ -7,6 +7,7 @@
 // invalidation is published to the org channel (§9.1).
 
 use std::collections::HashMap;
+#[cfg(feature = "integration")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -52,8 +53,12 @@ pub struct FalkorStorage {
     ontology: Arc<Ontology>,
     lsn_key: String,
     channel: String,
+    #[cfg(feature = "integration")]
     stream_memory_pages: AtomicU64,
+    #[cfg(feature = "integration")]
     stream_relationship_pages: AtomicU64,
+    #[cfg(feature = "integration")]
+    legacy_repair_queries: AtomicU64,
     #[cfg(feature = "integration")]
     fail_next_publish: std::sync::atomic::AtomicBool,
     #[cfg(feature = "integration")]
@@ -389,8 +394,12 @@ impl FalkorStorage {
             ontology,
             lsn_key: format!("exocortex:{}:lsn", cfg.org_id),
             channel: format!("exocortex:{}:inv", cfg.org_id),
+            #[cfg(feature = "integration")]
             stream_memory_pages: AtomicU64::new(0),
+            #[cfg(feature = "integration")]
             stream_relationship_pages: AtomicU64::new(0),
+            #[cfg(feature = "integration")]
+            legacy_repair_queries: AtomicU64::new(0),
             #[cfg(feature = "integration")]
             fail_next_publish: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "integration")]
@@ -414,6 +423,7 @@ impl FalkorStorage {
         }
         this.pin_fingerprint(graph_exists).await?;
         this.migrate_schema().await?;
+        this.repair_legacy_memories().await?;
         Ok(this)
     }
 
@@ -455,9 +465,17 @@ impl FalkorStorage {
                         .run_template("read_schema_version", &serde_json::json!({}), true)
                         .await?;
                     schema_needs_migration(&schema)?;
-                    return Err(StorageError::Backend(
-                        "fingerprint pin was rejected by schema guard".into(),
-                    ));
+                    let fingerprint = self
+                        .run_template("read_fingerprint", &serde_json::json!({}), true)
+                        .await?;
+                    return match decode_persisted_fingerprint(&fingerprint)? {
+                        Some(storage) => {
+                            Err(StorageError::FingerprintMismatch { storage, runtime })
+                        }
+                        None => Err(StorageError::Backend(
+                            "fingerprint pin was rejected by schema guard".into(),
+                        )),
+                    };
                 }
                 tracing::info!(fingerprint = %hexfp, "pinned ontology fingerprint");
                 Ok(())
@@ -492,12 +510,17 @@ impl FalkorStorage {
                 .ok_or_else(|| {
                     StorageError::Backend(format!("bad memory_type {}", memory.memory_type))
                 })?;
-            self.run_template(
-                "migrate_memory_schema_v1",
-                &self.memory_params(&memory, memory.lsn.value, memory_type_label),
-                false,
-            )
-            .await?;
+            let migrated = self
+                .run_template(
+                    "migrate_memory_schema_v1",
+                    &self.memory_params(&memory, memory.lsn.value, memory_type_label),
+                    false,
+                )
+                .await?;
+            // A rolling writer may replace the captured row. The captured-LSN
+            // CAS deliberately skips it; connect-time repair below adopts the
+            // replacement only when it lacks canonical assertion history.
+            let _ = migrated;
         }
 
         let mut relationships = <Self as Storage>::stream_all_relationships(self).await;
@@ -514,6 +537,8 @@ impl FalkorStorage {
             )
             .await?;
         }
+
+        self.repair_legacy_memories().await?;
 
         self.run_template(
             "write_schema_version",
@@ -640,6 +665,13 @@ impl FalkorStorage {
         params: &serde_json::Value,
         read_only: bool,
     ) -> Result<Vec<Vec<FalkorValue>>, StorageError> {
+        #[cfg(feature = "integration")]
+        if matches!(
+            template_id,
+            "legacy_memory_candidates" | "repair_legacy_memory_v1"
+        ) {
+            self.legacy_repair_queries.fetch_add(1, Ordering::Relaxed);
+        }
         let t = cypher::TEMPLATES.get(template_id).ok_or_else(|| {
             StorageError::Backend(format!("unregistered cypher template: {template_id}"))
         })?;
@@ -1083,7 +1115,8 @@ impl FalkorStorage {
         rs: &[Relationship],
         lease: Option<&OwnerLease>,
         journal: Option<(&FencedRestore, &str)>,
-    ) -> Result<FencedBatchCommit, StorageError> {
+        import_key: Option<&str>,
+    ) -> Result<Option<FencedBatchCommit>, StorageError> {
         // R-T4 inverse companions join the same transaction.
         let all_rels = self.expand_relationships(rs);
 
@@ -1095,6 +1128,13 @@ impl FalkorStorage {
         let mut records = Vec::with_capacity(total);
         let mut invalidations = Vec::with_capacity(total);
         let mut next = block.start;
+
+        if let Some(import_key) = import_key {
+            parts.push((
+                "governed_import_guard",
+                serde_json::json!({ "import_key": import_key }),
+            ));
+        }
 
         if let Some(last_lsn) = block.end.checked_sub(1) {
             parts.push(("mutation_lsn_guard", serde_json::json!({ "lsn": last_lsn })));
@@ -1258,6 +1298,9 @@ impl FalkorStorage {
             .map_err(|e| StorageError::Backend(format!("atomic batch failed: {e}")))?;
         let query_committed = result.data.count() > 0;
         if !query_committed {
+            if import_key.is_some() {
+                return Ok(None);
+            }
             return match lease {
                 Some(lease) => Err(StorageError::FencedWriteRejected {
                     lease_epoch: lease.epoch,
@@ -1271,70 +1314,18 @@ impl FalkorStorage {
         for inv in invalidations {
             self.publish(inv).await;
         }
-        Ok(committed)
-    }
-}
-
-#[async_trait]
-impl Storage for FalkorStorage {
-    #[instrument(skip(self, m))]
-    async fn upsert_memory(&self, m: &Memory) -> Result<CommitRecord, StorageError> {
-        let lsn = self.next_lsn().await?;
-        let now = Utc::now();
-        let mt_label = self
-            .ontology
-            .memory_type_names
-            .get(m.memory_type as usize)
-            .ok_or_else(|| StorageError::Backend(format!("bad memory_type {}", m.memory_type)))?;
-        let params = self.memory_params(m, lsn, mt_label);
-        let rows = self.run_template("upsert_memory", &params, false).await?;
-        let node_id = rows.first().and_then(|r| r.first()).and_then(|v| {
-            if let FalkorValue::I64(i) = v {
-                Some(*i as u64)
-            } else {
-                None
-            }
-        });
-        self.publish(Invalidation::MemoryUpserted { id: m.id, lsn })
-            .await;
-        Ok(CommitRecord {
-            lsn,
-            committed_at: now,
-            node_id,
-            edge_id: None,
-        })
+        Ok(Some(committed))
     }
 
-    async fn upsert_batch(
-        &self,
-        ms: &[Memory],
-        rs: &[Relationship],
-    ) -> Result<Vec<CommitRecord>, StorageError> {
-        Ok(self.upsert_batch_inner(ms, rs, None, None).await?.records)
-    }
-
-    async fn commit_ingest_batch(
+    async fn commit_ingest_batch_inner(
         &self,
         key: &IngestBatchKey,
         memories: &[Memory],
         relationships: &[Relationship],
         accepted: u32,
+        effect: Option<&PostIngestEffect>,
     ) -> Result<IngestCommitOutcome, StorageError> {
-        let mut all_relationships = Vec::with_capacity(relationships.len() * 2);
-        let mut seen: std::collections::HashSet<RelationshipId> = relationships
-            .iter()
-            .map(|relationship| relationship.id)
-            .collect();
-        for relationship in relationships {
-            all_relationships.push(relationship.clone());
-            if let Some(inverse) =
-                exocortex_kernel::materialize_inverse(&self.ontology, relationship)
-            {
-                if seen.insert(inverse.id) {
-                    all_relationships.push(inverse);
-                }
-            }
-        }
+        let all_relationships = self.expand_relationships(relationships);
         let total = memories.len() + all_relationships.len();
         let block = self.next_lsn_block(total).await?;
         let assigned_lsn = if total == 0 { 0 } else { block.end - 1 };
@@ -1366,9 +1357,6 @@ impl Storage for FalkorStorage {
                 "external_ids": external_ids,
             }),
         ));
-        // Validate every external endpoint before creating the durable claim.
-        // A rejected query must leave no `claiming` marker that could strand
-        // a later retry after the caller repairs the batch.
         parts.push((
             "ingest_claim_guard",
             serde_json::json!({
@@ -1448,6 +1436,9 @@ impl Storage for FalkorStorage {
                 "accepted": settled.accepted,
                 "rejected": settled.rejected,
                 "assigned_lsn": settled.assigned_lsn,
+                "effect_id": effect.map(|effect| effect.effect_id.as_str()),
+                "effect_json": effect.map(serde_json::to_string).transpose()
+                    .map_err(|error| StorageError::Backend(error.to_string()))?,
             }),
         ));
         if !self.run_atomic_parts(&parts).await? {
@@ -1471,6 +1462,122 @@ impl Storage for FalkorStorage {
             self.publish(invalidation).await;
         }
         Ok(IngestCommitOutcome::Committed { records, settled })
+    }
+}
+
+#[async_trait]
+impl Storage for FalkorStorage {
+    #[instrument(skip(self, m))]
+    async fn upsert_memory(&self, m: &Memory) -> Result<CommitRecord, StorageError> {
+        let lsn = self.next_lsn().await?;
+        let now = Utc::now();
+        let mt_label = self
+            .ontology
+            .memory_type_names
+            .get(m.memory_type as usize)
+            .ok_or_else(|| StorageError::Backend(format!("bad memory_type {}", m.memory_type)))?;
+        let params = self.memory_params(m, lsn, mt_label);
+        let rows = self.run_template("upsert_memory", &params, false).await?;
+        let node_id = rows.first().and_then(|r| r.first()).and_then(|v| {
+            if let FalkorValue::I64(i) = v {
+                Some(*i as u64)
+            } else {
+                None
+            }
+        });
+        self.publish(Invalidation::MemoryUpserted { id: m.id, lsn })
+            .await;
+        Ok(CommitRecord {
+            lsn,
+            committed_at: now,
+            node_id,
+            edge_id: None,
+        })
+    }
+
+    async fn upsert_batch(
+        &self,
+        ms: &[Memory],
+        rs: &[Relationship],
+    ) -> Result<Vec<CommitRecord>, StorageError> {
+        Ok(self
+            .upsert_batch_inner(ms, rs, None, None, None)
+            .await?
+            .expect("ordinary batch cannot take the idempotent no-op path")
+            .records)
+    }
+
+    async fn import_batch_once(
+        &self,
+        import_key: &str,
+        ms: &[Memory],
+        rs: &[Relationship],
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .upsert_batch_inner(ms, rs, None, None, Some(import_key))
+            .await?
+            .is_some())
+    }
+
+    async fn commit_ingest_batch(
+        &self,
+        key: &IngestBatchKey,
+        memories: &[Memory],
+        relationships: &[Relationship],
+        accepted: u32,
+    ) -> Result<IngestCommitOutcome, StorageError> {
+        self.commit_ingest_batch_inner(key, memories, relationships, accepted, None)
+            .await
+    }
+
+    async fn commit_ingest_batch_with_effect(
+        &self,
+        key: &IngestBatchKey,
+        memories: &[Memory],
+        relationships: &[Relationship],
+        accepted: u32,
+        effect: &PostIngestEffect,
+    ) -> Result<IngestCommitOutcome, StorageError> {
+        self.commit_ingest_batch_inner(key, memories, relationships, accepted, Some(effect))
+            .await
+    }
+
+    async fn pending_ingest_effects(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<PostIngestEffect>, StorageError> {
+        let rows = self
+            .run_template(
+                "ingest_effects_pending",
+                &serde_json::json!({ "limit": limit }),
+                true,
+            )
+            .await?;
+        rows.iter()
+            .map(|row| match row.first() {
+                Some(FalkorValue::String(json)) => {
+                    serde_json::from_str(json).map_err(|error| StorageError::CorruptMetadata {
+                        key: "ingest_effect",
+                        detail: error.to_string(),
+                    })
+                }
+                other => Err(StorageError::CorruptMetadata {
+                    key: "ingest_effect",
+                    detail: format!("expected string, found {other:?}"),
+                }),
+            })
+            .collect()
+    }
+
+    async fn acknowledge_ingest_effect(&self, effect_id: &str) -> Result<bool, StorageError> {
+        Ok(!self
+            .run_template(
+                "ingest_effect_acknowledge",
+                &serde_json::json!({ "effect_id": effect_id }),
+                false,
+            )
+            .await?
+            .is_empty())
     }
 
     async fn delete_memory(&self, id: &MemoryId) -> Result<CommitRecord, StorageError> {
@@ -1990,7 +2097,6 @@ impl Storage for FalkorStorage {
     }
 
     async fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>, StorageError> {
-        self.repair_legacy_memories().await?;
         // R-T11 (audit ST3): `Public` is treated as `Org` on v1 read paths —
         // fetch at the widest internal ceiling so a Public row is readable
         // instead of invisible.
@@ -2009,7 +2115,6 @@ impl Storage for FalkorStorage {
         id: &MemoryId,
         vc: &crate::VisibilityContext,
     ) -> Result<Option<Memory>, StorageError> {
-        self.repair_legacy_memories().await?;
         // ST4 (audit): fetch at the widest internal ceiling and apply the
         // visibility decision in Rust — an existing-but-forbidden row is
         // PermissionDenied (R-MT4), never a silent None.
@@ -2031,7 +2136,6 @@ impl Storage for FalkorStorage {
     }
 
     async fn get_memories(&self, ids: &[MemoryId]) -> Result<Vec<Memory>, StorageError> {
-        self.repair_legacy_memories().await?;
         let rows = self
             .run_template(
                 "get_memories_by_ids",
@@ -2051,7 +2155,6 @@ impl Storage for FalkorStorage {
         ids: &[MemoryId],
         vc: &crate::VisibilityContext,
     ) -> Result<Vec<Memory>, StorageError> {
-        self.repair_legacy_memories().await?;
         let rows = self
             .run_template(
                 "get_visible_memories_by_ids",
@@ -2152,13 +2255,68 @@ impl Storage for FalkorStorage {
         Ok(relationships)
     }
 
+    async fn memories_in_region(
+        &self,
+        region: &RegionKey,
+        limit: u32,
+    ) -> Result<Vec<Memory>, StorageError> {
+        let rows = self
+            .run_template(
+                "memories_in_region",
+                &serde_json::json!({
+                    "org_id": region.org,
+                    "project_id": region.project,
+                    "memory_type": region.memory_type,
+                    "limit": limit.saturating_add(1),
+                }),
+                true,
+            )
+            .await?;
+        if rows.len() > limit as usize {
+            return Err(StorageError::Backend(format!(
+                "region memory budget exceeded: more than {limit} rows"
+            )));
+        }
+        rows.iter()
+            .filter_map(|row| row.first())
+            .map(memory_from_value)
+            .collect()
+    }
+
+    async fn current_relationships_in_region(
+        &self,
+        region: &RegionKey,
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        let rows = self
+            .run_template(
+                "current_relationships_in_region",
+                &serde_json::json!({
+                    "org_id": region.org,
+                    "project_id": region.project,
+                    "memory_type": region.memory_type,
+                    "limit": limit.saturating_add(1),
+                }),
+                true,
+            )
+            .await?;
+        if rows.len() > limit as usize {
+            return Err(StorageError::Backend(format!(
+                "region relationship budget exceeded: more than {limit} rows"
+            )));
+        }
+        rows.iter()
+            .filter_map(|row| row.first())
+            .map(relationship_from_value)
+            .collect()
+    }
+
     async fn memories_sharing_attributes(
         &self,
         tags: &[smol_str::SmolStr],
         entities: &[EntityId],
         limit: u32,
     ) -> Result<Vec<Memory>, StorageError> {
-        self.repair_legacy_memories().await?;
         let rows = self
             .run_template(
                 "memories_sharing_attributes",
@@ -2358,9 +2516,6 @@ impl Storage for FalkorStorage {
     }
 
     async fn stream_all_memories(&self) -> BoxStream<'_, Result<Memory, StorageError>> {
-        if let Err(error) = self.repair_legacy_memories().await {
-            return Box::pin(futures::stream::once(async move { Err(error) }));
-        }
         let stream = futures::stream::unfold(
             (self, 0_u64, true, std::collections::VecDeque::new(), false),
             |(storage, mut cursor, mut first_page, mut buffered, mut done)| async move {
@@ -2374,6 +2529,7 @@ impl Storage for FalkorStorage {
                     let params = serde_json::json!({
                         "after_lsn": cursor, "first_page": first_page, "limit": 500_u32
                     });
+                    #[cfg(feature = "integration")]
                     storage.stream_memory_pages.fetch_add(1, Ordering::Relaxed);
                     let rows = match storage.run_template("stream_memories", &params, true).await {
                         Ok(rows) => rows,
@@ -2434,6 +2590,7 @@ impl Storage for FalkorStorage {
                     let params = serde_json::json!({
                         "after_lsn": cursor, "first_page": first_page, "limit": 500_u32
                     });
+                    #[cfg(feature = "integration")]
                     storage
                         .stream_relationship_pages
                         .fetch_add(1, Ordering::Relaxed);
@@ -2598,7 +2755,9 @@ impl Storage for FalkorStorage {
         rs: &[Relationship],
         lease: &OwnerLease,
     ) -> Result<FencedBatchCommit, StorageError> {
-        self.upsert_batch_inner(ms, rs, Some(lease), None).await
+        self.upsert_batch_inner(ms, rs, Some(lease), None, None)
+            .await?
+            .ok_or_else(|| StorageError::Backend("fenced batch unexpectedly became a no-op".into()))
     }
 
     async fn upsert_batch_fenced_journaled(
@@ -2609,8 +2768,15 @@ impl Storage for FalkorStorage {
         cycle_id: &str,
         lease: &OwnerLease,
     ) -> Result<FencedBatchCommit, StorageError> {
-        self.upsert_batch_inner(ms, rs, Some(lease), Some((prepared_restore, cycle_id)))
-            .await
+        self.upsert_batch_inner(
+            ms,
+            rs,
+            Some(lease),
+            Some((prepared_restore, cycle_id)),
+            None,
+        )
+        .await?
+        .ok_or_else(|| StorageError::Backend("journaled batch unexpectedly became a no-op".into()))
     }
 
     async fn get_active_cycle_journal(
@@ -3023,11 +3189,18 @@ impl FalkorStorage {
     /// Reset and return `(memory pages, relationship pages)` fetched by the
     /// lazy bulk streams. Exposed for backend paging acceptance tests.
     #[doc(hidden)]
+    #[cfg(feature = "integration")]
     pub fn take_stream_page_counts(&self) -> (u64, u64) {
         (
             self.stream_memory_pages.swap(0, Ordering::Relaxed),
             self.stream_relationship_pages.swap(0, Ordering::Relaxed),
         )
+    }
+    /// Reset and return compatibility-repair template executions.
+    #[doc(hidden)]
+    #[cfg(feature = "integration")]
+    pub fn take_legacy_repair_query_count(&self) -> u64 {
+        self.legacy_repair_queries.swap(0, Ordering::Relaxed)
     }
     /// Fail the next Redis publication after its durable graph mutation.
     #[cfg(feature = "integration")]

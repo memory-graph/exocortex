@@ -4,6 +4,7 @@ set -euo pipefail
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo check -p exocortex-server --all-targets --features fastembed
 cargo test --workspace --features exocortex-adapter-sdk/testing --no-fail-fast
 cargo deny check
 cargo xtask kernel-purity

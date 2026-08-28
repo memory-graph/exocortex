@@ -25,7 +25,33 @@ case "$mode" in
   mcp-client)
     exec "$bin_dir/exocortex-mcp-client" "$@"
     ;;
-  mcp-standalone|backend-node)
+  mcp-standalone)
+    node_bin=${EXOCORTEX_STANDALONE_NODE_BIN:-"$bin_dir/exocortex-node"}
+    "$node_bin" --mode mcp-standalone &
+    supervisor_pid=$!
+    client_pid=""
+    cleanup() {
+      if [ -n "$client_pid" ]; then
+        kill "$client_pid" 2>/dev/null || true
+        wait "$client_pid" 2>/dev/null || true
+      fi
+      kill "$supervisor_pid" 2>/dev/null || true
+      wait "$supervisor_pid" 2>/dev/null || true
+    }
+    trap cleanup EXIT
+    trap 'exit 143' HUP INT TERM
+    # The foreground process is the real cache/WAL/operation-registry MCP
+    # runtime. The sibling node owns and supervises embedded FalkorDB.
+    "$bin_dir/exocortex-mcp-client" "$@" <&0 &
+    client_pid=$!
+    set +e
+    wait "$client_pid"
+    status=$?
+    set -e
+    client_pid=""
+    exit "$status"
+    ;;
+  backend-node)
     exec "$bin_dir/exocortex-node" --mode "$mode" "$@"
     ;;
   *)

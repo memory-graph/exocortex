@@ -133,16 +133,6 @@ fn main() -> anyhow::Result<()> {
     require_linked_ontology_pack();
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
     let ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
-    if args.verify_rules {
-        exocortex_reasoning::acceptance::verify_nine_catalogued_rules(&ontology)
-            .map_err(anyhow::Error::msg)?;
-        println!(
-            "rules-ok mode={} count=9 artifact=exocortex-node",
-            std::env::var("EXOCORTEX_DEPLOYMENT_MODE").unwrap_or_else(|_| "backend-node".into())
-        );
-        return Ok(());
-    }
-
     // BR2 one-shot modes: org backup/restore against the selected
     // storage, then exit (no cluster, no serving).
     if args.export_org.is_some() || args.import_org.is_some() {
@@ -173,6 +163,10 @@ fn main() -> anyhow::Result<()> {
             };
             let mut server = supervisor::spawn_supervised(&cfg)?;
             tracing::info!(port = server.port, "exocortex-node mcp-standalone ready");
+            if args.verify_rules {
+                verify_deployed_rules(&ontology, "mcp-standalone")?;
+                return Ok(());
+            }
             // CS5 (audit): a REAL supervision loop — try_wait, restart
             // within the policy, exit non-zero when the budget is spent.
             // (Drop kills the child, so the parent never orphans it.)
@@ -334,13 +328,13 @@ fn backend_node_main(args: Args) -> anyhow::Result<()> {
                 )
                 .await?,
             );
-            serve_forever(storage, ontology, node_args).await
+            serve_forever(storage, ontology, node_args, args.verify_rules).await
         } else if args.storage == "memory" {
             // Non-durable topology: same InMemoryStorage the in-process
             // tests use. CI/dev only — never production.
             let storage =
                 std::sync::Arc::new(exocortex_storage::InMemoryStorage::new(ontology.clone()));
-            serve_forever(storage, ontology, node_args).await
+            serve_forever(storage, ontology, node_args, args.verify_rules).await
         } else {
             anyhow::bail!(
                 "backend-node needs --storage=falkor://host:port or memory (embedded storage is mcp-standalone)"
@@ -354,10 +348,28 @@ async fn serve_forever<S: exocortex_storage::Storage + 'static>(
     storage: std::sync::Arc<S>,
     ontology: std::sync::Arc<exocortex_kernel::Ontology>,
     node_args: backend::BackendNodeArgs,
+    verify_rules: bool,
 ) -> anyhow::Result<()> {
-    let node = backend::run_backend_node(storage, ontology, node_args).await?;
+    let node = backend::run_backend_node(storage, ontology.clone(), node_args).await?;
     tracing::info!(addr = %node.local_addr, "backend-node up; serving until interrupted");
+    if verify_rules {
+        verify_deployed_rules(&ontology, "backend-node")?;
+        return Ok(());
+    }
     std::future::pending::<anyhow::Result<()>>().await
+}
+
+fn verify_deployed_rules(
+    ontology: &exocortex_kernel::Ontology,
+    fallback_mode: &str,
+) -> anyhow::Result<()> {
+    exocortex_reasoning::acceptance::verify_nine_catalogued_rules(ontology)
+        .map_err(anyhow::Error::msg)?;
+    println!(
+        "rules-ok mode={} count=9 artifact=exocortex-node",
+        std::env::var("EXOCORTEX_DEPLOYMENT_MODE").unwrap_or_else(|_| fallback_mode.into())
+    );
+    Ok(())
 }
 
 /// Shared/backend mode never derives authentication material from a public

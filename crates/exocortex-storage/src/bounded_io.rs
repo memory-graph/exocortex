@@ -92,8 +92,7 @@ pub fn atomic_write_private(path: &Path, bytes: &[u8], noun: &str) -> std::io::R
 /// Testable form of [`atomic_write_private`]. The hook runs after the
 /// temporary file is durable and before rename; failures remove the temporary
 /// file and preserve the previous destination.
-#[doc(hidden)]
-pub fn atomic_write_private_with(
+fn atomic_write_private_with(
     path: &Path,
     bytes: &[u8],
     noun: &str,

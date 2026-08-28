@@ -21,6 +21,14 @@ use crate::ingest::v1::{IngestBatch, RegisterSourceRequest};
 
 type HmacSha256 = Hmac<sha2::Sha256>;
 
+/// Canonical SHA-256 content digest for durable idempotency identities. Digest
+/// ownership remains beside the workspace's signing primitives so callers do
+/// not introduce a second hashing implementation.
+pub fn content_digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes).into()
+}
+
 /// Derive the per-subscriber SSE verification key from the cluster key and
 /// opaque client token (R-Sec5).
 pub fn derive_sse_client_key(cluster_key: &[u8; 32], token: &str) -> [u8; 32] {

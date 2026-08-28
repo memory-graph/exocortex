@@ -1,6 +1,9 @@
 //! Administrator-owned bearer credential to request-principal mapping.
 
 use std::collections::HashSet;
+use std::io::Read as _;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use exocortex_kernel::Visibility;
@@ -44,17 +47,34 @@ impl PrincipalRegistry {
     /// Load and validate a JSON policy file. Missing, empty, duplicated, or
     /// malformed credentials fail startup rather than widening access.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let raw = std::fs::read_to_string(path)
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| anyhow::anyhow!("open principal policy {}: {e}", path.display()))?;
+        #[cfg(unix)]
+        {
+            let mode = file
+                .metadata()
+                .map_err(|e| anyhow::anyhow!("inspect principal policy {}: {e}", path.display()))?
+                .permissions()
+                .mode();
+            anyhow::ensure!(
+                mode & 0o077 == 0,
+                "principal policy {} must be owner-only (mode 0600 or stricter)",
+                path.display()
+            );
+        }
+        let mut raw = String::new();
+        file.read_to_string(&mut raw)
             .map_err(|e| anyhow::anyhow!("read principal policy {}: {e}", path.display()))?;
         let rows: Vec<PrincipalPolicyRow> = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("parse principal policy {}: {e}", path.display()))?;
         Self::from_rows(rows)
     }
 
-    /// Construct the single-principal registry used by embedded tests. The
-    /// production node uses [`Self::load`] exclusively.
+    /// Construct a least-privilege single-principal registry for embedded
+    /// callers. The production node uses [`Self::load`] exclusively; embedded
+    /// audit administrators must use [`Self::single_with_audit_admin`].
     pub fn single(token: String, principal: VisibilityContext) -> anyhow::Result<Self> {
-        Self::single_with_audit_admin(token, principal, true)
+        Self::single_with_audit_admin(token, principal, false)
     }
 
     /// Construct one explicitly permissioned principal for embedded tests.
@@ -174,6 +194,8 @@ mod tests {
             format!(r#"[{{"bearer_token":"{TEST_BEARER}","org_id":"o","user_id":"u","project_ids":["p"],"team_ids":["t"],"max_visibility":2,"audit_admin":true}}]"#),
         )
         .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let registry = PrincipalRegistry::load(&path).unwrap();
         let principal = registry.authenticate(TEST_BEARER.as_bytes()).unwrap();
         assert_eq!(principal.visibility.org_id.as_str(), "o");
@@ -214,7 +236,51 @@ mod tests {
             r#"[{"bearer_token":"short","org_id":"org","user_id":"user","max_visibility":3}]"#,
         )
         .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let error = PrincipalRegistry::load(&path).err().unwrap().to_string();
         assert!(error.contains("at least 32 bytes"));
+    }
+
+    #[test]
+    fn embedded_registry_is_non_admin_unless_explicitly_granted() {
+        let visibility = VisibilityContext {
+            user_id: "user".into(),
+            org_id: "org".into(),
+            project_ids: vec![].into(),
+            team_ids: vec![].into(),
+            max_visibility: Visibility::Org,
+        };
+        let ordinary = PrincipalRegistry::single(TEST_BEARER.into(), visibility.clone()).unwrap();
+        assert!(
+            !ordinary
+                .authenticate(TEST_BEARER.as_bytes())
+                .unwrap()
+                .audit_admin
+        );
+        let admin =
+            PrincipalRegistry::single_with_audit_admin(TEST_BEARER.into(), visibility, true)
+                .unwrap();
+        assert!(
+            admin
+                .authenticate(TEST_BEARER.as_bytes())
+                .unwrap()
+                .audit_admin
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn principal_policy_rejects_group_or_world_permissions_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("principals.json");
+        std::fs::write(&path, "not-json").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let error = PrincipalRegistry::load(&path).err().unwrap().to_string();
+        assert!(error.contains("owner-only"), "{error}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = PrincipalRegistry::load(&path).err().unwrap().to_string();
+        assert!(error.contains("parse principal policy"), "{error}");
     }
 }

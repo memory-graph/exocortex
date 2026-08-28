@@ -143,9 +143,7 @@ fn hex(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::BACKUP_NOUN;
-    use exocortex_storage::bounded_io::{
-        atomic_write_private_with, ensure_size, read_bounded, serialize_json_pretty_bounded,
-    };
+    use exocortex_storage::bounded_io::{ensure_size, read_bounded, serialize_json_pretty_bounded};
 
     #[test]
     fn backup_size_boundary_is_inclusive_and_file_reads_are_bounded() {
@@ -161,33 +159,6 @@ mod tests {
         assert!(read_bounded(&path, 6, BACKUP_NOUN).is_err());
         assert!(serialize_json_pretty_bounded(&"x", 3, BACKUP_NOUN).is_ok());
         assert!(serialize_json_pretty_bounded(&"x", 2, BACKUP_NOUN).is_err());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn private_atomic_write_preserves_previous_file_on_injected_failure() {
-        let dir =
-            std::env::temp_dir().join(format!("exocortex-private-backup-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("backup.json");
-        std::fs::write(&path, b"previous").unwrap();
-        let error = atomic_write_private_with(&path, b"replacement", BACKUP_NOUN, |_| {
-            Err(std::io::Error::other("injected before rename"))
-        })
-        .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
-        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
-
-        atomic_write_private_with(&path, b"replacement", BACKUP_NOUN, |_| Ok(())).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

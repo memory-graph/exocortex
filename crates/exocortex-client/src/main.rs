@@ -145,16 +145,6 @@ fn main() -> anyhow::Result<()> {
     // runs in this binary.
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
     let ontology: Arc<Ontology> = Arc::new(exocortex_kernel::pack::load_registered_packs()?);
-    if args.verify_rules {
-        exocortex_reasoning::acceptance::verify_nine_catalogued_rules(&ontology)
-            .map_err(anyhow::Error::msg)?;
-        println!(
-            "rules-ok mode={} count=9 artifact=exocortex-mcp-client",
-            std::env::var("EXOCORTEX_DEPLOYMENT_MODE").unwrap_or_else(|_| "mcp-client".into())
-        );
-        return Ok(());
-    }
-
     // WAL + playbook home (D5: OS data home by default; --data-dir for
     // tests and multi-tenant setups).
     let data_dir = args.data_dir.clone().unwrap_or_else(|| {
@@ -252,6 +242,20 @@ fn main() -> anyhow::Result<()> {
         ontology.clone(),
     )
     .with_offline_wal(wal.clone());
+
+    // The acceptance probe deliberately runs after the selected topology has
+    // opened its WAL, materialized its cache, and assembled the MCP operation
+    // runtime. This prevents a linked-catalogue-only shortcut from blessing a
+    // deployment mode that cannot actually initialize.
+    if args.verify_rules {
+        exocortex_reasoning::acceptance::verify_nine_catalogued_rules(&ontology)
+            .map_err(anyhow::Error::msg)?;
+        println!(
+            "rules-ok mode={} count=9 artifact=exocortex-mcp-client",
+            std::env::var("EXOCORTEX_DEPLOYMENT_MODE").unwrap_or_else(|_| "mcp-client".into())
+        );
+        return Ok(());
+    }
 
     // Online end_session (§13.6.2): a gRPC channel to the backend, plus the
     // producer HMAC key. Connect lazily at first call when unreachable. The

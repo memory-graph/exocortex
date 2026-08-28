@@ -42,7 +42,13 @@ struct InMemoryInner {
     stream_relationship_calls: AtomicU64,
     frontier_relationship_calls: AtomicU64,
     attribute_memory_calls: AtomicU64,
+    #[cfg(feature = "testing")]
+    region_memory_calls: AtomicU64,
+    #[cfg(feature = "testing")]
+    region_relationship_calls: AtomicU64,
     settled_ingest: Mutex<HashMap<IngestBatchKey, SettledIngestBatch>>,
+    ingest_effects: Mutex<HashMap<smol_str::SmolStr, (PostIngestEffect, bool)>>,
+    governed_imports: Mutex<std::collections::HashSet<String>>,
     cycle_journals: Mutex<HashMap<LeaseKey, CycleJournalRecord>>,
     point_reads: AtomicU64,
     batch_reads: AtomicU64,
@@ -54,6 +60,22 @@ struct InMemoryInner {
     stream_memory_fault_after: Mutex<Option<usize>>,
     #[cfg(feature = "testing")]
     stream_relationship_fault_after: Mutex<Option<usize>>,
+    #[cfg(feature = "testing")]
+    invalidation_epoch_faults: Mutex<std::collections::VecDeque<bool>>,
+    #[cfg(feature = "testing")]
+    invalidation_subscription_pause: Mutex<
+        Option<(
+            std::sync::Arc<tokio::sync::Notify>,
+            std::sync::Arc<tokio::sync::Notify>,
+        )>,
+    >,
+    #[cfg(feature = "testing")]
+    memory_snapshot_pause: Mutex<
+        Option<(
+            std::sync::Arc<tokio::sync::Notify>,
+            std::sync::Arc<tokio::sync::Notify>,
+        )>,
+    >,
 }
 
 #[derive(Clone)]
@@ -109,7 +131,13 @@ impl InMemoryStorage {
                 stream_relationship_calls: AtomicU64::new(0),
                 frontier_relationship_calls: AtomicU64::new(0),
                 attribute_memory_calls: AtomicU64::new(0),
+                #[cfg(feature = "testing")]
+                region_memory_calls: AtomicU64::new(0),
+                #[cfg(feature = "testing")]
+                region_relationship_calls: AtomicU64::new(0),
                 settled_ingest: Default::default(),
+                ingest_effects: Default::default(),
+                governed_imports: Default::default(),
                 cycle_journals: Default::default(),
                 point_reads: Default::default(),
                 batch_reads: Default::default(),
@@ -122,6 +150,12 @@ impl InMemoryStorage {
                 stream_memory_fault_after: Default::default(),
                 #[cfg(feature = "testing")]
                 stream_relationship_fault_after: Default::default(),
+                #[cfg(feature = "testing")]
+                invalidation_epoch_faults: Default::default(),
+                #[cfg(feature = "testing")]
+                invalidation_subscription_pause: Default::default(),
+                #[cfg(feature = "testing")]
+                memory_snapshot_pause: Default::default(),
             }),
             lsn: std::sync::Arc::new(AtomicU64::new(0)),
             feed: tokio::sync::broadcast::channel(4096).0,
@@ -137,6 +171,62 @@ impl InMemoryStorage {
     pub fn fail_next_stream_after(&self, memories: Option<usize>, relationships: Option<usize>) {
         *self.inner.stream_memory_fault_after.lock().unwrap() = memories;
         *self.inner.stream_relationship_fault_after.lock().unwrap() = relationships;
+    }
+
+    /// Script the next invalidation subscription to yield one error and end.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn fail_next_invalidation_epoch(&self) {
+        self.inner
+            .invalidation_epoch_faults
+            .lock()
+            .unwrap()
+            .push_back(true);
+    }
+
+    /// Script the next invalidation subscription to terminate cleanly.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn end_next_invalidation_epoch(&self) {
+        self.inner
+            .invalidation_epoch_faults
+            .lock()
+            .unwrap()
+            .push_back(false);
+    }
+
+    /// Pause the next invalidation subscription after its broadcast receiver
+    /// exists but before the subscription future returns.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn pause_next_invalidation_subscription(
+        &self,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *self.inner.invalidation_subscription_pause.lock().unwrap() =
+            Some((reached.clone(), release.clone()));
+        (reached, release)
+    }
+
+    /// Pause the next memory stream after its authoritative row set has been
+    /// captured but before the caller can consume it.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn pause_next_memory_stream_after_snapshot(
+        &self,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *self.inner.memory_snapshot_pause.lock().unwrap() =
+            Some((reached.clone(), release.clone()));
+        (reached, release)
     }
     /// Reset and return backend-read counters for scaling/conformance tests.
     /// The first element is point reads; the second is batched reads.
@@ -201,6 +291,16 @@ impl InMemoryStorage {
                 .frontier_relationship_calls
                 .load(Ordering::Relaxed),
             self.inner.attribute_memory_calls.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Regional query counters used to prove one bounded working-set load per cycle.
+    #[doc(hidden)]
+    #[cfg(feature = "testing")]
+    pub fn region_query_counts(&self) -> (u64, u64) {
+        (
+            self.inner.region_memory_calls.load(Ordering::Relaxed),
+            self.inner.region_relationship_calls.load(Ordering::Relaxed),
         )
     }
 
@@ -377,6 +477,57 @@ impl InMemoryStorage {
         }
     }
 
+    fn commit_ingest_locked(
+        &self,
+        key: &IngestBatchKey,
+        memories: &[Memory],
+        relationships: &[Relationship],
+        accepted: u32,
+        effect: Option<&PostIngestEffect>,
+    ) -> Result<(IngestCommitOutcome, Vec<Invalidation>), StorageError> {
+        if let Some(settled) = self.inner.settled_ingest.lock().unwrap().get(key).copied() {
+            return Ok((IngestCommitOutcome::Duplicate(settled), Vec::new()));
+        }
+        if let Some(effect) = effect {
+            if let Some((stored, _)) = self
+                .inner
+                .ingest_effects
+                .lock()
+                .unwrap()
+                .get(&effect.effect_id)
+            {
+                if stored != effect {
+                    return Err(StorageError::Backend(format!(
+                        "ingest effect {} already exists with different content",
+                        effect.effect_id
+                    )));
+                }
+            }
+        }
+        let (records, invalidations) = self.upsert_batch_locked(memories, relationships)?;
+        let settled = SettledIngestBatch {
+            accepted,
+            rejected: 0,
+            assigned_lsn: records.last().map_or(0, |record| record.lsn),
+        };
+        self.inner
+            .settled_ingest
+            .lock()
+            .unwrap()
+            .insert(key.clone(), settled);
+        if let Some(effect) = effect {
+            self.inner
+                .ingest_effects
+                .lock()
+                .unwrap()
+                .insert(effect.effect_id.clone(), (effect.clone(), false));
+        }
+        Ok((
+            IngestCommitOutcome::Committed { records, settled },
+            invalidations,
+        ))
+    }
+
     fn audit_value(audit: &AuditEvent, lsn: u64) -> serde_json::Value {
         fn digest_hex(bytes: &[u8; 32]) -> String {
             use std::fmt::Write as _;
@@ -447,6 +598,29 @@ impl Storage for InMemoryStorage {
             let _ = self.feed.send(inv);
         }
         Ok(records)
+    }
+    async fn import_batch_once(
+        &self,
+        import_key: &str,
+        ms: &[Memory],
+        rs: &[Relationship],
+    ) -> Result<bool, StorageError> {
+        let (records, invalidations) = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            let mut imports = self.inner.governed_imports.lock().unwrap();
+            if imports.contains(import_key) {
+                return Ok(false);
+            }
+            let result = self.upsert_batch_locked(ms, rs)?;
+            imports.insert(import_key.to_owned());
+            result
+        };
+        let _ = records;
+        for invalidation in invalidations {
+            self.index_invalidation(&invalidation);
+            let _ = self.feed.send(invalidation);
+        }
+        Ok(true)
     }
     async fn delete_memory(&self, id: &MemoryId) -> Result<CommitRecord, StorageError> {
         let record = {
@@ -524,29 +698,59 @@ impl Storage for InMemoryStorage {
         relationships: &[Relationship],
         accepted: u32,
     ) -> Result<IngestCommitOutcome, StorageError> {
-        let (records, invalidations, settled) = {
+        let (outcome, invalidations) = {
             let _gate = self.inner.mutation_gate.lock().unwrap();
-            if let Some(settled) = self.inner.settled_ingest.lock().unwrap().get(key).copied() {
-                return Ok(IngestCommitOutcome::Duplicate(settled));
-            }
-            let (records, invalidations) = self.upsert_batch_locked(memories, relationships)?;
-            let settled = SettledIngestBatch {
-                accepted,
-                rejected: 0,
-                assigned_lsn: records.last().map_or(0, |record| record.lsn),
-            };
-            self.inner
-                .settled_ingest
-                .lock()
-                .unwrap()
-                .insert(key.clone(), settled);
-            (records, invalidations, settled)
+            self.commit_ingest_locked(key, memories, relationships, accepted, None)?
         };
         for invalidation in invalidations {
             self.index_invalidation(&invalidation);
             let _ = self.feed.send(invalidation);
         }
-        Ok(IngestCommitOutcome::Committed { records, settled })
+        Ok(outcome)
+    }
+    async fn commit_ingest_batch_with_effect(
+        &self,
+        key: &IngestBatchKey,
+        memories: &[Memory],
+        relationships: &[Relationship],
+        accepted: u32,
+        effect: &PostIngestEffect,
+    ) -> Result<IngestCommitOutcome, StorageError> {
+        let (outcome, invalidations) = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            self.commit_ingest_locked(key, memories, relationships, accepted, Some(effect))?
+        };
+        for invalidation in invalidations {
+            self.index_invalidation(&invalidation);
+            let _ = self.feed.send(invalidation);
+        }
+        Ok(outcome)
+    }
+    async fn pending_ingest_effects(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<PostIngestEffect>, StorageError> {
+        let mut rows: Vec<_> = self
+            .inner
+            .ingest_effects
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|(_, acknowledged)| !acknowledged)
+            .map(|(effect, _)| effect.clone())
+            .collect();
+        rows.sort_by(|a, b| a.effect_id.cmp(&b.effect_id));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+    async fn acknowledge_ingest_effect(&self, effect_id: &str) -> Result<bool, StorageError> {
+        let _gate = self.inner.mutation_gate.lock().unwrap();
+        let mut effects = self.inner.ingest_effects.lock().unwrap();
+        let Some((_, acknowledged)) = effects.get_mut(effect_id) else {
+            return Ok(false);
+        };
+        *acknowledged = true;
+        Ok(true)
     }
     async fn upsert_memory_audited(
         &self,
@@ -959,6 +1163,107 @@ impl Storage for InMemoryStorage {
         }
         Ok(rows)
     }
+    async fn memories_in_region(
+        &self,
+        region: &RegionKey,
+        limit: u32,
+    ) -> Result<Vec<Memory>, StorageError> {
+        #[cfg(feature = "testing")]
+        if self
+            .inner
+            .stream_memory_fault_after
+            .lock()
+            .unwrap()
+            .take()
+            .is_some()
+        {
+            return Err(StorageError::Backend(
+                "injected memory stream failure".into(),
+            ));
+        }
+        #[cfg(feature = "testing")]
+        self.inner
+            .region_memory_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let memories = self.inner.memories.lock().unwrap();
+        let mut rows: Vec<_> = memories
+            .values()
+            .filter_map(|history| history.last())
+            .filter(|memory| {
+                memory.memory_type == region.memory_type
+                    && (region.org == "*"
+                        || memory.context.tenant_id.as_deref() == Some(region.org.as_str()))
+                    && (region.project == "*"
+                        || memory.context.project_id.as_deref() == Some(region.project.as_str()))
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|memory| memory.id);
+        if rows.len() > limit as usize {
+            return Err(StorageError::Backend(format!(
+                "region memory budget exceeded: more than {limit} rows"
+            )));
+        }
+        Ok(rows)
+    }
+    async fn current_relationships_in_region(
+        &self,
+        region: &RegionKey,
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        #[cfg(feature = "testing")]
+        if self
+            .inner
+            .stream_relationship_fault_after
+            .lock()
+            .unwrap()
+            .take()
+            .is_some()
+        {
+            return Err(StorageError::Backend(
+                "injected relationship stream failure".into(),
+            ));
+        }
+        #[cfg(feature = "testing")]
+        self.inner
+            .region_relationship_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let memories = self.inner.memories.lock().unwrap();
+        let in_region = |id: &MemoryId| {
+            memories
+                .get(id)
+                .and_then(|history| history.last())
+                .is_some_and(|memory| {
+                    memory.memory_type == region.memory_type
+                        && (region.org == "*"
+                            || memory.context.tenant_id.as_deref() == Some(region.org.as_str()))
+                        && (region.project == "*"
+                            || memory.context.project_id.as_deref()
+                                == Some(region.project.as_str()))
+                })
+        };
+        let relationships = self.inner.rels.lock().unwrap();
+        let mut rows: Vec<_> = relationships
+            .values()
+            .filter_map(|history| history.last())
+            .filter(|relationship| in_region(&relationship.from) && in_region(&relationship.to))
+            .cloned()
+            .collect();
+        rows.sort_by_key(|relationship| {
+            (
+                relationship.from,
+                relationship.to,
+                relationship.kind,
+                relationship.id,
+            )
+        });
+        if rows.len() > limit as usize {
+            return Err(StorageError::Backend(format!(
+                "region relationship budget exceeded: more than {limit} rows"
+            )));
+        }
+        Ok(rows)
+    }
     async fn memories_sharing_attributes(
         &self,
         tags: &[smol_str::SmolStr],
@@ -1099,6 +1404,13 @@ impl Storage for InMemoryStorage {
             .values()
             .filter_map(|h| h.last().cloned().map(Ok))
             .collect();
+        #[cfg(feature = "testing")]
+        let snapshot_pause = { self.inner.memory_snapshot_pause.lock().unwrap().take() };
+        #[cfg(feature = "testing")]
+        if let Some((reached, release)) = snapshot_pause {
+            reached.notify_one();
+            release.notified().await;
+        }
         #[cfg(feature = "testing")]
         let all = {
             let mut all = all;
@@ -1463,13 +1775,46 @@ impl Storage for InMemoryStorage {
         &self,
         _r: &RegionKey,
     ) -> Result<BoxStream<'_, Result<Invalidation, StorageError>>, StorageError> {
+        let rx = self.feed.subscribe();
+        #[cfg(feature = "testing")]
+        if let Some(fail) = self
+            .inner
+            .invalidation_epoch_faults
+            .lock()
+            .unwrap()
+            .pop_front()
+        {
+            if fail {
+                return Ok(Box::pin(futures::stream::once(async {
+                    Err(StorageError::Backend(
+                        "injected invalidation epoch failure".into(),
+                    ))
+                })));
+            }
+            return Ok(Box::pin(futures::stream::empty()));
+        }
+        #[cfg(feature = "testing")]
+        let subscription_pause = {
+            self.inner
+                .invalidation_subscription_pause
+                .lock()
+                .unwrap()
+                .take()
+        };
+        #[cfg(feature = "testing")]
+        if let Some((reached, release)) = subscription_pause {
+            reached.notify_one();
+            release.notified().await;
+        }
         // Wildcard regions (§9.1): the double fans every invalidation to
         // every subscriber regardless of the requested region key.
-        let rx = self.feed.subscribe();
         use futures::StreamExt as _;
         Ok(Box::pin(
-            tokio_stream::wrappers::BroadcastStream::new(rx)
-                .filter_map(|item| async move { item.ok().map(Ok) }),
+            tokio_stream::wrappers::BroadcastStream::new(rx).map(|item| {
+                item.map_err(|error| {
+                    StorageError::Backend(format!("in-memory invalidation feed lagged: {error}"))
+                })
+            }),
         ))
     }
     fn capabilities(&self) -> StorageCapabilities {

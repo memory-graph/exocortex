@@ -210,11 +210,15 @@ fn decode_event(
     let inv = match inv_pb.kind {
         Some(exocortex_wire::sse::v1::invalidation::Kind::MemoryUpserted(m)) => {
             let id = MemoryId(id16(&m.id)?);
-            let memory: exocortex_kernel::Memory = serde_json::from_slice(&m.snapshot_json)
+            let mut memory: exocortex_kernel::Memory = serde_json::from_slice(&m.snapshot_json)
                 .map_err(|error| SyncError::BadPayload(format!("memory snapshot: {error}")))?;
             if memory.id != id {
                 return Err(SyncError::BadPayload("memory snapshot id mismatch".into()));
             }
+            // Older peers may still include vectors. Never retain them in the
+            // client cache even while rolling through such a mixed-version
+            // deployment.
+            memory.embedding = None;
             Invalidation::MemorySnapshotUpserted {
                 memory: Box::new(memory),
                 lsn,
@@ -256,8 +260,11 @@ fn decode_event(
             Invalidation::VisibilityAdvance { lsn }
         }
         Some(exocortex_wire::sse::v1::invalidation::Kind::GraphReseed(snapshot)) => {
-            let snapshot = serde_json::from_slice(&snapshot.snapshot_json)
+            let mut snapshot: ClientGraphSnapshot = serde_json::from_slice(&snapshot.snapshot_json)
                 .map_err(|error| SyncError::BadPayload(format!("graph snapshot: {error}")))?;
+            for memory in &mut snapshot.memories {
+                memory.embedding = None;
+            }
             return Ok(DecodedEvent::Reseed(snapshot, lsn));
         }
         Some(exocortex_wire::sse::v1::invalidation::Kind::DiscoveryAvailable(discovery)) => {
@@ -358,7 +365,7 @@ pub async fn run_sse_sync(
         let url = subscription_url(&cfg.backend, since, needs_seed);
         tracing::info!(backend = %cfg.backend, since_lsn = since, seed = needs_seed, "sse subscribe");
         let mut gate = LsnGate::new(next_lsn);
-        let mut reconnect_reason = "stream ended";
+        let reconnect_reason;
         {
             let mut builder = match es::ClientBuilder::for_url(&url).map_err(|e| e.to_string()) {
                 Ok(b) => b,
@@ -424,6 +431,12 @@ pub async fn run_sse_sync(
                     item = stream.next() => item,
                 };
                 let Some(item) = item else {
+                    // A peer can commit durably and then disappear before its
+                    // delta is published. Replaying from the old frontier is
+                    // insufficient in that case; reconnect with an
+                    // authoritative replacement image.
+                    needs_seed = true;
+                    reconnect_reason = "stream ended before publication";
                     break;
                 };
                 // `eventsource-client` does not promise a separate
@@ -477,7 +490,6 @@ pub async fn run_sse_sync(
                                         .await;
                                     next_lsn = lsn.saturating_add(1);
                                     gate = LsnGate::new(next_lsn);
-                                    needs_seed = false;
                                     backoff = cfg.backoff;
                                     if let Some(ready) = &cfg.hydration_ready {
                                         ready.notify_one();
@@ -511,6 +523,7 @@ pub async fn run_sse_sync(
                     }
                     Err(e) => {
                         tracing::warn!(%e, "sse stream error");
+                        needs_seed = true;
                         reconnect_reason = "stream error";
                         break;
                     }

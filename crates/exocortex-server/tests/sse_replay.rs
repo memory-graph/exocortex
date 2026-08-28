@@ -71,10 +71,30 @@ async fn serve_for(
 /// GET `path`; read until EOF, 400ms of quiet, or an overall 2s deadline
 /// (SSE streams stay open by design — `read_to_end` would never return).
 async fn get_status_and_body(addr: std::net::SocketAddr, path: &str) -> (String, String) {
+    get_status_and_body_auth(addr, path, true).await
+}
+
+async fn get_status_and_body_without_bearer(
+    addr: std::net::SocketAddr,
+    path: &str,
+) -> (String, String) {
+    get_status_and_body_auth(addr, path, false).await
+}
+
+async fn get_status_and_body_auth(
+    addr: std::net::SocketAddr,
+    path: &str,
+    bearer: bool,
+) -> (String, String) {
     let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let authorization = if bearer {
+        "Authorization: Bearer test-only-sse-bearer-token-00000000\r\n"
+    } else {
+        ""
+    };
     sock.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\nX-Exocortex-SSE-Version: 2\r\nConnection: close\r\n\r\n")
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{authorization}Accept: text/event-stream\r\nX-Exocortex-SSE-Version: 2\r\nConnection: close\r\n\r\n")
             .as_bytes(),
     )
     .await
@@ -258,14 +278,16 @@ async fn required_token_mode_answers_401_without_token() {
     let _ = node.admit_and_publish(envelope(&node, 1, 1));
     let addr = serve(node.clone(), false).await;
 
-    let (status, body) = get_status_and_body(addr, "/v1/changes?since_lsn=0").await;
+    let (status, body) = get_status_and_body_without_bearer(addr, "/v1/changes?since_lsn=0").await;
     assert_eq!(status, "401", "R-Sec7: {body}");
 
     // An EMPTY token value is no token either — fail closed.
-    let (status, _) = get_status_and_body(addr, "/v1/changes?token=&since_lsn=0").await;
+    let (status, _) =
+        get_status_and_body_without_bearer(addr, "/v1/changes?token=&since_lsn=0").await;
     assert_eq!(status, "401", "empty token is rejected");
 
-    let (status, _) = get_status_and_body(addr, "/v1/changes?token=t&since_lsn=0").await;
+    let (status, _) =
+        get_status_and_body_without_bearer(addr, "/v1/changes?token=t&since_lsn=0").await;
     assert_eq!(
         status, "401",
         "a query token without an authenticated visibility context is rejected"
@@ -516,12 +538,14 @@ async fn backend_router_rejects_token_query_without_bearer() {
 
     // Any non-empty ?token= value WITHOUT a bearer header: 401 (the pinned
     // defect asserted 200 here for a token that was never provisioned).
-    let (status, body) = get_status_and_body(addr, "/v1/changes?token=forged&since_lsn=0").await;
+    let (status, body) =
+        get_status_and_body_without_bearer(addr, "/v1/changes?token=forged&since_lsn=0").await;
     assert_eq!(
         status, "401",
         "CS1: token query is not authentication: {body}"
     );
-    let (status, _) = get_status_and_body(addr, "/v1/changes?token=&since_lsn=0").await;
+    let (status, _) =
+        get_status_and_body_without_bearer(addr, "/v1/changes?token=&since_lsn=0").await;
     assert_eq!(status, "401", "CS1: empty token without bearer is rejected");
 
     // With the bearer header the subscriber is served (token selects the

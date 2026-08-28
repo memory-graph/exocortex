@@ -11,7 +11,8 @@ use exocortex_kernel::{
     Visibility, LSN,
 };
 use exocortex_storage::{
-    IngestBatchKey, IngestCommitOutcome, RegionKey, Storage, VisibilityContext,
+    IngestBatchKey, IngestCommitOutcome, IngestRegionDelta, PostIngestEffect, RegionKey, Storage,
+    VisibilityContext,
 };
 use exocortex_wire::ingest::v1::{
     ingest_service_server::IngestService, FingerprintRequest, FingerprintResponse, IngestAck,
@@ -1292,9 +1293,16 @@ impl<S: Storage + 'static> IngestServer<S> {
             producer_id: batch.producer_id.clone().into(),
             batch_id: batch.batch_id.clone().into(),
         };
+        let effect = self.post_ingest_effect(batch, rows, &key);
         let outcome = self
             .storage
-            .commit_ingest_batch(&key, &rows.memories, &rows.relationships, accepted)
+            .commit_ingest_batch_with_effect(
+                &key,
+                &rows.memories,
+                &rows.relationships,
+                accepted,
+                &effect,
+            )
             .await
             .map_err(|error| Status::internal(format!("storage: {error}")))?;
         match outcome {
@@ -1316,6 +1324,133 @@ impl<S: Storage + 'static> IngestServer<S> {
         }
     }
 
+    fn post_ingest_effect(
+        &self,
+        batch: &IngestBatch,
+        rows: &CommitRows,
+        key: &IngestBatchKey,
+    ) -> PostIngestEffect {
+        let mut regions = HashMap::<RegionKey, (u32, u32)>::new();
+        let mut memory_regions = HashMap::<MemoryId, RegionKey>::new();
+        for memory in &rows.producer_memories {
+            let region = RegionKey {
+                org: batch.org_id.clone().into(),
+                project: memory
+                    .context
+                    .project_id
+                    .clone()
+                    .unwrap_or_else(|| "*".into()),
+                memory_type: memory.memory_type,
+            };
+            regions.entry(region.clone()).or_default().0 += 1;
+            memory_regions.insert(memory.id, region);
+        }
+        for relationship in &rows.relationships {
+            if let Some(region) = memory_regions.get(&relationship.from) {
+                regions.entry(region.clone()).or_default().1 += 1;
+            }
+        }
+        let mut region_deltas = regions
+            .into_iter()
+            .map(|(region, (memories, relationships))| IngestRegionDelta {
+                region,
+                memories,
+                relationships,
+            })
+            .collect::<Vec<_>>();
+        region_deltas.sort_by(|left, right| {
+            (
+                left.region.org.as_str(),
+                left.region.project.as_str(),
+                left.region.memory_type,
+            )
+                .cmp(&(
+                    right.region.org.as_str(),
+                    right.region.project.as_str(),
+                    right.region.memory_type,
+                ))
+        });
+        PostIngestEffect {
+            effect_id: serde_json::to_string(key)
+                .expect("ingest batch identity is infallibly serializable")
+                .into(),
+            session_memory_ids: if batch.source_uri.starts_with("session://") {
+                rows.producer_memories
+                    .iter()
+                    .map(|memory| memory.id)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            region_deltas,
+        }
+    }
+
+    async fn deliver_post_ingest_effect(&self, effect: &PostIngestEffect) -> Result<(), String> {
+        if let Some(dreams) = &self.dreams {
+            for delta in &effect.region_deltas {
+                dreams
+                    .on_writes_once(
+                        effect.effect_id.as_str(),
+                        delta.region.clone(),
+                        delta.memories,
+                        delta.relationships,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if !effect.session_memory_ids.is_empty() {
+            if let Some(engine) = &self.reasoning {
+                engine
+                    .enqueue(exocortex_reasoning::ReasoningWork::SessionWrapup {
+                        memories: effect.session_memory_ids.clone(),
+                    })
+                    .await;
+            }
+        }
+        let acknowledged = self
+            .storage
+            .acknowledge_ingest_effect(effect.effect_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        if !acknowledged {
+            return Err("post-ingest outbox acknowledgement lost its pending effect".into());
+        }
+        Ok(())
+    }
+
+    /// Drain durable post-ingest work forever. Backend assembly retains this
+    /// task so dependency outages delay effects without retaining submit
+    /// permits or losing crash-recovery state.
+    pub async fn run_post_ingest_effects(self: Arc<Self>) {
+        let mut delay = std::time::Duration::from_millis(25);
+        loop {
+            match self.storage.pending_ingest_effects(1).await {
+                Ok(effects) if effects.is_empty() => {
+                    delay = std::time::Duration::from_millis(25);
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(effects) => {
+                    let effect = &effects[0];
+                    match self.deliver_post_ingest_effect(effect).await {
+                        Ok(()) => delay = std::time::Duration::from_millis(25),
+                        Err(error) => {
+                            tracing::warn!(%error, effect_id = %effect.effect_id, "post-ingest effect delivery retrying");
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "post-ingest outbox read retrying");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                }
+            }
+        }
+    }
+
     fn remember_ack(&self, batch: &IngestBatch, ack: IngestAck) -> IngestAck {
         self.seen_batches.lock().unwrap().put(
             (
@@ -1328,54 +1463,13 @@ impl<S: Storage + 'static> IngestServer<S> {
         ack
     }
 
-    async fn finish_commit(
+    fn finish_commit(
         &self,
         batch: &IngestBatch,
         rows: &CommitRows,
         assigned_lsn: u64,
         accepted: u32,
     ) -> IngestAck {
-        if batch.source_uri.starts_with("session://") {
-            if let Some(engine) = &self.reasoning {
-                engine
-                    .enqueue(exocortex_reasoning::ReasoningWork::SessionWrapup {
-                        memories: rows
-                            .producer_memories
-                            .iter()
-                            .map(|memory| memory.id)
-                            .collect(),
-                    })
-                    .await;
-            }
-        }
-        if let Some(dreams) = &self.dreams {
-            let mut regions = std::collections::HashMap::<RegionKey, u32>::new();
-            for memory in &rows.producer_memories {
-                let region = RegionKey {
-                    org: batch.org_id.clone().into(),
-                    project: memory
-                        .context
-                        .project_id
-                        .clone()
-                        .unwrap_or_else(|| "*".into()),
-                    memory_type: memory.memory_type,
-                };
-                *regions.entry(region).or_default() += 1;
-            }
-            for (region, memories) in regions {
-                let mut delay = std::time::Duration::from_millis(25);
-                loop {
-                    match dreams.on_writes(region.clone(), memories, 0).await {
-                        Ok(()) => break,
-                        Err(error) => {
-                            tracing::warn!(%error, ?region, "Dreams write-counter persistence retrying");
-                            tokio::time::sleep(delay).await;
-                            delay = (delay * 2).min(std::time::Duration::from_secs(5));
-                        }
-                    }
-                }
-            }
-        }
         let keyed = batch
             .memories
             .iter()
@@ -1437,9 +1531,7 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             Ok(commit) => commit,
             Err(ack) => return Ok(Response::new(self.remember_ack(&batch, ack))),
         };
-        let ack = self
-            .finish_commit(&batch, &rows, assigned_lsn, accepted)
-            .await;
+        let ack = self.finish_commit(&batch, &rows, assigned_lsn, accepted);
         Ok(Response::new(self.remember_ack(&batch, ack)))
     }
 

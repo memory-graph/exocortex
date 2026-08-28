@@ -65,9 +65,10 @@ pub struct HttpBind {
 }
 
 impl HttpBind {
-    /// Build an embedded single-principal binding. The bearer protects every
-    /// operation, SSE, metrics, and detailed health route. Only the minimal
-    /// identity-free readiness probe remains unauthenticated.
+    /// Build a least-privilege embedded single-principal binding. The bearer
+    /// protects every operation, SSE, metrics, and detailed health route, but
+    /// does not grant audit administration; callers needing that capability
+    /// must use [`Self::with_principals`] with an explicit policy.
     pub fn new(ctx: Arc<OpContext>, bearer: String) -> Self {
         let principals = PrincipalRegistry::single(bearer, ctx.visibility_ctx.clone())
             .expect("HttpBind bearer must contain at least 32 bytes");
@@ -391,18 +392,141 @@ mod tests {
     use super::*;
     use tower::ServiceExt;
 
+    const HTTP_STORAGE_SENTINEL: &str = "redis://credential-sentinel@example.invalid/private";
+
+    fn sentinel_method() -> http::Method {
+        http::Method::POST
+    }
+
+    fn sentinel_storage_error(
+        _ctx: &OpContext,
+        _input: serde_json::Value,
+    ) -> futures::future::BoxFuture<'_, Result<serde_json::Value, OpError>> {
+        Box::pin(async { Err(OpError::Storage(HTTP_STORAGE_SENTINEL.into())) })
+    }
+
+    #[tokio::test]
+    async fn embedded_audit_requires_an_explicit_admin_principal() {
+        const TOKEN: &str = "test-only-audit-bearer-token-00000000";
+        let ontology = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = Arc::new(exocortex_storage::InMemoryStorage::new(ontology));
+        let (cache, _writer) = exocortex_cache::LocalCache::new(1024 * 1024);
+        let visibility = VisibilityContext {
+            user_id: "user".into(),
+            org_id: "org".into(),
+            project_ids: Default::default(),
+            team_ids: Default::default(),
+            max_visibility: exocortex_kernel::Visibility::Org,
+        };
+        let ctx = Arc::new(OpContext::per_request(
+            visibility.clone(),
+            storage,
+            Arc::new(cache),
+            chrono::Duration::seconds(30),
+        ));
+        let request = || {
+            Request::builder()
+                .uri("/v1/audit?since_lsn=0")
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let ordinary = HttpBind::new(ctx.clone(), TOKEN.into())
+            .router(None)
+            .oneshot(request())
+            .await
+            .unwrap();
+        assert_eq!(ordinary.status(), StatusCode::FORBIDDEN);
+
+        let principals = Arc::new(
+            PrincipalRegistry::single_with_audit_admin(TOKEN.into(), visibility, true).unwrap(),
+        );
+        let admin = HttpBind::with_principals(ctx, principals)
+            .router(None)
+            .oneshot(request())
+            .await
+            .unwrap();
+        assert_eq!(admin.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn internal_http_error_never_reflects_dependency_detail() {
-        const SENTINEL: &str = "redis://credential-sentinel@example.invalid/private";
-        let response = internal_error_response(SENTINEL);
+        let response = internal_error_response(HTTP_STORAGE_SENTINEL);
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
         assert_eq!(&body[..], br#"{"error":"internal error"}"#);
         assert!(!body
-            .windows(SENTINEL.len())
-            .any(|window| window == SENTINEL.as_bytes()));
+            .windows(HTTP_STORAGE_SENTINEL.len())
+            .any(|window| window == HTTP_STORAGE_SENTINEL.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_operation_never_reflects_storage_error_detail() {
+        const TOKEN: &str = "test-only-sentinel-bearer-token-00000000";
+        let ontology = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = Arc::new(exocortex_storage::InMemoryStorage::new(ontology));
+        let (cache, _writer) = exocortex_cache::LocalCache::new(1024 * 1024);
+        let visibility = VisibilityContext {
+            user_id: "user".into(),
+            org_id: "org".into(),
+            project_ids: Default::default(),
+            team_ids: Default::default(),
+            max_visibility: exocortex_kernel::Visibility::Org,
+        };
+        let ctx = Arc::new(OpContext::per_request(
+            visibility,
+            storage,
+            Arc::new(cache),
+            chrono::Duration::seconds(30),
+        ));
+        let schema_source = entries()
+            .into_iter()
+            .next()
+            .expect("operation registry is populated");
+        let sentinel_operation = Box::leak(Box::new(OperationEntry {
+            name: "sentinel_storage_error",
+            mcp_tool_name: "exocortex.test_sentinel_storage_error",
+            http_method: sentinel_method,
+            http_path: "/v1/test/sentinel-storage-error",
+            input_schema: schema_source.input_schema,
+            output_schema: schema_source.output_schema,
+            handler: sentinel_storage_error,
+        }));
+        let extra = Router::new().route(
+            sentinel_operation.http_path,
+            axum::routing::post(op_route(sentinel_operation, ctx.clone())),
+        );
+        let response = HttpBind::new(ctx, TOKEN.into())
+            .router(Some(extra))
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri(sentinel_operation.http_path)
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"error":"internal error"}"#);
+        assert!(!body
+            .windows(HTTP_STORAGE_SENTINEL.len())
+            .any(|window| window == HTTP_STORAGE_SENTINEL.as_bytes()));
     }
 
     #[tokio::test]

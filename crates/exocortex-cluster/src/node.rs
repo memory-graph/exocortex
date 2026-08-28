@@ -399,4 +399,53 @@ mod tests {
             }
         );
     }
+
+    #[tokio::test]
+    async fn run_resubscribes_after_decode_failure_and_clean_eof() {
+        let ontology =
+            Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).expect("ontology"));
+        let storage = Arc::new(InMemoryStorage::new(ontology.clone()));
+        storage.fail_next_invalidation_epoch();
+        storage.end_next_invalidation_epoch();
+        let node = Arc::new(ClusterNode::new(
+            storage.clone(),
+            "run-retry".into(),
+            ontology.fingerprint,
+            [6; 32],
+        ));
+        let mut feed_health = node.subscribe_feed_health();
+        let mut delivered = node.subscribe_local();
+        let runner = tokio::spawn(node.clone().run());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let state = *feed_health.borrow_and_update();
+                if state.epoch >= 3 && state.ready && state.failures >= 2 {
+                    break;
+                }
+                feed_health
+                    .changed()
+                    .await
+                    .expect("run supervisor remains live");
+            }
+        })
+        .await
+        .expect("real run loop reaches a healthy third subscription");
+
+        let id = MemoryId::new_v7();
+        let commit = storage.delete_memory(&id).await.unwrap();
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), delivered.recv())
+            .await
+            .expect("recovered feed publishes")
+            .expect("local subscriber remains open");
+        let invalidation = envelope.inv.unwrap();
+        assert_eq!(invalidation.backend_lsn, commit.lsn);
+        assert!(matches!(
+            invalidation.kind,
+            Some(exocortex_wire::sse::v1::invalidation::Kind::MemoryDeleted(
+                _
+            ))
+        ));
+        runner.abort();
+    }
 }

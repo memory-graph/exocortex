@@ -7,7 +7,7 @@ use exocortex_kernel::{
     RelationshipProperties, Visibility, LSN,
 };
 use exocortex_server::org_backup;
-use exocortex_storage::{InMemoryStorage, Storage};
+use exocortex_storage::{InMemoryStorage, RegionKey, Storage};
 use futures::StreamExt;
 use std::sync::Arc;
 
@@ -179,6 +179,7 @@ async fn org_round_trip_is_byte_faithful_across_storage_instances() {
     a.upsert_memory(&m1).await.unwrap();
     a.upsert_memory(&m2).await.unwrap();
     a.upsert_relationship(&rel).await.unwrap();
+    let (_, mut a_rels) = rows(&a).await;
 
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("org.json");
@@ -197,18 +198,31 @@ async fn org_round_trip_is_byte_faithful_across_storage_instances() {
     assert_eq!(report.relationships, 2);
     let (b_mems, mut b_rels) = rows(&b).await;
     assert_eq!(b_mems.len(), 2);
-    // The restored edge plus its R-T4 inverse companion (materialized
-    // by the write path) — both are legitimate; the ORIGINAL row must
-    // be present under its original id.
-    assert!(!b_rels.is_empty());
-    // Storage does not promise relationship order. Reverse the observed
-    // sequence so this regression cannot accidentally rely on the adapter's
-    // current iteration order.
-    b_rels.reverse();
-    assert!(
-        b_rels.iter().any(|r| r.id == rel.id),
-        "the backed-up edge restored under its own id"
-    );
+    let strip_lsn = |mut value: serde_json::Value| {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("lsn");
+        }
+        value
+    };
+    // Storage does not promise stream order. Compare every field on both the
+    // requested edge and its materialized inverse after canonical ID sorting;
+    // LSN is the sole storage-authority difference allowed by the contract.
+    a_rels.sort_by_key(|relationship| relationship.id);
+    b_rels.sort_by_key(|relationship| relationship.id);
+    assert_eq!(a_rels.len(), 2);
+    assert_eq!(b_rels.len(), a_rels.len());
+    for (original, restored) in a_rels.iter().zip(&b_rels) {
+        assert_eq!(
+            strip_lsn(serde_json::to_value(restored).unwrap()),
+            strip_lsn(serde_json::to_value(original).unwrap()),
+            "relationship restore must preserve full original and inverse rows"
+        );
+        assert_eq!(
+            restored.lsn.space,
+            exocortex_kernel::ids::LsnSpace::Backend,
+            "restored relationships are re-stamped in Backend space"
+        );
+    }
     for m in [&m1, &m2] {
         let got = b_mems.iter().find(|x| x.id == m.id).expect("row present");
         let (g, w) = (
@@ -219,12 +233,6 @@ async fn org_round_trip_is_byte_faithful_across_storage_instances() {
         // exactly. LSN is the one sanctioned difference: storage is the
         // sequence authority (§6.2) and re-stamps rows at upsert — the
         // restore's ordering is what matters, not the old counter.
-        let strip_lsn = |mut v: serde_json::Value| {
-            if let Some(o) = v.as_object_mut() {
-                o.remove("lsn");
-            }
-            v
-        };
         assert_eq!(
             strip_lsn(g.clone()),
             strip_lsn(w.clone()),
@@ -290,12 +298,36 @@ async fn re_import_converges_without_duplicates() {
     org_backup::export_org(&a, "org", &fp, &file).await.unwrap();
 
     let b = InMemoryStorage::new(onto.clone());
+    let region = RegionKey {
+        org: "*".into(),
+        project: "*".into(),
+        memory_type: 0,
+    };
+    let mut invalidations = b.subscribe_invalidations(&region).await.unwrap();
     org_backup::import_org(&b, &onto, "org", &file)
         .await
         .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), invalidations.next())
+        .await
+        .expect("first import publishes its committed row")
+        .expect("stream remains open")
+        .expect("invalidation is valid");
+    let imported_id = test_mem("x", 4).id;
+    assert_eq!(b.memory_history(&imported_id).len(), 1);
     org_backup::import_org(&b, &onto, "org", &file)
         .await
         .unwrap();
+    assert_eq!(
+        b.memory_history(&imported_id).len(),
+        1,
+        "a repeated governed import must not append assertion history"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), invalidations.next())
+            .await
+            .is_err(),
+        "a repeated governed import must not republish invalidations"
+    );
     let (mems, rels) = rows(&b).await;
     assert_eq!(mems.len(), 1, "upsert semantics: no duplicates");
     assert!(rels.is_empty());

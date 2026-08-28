@@ -129,11 +129,24 @@ fn deployment_acceptance() -> Result<()> {
         .collect::<Vec<_>>();
     let dockerfile = std::fs::read_to_string("Dockerfile")?;
     let protoc_installer = std::fs::read_to_string("scripts/install-protoc.sh")?;
+    let verify_release = std::fs::read_to_string("scripts/verify-release.sh")?;
     validate_release_hardening(
         &workflows,
         &dockerfile,
         &protoc_installer,
         &[&compose, &storage_compose],
+    )?;
+    validate_fastembed_release(&workflows, &dockerfile, &verify_release)?;
+    run(
+        &[
+            "check",
+            "-p",
+            "exocortex-server",
+            "--all-targets",
+            "--features",
+            "fastembed",
+        ],
+        &[],
     )?;
     for node in ["node1", "node2", "node3"] {
         let marker = format!("  {node}:\n");
@@ -179,32 +192,101 @@ fn deployment_acceptance() -> Result<()> {
             );
         }
     }
-    for mode in ["mcp-client", "mcp-standalone", "backend-node"] {
-        let output = std::process::Command::new("scripts/exocortex")
-            .args(["--mode", mode, "--verify-rules"])
-            .env("EXOCORTEX_BIN_DIR", &bin_dir)
+    let topology = std::process::Command::new("sh")
+        .arg("scripts/tests/exocortex-entrypoint.sh")
+        .status()?;
+    anyhow::ensure!(topology.success(), "entrypoint topology test failed");
+    probe_deployed_rules(&bin_dir)?;
+    run(
+        &[
+            "test",
+            "-p",
+            "exocortex-client",
+            "--test",
+            "standalone_wrapper",
+        ],
+        &[],
+    )?;
+    println!("deployment-acceptance ok: chaos nodes build the current image; the installed entrypoint entered all 3 selected topologies; all 9 rules executed after topology initialization; standalone served a real MCP request while supervising its node; no secret-bearing argv flags");
+    Ok(())
+}
+
+fn probe_deployed_rules(bin_dir: &std::path::Path) -> Result<()> {
+    let fixture = std::env::temp_dir().join(format!(
+        "exocortex-deployment-rule-probe-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&fixture);
+    std::fs::create_dir_all(&fixture)?;
+    let result = (|| -> Result<()> {
+        let client = std::process::Command::new("scripts/exocortex")
+            .args([
+                "--mode",
+                "mcp-client",
+                "--verify-rules",
+                "--data-dir",
+                fixture.join("client").to_str().unwrap(),
+            ])
+            .env("EXOCORTEX_BIN_DIR", bin_dir)
             .output()?;
-        anyhow::ensure!(
-            output.status.success(),
-            "deployment mode {mode} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8(output.stdout)?;
-        anyhow::ensure!(
-            stdout.contains(&format!("rules-ok mode={mode} count=9")),
-            "deployment mode {mode} did not execute all nine rules: {stdout}"
-        );
-        let artifact = if mode == "mcp-client" {
-            "exocortex-mcp-client"
-        } else {
-            "exocortex-node"
-        };
-        anyhow::ensure!(
-            stdout.contains(&format!("artifact={artifact}")),
-            "deployment mode {mode} selected the wrong artifact: {stdout}"
-        );
-    }
-    println!("deployment-acceptance ok: chaos nodes build the current image; one entrypoint selected the correct artifact for 3 modes; each executed 9 rules; no secret-bearing argv flags");
+        ensure_rule_probe("mcp-client", &client)?;
+
+        let principal_policy = fixture.join("principals.json");
+        std::fs::write(
+            &principal_policy,
+            r#"[{"bearer_token":"deployment-rule-probe-token-00000000","org_id":"org","user_id":"probe","project_ids":[],"team_ids":[],"max_visibility":3}]"#,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&principal_policy, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let source_policy = fixture.join("sources.json");
+        std::fs::write(
+            &source_policy,
+            r#"[{"org_id":"org","source_uri":"deployment://probe","producer_id":"probe","ceiling":3,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
+        )?;
+        let backend = std::process::Command::new("scripts/exocortex")
+            .args([
+                "--mode",
+                "backend-node",
+                "--verify-rules",
+                "--storage",
+                "memory",
+                "--bind",
+                "127.0.0.1:0",
+                "--allow-plaintext-loopback",
+                "--gossip-addr",
+                "127.0.0.1:0",
+                "--principal-policy",
+                principal_policy.to_str().unwrap(),
+                "--source-policy",
+                source_policy.to_str().unwrap(),
+            ])
+            .env("EXOCORTEX_BIN_DIR", bin_dir)
+            .env(
+                "EXOCORTEX_CLUSTER_SECRET",
+                "4242424242424242424242424242424242424242424242424242424242424242",
+            )
+            .output()?;
+        ensure_rule_probe("backend-node", &backend)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&fixture);
+    result
+}
+
+fn ensure_rule_probe(mode: &str, output: &std::process::Output) -> Result<()> {
+    anyhow::ensure!(
+        output.status.success(),
+        "{mode} deployed rule probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    anyhow::ensure!(
+        stdout.contains(&format!("rules-ok mode={mode} count=9")),
+        "{mode} deployed rule probe did not execute all 9 rules: {stdout}"
+    );
     Ok(())
 }
 
@@ -217,7 +299,33 @@ fn validate_release_hardening(
     validate_workflows(workflows)?;
     validate_dockerfile(dockerfile)?;
     validate_protoc_installer(protoc_installer)?;
-    validate_compose_ports(compose_files)
+    validate_compose_files(compose_files)
+}
+
+fn validate_fastembed_release(
+    workflows: &[(&str, &str)],
+    dockerfile: &str,
+    verify_release: &str,
+) -> Result<()> {
+    let release = workflows
+        .iter()
+        .find(|(path, _)| path.ends_with("release.yml") || path.ends_with("release.yaml"))
+        .map(|(_, source)| *source)
+        .ok_or_else(|| anyhow::anyhow!("release workflow is missing"))?;
+    anyhow::ensure!(
+        release.contains("--features exocortex-server/fastembed"),
+        "release artifacts must enable exocortex-server/fastembed"
+    );
+    anyhow::ensure!(
+        dockerfile.contains("-p exocortex-server --bin exocortex-node --features fastembed"),
+        "Docker image must enable the server fastembed feature"
+    );
+    anyhow::ensure!(
+        verify_release
+            .contains("cargo check -p exocortex-server --all-targets --features fastembed"),
+        "verify-release must compile the exact production fastembed feature"
+    );
+    Ok(())
 }
 
 const MUTABLE_PACKAGE_COMMANDS: &[&str] = &[
@@ -262,6 +370,10 @@ fn validate_workflows(workflows: &[(&str, &str)]) -> Result<()> {
         );
         if path.ends_with("release.yml") || path.ends_with("release.yaml") {
             saw_release = true;
+            anyhow::ensure!(
+                workflow.contains("--features exocortex-server/fastembed"),
+                "release workflow must build the server with the production fastembed feature"
+            );
             let release_job = workflow
                 .split_once("\n  release:\n")
                 .map(|(_, section)| section)
@@ -339,6 +451,10 @@ fn validate_dockerfile(dockerfile: &str) -> Result<()> {
             .any(|line| line.trim() == "USER 65532:65532"),
         "runtime Dockerfile must select the unprivileged exocortex user"
     );
+    anyhow::ensure!(
+        dockerfile.contains("-p exocortex-server --bin exocortex-node --features fastembed"),
+        "Dockerfile must build exocortex-node with the production fastembed feature"
+    );
     Ok(())
 }
 
@@ -370,7 +486,7 @@ fn validate_protoc_installer(protoc_installer: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_compose_ports(compose_files: &[&str]) -> Result<()> {
+fn validate_compose_files(compose_files: &[&str]) -> Result<()> {
     for compose in compose_files {
         for port in compose
             .lines()
@@ -380,6 +496,21 @@ fn validate_compose_ports(compose_files: &[&str]) -> Result<()> {
             anyhow::ensure!(
                 port.starts_with("- \"127.0.0.1:"),
                 "test service port must bind to loopback: {port}"
+            );
+        }
+        for image in compose
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("image:"))
+            .map(str::trim)
+        {
+            let locally_built = image == "exocortex-node:local";
+            let immutable_external = image.split_once("@sha256:").is_some_and(|(_, digest)| {
+                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+            });
+            anyhow::ensure!(
+                locally_built || immutable_external,
+                "external Compose image must be pinned by full sha256 digest: {image}"
             );
         }
     }
@@ -1341,7 +1472,7 @@ mod metrics_hygiene_tests {
 
 #[cfg(test)]
 mod release_hardening_tests {
-    use super::validate_release_hardening;
+    use super::{validate_fastembed_release, validate_release_hardening};
 
     const SHA: &str = "11d5960a326750d5838078e36cf38b85af677262";
     const PROTOC_INSTALLER: &str = r#"readonly PROTOC_VERSION=28.3
@@ -1358,7 +1489,7 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
     #[test]
     fn rejects_mutable_actions_build_inputs_root_runtime_and_public_test_ports() {
         let good_release = format!(
-            "permissions:\n  contents: read\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@{SHA}\n      - run: bash scripts/install-protoc.sh /tmp/protoc\n      - run: bash scripts/install-protoc.sh /tmp/protoc-2\n  release:\n    permissions:\n      contents: write\n    steps:\n      - run: bash scripts/publish-release-assets.sh \"$TAG\" \"$GITHUB_REPOSITORY\" dist\n"
+            "permissions:\n  contents: read\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@{SHA}\n      - run: bash scripts/install-protoc.sh /tmp/protoc\n      - run: bash scripts/install-protoc.sh /tmp/protoc-2\n      - run: cargo build -p exocortex-server --features exocortex-server/fastembed\n  release:\n    permissions:\n      contents: write\n    steps:\n      - run: bash scripts/publish-release-assets.sh \"$TAG\" \"$GITHUB_REPOSITORY\" dist\n"
         );
         let good_ci = format!(
             "permissions:\n  contents: read\njobs:\n  gates:\n    steps:\n      - uses: actions/checkout@{SHA}\n      - run: bash scripts/install-protoc.sh /tmp/protoc\n"
@@ -1370,11 +1501,15 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
                 "FROM scratch AS protoc-arm64\n",
                 "ADD --checksum=sha256:{digest} https://example.invalid/protoc-28.3-linux-aarch_64.zip /protoc.zip\n",
                 "FROM gcr.io/distroless/cc-debian12:nonroot@sha256:{digest}\n",
+                "RUN cargo build --release -p exocortex-server --bin exocortex-node --features fastembed\n",
                 "USER 65532:65532\n"
             ),
             digest = "a".repeat(64)
         );
-        let good_compose = "ports:\n  - \"127.0.0.1:8080:8080\"\n";
+        let good_compose = &format!(
+            "image: redis@sha256:{}\nports:\n  - \"127.0.0.1:8080:8080\"\n",
+            "b".repeat(64)
+        );
         let workflows = [
             (".github/workflows/release.yml", good_release.as_str()),
             (".github/workflows/ci.yml", good_ci.as_str()),
@@ -1395,6 +1530,39 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
         assert!(validate_release_hardening(
             &workflows_with_mutable_ci,
             &good_dockerfile,
+            PROTOC_INSTALLER,
+            &[good_compose]
+        )
+        .is_err());
+        for mutable_image in ["redis:latest", "redis:7-alpine"] {
+            let compose = format!("image: {mutable_image}\nports:\n  - \"127.0.0.1:8080:8080\"\n");
+            assert!(validate_release_hardening(
+                &workflows,
+                &good_dockerfile,
+                PROTOC_INSTALLER,
+                &[&compose]
+            )
+            .is_err());
+        }
+        let missing_release_feature =
+            good_release.replace(" --features exocortex-server/fastembed", "");
+        assert!(validate_release_hardening(
+            &[
+                (
+                    ".github/workflows/release.yml",
+                    missing_release_feature.as_str()
+                ),
+                (".github/workflows/ci.yml", good_ci.as_str()),
+            ],
+            &good_dockerfile,
+            PROTOC_INSTALLER,
+            &[good_compose]
+        )
+        .is_err());
+        let missing_docker_feature = good_dockerfile.replace(" --features fastembed", "");
+        assert!(validate_release_hardening(
+            &workflows,
+            &missing_docker_feature,
             PROTOC_INSTALLER,
             &[good_compose]
         )
@@ -1493,5 +1661,22 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
             &[good_compose]
         )
         .is_err());
+    }
+
+    #[test]
+    fn fastembed_release_contract_rejects_each_missing_surface() {
+        let release = "--features exocortex-server/fastembed";
+        let workflows = [(".github/workflows/release.yml", release)];
+        let docker = "cargo build -p exocortex-server --bin exocortex-node --features fastembed";
+        let verify = "cargo check -p exocortex-server --all-targets --features fastembed";
+        assert!(validate_fastembed_release(&workflows, docker, verify).is_ok());
+        assert!(validate_fastembed_release(
+            &[(".github/workflows/release.yml", "cargo build")],
+            docker,
+            verify
+        )
+        .is_err());
+        assert!(validate_fastembed_release(&workflows, "cargo build", verify).is_err());
+        assert!(validate_fastembed_release(&workflows, docker, "cargo check").is_err());
     }
 }

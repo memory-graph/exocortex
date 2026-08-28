@@ -1030,3 +1030,53 @@ async fn health_ready_reflects_maintainer_truth() {
     assert_eq!(status, 503, "dead invalidation feed must fail readiness");
     assert!(body.contains("\"not-ready\""));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn production_startup_subscribes_before_authoritative_cache_image() {
+    let onto = std::sync::Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let storage = std::sync::Arc::new(InMemoryStorage::new(onto.clone()));
+    let (subscription_captured, release_subscription) =
+        storage.pause_next_invalidation_subscription();
+    let (snapshot_captured, release_snapshot) = storage.pause_next_memory_stream_after_snapshot();
+    let starting = tokio::spawn(run_backend_node(
+        storage.clone(),
+        onto,
+        args("127.0.0.1:0", 0, vec![]),
+    ));
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        subscription_captured.notified(),
+    )
+    .await
+    .expect("production cache bridge captures its receiver before reseeding");
+    release_subscription.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        snapshot_captured.notified(),
+    )
+    .await
+    .expect("authoritative memory image is captured after subscription");
+    let committed_during_startup = acceptance_memory(96, false);
+    storage
+        .upsert_memory(&committed_during_startup)
+        .await
+        .unwrap();
+    release_snapshot.notify_one();
+
+    let node = tokio::time::timeout(std::time::Duration::from_secs(5), starting)
+        .await
+        .expect("backend startup completes")
+        .expect("startup task remains live")
+        .expect("backend starts");
+    let visibility =
+        exocortex_ops::operations::ops_vc("org", "reader", exocortex_kernel::Visibility::Org);
+    assert!(
+        node.cache
+            .get_memory("org", &committed_during_startup.id, &visibility)
+            .is_some(),
+        "a commit in the snapshot/subscription window is present at startup"
+    );
+}
