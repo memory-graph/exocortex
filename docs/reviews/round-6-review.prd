@@ -742,6 +742,13 @@ gate. Focused server, storage integration compile, xtask negative-gate, and
 three-node stale-health regressions pass. R6-R182 remains open until the full
 mandatory matrix and a subsequent fresh strict whole-project review are clean.
 
+The first complete matrix attempt promoted and closed R6-R207. Whole-workspace
+Clippy rejected a nested early `return` in the stdio reader thread as an
+unreaped-child path. The equivalent loop `break` keeps the spawned MCP child
+visibly owned by `Client`, whose timeout and drop paths kill and wait. Client
+all-target Clippy and the bounded silent-child regression pass; the complete
+matrix must still restart from its first command.
+
 ### Historical pre-R176 closure evidence (superseded)
 
 At the earlier closure point, the complete mandatory gate matrix passed:

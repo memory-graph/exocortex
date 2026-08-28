@@ -37,7 +37,7 @@ impl Client {
             for line in std::io::BufReader::new(child_stdout).lines() {
                 let line = line.map_err(|error| error.to_string());
                 if stdout_tx.send(line).is_err() {
-                    return;
+                    break;
                 }
             }
         });
