@@ -633,10 +633,11 @@ itest!(
                 &second_relationships,
             ),
         );
-        assert_ne!(
-            first_once.unwrap(),
-            second_once.unwrap(),
-            "exactly one independent live client commits"
+        assert_eq!(
+            usize::from(matches!(first_once, Ok(true)))
+                + usize::from(matches!(second_once, Ok(true))),
+            1,
+            "exactly one independent live client commits; a publication owner may make the loser retry"
         );
         let assertion_count = restarted
             .query_cypher(&CypherQuery {
@@ -666,11 +667,7 @@ itest!(
             .await
             .is_err());
         assert!(!contender
-            .upsert_batch_once(
-                "reasoning:publish-repair",
-                &[repair_peer],
-                &[repair_edge.clone()],
-            )
+            .upsert_batch_once("reasoning:publish-repair", &[], &[])
             .await
             .unwrap());
         tokio::time::timeout(StdDuration::from_secs(2), async {

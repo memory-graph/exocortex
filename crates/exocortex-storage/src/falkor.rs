@@ -7,8 +7,9 @@
 // invalidation is published to the org channel (§9.1).
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 #[cfg(feature = "integration")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -53,6 +54,7 @@ pub struct FalkorStorage {
     ontology: Arc<Ontology>,
     lsn_key: String,
     channel: String,
+    publication_claim_seq: AtomicU64,
     #[cfg(feature = "integration")]
     stream_memory_pages: AtomicU64,
     #[cfg(feature = "integration")]
@@ -394,6 +396,7 @@ impl FalkorStorage {
             ontology,
             lsn_key: format!("exocortex:{}:lsn", cfg.org_id),
             channel: format!("exocortex:{}:inv", cfg.org_id),
+            publication_claim_seq: AtomicU64::new(0),
             #[cfg(feature = "integration")]
             stream_memory_pages: AtomicU64::new(0),
             #[cfg(feature = "integration")]
@@ -1116,6 +1119,7 @@ impl FalkorStorage {
         lease: Option<&OwnerLease>,
         journal: Option<(&FencedRestore, &str)>,
         import_key: Option<&str>,
+        publication_claim_token: Option<&str>,
     ) -> Result<Option<FencedBatchCommit>, StorageError> {
         // R-T4 inverse companions join the same transaction.
         let all_rels = self.expand_relationships(rs);
@@ -1128,13 +1132,6 @@ impl FalkorStorage {
         let mut records = Vec::with_capacity(total);
         let mut invalidations = Vec::with_capacity(total);
         let mut next = block.start;
-
-        if let Some(import_key) = import_key {
-            parts.push((
-                "governed_import_guard",
-                serde_json::json!({ "import_key": import_key }),
-            ));
-        }
 
         if let Some(last_lsn) = block.end.checked_sub(1) {
             parts.push(("mutation_lsn_guard", serde_json::json!({ "lsn": last_lsn })));
@@ -1274,6 +1271,23 @@ impl FalkorStorage {
             ));
         }
 
+        if let Some(import_key) = import_key {
+            parts.insert(
+                0,
+                (
+                    "governed_import_guard",
+                    serde_json::json!({
+                        "import_key": import_key,
+                        "publication_json": serde_json::to_string(&invalidations)
+                            .map_err(|error| StorageError::Backend(error.to_string()))?,
+                        "claim_token": publication_claim_token
+                            .expect("idempotent operation has claim token"),
+                        "lease_ms": 30_000,
+                    }),
+                ),
+            );
+        }
+
         let mut query_params = Vec::new();
         let mut bodies = Vec::with_capacity(parts.len());
         for (index, (template, params)) in parts.iter().enumerate() {
@@ -1315,7 +1329,18 @@ impl FalkorStorage {
             if import_key.is_some() {
                 // The durable operation marker makes a replay a no-op, so a
                 // publication failure must remain observable and replayable.
-                self.publish_checked(&inv).await?;
+                if let Err(error) = self.publish_checked(&inv).await {
+                    self.run_template(
+                        "idempotent_batch_publication_release",
+                        &serde_json::json!({
+                            "operation_key": import_key.expect("checked"),
+                            "claim_token": publication_claim_token.expect("checked"),
+                        }),
+                        false,
+                    )
+                    .await?;
+                    return Err(error);
+                }
             } else {
                 self.publish(inv).await;
             }
@@ -1323,7 +1348,10 @@ impl FalkorStorage {
         if let Some(operation_key) = import_key {
             self.run_template(
                 "idempotent_batch_publication_complete",
-                &serde_json::json!({ "operation_key": operation_key }),
+                &serde_json::json!({
+                    "operation_key": operation_key,
+                    "claim_token": publication_claim_token.expect("checked"),
+                }),
                 false,
             )
             .await?;
@@ -1515,7 +1543,7 @@ impl Storage for FalkorStorage {
         rs: &[Relationship],
     ) -> Result<Vec<CommitRecord>, StorageError> {
         Ok(self
-            .upsert_batch_inner(ms, rs, None, None, None)
+            .upsert_batch_inner(ms, rs, None, None, None, None)
             .await?
             .expect("ordinary batch cannot take the idempotent no-op path")
             .records)
@@ -1536,49 +1564,83 @@ impl Storage for FalkorStorage {
         ms: &[Memory],
         rs: &[Relationship],
     ) -> Result<bool, StorageError> {
+        let claim_token = format!(
+            "{}:{}:{}",
+            self.node_id,
+            Utc::now().timestamp_micros(),
+            self.publication_claim_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         let committed = self
-            .upsert_batch_inner(ms, rs, None, None, Some(operation_key))
+            .upsert_batch_inner(ms, rs, None, None, Some(operation_key), Some(&claim_token))
             .await?
             .is_some();
-        let publication_pending = !self
+        let pending_rows = self
             .run_template(
-                "idempotent_batch_publication_pending",
-                &serde_json::json!({ "operation_key": operation_key }),
-                true,
+                "idempotent_batch_publication_claim",
+                &serde_json::json!({
+                    "operation_key": operation_key,
+                    "claim_token": claim_token,
+                    "lease_ms": 30_000,
+                }),
+                false,
             )
-            .await?
-            .is_empty();
-        if !committed && publication_pending {
+            .await?;
+        if !committed && !pending_rows.is_empty() {
             // A prior attempt may have committed the marker and graph rows but
-            // failed publication. Reconstruct authoritative invalidations on
-            // replay so the durable no-op repairs the change feed.
-            for memory in ms {
-                if let Some(current) = self.get_memory(&memory.id).await? {
-                    self.publish_checked(&Invalidation::MemoryUpserted {
-                        id: current.id,
-                        lsn: current.lsn.value,
-                    })
+            // failed publication. Replay the exact payloads atomically stored
+            // with that marker, independent of the retry's now-empty write set.
+            let Some(FalkorValue::String(publication_json)) =
+                pending_rows.first().and_then(|row| row.first())
+            else {
+                return Err(StorageError::CorruptMetadata {
+                    key: "idempotent_batch_publication",
+                    detail: "pending marker lacks publication JSON".into(),
+                });
+            };
+            let invalidations: Vec<Invalidation> =
+                serde_json::from_str(publication_json).map_err(|error| {
+                    StorageError::CorruptMetadata {
+                        key: "idempotent_batch_publication",
+                        detail: error.to_string(),
+                    }
+                })?;
+            for invalidation in invalidations {
+                if let Err(error) = self.publish_checked(&invalidation).await {
+                    self.run_template(
+                        "idempotent_batch_publication_release",
+                        &serde_json::json!({
+                            "operation_key": operation_key,
+                            "claim_token": claim_token,
+                        }),
+                        false,
+                    )
                     .await?;
-                }
-            }
-            for relationship in self.expand_relationships(rs) {
-                if let Some(current) = self.get_relationship(&relationship.id).await? {
-                    self.publish_checked(&Invalidation::RelationshipUpserted {
-                        id: current.id,
-                        from: current.from,
-                        to: current.to,
-                        kind: current.kind,
-                        lsn: current.lsn.value,
-                    })
-                    .await?;
+                    return Err(error);
                 }
             }
             self.run_template(
                 "idempotent_batch_publication_complete",
-                &serde_json::json!({ "operation_key": operation_key }),
+                &serde_json::json!({
+                    "operation_key": operation_key,
+                    "claim_token": claim_token,
+                }),
                 false,
             )
             .await?;
+        } else if !committed
+            && !self
+                .run_template(
+                    "idempotent_batch_publication_is_pending",
+                    &serde_json::json!({ "operation_key": operation_key }),
+                    true,
+                )
+                .await?
+                .is_empty()
+        {
+            return Err(StorageError::Backend(
+                "idempotent batch publication is owned by another worker".into(),
+            ));
         }
         Ok(committed)
     }
@@ -2878,7 +2940,7 @@ impl Storage for FalkorStorage {
         rs: &[Relationship],
         lease: &OwnerLease,
     ) -> Result<FencedBatchCommit, StorageError> {
-        self.upsert_batch_inner(ms, rs, Some(lease), None, None)
+        self.upsert_batch_inner(ms, rs, Some(lease), None, None, None)
             .await?
             .ok_or_else(|| StorageError::Backend("fenced batch unexpectedly became a no-op".into()))
     }
@@ -2896,6 +2958,7 @@ impl Storage for FalkorStorage {
             rs,
             Some(lease),
             Some((prepared_restore, cycle_id)),
+            None,
             None,
         )
         .await?

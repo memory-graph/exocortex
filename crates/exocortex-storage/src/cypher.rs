@@ -520,17 +520,47 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     reg!(Template {
         id: "governed_import_guard",
         read_only: false,
-        required_params: &["import_key"],
+        required_params: &["import_key", "publication_json", "claim_token", "lease_ms"],
         cypher: r#"
             MERGE (i:_GovernedImport {key: $import_key})
             ON CREATE SET i.applied = false, i.publication_pending = false
             WITH i WHERE i.applied = false
-            SET i.applied = true, i.publication_pending = true
+            SET i.applied = true, i.publication_pending = true,
+                i.publication_json = $publication_json,
+                i.publication_claim_token = $claim_token,
+                i.publication_claim_until_ms = timestamp() + $lease_ms
         "#,
     });
 
     reg!(Template {
-        id: "idempotent_batch_publication_pending",
+        id: "idempotent_batch_publication_claim",
+        read_only: false,
+        required_params: &["operation_key", "claim_token", "lease_ms"],
+        cypher: r#"
+            MATCH (i:_GovernedImport {key: $operation_key})
+            WHERE i.applied = true AND i.publication_pending = true
+              AND (i.publication_claim_until_ms IS NULL OR i.publication_claim_until_ms <= timestamp())
+            SET i.publication_claim_token = $claim_token,
+                i.publication_claim_until_ms = timestamp() + $lease_ms
+            RETURN i.publication_json
+        "#,
+    });
+
+    reg!(Template {
+        id: "idempotent_batch_publication_complete",
+        read_only: false,
+        required_params: &["operation_key", "claim_token"],
+        cypher: r#"
+            MATCH (i:_GovernedImport {key: $operation_key})
+            WHERE i.applied = true AND i.publication_claim_token = $claim_token
+            SET i.publication_pending = false
+            REMOVE i.publication_claim_token, i.publication_claim_until_ms
+            RETURN i.key
+        "#,
+    });
+
+    reg!(Template {
+        id: "idempotent_batch_publication_is_pending",
         read_only: true,
         required_params: &["operation_key"],
         cypher: r#"
@@ -541,13 +571,14 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
-        id: "idempotent_batch_publication_complete",
+        id: "idempotent_batch_publication_release",
         read_only: false,
-        required_params: &["operation_key"],
+        required_params: &["operation_key", "claim_token"],
         cypher: r#"
             MATCH (i:_GovernedImport {key: $operation_key})
-            WHERE i.applied = true
-            SET i.publication_pending = false
+            WHERE i.applied = true AND i.publication_pending = true
+              AND i.publication_claim_token = $claim_token
+            REMOVE i.publication_claim_token, i.publication_claim_until_ms
             RETURN i.key
         "#,
     });
