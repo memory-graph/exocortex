@@ -29,6 +29,53 @@ fn llm_markers() -> Vec<String> {
     .into()
 }
 
+fn manifest_dependencies(manifest: &str) -> Vec<(String, String)> {
+    let mut dependencies = Vec::new();
+    let mut dependency_table = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let section = &trimmed[1..trimmed.len() - 1];
+            dependency_table = section == "dependencies"
+                || section == "build-dependencies"
+                || section == "workspace.dependencies"
+                || section.ends_with(".dependencies")
+                || section.ends_with(".build-dependencies");
+            continue;
+        }
+        if !dependency_table || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((alias, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let alias = alias.trim().trim_matches(['\'', '"']).to_string();
+        if alias.is_empty() {
+            continue;
+        }
+        let package = value
+            .split(',')
+            .find_map(|field| {
+                let (key, value) = field.split_once('=')?;
+                (key.trim().trim_start_matches('{').trim() == "package")
+                    .then(|| value.trim().trim_matches([' ', '\'', '"', '}']).to_string())
+            })
+            .filter(|package| !package.is_empty())
+            .unwrap_or_else(|| alias.clone());
+        dependencies.push((alias, package));
+    }
+    dependencies
+}
+
+fn reviewed_outbound_dependency(manifest: &str, package: &str) -> bool {
+    matches!(
+        (manifest, package),
+        ("Cargo.toml", "eventsource-client")
+            | ("crates/exocortex-client/Cargo.toml", "eventsource-client")
+            | ("crates/exocortex-cluster/Cargo.toml", "eventsource-client")
+    )
+}
+
 pub(crate) fn validate_storage_targets(root: &Path) -> Result<()> {
     let base = root.join("crates/exocortex-storage");
     for target in ["integration.rs", "fencing_live.rs"] {
@@ -59,7 +106,7 @@ pub(crate) fn dead_enforcement_violations(
             continue;
         }
         let source = std::fs::read_to_string(&path)?;
-        if !contains_production_call(&source, name) {
+        if !contains_reachable_production_call(&source, name) {
             violations.push(format!(
                 "`{name}` has no executable production call in {witness}"
             ));
@@ -68,16 +115,163 @@ pub(crate) fn dead_enforcement_violations(
     Ok(violations)
 }
 
-fn contains_production_call(source: &str, name: &str) -> bool {
+#[derive(Debug)]
+struct RustFunction {
+    name: String,
+    body_start: usize,
+    body_end: usize,
+    root: bool,
+    configured_out: bool,
+}
+
+fn contains_reachable_production_call(source: &str, name: &str) -> bool {
     let source = strip_comments_and_strings(source);
+    let functions = rust_functions(&source);
+    let mut reachable = vec![false; functions.len()];
+    for (index, function) in functions.iter().enumerate() {
+        reachable[index] = function.root && !function.configured_out;
+    }
+    loop {
+        let mut changed = false;
+        for caller in 0..functions.len() {
+            if !reachable[caller] {
+                continue;
+            }
+            let body = &source[functions[caller].body_start..functions[caller].body_end];
+            for callee in 0..functions.len() {
+                if !reachable[callee]
+                    && !functions[callee].configured_out
+                    && body.contains(&format!("{}(", functions[callee].name))
+                {
+                    reachable[callee] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     let needle = format!("{name}(");
-    source.match_indices(&needle).any(|(at, _)| {
-        let prefix = source[..at].trim_end();
-        !prefix.ends_with("fn")
-            && !prefix.ends_with("fn ")
-            && !prefix.ends_with("pub fn")
-            && !prefix.ends_with("async fn")
+    functions.iter().enumerate().any(|(index, function)| {
+        if !reachable[index] {
+            return false;
+        }
+        let body = &source[function.body_start..function.body_end];
+        body.match_indices(&needle).any(|(relative, _)| {
+            !configured_out_at(body, relative) && !after_unconditional_exit(body, relative)
+        })
     })
+}
+
+fn rust_functions(source: &str) -> Vec<RustFunction> {
+    let mut functions = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = source[cursor..].find("fn ") {
+        let at = cursor + relative;
+        if at > 0 && source.as_bytes()[at - 1].is_ascii_alphanumeric() {
+            cursor = at + 3;
+            continue;
+        }
+        let name_start = at + 3;
+        let name_end = source[name_start..]
+            .find(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .map(|offset| name_start + offset)
+            .unwrap_or(source.len());
+        let name = source[name_start..name_end].to_string();
+        let Some(body_relative) = source[name_end..].find('{') else {
+            break;
+        };
+        let body_start = name_end + body_relative;
+        if source[name_end..body_start].contains(';') {
+            cursor = name_end;
+            continue;
+        }
+        let Some(body_end) = matching_brace(source, body_start) else {
+            break;
+        };
+        let line_start = source[..at].rfind('\n').map_or(0, |line| line + 1);
+        let mut attribute_start = line_start;
+        while attribute_start > 0 {
+            let previous_end = attribute_start - 1;
+            let previous_start = source[..previous_end]
+                .rfind('\n')
+                .map_or(0, |line| line + 1);
+            if !source[previous_start..previous_end]
+                .trim()
+                .starts_with("#[")
+            {
+                break;
+            }
+            attribute_start = previous_start;
+        }
+        let header = &source[attribute_start..body_start];
+        let root = name == "main"
+            || name == "handle"
+            || header
+                .split_whitespace()
+                .any(|token| token.starts_with("pub"));
+        functions.push(RustFunction {
+            name,
+            body_start: body_start + 1,
+            body_end,
+            root,
+            configured_out: header.contains("#[cfg("),
+        });
+        cursor = body_start + 1;
+    }
+    functions
+}
+
+fn matching_brace(source: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn configured_out_at(body: &str, call: usize) -> bool {
+    let prefix = &body[..call];
+    let cfg = prefix.rfind("#[cfg(");
+    let boundary = prefix.rfind([';', '}']).unwrap_or(0);
+    cfg.is_some_and(|cfg| cfg > boundary)
+}
+
+fn after_unconditional_exit(body: &str, call: usize) -> bool {
+    let prefix = &body[..call];
+    let mut depth = 0usize;
+    let mut depth_at_exit = None;
+    for (index, byte) in prefix.as_bytes().iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth_at_exit.is_some_and(|exit_depth| exit_depth > depth) {
+                    depth_at_exit = None;
+                }
+            }
+            _ => {
+                if ["return;", "break;", "continue;", "panic!(", "unreachable!("]
+                    .iter()
+                    .any(|marker| prefix[index..].starts_with(marker))
+                {
+                    depth_at_exit = Some(depth);
+                }
+            }
+        }
+    }
+    depth_at_exit == Some(depth)
 }
 
 pub(crate) fn no_llm_violations(root: &Path) -> Result<Vec<String>> {
@@ -102,10 +296,56 @@ pub(crate) fn no_llm_violations(root: &Path) -> Result<Vec<String>> {
     let mut violations = Vec::new();
     for path in files {
         let source = std::fs::read_to_string(&path)?;
-        for marker in llm_markers() {
-            if source.contains(&marker) {
-                let rel = path.strip_prefix(root).unwrap_or(&path);
-                violations.push(format!("{}: contains `{marker}`", rel.display()));
+        let is_manifest = path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml");
+        if !is_manifest {
+            for marker in llm_markers() {
+                if source.contains(&marker) {
+                    let rel = path.strip_prefix(root).unwrap_or(&path);
+                    violations.push(format!("{}: contains `{marker}`", rel.display()));
+                }
+            }
+        }
+        if is_manifest {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            for (alias, package) in manifest_dependencies(&source) {
+                let normalized = package.replace('_', "-").to_ascii_lowercase();
+                let llm_dependencies = [
+                    ["async-", "openai"].concat(),
+                    ["anthropic", "-sdk"].concat(),
+                    ["llm", "-client"].concat(),
+                    ["ollama", "-rs"].concat(),
+                    ["rig", "-core"].concat(),
+                    ["mistralai", "-client"].concat(),
+                ];
+                if llm_dependencies
+                    .iter()
+                    .any(|marker| normalized.contains(marker))
+                {
+                    violations.push(format!(
+                        "{rel}: LLM dependency `{package}` (declared as `{alias}`)"
+                    ));
+                }
+                if [
+                    "reqwest",
+                    "ureq",
+                    "surf",
+                    "isahc",
+                    "awc",
+                    "hyper",
+                    "hyper-util",
+                    "eventsource-client",
+                ]
+                .contains(&normalized.as_str())
+                    && !reviewed_outbound_dependency(&rel, &normalized)
+                {
+                    violations.push(format!(
+                        "{rel}: unreviewed outbound client dependency `{package}` (declared as `{alias}`)"
+                    ));
+                }
             }
         }
     }
@@ -184,24 +424,12 @@ pub(crate) fn kernel_boundary_violations(root: &Path) -> Result<Vec<String>> {
     ];
     let kernel = root.join("crates/exocortex-kernel");
     let manifest = std::fs::read_to_string(kernel.join("Cargo.toml"))?;
-    let mut in_dependencies = false;
     let mut violations = Vec::new();
-    for line in manifest.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_dependencies = trimmed == "[dependencies]";
-            continue;
-        }
-        if !in_dependencies || trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if let Some((name, _)) = trimmed.split_once('=') {
-            let name = name.trim();
-            if !ALLOWED_DIRECT.contains(&name) {
-                violations.push(format!(
-                    "kernel direct dependency `{name}` is not pure-approved"
-                ));
-            }
+    for (alias, package) in manifest_dependencies(&manifest) {
+        if !ALLOWED_DIRECT.contains(&package.as_str()) {
+            violations.push(format!(
+                "kernel direct dependency `{package}` (declared as `{alias}`) is not pure-approved"
+            ));
         }
     }
     let mut files = Vec::new();
@@ -222,6 +450,44 @@ pub(crate) fn kernel_boundary_violations(root: &Path) -> Result<Vec<String>> {
                     path.strip_prefix(root).unwrap_or(&path).display()
                 ));
             }
+        }
+        for statement in source.split(';').map(str::trim) {
+            if (statement.starts_with("use std") || statement.starts_with("extern crate std"))
+                && statement
+                    .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                    .any(|token| ["fs", "io", "net", "process"].contains(&token))
+            {
+                violations.push(format!(
+                    "{} imports an aliased standard I/O boundary: {statement}",
+                    path.strip_prefix(root).unwrap_or(&path).display()
+                ));
+            }
+        }
+    }
+    Ok(violations)
+}
+
+pub(crate) fn cypher_outside_storage_violations(root: &Path) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    walk_files(&root.join("crates"), &mut files, &["rs"])?;
+    let mut violations = Vec::new();
+    for path in files {
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        if rel.starts_with("crates/exocortex-storage") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)?.to_ascii_uppercase();
+        let query = source.contains("GRAPH.QUERY")
+            || source.contains("CYPHER ")
+            || (source.contains("MATCH (")
+                && [" RETURN ", " MERGE (", " CREATE (", " DELETE ", " SET "]
+                    .iter()
+                    .any(|marker| source.contains(marker)));
+        if query {
+            violations.push(format!(
+                "{} contains executable-looking Cypher outside exocortex-storage",
+                rel.display()
+            ));
         }
     }
     Ok(violations)
@@ -385,6 +651,23 @@ pub(crate) fn signing_hygiene_violations(root: &Path) -> Result<Vec<String>> {
             violations.push(format!(
                 "{rel}: constructs a blank batch checksum without a canonical signer"
             ));
+        }
+    }
+    let mut manifests = Vec::new();
+    walk_files(&root.join("crates"), &mut manifests, &["toml"])?;
+    for path in manifests {
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        if rel == Path::new("crates/exocortex-wire/Cargo.toml") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)?;
+        for (alias, package) in manifest_dependencies(&source) {
+            if package.replace('_', "-") == "hmac" {
+                violations.push(format!(
+                    "{} declares HMAC dependency `{alias}` outside exocortex-wire",
+                    rel.display()
+                ));
+            }
         }
     }
     Ok(violations)
@@ -559,11 +842,92 @@ mod tests {
     }
 
     #[test]
+    fn dead_enforcement_rejects_unreachable_configured_out_and_uncalled_witnesses() {
+        for (name, source) in [
+            (
+                "unreachable",
+                "pub fn root() { return; fence(); }\nfn fence() {}\n",
+            ),
+            (
+                "configured-out",
+                "pub fn root() {}\n#[cfg(any())]\nfn disabled() { fence(); }\nfn fence() {}\n",
+            ),
+            (
+                "uncalled",
+                "pub fn root() {}\nfn abandoned() { fence(); }\nfn fence() {}\n",
+            ),
+        ] {
+            let root = fixture(name);
+            write(&root, "crates/example/src/lib.rs", source);
+            assert_eq!(
+                dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")])
+                    .unwrap()
+                    .len(),
+                1,
+                "{name} witness must fail closed"
+            );
+        }
+
+        let root = fixture("reachable");
+        write(
+            &root,
+            "crates/example/src/lib.rs",
+            "pub fn root() { helper(); }\nfn helper() { fence(); }\nfn fence() {}\n",
+        );
+        assert!(
+            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn no_llm_rejects_generated_target_fixture() {
         let root = fixture("llm");
         let endpoint = ["https://api.", "openai.com/v1"].concat();
         write(&root, "crates/example/build.rs", &endpoint);
         assert_eq!(no_llm_violations(&root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn no_llm_rejects_provider_neutral_and_renamed_clients() {
+        let root = fixture("provider-neutral");
+        write(
+            &root,
+            "crates/example/Cargo.toml",
+            "[dependencies]\nweb = { package = \"reqwest\", version = \"1\" }\n",
+        );
+        write(
+            &root,
+            "crates/example/src/lib.rs",
+            "fn send(url: &str) { let _ = web::Client::new().post(url); }\n",
+        );
+        assert_eq!(no_llm_violations(&root).unwrap().len(), 1);
+
+        let root = fixture("renamed-llm");
+        let package = ["async-", "openai"].concat();
+        write(
+            &root,
+            "crates/example/Cargo.toml",
+            &format!("[dependencies]\nbrain = {{ package = \"{package}\", version = \"1\" }}\n"),
+        );
+        assert_eq!(no_llm_violations(&root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn no_llm_accepts_the_reviewed_sse_client_dependency() {
+        let root = fixture("reviewed-outbound");
+        write(
+            &root,
+            "Cargo.toml",
+            "[workspace.dependencies]\neventsource-client = \"1\"\n",
+        );
+        write(
+            &root,
+            "crates/exocortex-client/Cargo.toml",
+            "[dependencies]\neventsource-client = { workspace = true }\n",
+        );
+        assert!(no_llm_violations(&root).unwrap().is_empty());
     }
 
     #[test]
@@ -595,6 +959,41 @@ mod tests {
         );
         let violations = kernel_boundary_violations(&root).unwrap();
         assert_eq!(violations.len(), 2, "{violations:?}");
+    }
+
+    #[test]
+    fn kernel_boundary_rejects_target_aliases_and_aliased_io() {
+        let root = fixture("kernel-target-alias");
+        write(
+            &root,
+            "crates/exocortex-kernel/Cargo.toml",
+            "[target.'cfg(unix)'.dependencies]\nwire = { package = \"exocortex-storage\", version = \"1\" }\n",
+        );
+        write(
+            &root,
+            "crates/exocortex-kernel/src/lib.rs",
+            "use std::fs as disk; fn leak() { let _ = disk::read(\"x\"); }\n",
+        );
+        let violations = kernel_boundary_violations(&root).unwrap();
+        assert_eq!(violations.len(), 2, "{violations:?}");
+    }
+
+    #[test]
+    fn cypher_guard_rejects_query_outside_storage() {
+        let root = fixture("cypher-boundary");
+        write(
+            &root,
+            "crates/exocortex-server/src/lib.rs",
+            "fn query() -> &'static str { \"MATCH (n) RETURN n\" }\n",
+        );
+        assert_eq!(cypher_outside_storage_violations(&root).unwrap().len(), 1);
+        write(
+            &root,
+            "crates/exocortex-storage/src/lib.rs",
+            "fn query() -> &'static str { \"MATCH (n) RETURN n\" }\n",
+        );
+        std::fs::remove_file(root.join("crates/exocortex-server/src/lib.rs")).unwrap();
+        assert!(cypher_outside_storage_violations(&root).unwrap().is_empty());
     }
 
     #[test]
@@ -642,6 +1041,17 @@ mod tests {
             &root,
             "crates/example/src/lib.rs",
             "use hmac::Hmac as OtherMac; use wire::IngestBatch; fn forge(_: IngestBatch) { let _: Option<OtherMac<sha2::Sha256>> = None; }",
+        );
+        assert_eq!(signing_hygiene_violations(&root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn signing_hygiene_rejects_renamed_hmac_dependency() {
+        let root = fixture("signing-manifest-alias");
+        write(
+            &root,
+            "crates/example/Cargo.toml",
+            "[dependencies]\ncrypto = { package = \"hmac\", version = \"1\" }\n",
         );
         assert_eq!(signing_hygiene_violations(&root).unwrap().len(), 1);
     }

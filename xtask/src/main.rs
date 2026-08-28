@@ -112,9 +112,23 @@ fn deployment_acceptance() -> Result<()> {
         std::fs::read_to_string("crates/exocortex-cluster/tests/docker-compose-cluster.yml")?;
     let storage_compose =
         std::fs::read_to_string("crates/exocortex-storage/tests/docker-compose.yml")?;
-    let release = std::fs::read_to_string(".github/workflows/release.yml")?;
+    let mut workflow_sources = Vec::new();
+    for entry in std::fs::read_dir(".github/workflows")? {
+        let path = entry?.path();
+        if matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            workflow_sources.push((path.display().to_string(), std::fs::read_to_string(&path)?));
+        }
+    }
+    workflow_sources.sort_by(|left, right| left.0.cmp(&right.0));
+    let workflows = workflow_sources
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
     let dockerfile = std::fs::read_to_string("Dockerfile")?;
-    validate_release_hardening(&release, &dockerfile, &[&compose, &storage_compose])?;
+    validate_release_hardening(&workflows, &dockerfile, &[&compose, &storage_compose])?;
     for node in ["node1", "node2", "node3"] {
         let marker = format!("  {node}:\n");
         let section = compose
@@ -189,36 +203,44 @@ fn deployment_acceptance() -> Result<()> {
 }
 
 fn validate_release_hardening(
-    workflow: &str,
+    workflows: &[(&str, &str)],
     dockerfile: &str,
     compose_files: &[&str],
 ) -> Result<()> {
-    anyhow::ensure!(
-        workflow.contains("permissions:\n  contents: read\n"),
-        "release workflow must default to read-only repository permission"
-    );
-    let release_job = workflow
-        .split_once("\n  release:\n")
-        .map(|(_, section)| section)
-        .ok_or_else(|| anyhow::anyhow!("release workflow is missing the release job"))?;
-    anyhow::ensure!(
-        release_job.contains("    permissions:\n      contents: write\n"),
-        "only the release job may receive contents: write"
-    );
-    for line in workflow.lines() {
-        let directive = line.trim().trim_start_matches("- ");
-        if !directive.starts_with("uses:") {
-            continue;
-        }
-        let action = directive
-            .split_once('@')
-            .map(|(_, revision)| revision.split_whitespace().next().unwrap_or_default())
-            .unwrap_or_default();
+    anyhow::ensure!(!workflows.is_empty(), "no GitHub workflows found");
+    let mut saw_release = false;
+    for (path, workflow) in workflows {
         anyhow::ensure!(
-            action.len() == 40 && action.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "release action must be pinned to a full commit SHA: {line}"
+            workflow.contains("permissions:\n  contents: read\n"),
+            "{path} must default to read-only repository permission"
         );
+        if path.ends_with("release.yml") || path.ends_with("release.yaml") {
+            saw_release = true;
+            let release_job = workflow
+                .split_once("\n  release:\n")
+                .map(|(_, section)| section)
+                .ok_or_else(|| anyhow::anyhow!("release workflow is missing the release job"))?;
+            anyhow::ensure!(
+                release_job.contains("    permissions:\n      contents: write\n"),
+                "only the release job may receive contents: write"
+            );
+        }
+        for line in workflow.lines() {
+            let directive = line.trim().trim_start_matches("- ");
+            if !directive.starts_with("uses:") {
+                continue;
+            }
+            let action = directive
+                .split_once('@')
+                .map(|(_, revision)| revision.split_whitespace().next().unwrap_or_default())
+                .unwrap_or_default();
+            anyhow::ensure!(
+                action.len() == 40 && action.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{path} action must be pinned to a full commit SHA: {line}"
+            );
+        }
     }
+    anyhow::ensure!(saw_release, "release workflow is missing");
     anyhow::ensure!(
         dockerfile
             .lines()
@@ -484,6 +506,12 @@ fn kernel_purity() -> Result<()> {
         boundary.is_empty(),
         "kernel-purity FAILED: {}",
         boundary.join("; ")
+    );
+    let cypher = gates::cypher_outside_storage_violations(std::path::Path::new("."))?;
+    anyhow::ensure!(
+        cypher.is_empty(),
+        "kernel-purity FAILED: {}",
+        cypher.join("; ")
     );
     for crate_name in [
         "exocortex-kernel",
@@ -1167,22 +1195,45 @@ mod release_hardening_tests {
 
     #[test]
     fn rejects_mutable_actions_root_runtime_and_public_test_ports() {
-        let good_workflow = format!(
+        let good_release = format!(
             "permissions:\n  contents: read\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@{SHA}\n  release:\n    permissions:\n      contents: write\n"
+        );
+        let good_ci = format!(
+            "permissions:\n  contents: read\njobs:\n  gates:\n    steps:\n      - uses: actions/checkout@{SHA}\n"
         );
         let good_dockerfile = "FROM scratch\nUSER 65532:65532\n";
         let good_compose = "ports:\n  - \"127.0.0.1:8080:8080\"\n";
-        assert!(
-            validate_release_hardening(&good_workflow, good_dockerfile, &[good_compose]).is_ok()
-        );
+        let workflows = [
+            (".github/workflows/release.yml", good_release.as_str()),
+            (".github/workflows/ci.yml", good_ci.as_str()),
+        ];
+        assert!(validate_release_hardening(&workflows, good_dockerfile, &[good_compose]).is_ok());
 
-        let mutable = good_workflow.replace(SHA, "v4");
-        assert!(validate_release_hardening(&mutable, good_dockerfile, &[good_compose]).is_err());
-        assert!(
-            validate_release_hardening(&good_workflow, "FROM scratch\n", &[good_compose]).is_err()
-        );
+        let mutable_ci = good_ci.replace(SHA, "v4");
+        let workflows_with_mutable_ci = [
+            (".github/workflows/release.yml", good_release.as_str()),
+            (".github/workflows/ci.yml", mutable_ci.as_str()),
+        ];
         assert!(validate_release_hardening(
-            &good_workflow,
+            &workflows_with_mutable_ci,
+            good_dockerfile,
+            &[good_compose]
+        )
+        .is_err());
+        let no_permissions = good_ci.replacen("permissions:\n  contents: read\n", "", 1);
+        let workflows_without_ci_permissions = [
+            (".github/workflows/release.yml", good_release.as_str()),
+            (".github/workflows/ci.yml", no_permissions.as_str()),
+        ];
+        assert!(validate_release_hardening(
+            &workflows_without_ci_permissions,
+            good_dockerfile,
+            &[good_compose]
+        )
+        .is_err());
+        assert!(validate_release_hardening(&workflows, "FROM scratch\n", &[good_compose]).is_err());
+        assert!(validate_release_hardening(
+            &workflows,
             good_dockerfile,
             &["ports:\n  - \"8080:8080\"\n"]
         )
