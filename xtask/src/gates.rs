@@ -202,14 +202,10 @@ fn rust_functions(source: &str) -> Vec<RustFunction> {
             .map(|offset| name_start + offset)
             .unwrap_or(source.len());
         let name = source[name_start..name_end].to_string();
-        let Some(body_relative) = source[name_end..].find('{') else {
-            break;
-        };
-        let body_start = name_end + body_relative;
-        if source[name_end..body_start].contains(';') {
+        let Some(body_start) = function_body_start(source, name_end) else {
             cursor = name_end;
             continue;
-        }
+        };
         let Some(body_end) = matching_brace(source, body_start) else {
             break;
         };
@@ -245,6 +241,23 @@ fn rust_functions(source: &str) -> Vec<RustFunction> {
         cursor = body_start + 1;
     }
     functions
+}
+
+fn function_body_start(source: &str, signature_start: usize) -> Option<usize> {
+    let mut parentheses = 0usize;
+    let mut brackets = 0usize;
+    for (offset, byte) in source.as_bytes()[signature_start..].iter().enumerate() {
+        match byte {
+            b'(' => parentheses += 1,
+            b')' => parentheses = parentheses.saturating_sub(1),
+            b'[' => brackets += 1,
+            b']' => brackets = brackets.saturating_sub(1),
+            b';' if parentheses == 0 && brackets == 0 => return None,
+            b'{' if parentheses == 0 && brackets == 0 => return Some(signature_start + offset),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn inside_trait_impl(source: &str, function_at: usize) -> bool {
@@ -1313,6 +1326,19 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "public trait implementations are production entrypoints"
+        );
+
+        let root = fixture("array-signature");
+        write(
+            &root,
+            "crates/example/src/lib.rs",
+            "pub fn root() { helper([0; 32]); }\nfn helper(_key: [u8; 32]) { fence(); }\nfn fence() {}\n",
+        );
+        assert!(
+            dead_enforcement_violations(&root, &[("fence", "crates/example/src/lib.rs")])
+                .unwrap()
+                .is_empty(),
+            "array-type semicolons are not function declaration terminators"
         );
     }
 
