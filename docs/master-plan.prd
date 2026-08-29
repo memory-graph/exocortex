@@ -1,16 +1,25 @@
 # Exocortex — Master Plan
 
-**Status (2026-08-29, Wave 0 shipped):** OC-PRD landed as the first
-post-v1 wave. The fingerprint is two-level (compatibility gates at
-`d60a2467…4ef52`; build reports at the unchanged v1 value
-`e1f7d17b…ddc9b2`), the six boundaries consult one kernel policy table
-(gated by `cargo xtask compatibility-policy`), superset acceptance
-makes additive ontology change a non-event with a real rolling window
-(prior fingerprints stay recognized from the advanced pin), every
-existing graph migrates (legacy 64-hex pins boot, rewrite to scheme-2
-records, and reboot unchanged), and both backup formats restore
-forward under subsets. All six S-criteria are executable
-(`docs/acceptance/section-23.tsv` rows oc1-oc6). Wave 1 is next.
+**Status (2026-08-29, Wave 0 shipped + Wave 1 nearly closed):** OC-PRD
+landed complete (two-level fingerprint — compatibility gates at
+`d60a2467…4ef52`, build reports at the unchanged v1 value
+`e1f7d17b…ddc9b2`; one kernel policy table behind
+`cargo xtask compatibility-policy`; superset rolling windows; legacy
+graph migration; forward-restoring backups; S-criteria oc1-oc6
+executable). Wave 1 then shipped four of its five items: PX6 (the
+kernel catalogue's three orphan verbs implemented with a bijection
+test), PX2-S1 (the macro spike: actions!/functions! are expressible in
+plain macro_rules!, decision recorded with an executable proof), D25
+(the ChangeLog seam with a conformance suite), PX1 (mortgage-v1, the
+second pack — §23 criterion 26 verified), and PX3's inventory half
+(`cargo xtask seam-inventory`, a 32-row bijection gate; the shared
+three-implementation corpus stays the recorded deviation-20 boundary).
+**PX2 itself (pack-registered Actions/Functions end to end) is the one
+open Wave 1 item** — the spike de-risked it to outcome (a); its full
+scope (framework-executed action bodies, MCP/HTTP dispatch with audit,
+the generated Function-SLO bench harness, --dump-tools and
+--dump-fingerprint, the one-implementation generalized preflight)
+remains accepted work. Wave 2 (D21/D18/D19/D13/D1/PX4) is untouched.
 
 **Status (2026-08-28, Round 6):** Round 6 CLOSED. The resumed
 finish-branch run closed the parked items (R6-R275/R6-R276), ran a fresh
