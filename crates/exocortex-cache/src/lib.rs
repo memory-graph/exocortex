@@ -80,18 +80,13 @@ impl RoaringLsb for roaring::RoaringBitmap {
 }
 
 /// Blank a byte range with spaces while preserving later arena offsets.
-fn blank_search_key_range(s: &mut String, from: usize, to: usize) -> usize {
-    // `from` and `to` are UTF-8 boundaries; one ASCII byte per removed byte
-    // preserves every subsequent byte offset.
-    let mut out = String::with_capacity(s.len());
-    out.push_str(&s[..from]);
-    for _ in from..to {
-        out.push(' ');
-    }
-    out.push_str(&s[to..]);
-    let n = out.len();
-    *s = out;
-    n
+fn blank_search_key_range(s: &mut String, from: usize, to: usize) {
+    // `from` and `to` are UTF-8 boundaries; one ASCII space per removed
+    // byte preserves every subsequent byte offset. Equal-length
+    // replacement shifts no tail bytes, so the cost is the range itself,
+    // never the arena behind it (repeat upserts must stay linear).
+    let blanks = " ".repeat(to - from);
+    s.replace_range(from..to, &blanks);
 }
 
 /// The key separator inside `search_arena`.
@@ -233,7 +228,7 @@ impl GraphSnapshot {
                 .copied()
                 .unwrap_or(self.search_arena.len() as u32) as usize;
             if from < to && to <= self.search_arena.len() {
-                let _ = blank_search_key_range(&mut self.search_arena, from, to);
+                blank_search_key_range(&mut self.search_arena, from, to);
             }
         }
     }
@@ -430,6 +425,7 @@ enum SnapshotDelta {
     UpsertRelationship(Box<Relationship>),
     DeleteRelationship(RelationshipId),
     AdvanceBackendLsn(u64),
+    AdvanceLocalLsn(u64),
 }
 
 impl SnapshotDelta {
@@ -445,6 +441,9 @@ impl SnapshotDelta {
             Self::DeleteRelationship(id) => snapshot.remove_relationship(id),
             Self::AdvanceBackendLsn(lsn) => {
                 snapshot.last_backend_lsn = snapshot.last_backend_lsn.max(*lsn);
+            }
+            Self::AdvanceLocalLsn(lsn) => {
+                snapshot.last_local_lsn = snapshot.last_local_lsn.max(*lsn);
             }
         }
     }
@@ -504,8 +503,9 @@ impl GraphSlot {
         memories: &[Memory],
         relationships: &[Relationship],
         local_lsn: u64,
+        clone_count: &AtomicU64,
     ) -> Option<(usize, usize)> {
-        // The read/check/clone/swap is one writer transaction. Offline MCP
+        // The read/check/publish is one writer transaction. Offline MCP
         // requests may run concurrently, so loading before taking this lock
         // can publish a stale generation and erase a sibling request.
         let mut state = self.reuse.lock();
@@ -513,27 +513,36 @@ impl GraphSlot {
         if memories.is_empty() && relationships.is_empty() && local_lsn <= current.last_local_lsn {
             return None;
         }
-        let old_bytes = current.est_bytes;
-        let mut next = clone_snapshot(&current);
+        let mut delta = Vec::with_capacity(memories.len() + relationships.len() + 1);
         for memory in memories {
-            next.insert_memory(memory.clone());
+            delta.push(SnapshotDelta::UpsertMemory(Box::new(memory.clone())));
         }
         for relationship in relationships {
-            next.insert_relationship(relationship.clone());
+            delta.push(SnapshotDelta::UpsertRelationship(Box::new(
+                relationship.clone(),
+            )));
         }
-        next.last_local_lsn = next.last_local_lsn.max(local_lsn);
-        let new_bytes = next.est_bytes;
-        state.generation = state.generation.saturating_add(1);
-        state.retired.clear();
-        state.journal.clear();
-        self.current.store(Arc::new(next));
-        Some((old_bytes, new_bytes))
+        delta.push(SnapshotDelta::AdvanceLocalLsn(local_lsn));
+        Some(self.publish_delta_locked(&mut state, current, delta, clone_count))
     }
 
     fn publish_delta(&self, delta: Vec<SnapshotDelta>, clone_count: &AtomicU64) -> (usize, usize) {
-        const RETIRED_BUFFERS: usize = 4;
         let mut state = self.reuse.lock();
         let current = self.current.load_full();
+        self.publish_delta_locked(&mut state, current, delta, clone_count)
+    }
+
+    /// The RCU publication protocol shared by feed deltas and local
+    /// submissions: reuse a uniquely-retired buffer (catching it up from
+    /// the bounded journal) instead of cloning the resident graph.
+    fn publish_delta_locked(
+        &self,
+        state: &mut SnapshotReuseState,
+        current: Arc<GraphSnapshot>,
+        delta: Vec<SnapshotDelta>,
+        clone_count: &AtomicU64,
+    ) -> (usize, usize) {
+        const RETIRED_BUFFERS: usize = 4;
         let old_bytes = current.est_bytes;
         let reusable = state
             .retired
@@ -1240,7 +1249,9 @@ impl LocalCache {
     /// observe the value the offline ack handed back.
     pub fn advance_local_lsn(&self, org: &str, local_lsn: u64) {
         if let Some(g) = self.graphs.get(org) {
-            if g.apply_local(&[], &[], local_lsn).is_some() {
+            if g.apply_local(&[], &[], local_lsn, &self.full_snapshot_clones)
+                .is_some()
+            {
                 self.snapshot_publications.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1266,7 +1277,12 @@ impl LocalCache {
             .entry(org.into())
             .or_insert_with(|| Arc::new(GraphSlot::new(Arc::new(GraphSnapshot::empty()))))
             .clone();
-        let Some((old_bytes, new_bytes)) = g.apply_local(memories, relationships, local_lsn) else {
+        let Some((old_bytes, new_bytes)) = g.apply_local(
+            memories,
+            relationships,
+            local_lsn,
+            &self.full_snapshot_clones,
+        ) else {
             return;
         };
         {
@@ -1500,6 +1516,21 @@ fn clone_snapshot(src: &GraphSnapshot) -> GraphSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blanking_a_key_range_never_reallocates_the_arena() {
+        let mut arena = "alpha\nbeta gamma\ndelta\n".to_string();
+        arena.reserve(256);
+        let capacity = arena.capacity();
+        let beta_at = arena.find("beta").unwrap();
+        blank_search_key_range(&mut arena, beta_at, beta_at + 4);
+        assert_eq!(arena, "alpha\n     gamma\ndelta\n");
+        assert_eq!(
+            arena.capacity(),
+            capacity,
+            "equal-length blanking must shift no tail bytes and reallocate nothing"
+        );
+    }
 
     #[tokio::test]
     async fn reseed_stream_errors_preserve_the_prior_generation() {

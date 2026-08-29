@@ -245,6 +245,35 @@ async fn failed_fetch_aborts_the_whole_invalidation_microbatch() {
 }
 
 #[test]
+fn repeated_local_submits_reuse_retired_snapshots() {
+    let (cache, _rx) = LocalCache::new(64 * 1024 * 1024);
+    let mut seed = GraphSnapshot::empty();
+    for index in 0..2_000u32 {
+        seed.push_test_memory(mem(&format!("seed-{index}"), Visibility::Org, None));
+    }
+    cache.publish("org", Arc::new(seed));
+    let baseline = cache.full_snapshot_clones();
+    let mut last = None;
+    for round in 0u64..8 {
+        let row = mem(&format!("round-{round}"), Visibility::Org, None);
+        let id = row.id;
+        cache.apply_local("org", std::slice::from_ref(&row), &[], round + 1);
+        last = Some(id);
+    }
+    let clones = cache.full_snapshot_clones();
+    assert!(
+        clones <= baseline + 1,
+        "a wrapup must cost a delta publication, not a corpus clone ({clones} clones after {baseline})"
+    );
+    assert_eq!(cache.graphs_snapshot("org").unwrap().last_local_lsn, 8);
+    assert!(cache
+        .graphs_snapshot("org")
+        .unwrap()
+        .by_id
+        .contains_key(&last.expect("eight rounds ran")));
+}
+
+#[test]
 fn out_of_order_concurrent_local_publications_merge_generations() {
     let (cache, _rx) = LocalCache::new(64 * 1024 * 1024);
     let later = mem("local-lsn-two", Visibility::Org, None);
