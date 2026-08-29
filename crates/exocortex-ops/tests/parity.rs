@@ -889,3 +889,299 @@ async fn superseded_state_is_visible_on_reads() {
         Some("02020202020202020202020202020202")
     );
 }
+
+// ---- PX6: kernel catalogue <-> operation registry bijection, and the
+// three newly registered operations.
+
+/// PX6: every kernel Action/Function has exactly one operation-side
+/// implementation. `commit_wrapup` is the ingestion submit path (§5.2,
+/// surfaced as `preflight_wrapup` + the signed batch submit, not an
+/// interactive op); `traverse_relationships` is registered under the
+/// PRD §21.1 example name `find_related`. Both mappings are
+/// PRD-grounded and named here so a new kernel entry cannot ship
+/// silently unimplemented.
+#[test]
+fn kernel_catalogue_is_registered() {
+    use exocortex_kernel::actions::Action as _;
+    use exocortex_kernel::functions::Function as _;
+
+    let registered: std::collections::HashSet<&'static str> =
+        entries().iter().map(|e| e.name).collect();
+    let kernel_actions = [
+        exocortex_kernel::actions::CommitWrapup::NAME,
+        exocortex_kernel::actions::AcceptDiscovery::NAME,
+        exocortex_kernel::actions::PromoteVisibility::NAME,
+        exocortex_kernel::actions::RetractEdge::NAME,
+    ];
+    let kernel_functions = [
+        exocortex_kernel::functions::SearchMemories::NAME,
+        exocortex_kernel::functions::TraverseRelationships::NAME,
+        exocortex_kernel::functions::GetChain::NAME,
+        exocortex_kernel::functions::ExplainEdge::NAME,
+    ];
+    // Documented mappings: kernel name -> implementing surface.
+    let aliases: &[(&'static str, &'static str)] = &[
+        // §5.2: the wrapup Action IS the signed batch submit.
+        ("commit_wrapup", "preflight_wrapup"),
+        // §21.1 names the k-hop traversal op `find_related`.
+        ("traverse_relationships", "find_related"),
+    ];
+    for name in kernel_actions.into_iter().chain(kernel_functions) {
+        let implemented = registered.contains(name)
+            || aliases
+                .iter()
+                .any(|(kernel, op)| *kernel == name && registered.contains(op));
+        assert!(
+            implemented,
+            "kernel catalogue entry `{name}` has no registered operation              (and no documented mapping)"
+        );
+    }
+    // The three PX6 registrations exist under their kernel names.
+    for name in ["retract_edge", "get_chain", "explain_edge"] {
+        assert!(registered.contains(name), "`{name}` must be registered");
+    }
+}
+
+fn rel_between(from: MemoryId, to: MemoryId, derived: bool) -> exocortex_kernel::Relationship {
+    use exocortex_kernel::relationship::RelationshipProperties;
+    let kind = exocortex_kernel::kinds::SOLVES;
+    let provenance = if derived {
+        Provenance::Derived {
+            rule_id: "R1".into(),
+            evidence: vec![],
+        }
+    } else {
+        Provenance::Asserted {
+            author: "t".into(),
+            producer_kind: None,
+        }
+    };
+    exocortex_kernel::Relationship {
+        id: exocortex_kernel::RelationshipId::derive(from, kind, to, None),
+        kind,
+        from,
+        to,
+        visibility: Visibility::Org,
+        provenance,
+        properties: RelationshipProperties {
+            strength: 0.8,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: chrono::Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        lsn: LSN::new_local(0),
+    }
+}
+
+#[tokio::test]
+async fn retract_edge_closes_audits_and_refuses_invisible_endpoints() {
+    use exocortex_ops::operations::{RetractEdgeInput, RetractEdgeOp};
+    use exocortex_storage::Storage as _;
+
+    let onto = ontology();
+    let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let a = mem("retract-a");
+    let b = mem("retract-b");
+    storage.upsert_memory(&a).await.unwrap();
+    storage.upsert_memory(&b).await.unwrap();
+    let edge = rel_between(a.id, b.id, false);
+    storage.upsert_relationship(&edge).await.unwrap();
+
+    let ctx = OpContext {
+        ontology: None,
+        visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        audit_admin: true,
+        storage: storage.clone(),
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+    };
+    let out = RetractEdgeOp
+        .handle(
+            &ctx,
+            RetractEdgeInput {
+                edge_id: hex(&MemoryId(edge.id.0)),
+                reason: "superseded by direct observation".into(),
+            },
+        )
+        .await
+        .expect("retraction");
+    assert!(out.audit_lsn > 0, "audited atomically");
+    let closed = storage
+        .get_relationship(&edge.id)
+        .await
+        .unwrap()
+        .expect("row present");
+    assert!(closed.valid_until.is_some(), "edge closed");
+
+    // Audit ledger carries the action with the reason in its digest input.
+    let rows = exocortex_ops::operations::ListAuditRecordsOp
+        .handle(
+            &ctx,
+            exocortex_ops::operations::ListAuditInput { since_lsn: 0 },
+        )
+        .await
+        .unwrap();
+    assert!(rows
+        .records
+        .iter()
+        .any(|r| r["action"] == serde_json::json!("retract_edge")));
+
+    // A caller who cannot see one endpoint may not close the edge.
+    let (cache2, _rx2) = LocalCache::new(16 * 1024 * 1024);
+    let c = mem("retract-c");
+    let mut hidden = mem("retract-hidden");
+    hidden.visibility = Visibility::Private;
+    hidden.provenance = Provenance::Asserted {
+        author: "someone-else".into(),
+        producer_kind: None,
+    };
+    storage.upsert_memory(&c).await.unwrap();
+    storage.upsert_memory(&hidden).await.unwrap();
+    let edge2 = rel_between(c.id, hidden.id, false);
+    storage.upsert_relationship(&edge2).await.unwrap();
+    let ctx2 = OpContext {
+        ontology: None,
+        visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        audit_admin: false,
+        storage: storage.clone(),
+        cache: Arc::new(cache2),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+    };
+    let err = RetractEdgeOp
+        .handle(
+            &ctx2,
+            RetractEdgeInput {
+                edge_id: hex(&MemoryId(edge2.id.0)),
+                reason: "should not work".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, exocortex_ops::OpError::Unauthorized(_)),
+        "{err:?}"
+    );
+    let live = storage
+        .get_relationship(&edge2.id)
+        .await
+        .unwrap()
+        .expect("still present");
+    assert!(live.valid_until.is_none(), "invisible endpoints preserved");
+}
+
+#[tokio::test]
+async fn get_chain_walks_derived_evidence_and_explain_edge_renders() {
+    use exocortex_ops::operations::{ExplainEdgeInput, ExplainEdgeOp, GetChainInput, GetChainOp};
+    use exocortex_storage::Storage as _;
+
+    let onto = ontology();
+    let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let origin = mem("chain-origin");
+    let middle = mem("chain-middle");
+    let target = mem("chain-target");
+    for m in [&origin, &middle, &target] {
+        storage.upsert_memory(m).await.unwrap();
+    }
+    // origin -[SOLVES]-> middle, derived from nothing; target derived
+    // FROM the first edge.
+    let support = rel_between(origin.id, middle.id, true);
+    storage.upsert_relationship(&support).await.unwrap();
+    let mut derived_target = rel_between(middle.id, target.id, true);
+    derived_target.provenance = Provenance::Derived {
+        rule_id: "R4".into(),
+        evidence: vec![support.id],
+    };
+    derived_target.id =
+        exocortex_kernel::RelationshipId::derive(middle.id, derived_target.kind, target.id, None);
+    storage.upsert_relationship(&derived_target).await.unwrap();
+    let mut derived_memory = target.clone();
+    derived_memory.provenance = Provenance::Derived {
+        rule_id: "R4".into(),
+        evidence: vec![derived_target.id],
+    };
+    storage.upsert_memory(&derived_memory).await.unwrap();
+    // The middle belief is itself derived from the supporting edge, so
+    // the walk reaches the origin through two hops.
+    let mut derived_middle = middle.clone();
+    derived_middle.provenance = Provenance::Derived {
+        rule_id: "R1".into(),
+        evidence: vec![support.id],
+    };
+    storage.upsert_memory(&derived_middle).await.unwrap();
+
+    let ctx = OpContext {
+        ontology: Some(onto.clone()),
+        visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        audit_admin: false,
+        storage: storage.clone(),
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+    };
+
+    let chain = GetChainOp
+        .handle(
+            &ctx,
+            GetChainInput {
+                memory: hex(&target.id),
+                max_depth: 4,
+            },
+        )
+        .await
+        .expect("chain");
+    assert!(
+        chain.chain.len() >= 3,
+        "walked the evidence: {:?}",
+        chain.chain
+    );
+    assert_eq!(chain.chain.last(), Some(&hex(&target.id)));
+
+    let explained = ExplainEdgeOp
+        .handle(
+            &ctx,
+            ExplainEdgeInput {
+                edge: hex(&MemoryId(derived_target.id.0)),
+            },
+        )
+        .await
+        .expect("derived edges explain");
+    assert!(!explained.tree.is_empty(), "Steel rendered a tree");
+    assert!(
+        explained.tree.contains("(derived"),
+        "tree is a derivation over named input facts: {}",
+        explained.tree
+    );
+    assert!(
+        explained.tree.contains("Solves"),
+        "tree names the edge kinds: {}",
+        explained.tree
+    );
+
+    // An asserted edge has nothing to explain.
+    let asserted = rel_between(origin.id, target.id, false);
+    storage.upsert_relationship(&asserted).await.unwrap();
+    let err = ExplainEdgeOp
+        .handle(
+            &ctx,
+            ExplainEdgeInput {
+                edge: hex(&MemoryId(asserted.id.0)),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, exocortex_ops::OpError::BadInput(_)),
+        "asserted edge refused: {err:?}"
+    );
+}

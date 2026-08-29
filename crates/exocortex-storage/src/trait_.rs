@@ -222,6 +222,21 @@ pub trait Storage: Send + Sync + 'static {
             "audited mutations unsupported".into(),
         ))
     }
+    /// Atomically close an open relationship (`valid_until`) and append
+    /// the required audit event. Neither may commit without the other
+    /// (PX6: the `RetractEdge` Action's storage boundary; R6-B18
+    /// pattern). A missing or already-closed edge is an error, never a
+    /// silent success.
+    async fn delete_relationship_audited(
+        &self,
+        id: &RelationshipId,
+        audit: &AuditEvent,
+    ) -> crate::Result<CommitRecord> {
+        let _ = (id, audit);
+        Err(StorageError::Backend(
+            "audited relationship deletion unsupported".into(),
+        ))
+    }
     /// Persist one immutable server-issued discovery proposal. Reissuing the
     /// same id is idempotent only when every scoped field is identical.
     async fn create_discovery_proposal(&self, proposal: &DiscoveryProposal) -> crate::Result<()> {

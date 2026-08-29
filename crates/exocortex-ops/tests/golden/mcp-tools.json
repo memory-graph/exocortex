@@ -34,6 +34,25 @@
     "name": "exocortex.accept_discovery"
   },
   {
+    "description": "explain_edge",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `explain_edge`.",
+      "properties": {
+        "edge": {
+          "description": "Hex relationship id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "edge"
+      ],
+      "title": "ExplainEdgeInput",
+      "type": "object"
+    },
+    "name": "exocortex.explain_edge"
+  },
+  {
     "description": "find_related",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -58,6 +77,32 @@
       "type": "object"
     },
     "name": "exocortex.find_related"
+  },
+  {
+    "description": "get_chain",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `get_chain`.",
+      "properties": {
+        "max_depth": {
+          "default": 2,
+          "description": "Depth bound (hard-capped at 4).",
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "memory": {
+          "description": "Hex memory id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "memory"
+      ],
+      "title": "GetChainInput",
+      "type": "object"
+    },
+    "name": "exocortex.get_chain"
   },
   {
     "description": "get_memory",
@@ -275,6 +320,30 @@
       "type": "object"
     },
     "name": "exocortex.promote_visibility"
+  },
+  {
+    "description": "retract_edge",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `retract_edge`.",
+      "properties": {
+        "edge_id": {
+          "description": "Hex relationship id.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Human-readable reason, kept in the audit log.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "edge_id",
+        "reason"
+      ],
+      "title": "RetractEdgeInput",
+      "type": "object"
+    },
+    "name": "exocortex.retract_edge"
   },
   {
     "description": "search_memories",

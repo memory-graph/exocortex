@@ -986,3 +986,373 @@ register_operation!(
     PreflightWrapupInput,
     crate::preflight::PreflightResult
 );
+
+// ---- PX6: the three kernel-catalogue entries that had no registered
+// operation (GetChain, ExplainEdge, RetractEdge). Every kernel
+// Action/Function now has exactly one operation-side implementation;
+// `kernel_catalogue_is_registered` below pins the bijection.
+
+/// `retract_edge` (§7.11 `RetractEdge`): close `valid_until` on an edge
+/// with a reason. The only human path to close an asserted edge; audited
+/// atomically with the mutation (R6-B18 pattern).
+#[derive(Default)]
+pub struct RetractEdgeOp;
+
+/// Input for `retract_edge`.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct RetractEdgeInput {
+    /// Hex relationship id.
+    pub edge_id: String,
+    /// Human-readable reason, kept in the audit log.
+    pub reason: String,
+}
+
+/// Output for `retract_edge`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RetractEdgeOutput {
+    /// The closed relationship id.
+    pub edge_id: String,
+    /// The audit record written in the same commit.
+    pub audit_lsn: u64,
+}
+
+fn rel_unhex(s: &str) -> Result<RelationshipId, OpError> {
+    let bytes: [u8; 16] = {
+        let mut out = [0u8; 16];
+        if s.len() != 32 {
+            return Err(OpError::BadInput("expected 32-char hex id".into()));
+        }
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+                .map_err(|_| OpError::BadInput("expected 32-char hex id".into()))?;
+        }
+        out
+    };
+    Ok(RelationshipId(bytes))
+}
+
+#[async_trait]
+impl Operation for RetractEdgeOp {
+    type Input = RetractEdgeInput;
+    type Output = RetractEdgeOutput;
+    fn name(&self) -> &'static str {
+        "retract_edge"
+    }
+    fn mcp_tool_name(&self) -> &'static str {
+        "exocortex.retract_edge"
+    }
+    fn http_method(&self) -> http::Method {
+        http::Method::POST
+    }
+    fn http_path(&self) -> &'static str {
+        "/v1/retract_edge"
+    }
+    async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        ctx.check_deadline()?;
+        if input.reason.trim().is_empty() {
+            return Err(OpError::BadInput("retraction requires a reason".into()));
+        }
+        let id = rel_unhex(&input.edge_id)?;
+        // Caller must be able to see BOTH endpoints before closing the
+        // edge between them (IN2 pattern: scoped reads, never blind
+        // mutation of invisible rows).
+        let edge = ctx
+            .storage
+            .get_relationship(&id)
+            .await
+            .map_err(|e| OpError::Storage(e.to_string()))?
+            .ok_or(OpError::NotFound)?;
+        let endpoints = ctx
+            .storage
+            .get_visible_memories(&[edge.from, edge.to], &ctx.visibility_ctx)
+            .await
+            .map_err(|e| OpError::Storage(e.to_string()))?;
+        if endpoints.len() != 2 {
+            return Err(OpError::Unauthorized(
+                "caller may not see both endpoints of this edge".into(),
+            ));
+        }
+        // KP5 pattern: the ceiling comes from the kernel's typed Action.
+        use exocortex_kernel::actions::Action as _;
+        let max = exocortex_kernel::actions::RetractEdge::REQUIRED_VISIBILITY_CEILING;
+        if ctx.visibility_ctx.max_visibility > max {
+            return Err(OpError::Unauthorized(
+                "retraction exceeds the RetractEdge ceiling".into(),
+            ));
+        }
+        let record = crate::audit::AuditRecord {
+            action: "retract_edge".into(),
+            actor: ctx.visibility_ctx.user_id.clone(),
+            org_id: ctx.visibility_ctx.org_id.clone(),
+            input_digest: crate::audit::digest_input(&serde_json::json!({
+                "edge_id": input.edge_id,
+                "reason": input.reason,
+            })),
+            output_ids: [input.edge_id.clone().into()].into_iter().collect(),
+            fingerprint: ctx.storage.ontology_fingerprint(),
+            lease_epoch: None,
+            recorded_at: chrono::Utc::now(),
+        };
+        let commit = ctx
+            .storage
+            .delete_relationship_audited(&id, &record)
+            .await
+            .map_err(|e| OpError::Storage(e.to_string()))?;
+        Ok(RetractEdgeOutput {
+            edge_id: input.edge_id,
+            audit_lsn: commit.lsn,
+        })
+    }
+}
+
+register_operation!(
+    RetractEdgeOp,
+    "retract_edge",
+    "exocortex.retract_edge",
+    POST,
+    "/v1/retract_edge",
+    RetractEdgeInput,
+    RetractEdgeOutput
+);
+
+/// `get_chain` (§7.12 `GetChain`): the provenance chain for a memory —
+/// the memories an assertion transitively rests on, walked backwards
+/// through Derived evidence, caller-visible endpoints only.
+#[derive(Default)]
+pub struct GetChainOp;
+
+/// Input for `get_chain`.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct GetChainInput {
+    /// Hex memory id.
+    pub memory: String,
+    /// Depth bound (hard-capped at 4).
+    #[serde(default = "default_chain_depth")]
+    pub max_depth: u8,
+}
+
+fn default_chain_depth() -> u8 {
+    2
+}
+
+/// Output for `get_chain`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GetChainOutput {
+    /// Chain of hex memory ids, origin first, requested memory last.
+    pub chain: Vec<String>,
+}
+
+#[async_trait]
+impl Operation for GetChainOp {
+    type Input = GetChainInput;
+    type Output = GetChainOutput;
+    fn name(&self) -> &'static str {
+        "get_chain"
+    }
+    fn mcp_tool_name(&self) -> &'static str {
+        "exocortex.get_chain"
+    }
+    fn http_method(&self) -> http::Method {
+        http::Method::POST
+    }
+    fn http_path(&self) -> &'static str {
+        "/v1/get_chain"
+    }
+    async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        ctx.check_deadline()?;
+        let target = unhex(&input.memory)?;
+        let depth = input.max_depth.min(4);
+        // Bounded backward walk over Derived evidence: the memory's own
+        // provenance names supporting EDGES; each edge's from-endpoint
+        // is the prior belief. One batched read per hop (R6-R191
+        // discipline: no per-row point reads on the walk).
+        // Levels of the backward walk: level 0 is the target, level i
+        // the beliefs level i-1 rests on. Reversed and flattened, the
+        // chain reads origin-first, target-last.
+        let mut levels: Vec<Vec<String>> = vec![vec![target.to_hex()]];
+        let mut frontier = vec![target];
+        let mut seen = std::collections::HashSet::from([target]);
+        for _ in 0..depth {
+            let rows = ctx
+                .storage
+                .get_visible_memories(&frontier, &ctx.visibility_ctx)
+                .await
+                .map_err(|e| OpError::Storage(e.to_string()))?;
+            let mut evidence: Vec<RelationshipId> = Vec::new();
+            for memory in &rows {
+                if let exocortex_kernel::Provenance::Derived { evidence: ids, .. } =
+                    &memory.provenance
+                {
+                    evidence.extend(ids.iter().copied());
+                }
+            }
+            if evidence.is_empty() {
+                break;
+            }
+            let edges = ctx
+                .storage
+                .get_relationships(&evidence)
+                .await
+                .map_err(|e| OpError::Storage(e.to_string()))?;
+            let mut next: Vec<MemoryId> = Vec::new();
+            for edge in &edges {
+                if edge.from != target && seen.insert(edge.from) {
+                    next.push(edge.from);
+                }
+                if edge.to != target && seen.insert(edge.to) {
+                    next.push(edge.to);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            levels.push(next.iter().map(|id| id.to_hex()).collect());
+            frontier = next;
+        }
+        let chain = levels.into_iter().rev().flatten().collect();
+        Ok(GetChainOutput { chain })
+    }
+}
+
+register_operation!(
+    GetChainOp,
+    "get_chain",
+    "exocortex.get_chain",
+    POST,
+    "/v1/get_chain",
+    GetChainInput,
+    GetChainOutput
+);
+
+/// `explain_edge` (§7.12 `ExplainEdge`): a Steel-rendered explanation
+/// tree for a Derived edge, naming every input fact.
+#[derive(Default)]
+pub struct ExplainEdgeOp;
+
+/// Input for `explain_edge`.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct ExplainEdgeInput {
+    /// Hex relationship id.
+    pub edge: String,
+}
+
+/// Output for `explain_edge`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ExplainEdgeOutput {
+    /// Structured explanation tree (sexp string rendered by Steel).
+    pub tree: String,
+}
+
+#[async_trait]
+impl Operation for ExplainEdgeOp {
+    type Input = ExplainEdgeInput;
+    type Output = ExplainEdgeOutput;
+    fn name(&self) -> &'static str {
+        "explain_edge"
+    }
+    fn mcp_tool_name(&self) -> &'static str {
+        "exocortex.explain_edge"
+    }
+    fn http_method(&self) -> http::Method {
+        http::Method::POST
+    }
+    fn http_path(&self) -> &'static str {
+        "/v1/explain_edge"
+    }
+    async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        ctx.check_deadline()?;
+        let target_id = rel_unhex(&input.edge)?;
+        let target = ctx
+            .storage
+            .get_relationship(&target_id)
+            .await
+            .map_err(|e| OpError::Storage(e.to_string()))?
+            .ok_or(OpError::NotFound)?;
+        // Both endpoints must be visible: an explanation is a read of
+        // the subgraph it names.
+        let endpoints = ctx
+            .storage
+            .get_visible_memories(&[target.from, target.to], &ctx.visibility_ctx)
+            .await
+            .map_err(|e| OpError::Storage(e.to_string()))?;
+        if endpoints.len() != 2 {
+            return Err(OpError::Unauthorized(
+                "caller may not see both endpoints of this edge".into(),
+            ));
+        }
+        // Walk the derivation DAG backwards, bounded; every visited
+        // edge becomes one ExplainEngine fact.
+        let kind_name = |id: exocortex_kernel::RelKindId| -> String {
+            ctx.ontology
+                .as_ref()
+                .and_then(|o| o.kinds_by_id.get(&id))
+                .map(|k| k.display_name.to_string())
+                .unwrap_or_else(|| format!("{:#x}", id.0))
+        };
+        let mut facts: Vec<exocortex_reasoning::EdgeFacts> = Vec::new();
+        let mut frontier = vec![target_id];
+        let mut seen = std::collections::HashSet::from([target_id]);
+        let mut budget = 64usize;
+        while let Some(id) = frontier.pop() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let edge = if id == target_id {
+                target.clone()
+            } else {
+                match ctx
+                    .storage
+                    .get_relationship(&id)
+                    .await
+                    .map_err(|e| OpError::Storage(e.to_string()))?
+                {
+                    Some(edge) => edge,
+                    None => continue,
+                }
+            };
+            let (rule_id, parents) = match &edge.provenance {
+                exocortex_kernel::Provenance::Derived { rule_id, evidence } => {
+                    (Some(rule_id.to_string()), evidence.clone())
+                }
+                _ => (None, Vec::new()),
+            };
+            for parent in &parents {
+                if seen.insert(*parent) {
+                    frontier.push(*parent);
+                }
+            }
+            facts.push(exocortex_reasoning::EdgeFacts {
+                edge_hex: MemoryId(edge.id.0).to_hex(),
+                from_hex: edge.from.to_hex(),
+                to_hex: edge.to.to_hex(),
+                kind_name: kind_name(edge.kind),
+                rule_id,
+                parents: parents.iter().map(|p| MemoryId(p.0).to_hex()).collect(),
+            });
+        }
+        if !facts
+            .iter()
+            .any(|fact| fact.edge_hex == MemoryId(target_id.0).to_hex() && fact.rule_id.is_some())
+        {
+            return Err(OpError::BadInput(
+                "edge is not derived; there is nothing to explain".into(),
+            ));
+        }
+        // Steel's VM is !Send (Rc internals), so the engine is built
+        // after the last await and never crosses one.
+        let tree = exocortex_reasoning::ExplainEngine::default()
+            .explain(facts, &MemoryId(target_id.0).to_hex());
+        Ok(ExplainEdgeOutput { tree })
+    }
+}
+
+register_operation!(
+    ExplainEdgeOp,
+    "explain_edge",
+    "exocortex.explain_edge",
+    POST,
+    "/v1/explain_edge",
+    ExplainEdgeInput,
+    ExplainEdgeOutput
+);

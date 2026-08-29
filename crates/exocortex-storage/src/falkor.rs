@@ -2631,6 +2631,73 @@ impl Storage for FalkorStorage {
         })
     }
 
+    async fn delete_relationship_audited(
+        &self,
+        id: &RelationshipId,
+        audit: &AuditEvent,
+    ) -> Result<CommitRecord, StorageError> {
+        // Read the open row (same shape as `delete_relationship`), then
+        // close it AND append the audit event in ONE atomic
+        // LSN-guarded query (PX6: RetractEdge's storage boundary).
+        let params = serde_json::json!({ "rel_id": hex(&id.0) });
+        let rows = self
+            .run_template("get_relationship_by_id", &params, true)
+            .await?;
+        let props = rows.first().and_then(|r| r.first()).and_then(|v| match v {
+            FalkorValue::Edge(e) => e.properties.get("props_json").cloned(),
+            _ => None,
+        });
+        let live = props
+            .as_ref()
+            .map(|p| !matches!(p, FalkorValue::None))
+            .unwrap_or(false);
+        if !live {
+            return Err(StorageError::Backend(format!(
+                "delete_relationship_audited: {} not found",
+                hex(&id.0)
+            )));
+        }
+        let FalkorValue::String(json_str) = props.expect("live implies string props_json") else {
+            return Err(StorageError::Backend("bad rel props_json".into()));
+        };
+        let mut relationship: Relationship = serde_json::from_str(&json_str)
+            .map_err(|e| StorageError::Backend(format!("bad rel props_json: {e}")))?;
+        if relationship.valid_until.is_some() {
+            return Err(StorageError::Backend(format!(
+                "delete_relationship_audited: {} already closed",
+                hex(&id.0)
+            )));
+        }
+        let lsn = self.next_lsn().await?;
+        let now = Utc::now();
+        relationship.valid_until = Some(now);
+        relationship.recorded_at = now;
+        let parts = [
+            (
+                "soft_delete_relationship",
+                serde_json::json!({
+                    "rel_id": hex(&id.0), "now": now.to_rfc3339(), "lsn": lsn,
+                    "props_json": FalkorStorage::props_json(&relationship, lsn),
+                }),
+            ),
+            ("batch_audit_append", Self::audit_params(audit, lsn)),
+        ];
+        if !self.run_atomic_parts(&parts).await? {
+            return Err(StorageError::Backend(format!(
+                "delete_relationship_audited: {} not found or already closed",
+                hex(&id.0)
+            )));
+        }
+        self.publish(Invalidation::RelationshipDeleted { id: *id, lsn })
+            .await;
+        Ok(CommitRecord {
+            lsn,
+            committed_at: now,
+            node_id: None,
+            edge_id: None,
+        })
+    }
+
     async fn promote_memory_visibility_audited(
         &self,
         memory: &Memory,

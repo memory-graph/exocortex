@@ -797,6 +797,55 @@ impl Storage for InMemoryStorage {
             edge_id: None,
         })
     }
+    async fn delete_relationship_audited(
+        &self,
+        id: &RelationshipId,
+        audit: &AuditEvent,
+    ) -> Result<CommitRecord, StorageError> {
+        let _gate = self.inner.mutation_gate.lock().unwrap();
+        let lsn = self.next_lsn();
+        let now = Utc::now();
+        let mut store = self.inner.rels.lock().unwrap();
+        let mut closed = false;
+        if let Some(history) = store.get_mut(id) {
+            if let Some(last) = history.last().cloned() {
+                if last.valid_until.is_none() {
+                    let mut closed_row = last;
+                    closed_row.valid_until = Some(now);
+                    closed_row.recorded_at = now;
+                    closed_row.lsn = exocortex_kernel::LSN::new_backend(lsn);
+                    history.push(closed_row);
+                    closed = true;
+                }
+            }
+        }
+        if !closed {
+            drop(store);
+            return Err(StorageError::Backend(format!(
+                "delete_relationship_audited: {:02x?} not found or already closed",
+                id.0
+            )));
+        }
+        // Same critical section as the close: the audit row cannot land
+        // without the mutation, and the mutation cannot commit without
+        // its audit (R6-B18 pattern).
+        self.inner
+            .audits
+            .lock()
+            .unwrap()
+            .push(Self::audit_value(audit, lsn));
+        drop(store);
+        let _ = self
+            .feed
+            .send(Invalidation::RelationshipDeleted { id: *id, lsn });
+        Ok(CommitRecord {
+            lsn,
+            committed_at: now,
+            node_id: None,
+            edge_id: None,
+        })
+    }
+
     async fn commit_ingest_batch(
         &self,
         key: &IngestBatchKey,

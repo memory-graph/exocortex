@@ -113,6 +113,37 @@
         }
       }
     },
+    "/v1/explain_edge": {
+      "post": {
+        "operationId": "explain_edge",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "description": "Input for `explain_edge`.",
+                "properties": {
+                  "edge": {
+                    "description": "Hex relationship id.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "edge"
+                ],
+                "title": "ExplainEdgeInput",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
     "/v1/find_related": {
       "post": {
         "operationId": "find_related",
@@ -139,6 +170,44 @@
                   "anchor"
                 ],
                 "title": "FindRelatedInput",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/v1/get_chain": {
+      "post": {
+        "operationId": "get_chain",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "description": "Input for `get_chain`.",
+                "properties": {
+                  "max_depth": {
+                    "default": 2,
+                    "description": "Depth bound (hard-capped at 4).",
+                    "format": "uint8",
+                    "minimum": 0.0,
+                    "type": "integer"
+                  },
+                  "memory": {
+                    "description": "Hex memory id.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "memory"
+                ],
+                "title": "GetChainInput",
                 "type": "object"
               }
             }
@@ -366,6 +435,42 @@
                   "to"
                 ],
                 "title": "PromoteVisibilityInput",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/v1/retract_edge": {
+      "post": {
+        "operationId": "retract_edge",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "description": "Input for `retract_edge`.",
+                "properties": {
+                  "edge_id": {
+                    "description": "Hex relationship id.",
+                    "type": "string"
+                  },
+                  "reason": {
+                    "description": "Human-readable reason, kept in the audit log.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "edge_id",
+                  "reason"
+                ],
+                "title": "RetractEdgeInput",
                 "type": "object"
               }
             }

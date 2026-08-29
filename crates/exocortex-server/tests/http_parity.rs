@@ -117,6 +117,49 @@ async fn every_operation_answers_over_http_with_auth() {
     cache.publish("org", Arc::new(snap));
     storage.upsert_memory(&a).await.unwrap();
     storage.upsert_memory(&b).await.unwrap();
+    // PX6: one derived edge so `explain_edge` answers successfully.
+    let derived_edge = exocortex_kernel::Relationship {
+        id: exocortex_kernel::RelationshipId::derive(
+            a.id,
+            exocortex_kernel::kinds::SOLVES,
+            b.id,
+            None,
+        ),
+        kind: exocortex_kernel::kinds::SOLVES,
+        from: a.id,
+        to: b.id,
+        visibility: Visibility::Org,
+        provenance: exocortex_kernel::Provenance::Derived {
+            rule_id: "R1".into(),
+            evidence: vec![],
+        },
+        properties: exocortex_kernel::relationship::RelationshipProperties {
+            strength: 0.8,
+            confidence: 0.8,
+            context: None,
+            evidence_count: 1,
+            success_rate: None,
+            validation_count: 0,
+            counter_evidence_count: 0,
+            last_validated: chrono::Utc::now(),
+        },
+        description: None,
+        bidirectional: false,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        lsn: exocortex_kernel::LSN::new_local(0),
+    };
+    storage.upsert_relationship(&derived_edge).await.unwrap();
+    let derived_edge_hex = {
+        use std::fmt::Write as _;
+        let mut hex = String::with_capacity(32);
+        for byte in derived_edge.id.0 {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex
+    };
     let discovery_at = chrono::Utc::now();
     storage
         .store_discovery(&DiscoveryRecord {
@@ -196,6 +239,14 @@ async fn every_operation_answers_over_http_with_auth() {
                 "kind": "RelatedTo",
             }),
             "list_audit_records" => serde_json::json!({ "since_lsn": 0 }),
+            "retract_edge" => {
+                serde_json::json!({
+                    "edge_id": derived_edge_hex,
+                    "reason": "http parity probe",
+                })
+            }
+            "get_chain" => serde_json::json!({ "memory": hex(&a.id), "max_depth": 2 }),
+            "explain_edge" => serde_json::json!({ "edge": derived_edge_hex }),
             other => panic!("no test input crafted for op {other}"),
         }
     };
@@ -249,6 +300,26 @@ async fn every_operation_answers_over_http_with_auth() {
         // permanently consumes the first id. Relationship identity depends on
         // endpoints and kind, so the stable outputs remain directly comparable.
         let mut http_input = input.clone();
+        if entry.name == "retract_edge" {
+            // Retraction permanently closes its edge: give HTTP a
+            // second open edge with identical shape so both surfaces
+            // answer successfully and outputs stay comparable.
+            let mut http_edge = derived_edge.clone();
+            http_edge.kind = exocortex_kernel::kinds::CAUSES;
+            http_edge.id = exocortex_kernel::RelationshipId::derive(
+                a.id,
+                exocortex_kernel::kinds::CAUSES,
+                b.id,
+                None,
+            );
+            storage.upsert_relationship(&http_edge).await.unwrap();
+            let mut hex = String::with_capacity(32);
+            use std::fmt::Write as _;
+            for byte in http_edge.id.0 {
+                let _ = write!(hex, "{byte:02x}");
+            }
+            http_input["edge_id"] = serde_json::Value::String(hex);
+        }
         if entry.name == "issue_discovery" {
             // Issuance atomically retires presentation state and leaves an
             // immutable proposal behind. Give HTTP an independent discovery
@@ -385,6 +456,19 @@ fn parity_check(name: &str, http_out: &serde_json::Value, direct: &serde_json::V
             assert_ne!(http_out["discovery_id"], direct["discovery_id"]);
             for field in ["from", "to", "kind", "visibility"] {
                 assert_eq!(http_out[field], direct[field], "{name}: {field}");
+            }
+        }
+        "retract_edge" => {
+            // The two surfaces close two independently created open
+            // edges, so ids and audit LSNs differ by construction; both
+            // must name a concrete 32-hex id and an audit commit.
+            for output in [http_out, direct] {
+                assert_eq!(
+                    output["edge_id"].as_str().map(str::len),
+                    Some(32),
+                    "{name}: edge id"
+                );
+                assert!(output["audit_lsn"].as_u64().unwrap_or(0) > 0);
             }
         }
         "accept_discovery" => {
