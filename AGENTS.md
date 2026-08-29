@@ -116,6 +116,7 @@ cargo xtask artifact-equivalence  # §2.4 pack rules == engine; MCP result == re
 cargo xtask acceptance-coverage   # §23 requirement-to-test/gate matrix is complete and current
 cargo xtask deployment-acceptance # §23 one entrypoint / every mode / all nine rules
 cargo xtask ontology-surfaces     # §23 non-Rust ontology catalogues derive from the Rust pack
+cargo xtask mock-provider-audit   # §23 #19 runtime no-LLM provider trap (on-demand; enforced transitively by acceptance-coverage)
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these on push; the toolchain

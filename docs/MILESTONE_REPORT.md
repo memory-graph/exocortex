@@ -265,7 +265,10 @@ closed all of it. Worklist → code map:
   not at fire (R-Dr13); backend-node wires the Redis fire drainer
   (`--redis-url`, `--quiet-hours`).
 - **W9** dependency edges: client→storage removed (types via
-  `exocortex-ops` re-exports; storage is dev-dep only). The
+  `exocortex-ops` re-exports; storage is dev-dep only). **Amended
+  2026-08-28:** IN10 (registry dispatch over the `Storage` trait)
+  later restored client→storage as a recorded runtime dependency; the
+  original removal stood only until IN10 landed. The
   reasoning→storage and cache→storage edges are REQUIRED by the PRD's own
   verbatim skeletons (§10.6 `ReasoningEngine<S: Storage>`; §8.4 imports
   `exocortex_storage::{...}`) — a §2.5-vs-body conflict, recorded here
