@@ -341,7 +341,9 @@ fn inside_uncalled_closure(body: &str, offset: usize) -> bool {
         .any(|(binding, close)| {
             let suffix = &body[close + 1..];
             !suffix.match_indices(&format!("{binding}(")).any(|(at, _)| {
-                is_call_to(suffix, at, Some(false)) && call_is_reachable_outside_closure(suffix, at)
+                // Full reachability: an invocation nested inside a second
+                // uncalled closure is not a live call site.
+                is_call_to(suffix, at, Some(false)) && call_is_reachable(suffix, at)
             })
         })
 }
@@ -1980,6 +1982,7 @@ mod tests {
             "pub fn root() { let unused = || { let value = 1; let _ = value; fence(); }; let _ = unused; } fn fence() {}\n",
             "pub fn root() { let unused = || fence(); let _ = unused; } fn fence() {}\n",
             "pub fn root() { let unused = || -> bool { fence(); true }; let _ = unused; } fn fence() {}\n",
+            "pub fn root() { let inner = || { fence(); }; let outer = || { inner(); }; let _ = (inner, outer); } fn fence() {}\n",
             "pub fn root() { let unused = || { fence(); }; #[cfg(any())] unused(); } fn fence() {}\n",
             "pub fn root() { let unused = || { fence(); }; if false { unused(); } } fn fence() {}\n",
         ] {
@@ -2489,6 +2492,24 @@ mod tests {
         assert!(
             validate_acceptance_matrix(&root).is_ok(),
             "called nested I/O remains executable evidence"
+        );
+        write(
+            &root,
+            "xtask/src/main.rs",
+            "fn inspect() { let inner = || { let _ = std::fs::read_to_string(\"scripts/check\"); }; let outer = || { inner(); }; outer(); }\n",
+        );
+        assert!(
+            validate_acceptance_matrix(&root).is_ok(),
+            "closure I/O invoked through a called outer closure remains executable evidence"
+        );
+        write(
+            &root,
+            "xtask/src/main.rs",
+            "fn inspect() { let inner = || { let _ = std::fs::read_to_string(\"scripts/check\"); }; let outer = || { inner(); }; let _ = (inner, outer); }\n",
+        );
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "closure I/O invoked only through an uncalled outer closure is inert"
         );
         write(
             &root,
