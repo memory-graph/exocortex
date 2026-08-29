@@ -63,6 +63,10 @@ enum Cmd {
     /// per-boundary policy table (kernel or wire homes); no production
     /// source compares fingerprint bytes directly.
     CompatibilityPolicy,
+    /// PX3: the seam inventory — a bijection between declared seams
+    /// and conformance suites (every seam has a suite with a canary;
+    /// every seam-crate tests/ file is claimed by a row).
+    SeamInventory,
     /// Metrics expose no identity labels or caller-controlled cardinality.
     MetricsHygiene,
     /// GATE1 (audit §2.1): one storage suite, both backends — the double
@@ -104,6 +108,7 @@ fn main() -> Result<()> {
         Cmd::WireStandalone => wire_standalone(),
         Cmd::SigningHygiene => signing_hygiene(),
         Cmd::CompatibilityPolicy => compatibility_policy(),
+        Cmd::SeamInventory => seam_inventory(),
         Cmd::MetricsHygiene => metrics_hygiene(),
         Cmd::StorageConformance => storage_conformance(),
         Cmd::WritePathParity => write_path_parity(),
@@ -1497,6 +1502,35 @@ fn wire_version() -> anyhow::Result<String> {
 ///  2. No producer submits a blank checksum: every `IngestBatch`
 ///     construction site with `checksum: String::new()` must be
 ///     followed by prepare_batch/canonical_checksum before submit.
+fn seam_inventory() -> Result<()> {
+    let violations = gates::seam_inventory_violations(std::path::Path::new("."))?;
+    anyhow::ensure!(
+        violations.is_empty(),
+        "seam-inventory FAILED:
+{}",
+        violations.join(
+            "
+"
+        )
+    );
+    // Every declared seam's suite executes here (the live-feature
+    // suites skip loudly without their backends, exactly as
+    // storage-conformance reports them).
+    for (_, package, file, _) in gates::SEAM_INVENTORY {
+        if let Some(target) = file
+            .strip_prefix("tests/")
+            .and_then(|t| t.strip_suffix(".rs"))
+        {
+            run(&["test", "-p", package, "--test", target], &[])?;
+        }
+    }
+    println!(
+        "seam-inventory ok: {} seams, each with a suite and a canary; no unclaimed suite files",
+        gates::SEAM_INVENTORY.len()
+    );
+    Ok(())
+}
+
 fn compatibility_policy() -> anyhow::Result<()> {
     let violations = gates::compatibility_policy_violations(std::path::Path::new("."))?;
     anyhow::ensure!(

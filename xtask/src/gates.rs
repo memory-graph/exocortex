@@ -1612,6 +1612,276 @@ fn package_name(line: &str) -> Option<&str> {
 /// wire-side projection `exocortex_wire::compatibility` for kernel-free
 /// components). A production source that compares fingerprint bytes
 /// directly is a boundary that did not declare its rule.
+/// PX3: the seam inventory. Every declared seam carries exactly one
+/// conformance suite (crate + source file + canary test); every test
+/// FILE in a seam crate's tests/ directory is claimed by exactly one
+/// row. The bijection, not a count: adding a legitimate seam costs a
+/// suite, and adding a suite costs a row — a tests/ file that appears
+/// in a seam crate without a row fails the gate, and a row whose file
+/// or canary is missing fails the gate.
+pub(crate) const SEAM_INVENTORY: &[(&str, &str, &str, &str)] = &[
+    // (seam, package, file under the crate, canary test)
+    (
+        "kernel-pack",
+        "exocortex-kernel",
+        "tests/pack_registration.rs",
+        "registered_pack_loads_with_kernel_constants_bound",
+    ),
+    (
+        "kernel-compatibility",
+        "exocortex-kernel",
+        "tests/compatibility.rs",
+        "boundary_rules_come_from_the_policy_table",
+    ),
+    (
+        "kernel-actions-macro",
+        "exocortex-kernel",
+        "tests/actions_macro_spike.rs",
+        "actions_bodies_expand_and_type_check",
+    ),
+    (
+        "kernel-ids",
+        "exocortex-kernel",
+        "tests/ids.rs",
+        "external_identity_is_layout_immune_property",
+    ),
+    (
+        "kernel-validator",
+        "exocortex-kernel",
+        "tests/validator.rs",
+        "valid_solves_solution_problem_is_accepted",
+    ),
+    (
+        "kernel-embedding",
+        "exocortex-kernel",
+        "tests/embedding.rs",
+        "embedding_vector_and_model_revision_round_trip_together",
+    ),
+    (
+        "pack-dev-v1",
+        "exocortex-pack-dev-v1",
+        "tests/loads_correctly.rs",
+        "golden_fingerprint_is_pinned",
+    ),
+    (
+        "pack-mortgage-v1",
+        "exocortex-pack-mortgage-v1",
+        "tests/loads_correctly.rs",
+        "both_packs_register_into_one_ontology",
+    ),
+    (
+        "wire-signing",
+        "exocortex-wire",
+        "src/signing.rs",
+        "invalidation_envelope_signing_is_canonical_and_tamper_evident",
+    ),
+    (
+        "cache",
+        "exocortex-cache",
+        "tests/cache.rs",
+        "traversal_never_crosses_an_invisible_intermediate_node",
+    ),
+    (
+        "cache-allocation",
+        "exocortex-cache",
+        "tests/alloc.rs",
+        "read_hot_path_snapshot_load_is_allocation_free",
+    ),
+    (
+        "reasoning",
+        "exocortex-reasoning",
+        "tests/rules.rs",
+        "durable_submission_survives_worker_restart",
+    ),
+    (
+        "storage-cypher",
+        "exocortex-storage",
+        "tests/cypher.rs",
+        "no_cypher_outside_the_catalogue_module",
+    ),
+    (
+        "storage-fencing",
+        "exocortex-storage",
+        "tests/fencing.rs",
+        "batch_row_failure_rolls_back_every_memory_and_lsn",
+    ),
+    (
+        "storage-fencing-live",
+        "exocortex-storage",
+        "tests/fencing_live.rs",
+        "stale_lease_write_is_fenced_live",
+    ),
+    (
+        "storage-fingerprint-migration",
+        "exocortex-storage",
+        "tests/fingerprint_migration.rs",
+        "legacy_v1_pin_boots_migrates_and_reboots",
+    ),
+    (
+        "storage-in-memory-props",
+        "exocortex-storage",
+        "tests/in_memory_props.rs",
+        "bi_temporal_roundtrip_prop",
+    ),
+    (
+        "storage-integration-live",
+        "exocortex-storage",
+        "tests/integration.rs",
+        "roundtrip_memory",
+    ),
+    (
+        "storage-live-bench",
+        "exocortex-storage",
+        "tests/live_bench.rs",
+        "indexed_relationship_point_read_meets_live_falkor_budget",
+    ),
+    (
+        "change-log",
+        "exocortex-cluster",
+        "tests/change_log.rs",
+        "floor_is_the_oldest_buffered_lsn_not_the_frontier",
+    ),
+    (
+        "cluster",
+        "exocortex-cluster",
+        "tests/cluster.rs",
+        "envelope_hmac_verifies_and_rejects_tampering",
+    ),
+    (
+        "cluster-cross-node",
+        "exocortex-cluster",
+        "tests/cross_node.rs",
+        "cross_node_commit_reaches_peer_hub",
+    ),
+    (
+        "cluster-rolling-upgrade",
+        "exocortex-cluster",
+        "tests/rolling_upgrade.rs",
+        "superset_accepts_subset_producer_subset_rejects_legibly",
+    ),
+    (
+        "cluster-sse-e2e",
+        "exocortex-cluster",
+        "tests/sse_e2e.rs",
+        "sse_client_observes_upsert_within_200ms",
+    ),
+    (
+        "ingest",
+        "exocortex-ingest",
+        "tests/ingest.rs",
+        "e2e_valid_batch_accepted_with_monotonic_lsn",
+    ),
+    (
+        "ingest-e2e",
+        "exocortex-ingest",
+        "tests/e2e.rs",
+        "fifty_row_batch_accepted_lsn_monotonic",
+    ),
+    (
+        "ingest-embedding-runtime",
+        "exocortex-ingest",
+        "tests/embedding_runtime.rs",
+        "max_batch_embedding_is_one_blocking_invocation_without_worker_starvation",
+    ),
+    (
+        "ingest-external-key",
+        "exocortex-ingest",
+        "tests/external_key.rs",
+        "identity_derives_from_raw_uuid_bytes",
+    ),
+    (
+        "ingest-grouping",
+        "exocortex-ingest",
+        "tests/grouping.rs",
+        "two_batches_group_under_one_conversation_across_restart",
+    ),
+    (
+        "ingest-round1",
+        "exocortex-ingest",
+        "tests/round1_e2e.rs",
+        "dreams_cycle_over_ingested_data",
+    ),
+    (
+        "write-path-parity",
+        "exocortex-ingest",
+        "tests/write_path_parity.rs",
+        "verdicts_agree_row_for_row",
+    ),
+    (
+        "ops-registry",
+        "exocortex-ops",
+        "tests/parity.rs",
+        "parity_every_operation_on_both_surfaces_with_schemas",
+    ),
+];
+
+/// Validate the bijection statically: every row resolves to a real
+/// file carrying its canary, and every tests/ file in a seam crate is
+/// claimed by a row.
+pub(crate) fn seam_inventory_violations(root: &Path) -> Result<Vec<String>> {
+    let mut violations = Vec::new();
+    let mut claimed: std::collections::BTreeSet<(String, String)> = Default::default();
+    for (seam, package, file, canary) in SEAM_INVENTORY {
+        let path = root.join("crates").join(package).join(file);
+        if !path.is_file() {
+            violations.push(format!(
+                "seam `{seam}`: crates/{package}/{file} does not exist"
+            ));
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)?;
+        let clean = strip_comments_and_strings(&source);
+        let plain_fn = clean.contains(&format!("fn {canary}"));
+        // Macro-generated tests (itest!) name their symbol at the
+        // invocation site instead of a fn declaration.
+        let macro_test =
+            clean.contains(&format!("{canary},")) || clean.contains(&format!("{canary}("));
+        if !plain_fn && !macro_test {
+            violations.push(format!(
+                "seam `{seam}`: canary `{canary}` is absent from crates/{package}/{file}"
+            ));
+        }
+        let stem = path
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default()
+            .to_string();
+        if file.starts_with("tests/") && !claimed.insert((package.to_string(), stem.clone())) {
+            violations.push(format!(
+                "seam `{seam}`: tests/{stem}.rs in {package} is claimed twice"
+            ));
+        }
+    }
+    // The other direction: unclaimed suite files in seam crates. A
+    // tests/ file that appears without a row is a seam nobody
+    // inventoried.
+    let mut seam_crates: std::collections::BTreeSet<&str> = Default::default();
+    for (_, package, _, _) in SEAM_INVENTORY {
+        seam_crates.insert(package);
+    }
+    for package in seam_crates {
+        let dir = root.join("crates").join(package).join("tests");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".rs") else {
+                continue;
+            };
+            if !claimed.contains(&(package.to_string(), stem.to_string())) {
+                violations.push(format!(
+                    "crates/{package}/tests/{stem}.rs matches no seam row — a legitimate new seam costs a row and a canary, not silence"
+                ));
+            }
+        }
+    }
+    Ok(violations)
+}
+
 pub(crate) fn compatibility_policy_violations(root: &Path) -> Result<Vec<String>> {
     const HOMES: &[&str] = &[
         "crates/exocortex-kernel/src/compatibility.rs",
@@ -1906,6 +2176,86 @@ mod tests {
         std::fs::write(path, contents).unwrap();
     }
 
+    #[test]
+    fn seam_inventory_rejects_unclaimed_suites_and_missing_canaries() {
+        let root = fixture("seam-inventory");
+        // All kernel suite files exist with their canaries, except
+        // compatibility.rs, whose canary is absent.
+        write(
+            &root,
+            "crates/exocortex-kernel/tests/pack_registration.rs",
+            "#[test]
+fn registered_pack_loads_with_kernel_constants_bound() {}
+",
+        );
+        write(
+            &root,
+            "crates/exocortex-kernel/tests/compatibility.rs",
+            "#[test]
+fn something_else() {}
+",
+        );
+        write(
+            &root,
+            "crates/exocortex-kernel/tests/actions_macro_spike.rs",
+            "#[test]
+fn actions_bodies_expand_and_type_check() {}
+",
+        );
+        write(
+            &root,
+            "crates/exocortex-kernel/tests/ids.rs",
+            "#[test]
+fn external_identity_is_layout_immune_property() {}
+",
+        );
+        write(
+            &root,
+            "crates/exocortex-kernel/tests/validator.rs",
+            "#[test]
+fn valid_solves_solution_problem_is_accepted() {}
+",
+        );
+        write(
+            &root,
+            "crates/exocortex-kernel/tests/embedding.rs",
+            "#[test]
+fn embedding_vector_and_model_revision_round_trip_together() {}
+",
+        );
+        // (Rows for other crates report their missing files; the two
+        // failure directions under test are the missing canary and the
+        // unclaimed suite file.)
+
+        // A row whose canary vanished from its file, and an unclaimed
+        // suite file in a seam crate.
+        write(
+            &root,
+            "crates/exocortex-kernel/tests/ids.rs",
+            "#[test]
+fn renamed() {}
+",
+        );
+        // An unclaimed suite file in a seam crate.
+        write(
+            &root,
+            "crates/exocortex-kernel/tests/rogue.rs",
+            "#[test]
+fn unclaimed() {}
+",
+        );
+        let violations = seam_inventory_violations(&root).unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("external_identity_is_layout_immune_property")),
+            "missing canary reported: {violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.contains("rogue.rs")),
+            "unclaimed suite reported: {violations:?}"
+        );
+    }
     #[test]
     fn compatibility_policy_rejects_raw_fingerprint_comparisons() {
         let root = fixture("compat-policy");
