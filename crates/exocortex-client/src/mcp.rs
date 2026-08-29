@@ -261,8 +261,10 @@ impl ExocortexMcp {
         }
         let now = chrono::Utc::now();
         // W1/IN7/CL1: capture the rebuild inputs BEFORE the loop consumes
-        // the drafts (content-bound batch id, keys, tags).
-        let batch_id = offline_batch_id(&session_id, &args.memories, &args.edges);
+        // the drafts. One canonical derivation (drain::content_batch_id):
+        // the offline WAL stamp and a later online submission of the same
+        // content hit one server idempotency entry.
+        let batch_id = crate::drain::content_batch_id(&session_id, &args.memories, &args.edges);
         let draft_keys: Vec<String> = args.memories.iter().map(|m| m.draft_key.clone()).collect();
         let tags: Vec<Vec<String>> = args.memories.iter().map(|m| m.tags.clone()).collect();
         let mut ids: Vec<(String, MemoryId)> = Vec::with_capacity(args.memories.len());
@@ -603,41 +605,4 @@ impl ServerHandler for ExocortexMcp {
             )),
         }
     }
-}
-
-/// Deterministic offline batch id (IN7): content-bound, so a drain retry
-/// (and a re-submitted wrapup with the same drafts) dedupes server-side.
-fn offline_batch_id(
-    session_id: &str,
-    memories: &[MemoryDraftInput],
-    edges: &[EdgeHintInput],
-) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(session_id.as_bytes());
-    for m in memories {
-        hasher.update(m.draft_key.as_bytes());
-        hasher.update(&[0x1e]);
-        hasher.update(m.memory_type.as_bytes());
-        hasher.update(&[0x1e]);
-        hasher.update(m.title.as_bytes());
-        hasher.update(&[0x1e]);
-        hasher.update(m.content.as_bytes());
-        hasher.update(&[0x1e]);
-        hasher.update(m.visibility.as_bytes());
-        hasher.update(&[0x1e]);
-        for t in &m.tags {
-            hasher.update(t.as_bytes());
-            hasher.update(&[0x1f]);
-        }
-    }
-    for e in edges {
-        hasher.update(e.from_draft_key.as_bytes());
-        hasher.update(&[0x1e]);
-        hasher.update(e.to_draft_key.as_bytes());
-        hasher.update(&[0x1e]);
-        hasher.update(e.kind.as_bytes());
-        hasher.update(&[0x1e]);
-        hasher.update(&e.strength.to_le_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
 }

@@ -270,35 +270,145 @@ fn rebuild_batch(
     })
 }
 
+/// Fields of a draft that participate in the content-bound batch id. One
+/// trait so the MCP preflight shape and the wire shape derive the SAME id
+/// for the same session content (IN7): the offline WAL stamp and the online
+/// submission must hit one idempotency registry entry.
+pub trait BatchIdDraft {
+    fn draft_key(&self) -> &str;
+    fn memory_type(&self) -> &str;
+    fn title(&self) -> &str;
+    fn content(&self) -> &str;
+    fn visibility(&self) -> i32;
+    fn tags(&self) -> &[String];
+}
+
+/// Fields of an edge hint that participate in the content-bound batch id.
+pub trait BatchIdEdge {
+    fn source_key(&self) -> &str;
+    fn to_draft_key(&self) -> &str;
+    fn kind(&self) -> &str;
+    fn strength(&self) -> f32;
+}
+
+impl BatchIdDraft for WireDraft {
+    fn draft_key(&self) -> &str {
+        &self.draft_key
+    }
+    fn memory_type(&self) -> &str {
+        &self.memory_type
+    }
+    fn title(&self) -> &str {
+        &self.title
+    }
+    fn content(&self) -> &str {
+        &self.content
+    }
+    fn visibility(&self) -> i32 {
+        self.visibility
+    }
+    fn tags(&self) -> &[String] {
+        &self.tags
+    }
+}
+
+impl BatchIdEdge for WireRel {
+    fn source_key(&self) -> &str {
+        &self.from_draft_key
+    }
+    fn to_draft_key(&self) -> &str {
+        &self.to_draft_key
+    }
+    fn kind(&self) -> &str {
+        &self.kind
+    }
+    fn strength(&self) -> f32 {
+        self.strength
+    }
+}
+
+fn visibility_discriminant(label: &str) -> i32 {
+    match label.to_lowercase().as_str() {
+        "private" => 0,
+        "project" => 1,
+        "team" => 2,
+        "org" => 3,
+        // Unknown labels never persist: every capture path rejects the
+        // draft before the WAL entry is written. -1 keeps the preimage
+        // distinct from any accepted visibility.
+        _ => -1,
+    }
+}
+
+impl BatchIdDraft for exocortex_ops::preflight::PreflightMemoryDraft {
+    fn draft_key(&self) -> &str {
+        &self.draft_key
+    }
+    fn memory_type(&self) -> &str {
+        &self.memory_type
+    }
+    fn title(&self) -> &str {
+        &self.title
+    }
+    fn content(&self) -> &str {
+        &self.content
+    }
+    fn visibility(&self) -> i32 {
+        visibility_discriminant(&self.visibility)
+    }
+    fn tags(&self) -> &[String] {
+        &self.tags
+    }
+}
+
+impl BatchIdEdge for exocortex_ops::preflight::PreflightEdgeHint {
+    fn source_key(&self) -> &str {
+        &self.from_draft_key
+    }
+    fn to_draft_key(&self) -> &str {
+        &self.to_draft_key
+    }
+    fn kind(&self) -> &str {
+        &self.kind
+    }
+    fn strength(&self) -> f32 {
+        self.strength
+    }
+}
+
 /// Deterministic content-bound batch id (IN7): the same wrapup retried
 /// after a lost response hits the server's idempotency registry.
-pub fn content_batch_id(session_id: &str, drafts: &[WireDraft], rels: &[WireRel]) -> String {
+pub fn content_batch_id<D: BatchIdDraft, E: BatchIdEdge>(
+    session_id: &str,
+    drafts: &[D],
+    rels: &[E],
+) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(session_id.as_bytes());
     for d in drafts {
-        hasher.update(d.draft_key.as_bytes());
+        hasher.update(d.draft_key().as_bytes());
         hasher.update(&[0x1e]);
-        hasher.update(d.memory_type.as_bytes());
+        hasher.update(d.memory_type().as_bytes());
         hasher.update(&[0x1e]);
-        hasher.update(d.title.as_bytes());
+        hasher.update(d.title().as_bytes());
         hasher.update(&[0x1e]);
-        hasher.update(d.content.as_bytes());
+        hasher.update(d.content().as_bytes());
         hasher.update(&[0x1e]);
-        hasher.update(&d.visibility.to_le_bytes());
-        for t in &d.tags {
+        hasher.update(&d.visibility().to_le_bytes());
+        for t in d.tags() {
             hasher.update(t.as_bytes());
             hasher.update(&[0x1f]);
         }
         hasher.update(&[0x1e]);
     }
     for r in rels {
-        hasher.update(r.from_draft_key.as_bytes());
+        hasher.update(r.source_key().as_bytes());
         hasher.update(&[0x1e]);
-        hasher.update(r.to_draft_key.as_bytes());
+        hasher.update(r.to_draft_key().as_bytes());
         hasher.update(&[0x1e]);
-        hasher.update(r.kind.as_bytes());
+        hasher.update(r.kind().as_bytes());
         hasher.update(&[0x1e]);
-        hasher.update(&r.strength.to_le_bytes());
+        hasher.update(&r.strength().to_le_bytes());
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -358,5 +468,56 @@ pub async fn drain_all(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preflight_and_wire_drafts_derive_one_batch_id() {
+        let preflight = exocortex_ops::preflight::PreflightMemoryDraft {
+            draft_key: "k1".into(),
+            memory_type: "Fix".into(),
+            title: "title".into(),
+            content: "content".into(),
+            visibility: "org".into(),
+            tags: vec!["rust".into()],
+        };
+        let preflight_edge = exocortex_ops::preflight::PreflightEdgeHint {
+            from_draft_key: "k1".into(),
+            to_draft_key: "k2".into(),
+            to_memory_id: String::new(),
+            kind: "Solves".into(),
+            strength: 0.5,
+        };
+        let wire = WireDraft {
+            draft_key: "k1".into(),
+            id: String::new(),
+            memory_type: "Fix".into(),
+            title: "title".into(),
+            content: "content".into(),
+            tags: vec!["rust".into()],
+            visibility: 3,
+            valid_from: None,
+            valid_until: None,
+            external_key: None,
+        };
+        let wire_rel = WireRel {
+            from_draft_key: "k1".into(),
+            to_draft_key: "k2".into(),
+            kind: "Solves".into(),
+            strength: 0.5,
+            confidence: 0.8,
+            context: String::new(),
+            visibility: 1,
+            to_memory_id: String::new(),
+        };
+        assert_eq!(
+            content_batch_id("session", &[preflight], &[preflight_edge]),
+            content_batch_id("session", &[wire], &[wire_rel]),
+            "the offline WAL stamp and the online submission of one wrapup must share one id"
+        );
     }
 }
