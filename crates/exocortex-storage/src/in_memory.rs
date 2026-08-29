@@ -94,6 +94,7 @@ struct InMemoryIngestEffect {
     acknowledged: bool,
     cleanup_complete: bool,
     delivery_generation: Option<u64>,
+    retain_legacy_identity: bool,
     claim: Option<(smol_str::SmolStr, std::time::Instant)>,
 }
 
@@ -584,6 +585,7 @@ impl InMemoryStorage {
                     acknowledged: false,
                     cleanup_complete: false,
                     delivery_generation: None,
+                    retain_legacy_identity: false,
                     claim: None,
                 },
             );
@@ -855,6 +857,10 @@ impl Storage for InMemoryStorage {
             return Ok(None);
         };
         let row = effects.get_mut(effect_id).expect("selected effect exists");
+        // Mirrors the Cypher claim: a row whose generation is missing while a
+        // prior claim existed was delivered by a pre-generation command, so
+        // its Redis marker can never be observed by the generation fence.
+        let was_legacy = row.delivery_generation.is_none() && row.claim.is_some();
         row.claim = Some((
             claim_token.into(),
             now + std::time::Duration::from_millis(lease_ms.try_into().unwrap_or(0)),
@@ -865,10 +871,11 @@ impl Storage for InMemoryStorage {
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
         row.delivery_generation = Some(delivery_generation);
+        row.retain_legacy_identity |= was_legacy;
         Ok(Some(crate::ClaimedPostIngestEffect {
             effect: row.effect.clone(),
             delivery_generation,
-            retain_legacy_identity: false,
+            retain_legacy_identity: row.retain_legacy_identity,
         }))
     }
     async fn renew_ingest_effect_claim(
@@ -928,7 +935,7 @@ impl Storage for InMemoryStorage {
                     .map(|delivery_generation| crate::ClaimedPostIngestEffect {
                         effect: row.effect.clone(),
                         delivery_generation,
-                        retain_legacy_identity: false,
+                        retain_legacy_identity: row.retain_legacy_identity,
                     })
             })
             .collect::<Vec<_>>();

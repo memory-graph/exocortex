@@ -1371,6 +1371,71 @@ itest!(distinct_ingest_effect_claims_are_globally_serialized, {
     assert!(second.delivery_generation > first.delivery_generation);
 });
 
+itest!(reclaim_of_pre_generation_claim_retains_legacy_identity, {
+    let store = connect("legacy-reclaim").await;
+    let key = IngestBatchKey {
+        org_id: "test-org".into(),
+        producer_id: "producer".into(),
+        batch_id: format!("legacy-reclaim-{}", graph_suffix()).into(),
+    };
+    let effect = PostIngestEffect {
+        effect_id: format!("{}/{}/{}", key.org_id, key.producer_id, key.batch_id).into(),
+        session_memory_ids: vec![],
+        region_deltas: vec![],
+    };
+    assert!(matches!(
+        store
+            .commit_ingest_batch_with_effect(&key, &[], &[], 0, &effect)
+            .await
+            .unwrap(),
+        IngestCommitOutcome::Committed { .. }
+    ));
+    assert!(
+        !store
+            .claim_ingest_effect("pre-generation-worker", 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .retain_legacy_identity
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    store
+        .query_cypher(&CypherQuery {
+            template_id: "integration_clear_ingest_effect_generation",
+            params: serde_json::json!({ "effect_id": effect.effect_id }),
+            read_only: false,
+            deadline: Utc::now() + Duration::seconds(5),
+        })
+        .await
+        .unwrap();
+    let reclaimed = store
+        .claim_ingest_effect("current-worker", 30_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reclaimed.effect, effect);
+    assert!(
+        reclaimed.retain_legacy_identity,
+        "a row claimed before delivery generations existed must keep its Redis marker"
+    );
+    assert!(store
+        .acknowledge_ingest_effect(effect.effect_id.as_str(), "current-worker")
+        .await
+        .unwrap());
+    let cleanups = store.pending_ingest_effect_cleanups(10).await.unwrap();
+    assert_eq!(cleanups.len(), 1);
+    assert!(cleanups[0].retain_legacy_identity);
+    assert!(store
+        .complete_ingest_effect_cleanup(effect.effect_id.as_str())
+        .await
+        .unwrap());
+    assert!(store
+        .pending_ingest_effect_cleanups(10)
+        .await
+        .unwrap()
+        .is_empty());
+});
+
 itest!(corrupt_ingest_settlement_fails_closed_on_retry, {
     for (case, accepted, rejected, assigned_lsn) in [
         (

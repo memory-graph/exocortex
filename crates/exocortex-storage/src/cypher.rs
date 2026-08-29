@@ -904,12 +904,17 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
               AND (d.effect_claim_until_ms IS NULL OR d.effect_claim_until_ms <= timestamp())
             MERGE (clock:_IngestEffectClaimClock {id: 'global'})
             SET clock.generation = coalesce(clock.generation, 0) + 1
-            WITH d, clock.generation AS delivery_generation
+            WITH d, clock.generation AS delivery_generation,
+                 (d.effect_delivery_generation IS NULL
+                  AND d.effect_claim_until_ms IS NOT NULL) AS was_legacy
             SET d.effect_claim_token = $claim_token,
                 d.effect_claim_until_ms = timestamp() + $lease_ms,
                 d.effect_delivery_generation = delivery_generation,
-                d.effect_cleanup_retain_identity = false
-            RETURN d.effect_json, delivery_generation, false
+                d.effect_cleanup_retain_identity =
+                    coalesce(d.effect_cleanup_retain_identity, false)
+                    OR was_legacy
+            RETURN d.effect_json, delivery_generation,
+                d.effect_cleanup_retain_identity
         "#,
     });
 

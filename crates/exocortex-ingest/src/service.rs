@@ -1555,6 +1555,7 @@ impl<S: Storage + 'static> IngestServer<S> {
         effect: &PostIngestEffect,
         delivery_generation: u64,
         claim_token: &str,
+        retain_legacy_identity: bool,
     ) -> Result<(), String> {
         if let Some(dreams) = &self.dreams {
             for delta in &effect.region_deltas {
@@ -1589,7 +1590,7 @@ impl<S: Storage + 'static> IngestServer<S> {
         if !acknowledged {
             return Err("post-ingest outbox acknowledgement lost its pending effect".into());
         }
-        self.reclaim_ingest_effect(effect, delivery_generation, false)
+        self.reclaim_ingest_effect(effect, delivery_generation, retain_legacy_identity)
             .await
     }
 
@@ -1687,8 +1688,12 @@ impl<S: Storage + 'static> IngestServer<S> {
                     let mut renewal = tokio::time::interval(std::time::Duration::from_secs(10));
                     renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     renewal.tick().await;
-                    let delivery =
-                        self.deliver_post_ingest_effect(&effect, delivery_generation, &claim_token);
+                    let delivery = self.deliver_post_ingest_effect(
+                        &effect,
+                        delivery_generation,
+                        &claim_token,
+                        claimed.retain_legacy_identity,
+                    );
                     tokio::pin!(delivery);
                     let result = loop {
                         tokio::select! {
