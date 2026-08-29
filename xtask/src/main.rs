@@ -880,6 +880,26 @@ fn storage_conformance() -> Result<()> {
             "storage-conformance: live Falkor suite UNEXECUTED — FALKOR_URL is unset or empty"
         );
     }
+    if std::env::var("REDIS_URL").is_ok_and(|url| !url.is_empty()) {
+        println!("storage-conformance: live Redis fire suite (REDIS_URL set)");
+        run(
+            &[
+                "test",
+                "-p",
+                "exocortex-dreams",
+                "--features",
+                "integration",
+                "--test",
+                "fire_live",
+            ],
+            &[],
+        )?;
+        println!("storage-conformance: live Redis fire suite PASS");
+    } else {
+        println!(
+            "storage-conformance: live Redis fire suite UNEXECUTED — REDIS_URL is unset or empty"
+        );
+    }
     println!(
         "storage-conformance: available target suites complete (PX3 shared corpus is post-v1)"
     );

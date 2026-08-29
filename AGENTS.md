@@ -108,7 +108,7 @@ cargo xtask signing-hygiene # one batch-signing impl; no unsigned submitters
 cargo xtask metrics-hygiene # authenticated metrics; bounded literal labels only
 cargo xtask wire-standalone # packaged wire builds standalone
 cargo xtask bench           # SLO gates (search, k-hop)
-cargo xtask storage-conformance   # umbrella: in-memory targets + distinct live Falkor targets (FALKOR_URL)
+cargo xtask storage-conformance   # umbrella: in-memory targets + distinct live Falkor (FALKOR_URL) and live Redis fire (REDIS_URL) targets
 cargo xtask write-path-parity     # W2  offline + ingest validators agree (golden table)
 cargo xtask dead-enforcement      # §2.2 invariant/security fns have live callers
 cargo xtask auth-coverage         # §2.3 detailed endpoints reject unauthenticated calls; readiness is minimal/public

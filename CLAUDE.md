@@ -41,10 +41,14 @@ fails any run that would leave them dark. Never drop the flag to make a
 run faster.
 
 Live-backend suites are feature-gated and **skip loudly** without
-`FALKOR_URL`. A green `cargo xtask storage-conformance` with `FALKOR_URL`
-unset has not exercised FalkorDB at all; it prints
-`live Falkor suite UNEXECUTED`. Do not report storage coverage you did
-not run — read the gate's own output before claiming it passed.
+`FALKOR_URL`/`REDIS_URL`. A green `cargo xtask storage-conformance`
+with either unset has not exercised that backend at all; it prints
+`live Falkor suite UNEXECUTED` / `live Redis fire suite UNEXECUTED`.
+The Dreams `fire_live` suite is also dark under the plain workspace
+run (its `integration` feature is not part of
+`--features exocortex-adapter-sdk/testing`) — the conformance gate is
+the layer that runs it. Do not report storage coverage you did not
+run — read the gate's own output before claiming it passed.
 
 ## Fingerprint changes mean you broke something
 

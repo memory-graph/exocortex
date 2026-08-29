@@ -383,6 +383,86 @@ async fn ambiguous_success_retry_preserves_post_fire_writes() {
 }
 
 #[tokio::test]
+async fn engine_settlement_retain_flag_reaches_the_distributed_queue() {
+    let Some((client, queue, key)) = isolated_queue("settle-seam-org").await else {
+        return;
+    };
+    let queue = Arc::new(tokio::sync::Mutex::new(queue));
+    let ontology = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()]).unwrap(),
+    );
+    let engine = DreamsEngine::new(
+        Arc::new(InMemoryStorage::new(ontology)),
+        DreamsTrigger {
+            memory_threshold: u32::MAX,
+            edge_threshold: u32::MAX,
+            age_floor_days: u32::MAX,
+            min_interval_hours: 0,
+        },
+        0.01,
+        0.05,
+        false,
+        "settle-seam".into(),
+    )
+    .with_distributed_fire(queue.clone());
+    let region = RegionKey {
+        org: "settle-seam-org".into(),
+        project: "project".into(),
+        memory_type: 3,
+    };
+    let event = format!("settle-seam-effect:{}", uuid::Uuid::new_v4());
+    let counter_key = format!(
+        "exocortex:dreams:counters:{}",
+        serde_json::to_string(&region).unwrap()
+    );
+    let processed_key = format!("{counter_key}:processed-events");
+
+    engine
+        .on_writes_once(&event, 5, region.clone(), 1, 0)
+        .await
+        .unwrap();
+    engine
+        .settle_writes_once(&event, 5, true, vec![region.clone()])
+        .await
+        .unwrap();
+
+    let mut inspect = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("inspection connection");
+    let (processed, settled): (u64, u64) = redis::pipe()
+        .cmd("SCARD")
+        .arg(&processed_key)
+        .cmd("HGET")
+        .arg(&counter_key)
+        .arg("settled_generation")
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+    assert_eq!(
+        (processed, settled),
+        (1, 5),
+        "retained settlement advances the fence but keeps the marker (R6-R275 contract through the engine seam)"
+    );
+    let memories: u64 = redis::cmd("HGET")
+        .arg(&counter_key)
+        .arg("memories")
+        .query_async(&mut inspect)
+        .await
+        .unwrap_or(0);
+    assert_eq!(memories, 1, "no duplicate write after settlement");
+    let _: u64 = redis::cmd("DEL")
+        .arg(&key)
+        .arg(format!("{key}:deferred"))
+        .arg(format!("{key}:processing"))
+        .arg(&counter_key)
+        .arg(&processed_key)
+        .query_async(&mut inspect)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn engine_on_write_uses_shared_transport_even_as_follower() {
     let Some((client, queue, key)) = isolated_queue("engine-org").await else {
         return;
