@@ -3,11 +3,12 @@
 **Status (2026-08-28, Round 6):** Round 6 CLOSED. The resumed
 finish-branch run closed the parked items (R6-R275/R6-R276), ran a fresh
 strict whole-project review whose findings closed as R6-R277 through
-R6-R293 (including the verification pass), passed the complete final gate
-matrix (22 gate commands plus bench, live legs executed), and passed live
-validation including the Docker leader-kill chaos harness (1,384 ms).
-R6-R182 is closed with one internally consistent verdict across this plan,
-the Round 6 review, and the PRD index.
+R6-R294 (including the remediation-verification and closure-verdict
+passes), passed the complete final gate matrix (22 gate commands plus
+bench, live legs executed), and passed live validation including the
+Docker leader-kill chaos harness (1,384 ms). R6-R182 is closed with one
+internally consistent verdict across this plan, the Round 6 review, and
+the PRD index.
 
 **Restart checkpoint:** completed. The parked run resumed 2026-08-28 from
 [`docs/CONTINUE_ROUND_6.md`](CONTINUE_ROUND_6.md) and finished every step;
@@ -280,6 +281,11 @@ idea:
 
 ## In progress
 
+Nothing is in progress. The table below is the closed Round 6 detail
+ledger (every row Done or Verified safe, evidence inline; the summary
+rows live in the Done section). A new item enters here only when work
+actually starts.
+
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
 | R6-B30-14 | PRD §23 #14: stamp every stored embedding with its model/version, not only the MCR² aggregate | Codex | Done — vectors are inseparable from model name/version; ingest stamps each row and MCR² rejects mixed revisions while stamping the common input revision |
@@ -471,7 +477,7 @@ idea:
 | R6-R179 | Post-closure chaos verification: authenticate detailed health polling | Codex | Done — both polling loops derive the dev bearer from the policy fixture and send it in the Authorization header; negative gate rejects either omission; no-cache current-image failover passes node2 -> node1 in 1,393 ms |
 | R6-R180 | Strict release convergence: prove a leader killed mid-Dreams cannot land zombie writes after takeover | Codex | Done — the Docker harness kills the elected node, observes authenticated takeover in 1,383 ms, then crosses the live journaled Dreams write's LSN-allocation barrier with the old epoch; Falkor rejects it and executable assertions prove zero current, history, or journal residue |
 | R6-R181 | Strict release convergence: pin, verify, and stamp the production embedding model at an immutable revision | Codex | Done — release fetch, Docker BuildKit, and runtime independently verify all five BGE-small files at Hugging Face commit `ea104dac…f3e3`; FastEmbed constructs offline, vectors stamp the full commit, the probe enforces a golden output prefix, corrupt/mutable/weakened negative regressions pass, and a no-cache image plus its distroless runtime both execute the probe |
-| R6-R182 | Strict release convergence advisory: make the authoritative Round 6 closure state internally consistent | Codex | Done — R6-R180/R181 carried live evidence; the resumed run's strict review (R6-R277..R6-R293) closed clean, the complete 22-gate matrix plus bench passed with live legs executed, and the chaos harness passed at 1,384 ms; the review header, this plan, and the PRD index now state one verdict (final closure commit, 2026-08-28) |
+| R6-R182 | Strict release convergence advisory: make the authoritative Round 6 closure state internally consistent | Codex | Done — R6-R180/R181 carried live evidence; the resumed run's strict review (R6-R277..R6-R294) closed clean, the complete 22-gate matrix plus bench passed with live legs executed, and the chaos harness passed at 1,384 ms; the review header, this plan, and the PRD index now state one verdict (final closure commit, 2026-08-28) |
 | R6-R183 | Strict release convergence: reconcile the FastEmbed 5.2 migration with the authoritative PRD and historical plan evidence | Codex | Done — milestone deviation 16 records why clean production startup requires exact fastembed 5.2 without editing the PRD; R6-R79 and R6-R178 now distinguish their superseded dependency/acquisition evidence from R6-R181's current offline sidecar |
 | R6-R184 | Full-gate reliability: diagnose and repair the Crush SEP-2575 fallback child exit that reproduces only under the full workspace test command | Codex | Done — the regression now models Crush's real two-phase fallback by waiting for `server/discover` method-not-found before initialize, retains child status/stderr diagnostics, passes 10 focused repetitions, and passes the exact full workspace feature matrix without global serialization (this commit) |
 | R6-R185 | Strict review: make binary + immutable model installation failure-atomic and prove the real installed resolver path | Codex | Done — the installer stages and verifies the exact binary/model pair, backs up every live path, rolls all paths back on error/signal, then executes the installed node with no model-dir override; the release workflow repeats the real prefix-layout probe, and the fixture injects model-commit failure and proves every prior binary/model survives byte-for-byte (this commit) |
@@ -582,8 +588,8 @@ idea:
 | R6-R290 | Strict review: the R6-R275 retained-identity chain was tested only at its two ends — no test crossed the `settle_writes_once` distributed branch with the retain flag, so a dropped pass-through would leave every suite green | Codex (resumed run) | Done — live `engine_settlement_retain_flag_reaches_the_distributed_queue` drives a distributed `DreamsEngine` through `on_writes_once` → `settle_writes_once(retain=true)` and proves the fence advanced to the generation while the processed-events marker survived (dropping the flag in lib.rs fails the `(1, 5)` assertion); live Redis fire suite now 15/15 (this commit) |
 | R6-R291 | Strict review: the live Redis fire suite could go dark with zero signal — the `integration` feature is not part of the standard workspace run, no gate or canary covered it (the SDK's identical trap got a failing canary in round 3), and three closure rows cite it as evidence | Codex (resumed run) | Done — `cargo xtask storage-conformance` now also executes `-p exocortex-dreams --features integration --test fire_live` when `REDIS_URL` is set and prints a loud `live Redis fire suite UNEXECUTED` line otherwise; AGENTS.md's gate line and CLAUDE.md's test-invocation trap note record both env vars; the gate passes end-to-end with both live backends (integration 48 + fencing_live 8 + fire 15) (this commit) |
 | R6-R293 | Verification pass over the remediation: comment drift, a missing self-reference fixture, and two stale suite counts | Codex (resumed run) | Done — the client 409 comment no longer claims header-based resume it never performs, the nested-closure fixtures cover a self-invoking closure, and the R6-R279/R6-R291 counts state their exact suites; xtask (25) and client suites pass (this commit) |
-| R6-R294 | Closure-verdict review: fencing suite undercounted (7 vs the actual 8), one historical sentence read as present-tense contradiction, a stale RELEASE BLOCKED pointer in the Palantir PRD, an imprecise EntityId disposition justification, and redundant gate arithmetic phrasing | Codex (resumed run) | Done — all five closure-doc defects corrected (counts, historical labeling, past-tense pointer, injectivity rationale, gate phrasing); no code changed (this commit) |
 | R6-R292 | Strict review doc-truth: the plan header named a stale review frontier (R6-R228), R6-B28 cited a nonexistent fixture name, MILESTONE_REPORT W9 recorded a dependency state IN10 later reversed, and AGENTS.md's gate list omitted the on-demand §23 #19 `mock-provider-audit` command | Codex (resumed run) | Done — the header states the current promotion frontier through R6-R291, the citation names the actual `storage_conformance_rejects_missing_empty_and_configured_out_live_targets` fixture, W9 carries the IN10 amendment, and AGENTS.md lists `mock-provider-audit` with its transitive-enforcement note (this commit) |
+| R6-R294 | Closure-verdict review: fencing suite undercounted (7 vs the actual 8), one historical sentence read as present-tense contradiction, a stale RELEASE BLOCKED pointer in the Palantir PRD, an imprecise EntityId disposition justification, and redundant gate arithmetic phrasing | Codex (resumed run) | Done — all five closure-doc defects corrected (counts, historical labeling, past-tense pointer, injectivity rationale, gate phrasing); no code changed (this commit) |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
 ### Round 6 item evidence
@@ -726,6 +732,10 @@ are recorded in the "Rounds 4-5" section below.
 | R6-S3 | Atomicity and durability (B08-B10, B15-B18, B20) | Item-level evidence above; in-memory and live Falkor storage conformance plus strict whole-project review pass |
 | R6-S4 | Backend/runtime completeness (B11-B12, B14, B24) | Item-level evidence above; deployment acceptance, live Docker failover, and strict whole-project review pass |
 | R6-S5 | Delivery truth (B27-B30) | Item-level evidence above; all mandatory drift/architecture gates, acceptance coverage, and strict whole-project review pass |
+| **Round 6 resumed finish-branch run (2026-08-28, closure)** | | |
+| R6-R275..R6-R276 | Parked strict-review fixes: legacy Redis marker retention through adopted cleanup; expression/return-typed closure evidence | Live Falkor/Redis regressions in the rows above; commits `e2928f8`, `eff9fc4` |
+| R6-R277..R6-R292 | Fresh nine-lens strict whole-project review of the resumed run: claim-time legacy retention, recursive closure liveness, entity capture-group identity, true replay floor, supervised-store auth, cache RCU + arena blanking, one batch-id derivation, catalogue-owned LSN guard, canonical digests/hex, memory_type_id index, walker/hydration dedup, fire_live gate coverage, doc truth | Each row above carries its failing-without-it test or live/gate evidence; 15 commits `ecf44bb`..`cd2674a` |
+| R6-R293..R6-R294 | Remediation-verification and closure-verdict passes over the run's own output | Rows above; final gate matrix 22/22 + bench with live legs, chaos 1,384 ms, tree limited to the three operator export files |
 | **Rounds 4-5 (2026-08-26, audit sweep)** | | |
 | W1-W7 | Write-path parity defects (WAL drain, shared validators, session context, reject detail, edge visibility, computed-only marker, persistent dedup) | `drain.rs` + `wal.rs` + kernel `validate_draft`/`validate_triple`; `wal_roundtrip.rs`, `ingest.rs`, `write_path_parity.rs` |
 | Phase A (CS1/WS1/WS2/IN2/CL3) | Network surface: SSE behind bearer auth, signed registrations, admin ceilings, scoped promote, hardened key decoding | `http_bind.rs`, `sse.rs`, `signing.rs`; `sse_replay.rs`, `ingest.rs`, `parity.rs`, `stdio_smoke.rs` |

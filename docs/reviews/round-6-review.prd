@@ -1,7 +1,7 @@
 # Exocortex v1 — Round 6 Whole-Project Review
 
 **Status:** Round 6 CLOSED (2026-08-28). Every promoted item through
-R6-R293 is remediated with same-commit closure evidence. The final gate
+R6-R294 is remediated with same-commit closure evidence. The final gate
 matrix passed in full (22 gate commands plus the bench SLO gate with its
 live Falkor leg), live validation covered Falkor (integration 48,
 fencing 8), Redis (fire_live 15), the standalone runtime (supervised-store
@@ -9,7 +9,8 @@ auth, deployment acceptance, stdio smoke), and the Docker leader-kill
 chaos harness (node2 -> node1 in 1,384 ms, zero old-epoch residue), and
 the resumed finish-branch run's strict review plus its verification pass
 closed clean (R6-R277 through R6-R293 below; the verification lenses'
-residual nits became R6-R293).
+residual nits became R6-R293), and the closure-verdict lens over the
+closure commit itself promoted R6-R294.
 
 **Review baseline:** `f7bf463aa4a77ac719c485bfe713541d79edeab1`
 (2026-08-27). Scope was the entire tracked repository: 199 files, of which
@@ -694,8 +695,9 @@ CLOSED 2026-08-28: R6-R180/R181 carry their live evidence above; the
 complete matrix and live validation are recorded in the header and the
 closure paragraph below; the fresh strict review is the resumed
 finish-branch run's nine-lens whole-project review (promoting R6-R277
-through R6-R293, all closed) plus its remediation-verification lenses
-(residual findings closed as R6-R293). This file's header, the master
+through R6-R293, all closed) plus its remediation-verification and
+closure-verdict lenses (residual findings closed as R6-R293 and
+R6-R294). This file's header, the master
 plan, and the PRD index now state one verdict.
 
 ### R6-R183 — FastEmbed 5.2 migration is unreconciled with the PRD
