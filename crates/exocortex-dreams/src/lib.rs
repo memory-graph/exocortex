@@ -570,7 +570,8 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         Ok(())
     }
 
-    /// Fire a region explicitly (Redis fire-queue drainer side).
+    /// Fire a region explicitly (test-driving the scheduler; the
+    /// distributed drainer goes through `notify_distributed`).
     pub fn notify(&self, region: RegionKey) {
         if !self.is_leader() {
             return;

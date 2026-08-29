@@ -419,10 +419,10 @@ fn closure_body_bounds(body: &str, pipe_end: usize) -> Option<(usize, usize)> {
     }
     if body[body_start..].starts_with("->") {
         let open = body[body_start + 2..].find('{')? + body_start + 2;
-        return matching_brace(body, open).map(|close| (open, close));
+        return matching_delimiter(body, open, b'{', b'}').map(|close| (open, close));
     }
     if body.as_bytes().get(body_start) == Some(&b'{') {
-        return matching_brace(body, body_start).map(|close| (body_start, close));
+        return matching_delimiter(body, body_start, b'{', b'}').map(|close| (body_start, close));
     }
     closure_expression_end(body, body_start).map(|close| (body_start, close))
 }
@@ -467,7 +467,7 @@ fn rust_functions(source: &str) -> Vec<RustFunction> {
             cursor = name_end;
             continue;
         };
-        let Some(body_end) = matching_brace(source, body_start) else {
+        let Some(body_end) = matching_delimiter(source, body_start, b'{', b'}') else {
             break;
         };
         let line_start = source[..at].rfind('\n').map_or(0, |line| line + 1);
@@ -510,6 +510,11 @@ fn rust_functions(source: &str) -> Vec<RustFunction> {
 }
 
 fn inside_impl(source: &str, function_at: usize) -> bool {
+    enclosing_impl_span(source, function_at).is_some()
+}
+
+/// The nearest `impl` block (by brace span) enclosing `function_at`.
+fn enclosing_impl_span(source: &str, function_at: usize) -> Option<(usize, usize)> {
     let mut search_end = function_at;
     while let Some(impl_at) = source[..search_end].rfind("impl") {
         let before_is_ident = impl_at > 0
@@ -526,12 +531,12 @@ fn inside_impl(source: &str, function_at: usize) -> bool {
             continue;
         };
         let open = impl_at + open_offset;
-        if matching_brace(source, open).is_some_and(|close| close > function_at) {
-            return true;
+        if matching_delimiter(source, open, b'{', b'}').is_some_and(|close| close > function_at) {
+            return Some((impl_at, open));
         }
         search_end = impl_at;
     }
-    false
+    None
 }
 
 fn function_body_start(source: &str, signature_start: usize) -> Option<usize> {
@@ -557,45 +562,8 @@ fn function_body_start(source: &str, signature_start: usize) -> Option<usize> {
 }
 
 fn inside_trait_impl(source: &str, function_at: usize) -> bool {
-    let mut search_end = function_at;
-    while let Some(impl_at) = source[..search_end].rfind("impl") {
-        let before_is_ident = impl_at > 0
-            && (source.as_bytes()[impl_at - 1].is_ascii_alphanumeric()
-                || source.as_bytes()[impl_at - 1] == b'_');
-        let after = source.as_bytes().get(impl_at + 4).copied();
-        if before_is_ident || !after.is_some_and(|byte| byte.is_ascii_whitespace() || byte == b'<')
-        {
-            search_end = impl_at;
-            continue;
-        }
-        let Some(open_offset) = source[impl_at..function_at].find('{') else {
-            search_end = impl_at;
-            continue;
-        };
-        let open = impl_at + open_offset;
-        if matching_brace(source, open).is_some_and(|close| close > function_at) {
-            return source[impl_at..open].contains(" for ");
-        }
-        search_end = impl_at;
-    }
-    false
-}
-
-fn matching_brace(source: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
-        match byte {
-            b'{' => depth += 1,
-            b'}' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(open + offset);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    enclosing_impl_span(source, function_at)
+        .is_some_and(|(impl_at, open)| source[impl_at..open].contains(" for "))
 }
 
 fn configured_out_at(body: &str, call: usize) -> bool {

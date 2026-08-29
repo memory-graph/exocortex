@@ -255,17 +255,11 @@ async fn handler<S: Storage + 'static>(
         // Initial comment anchors the connection before the first delta.
         yield Ok::<Event, Infallible>(Event::default().comment(format!("exocortex {node_id}")));
         if let Some(env) = initial_snapshot {
-            let envelopes = match finalize_for_subscriber(
-                &cluster,
-                env,
-                client_key.as_ref(),
-                supports_additive_events,
-            ) {
-                Ok(envelopes) => envelopes,
-                Err(error) => {
-                    tracing::warn!(?error, "closing SSE stream after invalid initial envelope");
-                    return;
-                }
+            let Some(envelopes) =
+                admit_envelope(&cluster, &state.hydration, env, visibility.as_ref(), client_key.as_ref(), supports_additive_events, "initial")
+                    .await
+            else {
+                return;
             };
             for env in envelopes {
                 let payload = exocortex_wire::transport::base64_encode(&prost_encode(&env));
@@ -275,33 +269,11 @@ async fn handler<S: Storage + 'static>(
         // R-C6 replay first (LSN order); the client's LSN gate dedups any
         // overlap with the live stream that follows.
         for env in replay {
-            if let Err(error) = cluster.verify_hmac(&env) {
-                tracing::warn!(?error, "closing SSE stream after invalid replay envelope");
+            let Some(envelopes) =
+                admit_envelope(&cluster, &state.hydration, env, visibility.as_ref(), client_key.as_ref(), supports_additive_events, "replay")
+                    .await
+            else {
                 return;
-            }
-            let env = match prepare_for_subscriber(
-                &cluster,
-                &state.hydration,
-                env,
-                visibility.as_ref(),
-            ).await {
-                Ok(env) => env,
-                Err(error) => {
-                    tracing::warn!(?error, "closing SSE stream after visibility lookup failure");
-                    return;
-                }
-            };
-            let envelopes = match finalize_for_subscriber(
-                &cluster,
-                env,
-                client_key.as_ref(),
-                supports_additive_events,
-            ) {
-                Ok(envelopes) => envelopes,
-                Err(error) => {
-                    tracing::warn!(?error, "closing SSE stream after invalid prepared envelope");
-                    return;
-                }
             };
             for env in envelopes {
                 let payload = exocortex_wire::transport::base64_encode(&prost_encode(&env));
@@ -316,33 +288,11 @@ async fn handler<S: Storage + 'static>(
                     return;
                 }
             };
-            if let Err(error) = cluster.verify_hmac(&env) {
-                tracing::warn!(?error, "closing SSE stream after invalid live envelope");
+            let Some(envelopes) =
+                admit_envelope(&cluster, &state.hydration, env, visibility.as_ref(), client_key.as_ref(), supports_additive_events, "live")
+                    .await
+            else {
                 return;
-            }
-            let env = match prepare_for_subscriber(
-                &cluster,
-                &state.hydration,
-                env,
-                visibility.as_ref(),
-            ).await {
-                Ok(env) => env,
-                Err(error) => {
-                    tracing::warn!(?error, "closing SSE stream after visibility lookup failure");
-                    return;
-                }
-            };
-            let envelopes = match finalize_for_subscriber(
-                &cluster,
-                env,
-                client_key.as_ref(),
-                supports_additive_events,
-            ) {
-                Ok(envelopes) => envelopes,
-                Err(error) => {
-                    tracing::warn!(?error, "closing SSE stream after invalid prepared envelope");
-                    return;
-                }
             };
             for env in envelopes {
                 let payload = exocortex_wire::transport::base64_encode(&prost_encode(&env));
@@ -353,6 +303,47 @@ async fn handler<S: Storage + 'static>(
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(5)))
         .into_response()
+}
+
+/// One envelope's full admission pipeline, shared by the initial-snapshot,
+/// replay, and live loops: verify the cluster HMAC, hydrate per-subscriber
+/// visibility, then re-sign for this subscriber. Logs and returns `None` on
+/// the first failure (the stream closes; the client reseeds).
+async fn admit_envelope<S: Storage + 'static>(
+    cluster: &ClusterNode<S>,
+    hydration: &SharedEventHydration,
+    env: InvalidationEnvelope,
+    visibility: Option<&VisibilityContext>,
+    client_key: Option<&[u8; 32]>,
+    supports_additive_events: bool,
+    phase: &str,
+) -> Option<Vec<InvalidationEnvelope>> {
+    if let Err(error) = cluster.verify_hmac(&env) {
+        tracing::warn!(?error, phase, "closing SSE stream after invalid envelope");
+        return None;
+    }
+    let env = match prepare_for_subscriber(cluster, hydration, env, visibility).await {
+        Ok(env) => env,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                phase,
+                "closing SSE stream after visibility lookup failure"
+            );
+            return None;
+        }
+    };
+    match finalize_for_subscriber(cluster, env, client_key, supports_additive_events) {
+        Ok(envelopes) => Some(envelopes),
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                phase,
+                "closing SSE stream after invalid prepared envelope"
+            );
+            None
+        }
+    }
 }
 
 fn finalize_for_subscriber<S: Storage + 'static>(
@@ -413,16 +404,8 @@ async fn prepare_for_subscriber<S: Storage + 'static>(
     let kind = inv.kind.clone();
     match kind.as_ref() {
         Some(Kind::MemoryUpserted(row)) => {
-            let hydrated = hydration
-                .load(
-                    cluster.storage.as_ref(),
-                    HydrationKey {
-                        lsn,
-                        kind: 1,
-                        id: row.id.clone(),
-                    },
-                )
-                .await?;
+            let hydrated =
+                load_hydrated(hydration, cluster.storage.as_ref(), lsn, 1, row.id.clone()).await?;
             let HydratedEvent::Memory(memory) = hydrated.as_ref() else {
                 return Err(StorageError::Backend("SSE hydration kind mismatch".into()));
             };
@@ -445,16 +428,8 @@ async fn prepare_for_subscriber<S: Storage + 'static>(
             }
         }
         Some(Kind::MemoryDeleted(row)) => {
-            let hydrated = hydration
-                .load(
-                    cluster.storage.as_ref(),
-                    HydrationKey {
-                        lsn,
-                        kind: 1,
-                        id: row.id.clone(),
-                    },
-                )
-                .await?;
+            let hydrated =
+                load_hydrated(hydration, cluster.storage.as_ref(), lsn, 1, row.id.clone()).await?;
             let HydratedEvent::Memory(memory) = hydrated.as_ref() else {
                 return Err(StorageError::Backend("SSE hydration kind mismatch".into()));
             };
@@ -465,16 +440,8 @@ async fn prepare_for_subscriber<S: Storage + 'static>(
             }
         }
         Some(Kind::RelationshipUpserted(row)) => {
-            let hydrated = hydration
-                .load(
-                    cluster.storage.as_ref(),
-                    HydrationKey {
-                        lsn,
-                        kind: 2,
-                        id: row.id.clone(),
-                    },
-                )
-                .await?;
+            let hydrated =
+                load_hydrated(hydration, cluster.storage.as_ref(), lsn, 2, row.id.clone()).await?;
             let HydratedEvent::Relationship(relationship) = hydrated.as_ref() else {
                 return Err(StorageError::Backend("SSE hydration kind mismatch".into()));
             };
@@ -494,16 +461,8 @@ async fn prepare_for_subscriber<S: Storage + 'static>(
             }
         }
         Some(Kind::RelationshipDeleted(row)) => {
-            let hydrated = hydration
-                .load(
-                    cluster.storage.as_ref(),
-                    HydrationKey {
-                        lsn,
-                        kind: 2,
-                        id: row.id.clone(),
-                    },
-                )
-                .await?;
+            let hydrated =
+                load_hydrated(hydration, cluster.storage.as_ref(), lsn, 2, row.id.clone()).await?;
             let HydratedEvent::Relationship(relationship) = hydrated.as_ref() else {
                 return Err(StorageError::Backend("SSE hydration kind mismatch".into()));
             };
@@ -525,16 +484,14 @@ async fn prepare_for_subscriber<S: Storage + 'static>(
                 serde_json::from_slice(&row.record_json).map_err(|error| {
                     StorageError::Backend(format!("SSE discovery record malformed: {error}"))
                 })?;
-            let hydrated = hydration
-                .load(
-                    cluster.storage.as_ref(),
-                    HydrationKey {
-                        lsn,
-                        kind: 3,
-                        id: encoded_record.discovery_id.as_bytes().to_vec(),
-                    },
-                )
-                .await?;
+            let hydrated = load_hydrated(
+                hydration,
+                cluster.storage.as_ref(),
+                lsn,
+                3,
+                encoded_record.discovery_id.as_bytes().to_vec(),
+            )
+            .await?;
             let HydratedEvent::Discovery(discovery) = hydrated.as_ref() else {
                 return Err(StorageError::Backend("SSE hydration kind mismatch".into()));
             };
@@ -553,6 +510,20 @@ async fn prepare_for_subscriber<S: Storage + 'static>(
             "SSE invalidation missing event kind".into(),
         )),
     }
+}
+
+/// Hydrate one event through the shared cache (R6-R32 coalescing wrapper
+/// around `SharedEventHydration::load` for the five subscriber arms).
+async fn load_hydrated<S: Storage>(
+    hydration: &SharedEventHydration,
+    storage: &S,
+    lsn: u64,
+    kind: u8,
+    id: Vec<u8>,
+) -> Result<Arc<HydratedEvent>, StorageError> {
+    hydration
+        .load(storage, HydrationKey { lsn, kind, id })
+        .await
 }
 
 impl SharedEventHydration {
@@ -776,11 +747,8 @@ async fn graph_reseed_envelope_at<S: Storage + 'static>(
     }))
 }
 
-#[derive(Default)]
 struct CountingWriter {
     len: usize,
-    largest_external_write: usize,
-    borrowed_range: Option<(usize, usize)>,
 }
 
 impl std::io::Write for CountingWriter {
@@ -788,14 +756,6 @@ impl std::io::Write for CountingWriter {
         self.len = self.len.checked_add(bytes.len()).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::FileTooLarge, "JSON length overflow")
         })?;
-        let start = bytes.as_ptr() as usize;
-        let end = start.saturating_add(bytes.len());
-        let borrowed = self
-            .borrowed_range
-            .is_some_and(|(source_start, source_end)| start >= source_start && end <= source_end);
-        if !borrowed {
-            self.largest_external_write = self.largest_external_write.max(bytes.len());
-        }
         Ok(bytes.len())
     }
 
@@ -804,21 +764,11 @@ impl std::io::Write for CountingWriter {
     }
 }
 
-fn encoded_json_metrics<T: serde::Serialize>(
-    value: &T,
-    borrowed_range: Option<(usize, usize)>,
-) -> Result<(usize, usize), StorageError> {
-    let mut counter = CountingWriter {
-        borrowed_range,
-        ..CountingWriter::default()
-    };
+fn encoded_json_len<T: serde::Serialize>(value: &T) -> Result<usize, StorageError> {
+    let mut counter = CountingWriter { len: 0 };
     serde_json::to_writer(&mut counter, value)
         .map_err(|error| StorageError::Backend(error.to_string()))?;
-    Ok((counter.len, counter.largest_external_write))
-}
-
-fn encoded_json_len<T: serde::Serialize>(value: &T) -> Result<usize, StorageError> {
-    encoded_json_metrics(value, None).map(|(len, _)| len)
+    Ok(counter.len)
 }
 
 fn ensure_reseed_budget(rows: usize, bytes: usize) -> Result<(), StorageError> {
@@ -1030,20 +980,60 @@ mod tests {
 
     #[test]
     fn reseed_byte_counter_matches_serialized_output_without_retaining_it() {
+        // A test-local counting writer with the no-materialization probe:
+        // writes landing inside the borrowed payload range are free; the
+        // invariant is that serde_json never materializes the payload as
+        // one owned chunk outside it.
+        #[derive(Default)]
+        struct ProbingWriter {
+            len: usize,
+            largest_external_write: usize,
+            borrowed_range: Option<(usize, usize)>,
+        }
+        impl std::io::Write for ProbingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.len = self.len.checked_add(bytes.len()).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::FileTooLarge, "JSON length overflow")
+                })?;
+                let start = bytes.as_ptr() as usize;
+                let end = start.saturating_add(bytes.len());
+                let borrowed = self
+                    .borrowed_range
+                    .is_some_and(|(source_start, source_end)| {
+                        start >= source_start && end <= source_end
+                    });
+                if !borrowed {
+                    self.largest_external_write = self.largest_external_write.max(bytes.len());
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
         let payload = "x".repeat(512 * 1024);
         let value = serde_json::json!({"memories": [payload], "relationships": []});
         let encoded = serde_json::to_vec(&value).unwrap();
         let source = value["memories"][0].as_str().unwrap();
         let source_start = source.as_ptr() as usize;
-        let (measured, largest_external_write) =
-            super::encoded_json_metrics(&value, Some((source_start, source_start + source.len())))
-                .unwrap();
+        let mut counter = ProbingWriter {
+            borrowed_range: Some((source_start, source_start + source.len())),
+            ..ProbingWriter::default()
+        };
+        serde_json::to_writer(&mut counter, &value).unwrap();
+        let (measured, largest_external_write) = (counter.len, counter.largest_external_write);
 
         assert_eq!(measured, encoded.len());
         assert!(
             largest_external_write < encoded.len() / 8,
             "length-only encoding materialized a {largest_external_write}-byte output chunk outside the borrowed source for a {}-byte payload",
             encoded.len()
+        );
+        assert_eq!(
+            super::encoded_json_len(&value).unwrap(),
+            encoded.len(),
+            "production length accounting agrees with the probed count"
         );
     }
 

@@ -399,12 +399,21 @@ impl RedisFireQueue {
             "{DREAMS_QUEUE_KEY}:org:{}",
             serde_json::to_string(org.as_str()).expect("organization serialization is infallible")
         );
+        Self::from_queue_key(conn, quiet_hours, org, queue_key.into())
+    }
+
+    fn from_queue_key(
+        conn: redis::aio::MultiplexedConnection,
+        quiet_hours: QuietHours,
+        org: SmolStr,
+        queue_key: SmolStr,
+    ) -> Self {
         Self {
             conn,
             org,
             deferred_key: format!("{queue_key}:deferred").into(),
             processing_key: format!("{queue_key}:processing").into(),
-            queue_key: queue_key.into(),
+            queue_key,
             quiet_hours,
         }
     }
@@ -418,15 +427,7 @@ impl RedisFireQueue {
         org: impl Into<SmolStr>,
         queue_key: impl Into<SmolStr>,
     ) -> Self {
-        let queue_key = queue_key.into();
-        Self {
-            conn,
-            org: org.into(),
-            deferred_key: format!("{queue_key}:deferred").into(),
-            processing_key: format!("{queue_key}:processing").into(),
-            queue_key,
-            quiet_hours,
-        }
+        Self::from_queue_key(conn, quiet_hours, org.into(), queue_key.into())
     }
 
     /// Atomically append a region below the R-Dr15 queue ceiling. Saturation

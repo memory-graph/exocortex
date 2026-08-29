@@ -8,7 +8,7 @@ use futures::stream::BoxStream;
 
 use crate::types::*;
 use crate::{Storage, StorageError};
-use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId, Visibility};
+use exocortex_kernel::{EntityId, Memory, MemoryId, Relationship, RelationshipId};
 
 /// The deterministic test double (§6.6): HashMaps and Vecs, no Cypher, no
 /// I/O. Ships as a v1 deliverable — every unit test above the storage seam
@@ -2202,22 +2202,22 @@ impl Storage for InMemoryStorage {
     }
 }
 
-/// Helper for tests above the seam: a visibility context that can see
-/// everything up to `Visibility::Org`.
+/// A visibility context that can see everything up to `Visibility::Org`.
+#[cfg(test)]
 pub fn org_visibility_ctx(org: &str, user: &str) -> VisibilityContext {
     VisibilityContext {
         user_id: user.into(),
         org_id: org.into(),
         project_ids: Default::default(),
         team_ids: Default::default(),
-        max_visibility: Visibility::Org,
+        max_visibility: exocortex_kernel::Visibility::Org,
     }
 }
 
 #[cfg(test)]
 mod atomic_fence_tests {
     use super::*;
-    use exocortex_kernel::{MemoryContext, Provenance, RelationshipProperties, LSN};
+    use exocortex_kernel::{MemoryContext, Provenance, RelationshipProperties, Visibility, LSN};
 
     fn memory() -> Memory {
         Memory {
