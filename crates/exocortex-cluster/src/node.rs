@@ -150,7 +150,9 @@ impl<S: Storage + 'static> ClusterNode<S> {
     }
 
     /// The oldest buffered LSN (1 when the ring is empty): the floor a
-    /// `409` tells the client to resume from.
+    /// `409` tells the client to resume from. Never the newest observed
+    /// LSN — a resume floor above the ring front would instruct clients to
+    /// skip events the buffer still holds.
     pub fn replay_floor(&self) -> u64 {
         self.replay
             .lock()
@@ -158,10 +160,6 @@ impl<S: Storage + 'static> ClusterNode<S> {
             .front()
             .map(envelope_lsn)
             .unwrap_or(1)
-            .max(
-                self.max_observed_lsn
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            )
     }
 
     /// Track one envelope in the replay ring (LSN-ordered; the ring is
@@ -351,6 +349,37 @@ mod tests {
             ontology.fingerprint,
             [5; 32],
         )
+    }
+
+    #[tokio::test]
+    async fn replay_floor_reports_the_oldest_buffered_lsn() {
+        let ontology =
+            Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).expect("ontology"));
+        let node = ClusterNode::new(
+            Arc::new(InMemoryStorage::new(ontology.clone())),
+            "floor-test".into(),
+            ontology.fingerprint,
+            [7; 32],
+        )
+        .with_replay_capacity(3);
+        assert_eq!(
+            node.replay_floor(),
+            1,
+            "an empty ring reports the documented default"
+        );
+        for lsn in 10u64..=13 {
+            node.admit_and_publish(node.envelope(Invalidation::MemoryUpserted {
+                id: MemoryId::new_v7(),
+                lsn,
+            }))
+            .unwrap();
+        }
+        assert!(matches!(node.replay_since(0), crate::Replay::TooOld));
+        assert_eq!(
+            node.replay_floor(),
+            11,
+            "a wrapped ring reports its oldest buffered LSN, never the newest observed"
+        );
     }
 
     #[tokio::test]
