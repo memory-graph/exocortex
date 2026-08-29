@@ -1286,6 +1286,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "exocortex-pack-mortgage-v1"
+version = "0.2.2"
+dependencies = [
+ "exocortex-kernel",
+ "exocortex-pack-dev-v1",
+ "inventory",
+ "smol_str",
+]
+
+[[package]]
 name = "exocortex-reasoning"
 version = "0.2.2"
 dependencies = [

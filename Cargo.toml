@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "crates/exocortex-kernel",
     "crates/exocortex-pack-dev-v1",
+    "crates/exocortex-pack-mortgage-v1",
     "crates/exocortex-wire",
     "crates/exocortex-adapter-sdk",
     "crates/exocortex-storage",

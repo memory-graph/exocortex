@@ -27,7 +27,7 @@ crate must exist on crates.io before its dependents verify):
 
 ```
 exocortex-kernel
-  -> exocortex-pack-dev-v1, exocortex-wire
+  -> exocortex-pack-dev-v1, exocortex-pack-mortgage-v1, exocortex-wire
   -> exocortex-adapter-sdk
   -> exocortex-storage
   -> exocortex-cache, exocortex-reasoning
