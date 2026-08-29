@@ -1064,13 +1064,7 @@ impl FalkorStorage {
             params.get("lsn").and_then(serde_json::Value::as_u64)
         };
         if ordered_lsn.is_some() {
-            cypher_text = format!(
-                "MERGE (order:_ExocortexMeta {{key: 'committed_lsn'}}) \
-                 ON CREATE SET order.value = 0 \
-                 WITH order WHERE order.value < $lsn \
-                 SET order.value = $lsn \
-                 WITH 1 AS __ordered_step\n{cypher_text}"
-            );
+            cypher_text = format!("{}{cypher_text}", crate::cypher::ORDERED_COMMIT_LSN_GUARD);
         }
         let mut builder = if t.read_only {
             graph.ro_query(cypher_text.as_str())

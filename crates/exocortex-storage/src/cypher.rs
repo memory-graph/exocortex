@@ -1,9 +1,24 @@
 //! Every Cypher template the FalkorDB adapter can execute. Registered at
 //! compile time; the trait method `query_cypher` refuses templates not listed
-//! here. This keeps Cypher confined to one file (CR-10).
+//! here. This keeps Cypher confined to one file (CR-10). The one composed
+//! fragment outside the registry — the ordered-commit watermark guard below,
+//! prepended to LSN-ordered mutations by the adapter — lives here too so the
+//! watermark has a single source (R-S3).
 
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+
+/// Guard prepended to LSN-ordered mutations by the adapter: a mutation may
+/// only run while the graph's `committed_lsn` watermark is strictly below
+/// the mutation's own `$lsn`, and the guard advances the watermark to it
+/// (R-S3). The `fenced_discovery_record_store` template advances the same
+/// watermark inline for its multi-row journal commit — change one, change
+/// both.
+pub const ORDERED_COMMIT_LSN_GUARD: &str = "MERGE (order:_ExocortexMeta {key: 'committed_lsn'}) \
+     ON CREATE SET order.value = 0 \
+     WITH order WHERE order.value < $lsn \
+     SET order.value = $lsn \
+     WITH 1 AS __ordered_step\n";
 
 /// A registered, parameterized Cypher template.
 pub struct Template {
