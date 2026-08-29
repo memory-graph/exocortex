@@ -1,9 +1,11 @@
 # Round 6 restart checkpoint
 
 Recorded 2026-08-28 because the operator explicitly parked the autonomous
-finish-branch run; resumed the same day. This file is a restart aid, not
-closure evidence. The authoritative scope and status remain
-`docs/reviews/round-6-review.prd` and `docs/master-plan.prd`.
+finish-branch run; resumed and COMPLETED the same day. This file is now a
+historical record of the interruption. Closure evidence lives in
+`docs/reviews/round-6-review.prd` (final closure paragraph) and
+`docs/master-plan.prd` (closure baseline); nothing here is closure
+evidence.
 
 ## Repository state
 

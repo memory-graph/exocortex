@@ -1,11 +1,15 @@
 # Exocortex v1 — Round 6 Whole-Project Review
 
-**Status:** RELEASE BLOCKED. The first fresh strict review promoted R6-R185
-through R6-R202 into the master plan. R6-R202 live planner verification then
-confirmed and promoted R6-R203; its full live validation then promoted
-R6-R204. R6-R182 remains open until their
-remediation, the complete final gate matrix, and a subsequent clean strict
-review.
+**Status:** Round 6 CLOSED (2026-08-28). Every promoted item through
+R6-R293 is remediated with same-commit closure evidence. The final gate
+matrix passed in full (22 gate commands plus the bench SLO gate with its
+live Falkor leg), live validation covered Falkor (integration 48,
+fencing 7), Redis (fire_live 15), the standalone runtime (supervised-store
+auth, deployment acceptance, stdio smoke), and the Docker leader-kill
+chaos harness (node2 -> node1 in 1,384 ms, zero old-epoch residue), and
+the resumed finish-branch run's strict review plus its verification pass
+closed clean (R6-R277 through R6-R293 below; the verification lenses'
+residual nits became R6-R293).
 
 **Review baseline:** `f7bf463aa4a77ac719c485bfe713541d79edeab1`
 (2026-08-27). Scope was the entire tracked repository: 199 files, of which
@@ -686,6 +690,14 @@ closed without labeling that statement as historical. Closure requires a
 single internally consistent final verdict after R6-R180/R181, the complete
 gate matrix, and a fresh strict review pass.
 
+CLOSED 2026-08-28: R6-R180/R181 carry their live evidence above; the
+complete matrix and live validation are recorded in the header and the
+closure paragraph below; the fresh strict review is the resumed
+finish-branch run's nine-lens whole-project review (promoting R6-R277
+through R6-R293, all closed) plus its remediation-verification lenses
+(residual findings closed as R6-R293). This file's header, the master
+plan, and the PRD index now state one verdict.
+
 ### R6-R183 — FastEmbed 5.2 migration is unreconciled with the PRD
 
 The core PRD explicitly specifies `fastembed = "3"`, while the production
@@ -814,3 +826,42 @@ acceptance, and Docker leader failover also passed; the latter elected
 but R6-R176 through R6-R183 subsequently reopened it; this paragraph is
 historical evidence, not the current verdict. PRD-backed v2 and post-v1
 deferrals remain deferrals and are not release blockers.
+
+### Final closure evidence (2026-08-28, resumed finish-branch run)
+
+The parked run resumed from `docs/CONTINUE_ROUND_6.md`, closed R6-R275 and
+R6-R276, then ran a fresh strict whole-project review (nine lenses plus the
+hazard-class grid) which promoted R6-R277 through R6-R292; a verification
+pass over that remediation promoted R6-R293. Every item closed with
+same-commit plan evidence.
+
+The final matrix: fmt, workspace clippy, deny, workspace tests with the
+mandatory SDK feature (all suites green), kernel-purity, fingerprint
+(`e1f7d17b…ddc9b2`, unchanged), gen-schemas, gen-playbook (48/47; 299
+words), no-llm, proto-sync, signing-hygiene, metrics-hygiene,
+wire-standalone, write-path-parity, dead-enforcement, auth-coverage,
+artifact-equivalence, acceptance-coverage, deployment-acceptance,
+ontology-surfaces, mock-provider-audit, storage-conformance (live legs
+executed), and bench — 22 gate commands plus bench, all green. Live
+validation: Falkor integration 48/48 and fencing 7/7, live Falkor indexed
+read p99 11.4 ms against its budget, Redis fire_live 15/15, the supervised
+standalone store proving NOAUTH refusal against the real runtime, and the
+three-node Docker leader-kill harness passing at 1,384 ms with zero
+old-LSN residue.
+
+Verified-safe dispositions from the resumed strict review (recorded so
+they are not re-litigated): EntityId preimages are blake3-hashed with
+separator bytes and the extractor's regex charset cannot emit the
+separator, so no cross-name collision exists (kernel ids.rs); the seed
+snapshot's frontier can stamp low when trailing commits are tombstones,
+which only makes clients over-fetch until the next invalidation max-heals
+(fail-safe direction); MCR2 sparsity runs as one degenerate whole-region
+cluster because production passes cluster id 0 by construction (the
+ClusterId plumbing is scaffolding, internally consistent); the periodic
+60-second authoritative reconcile is deliberate R6-R17 durability, not a
+performance defect; FalkorDB error replies quote query-body tokens (static
+template text), not the CYPHER parameter preamble carrying tenant content,
+and HTTP responses are already generic (R6-R91), leaving only operator
+telemetry. Pre-existing module cruft surfaced by the cleanup lens
+(unused PruneReason variants mirroring the §12.5 taxonomy, a triple walk,
+a double tokenize) is recorded here and stays out of scope.
