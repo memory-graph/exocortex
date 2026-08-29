@@ -6,7 +6,9 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]
 
+pub mod change_log;
 pub mod node;
 pub mod sse;
 
-pub use node::{ClusterError, ClusterNode, FeedHealth, Replay};
+pub use change_log::{ChangeLog, Replay, RingChangeLog};
+pub use node::{ClusterError, ClusterNode, FeedHealth};

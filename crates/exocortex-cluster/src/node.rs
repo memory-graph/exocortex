@@ -3,11 +3,11 @@
 //! pub-sub), and verifies peer admission — wire version, ontology
 //! fingerprint, and HMAC — before accepting inbound envelopes.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::sync::{broadcast, watch};
 
+use crate::change_log::ChangeLog as _;
 use exocortex_kernel::OntologyFingerprint;
 use exocortex_storage::{Invalidation, LeaseKey, OwnerLease, Storage};
 use exocortex_wire::cluster::v1::InvalidationEnvelope;
@@ -42,18 +42,11 @@ pub struct ClusterNode<S: Storage> {
     pub hmac_key: [u8; 32],
     /// Local fan-out hub backing the SSE router.
     tx: broadcast::Sender<InvalidationEnvelope>,
-    /// Bounded replay buffer for `?since_lsn` reconnects (R-C6): the last
-    /// `replay_cap` envelopes in backend-LSN order. When a reconnect's
-    /// `since_lsn` is older than the buffer floor the server answers
-    /// `409 Resync Required` instead of silently skipping deltas.
-    replay: Mutex<VecDeque<InvalidationEnvelope>>,
-    /// CS1 (audit): whether this node has ever observed an envelope — an
-    /// empty ring alone must not read as "nothing ever happened".
-    observed_anything: std::sync::atomic::AtomicBool,
-    /// CS1 (audit): highest LSN ever observed (survives ring eviction).
-    max_observed_lsn: std::sync::atomic::AtomicU64,
-    /// Ring capacity (default [`REPLAY_CAPACITY_DEFAULT`]).
-    replay_cap: usize,
+    /// D25: the change-feed seam. The bounded replay ring, the
+    /// eviction-proof observation markers, and the floor/frontier
+    /// contract live behind one trait; `ClusterNode` appends, the SSE
+    /// handler replays, the client consumes the same `Replay` verdicts.
+    change_log: crate::change_log::RingChangeLog,
     feed_health: watch::Sender<FeedHealth>,
 }
 
@@ -73,14 +66,7 @@ pub struct FeedHealth {
 /// embedded default with the same contract.
 pub const REPLAY_CAPACITY_DEFAULT: usize = 1024;
 
-/// R-C6 replay outcome for a reconnecting subscriber.
-#[derive(Debug, Clone)]
-pub enum Replay {
-    /// Envelopes after `since_lsn`, oldest first (possibly empty).
-    Fresh(Vec<InvalidationEnvelope>),
-    /// `since_lsn` precedes the buffer floor: the client must reseed.
-    TooOld,
-}
+pub use crate::change_log::Replay;
 
 impl<S: Storage + 'static> ClusterNode<S> {
     /// Build a node over a storage backend.
@@ -98,91 +84,41 @@ impl<S: Storage + 'static> ClusterNode<S> {
             fp,
             hmac_key,
             tx,
-            replay: Mutex::new(VecDeque::with_capacity(REPLAY_CAPACITY_DEFAULT)),
-            replay_cap: REPLAY_CAPACITY_DEFAULT,
-            observed_anything: std::sync::atomic::AtomicBool::new(false),
-            max_observed_lsn: std::sync::atomic::AtomicU64::new(0),
+            change_log: crate::change_log::RingChangeLog::new(),
             feed_health,
         }
     }
 
     /// Shrink the replay ring (tests pin a small floor to exercise 409s).
     pub fn with_replay_capacity(mut self, cap: usize) -> Self {
-        self.replay_cap = cap.max(1);
+        self.change_log = crate::change_log::RingChangeLog::with_capacity(cap);
         self
     }
 
-    /// R-C6: envelopes with `backend_lsn > since_lsn`, oldest first.
-    /// `Replay::TooOld` when `since_lsn + 1` precedes the buffer's oldest
-    /// entry — a gap the buffer can no longer bridge. CS1 (audit): an
-    /// EMPTY ring is only bridgeable when nothing has ever been published
-    /// — a node that has observed envelopes but lost its ring answers
-    /// `TooOld` instead of "you are current", so a restarted load-balanced
-    /// peer can never silently drop a gap.
+    /// D25: the change-log seam this node appends through and the SSE
+    /// handler replays through.
+    pub fn change_log(&self) -> &dyn crate::change_log::ChangeLog {
+        &self.change_log
+    }
+
+    /// R-C6 (D25 seam): delegate to the change log.
     pub fn replay_since(&self, since_lsn: u64) -> Replay {
-        let ring = self.replay.lock().unwrap();
-        let Some(oldest) = ring.front() else {
-            // Empty ring: fresh only if we have never observed anything.
-            if self
-                .observed_anything
-                .load(std::sync::atomic::Ordering::SeqCst)
-                && since_lsn
-                    < self
-                        .max_observed_lsn
-                        .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                return Replay::TooOld;
-            }
-            return Replay::Fresh(vec![]);
-        };
-        let floor = envelope_lsn(oldest);
-        // CS8 (audit): saturating — since_lsn = u64::MAX must answer, not
-        // overflow-panic in debug or wrap in release.
-        if since_lsn.saturating_add(1) < floor {
-            return Replay::TooOld;
-        }
-        Replay::Fresh(
-            ring.iter()
-                .filter(|e| envelope_lsn(e) > since_lsn)
-                .cloned()
-                .collect(),
-        )
+        self.change_log.replay_since(since_lsn)
     }
 
-    /// The oldest buffered LSN (1 when the ring is empty): the floor a
-    /// `409` tells the client to resume from. Never the newest observed
-    /// LSN — a resume floor above the ring front would instruct clients to
-    /// skip events the buffer still holds.
+    /// The oldest buffered LSN (D25 seam): the floor a `409` tells the
+    /// client to resume from.
     pub fn replay_floor(&self) -> u64 {
-        self.replay
-            .lock()
-            .unwrap()
-            .front()
-            .map(envelope_lsn)
-            .unwrap_or(1)
+        self.change_log.replay_floor()
     }
 
-    /// Track one envelope in the replay ring (LSN-ordered; the ring is
-    /// fed from the same storage stream the hub fans out).
-    fn record_replay(&self, env: InvalidationEnvelope) {
-        let mut ring = self.replay.lock().unwrap();
-        if ring.len() == self.replay_cap {
-            ring.pop_front();
-        }
-        ring.push_back(env);
-    }
-
-    /// Fan one envelope out through the hub AND the replay ring. This is
-    /// the single publish path: whatever the hub serves, `?since_lsn`
-    /// reconnects can replay (R-C6).
+    /// Fan one envelope out through the hub AND the change log (D25:
+    /// the ring is fed from the same storage stream the hub fans out).
+    /// This is the single publish path: whatever the hub serves,
+    /// `?since_lsn` reconnects can replay (R-C6).
     fn publish_envelope(&self, env: InvalidationEnvelope) {
-        let lsn = envelope_lsn(&env);
-        self.observed_anything
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.max_observed_lsn
-            .fetch_max(lsn, std::sync::atomic::Ordering::SeqCst);
-        self.record_replay(env.clone());
         metrics::counter!("exocortex_cluster_invalidations_published_total").increment(1);
+        self.change_log.append(env.clone());
         let _ = self.tx.send(env);
     }
 
@@ -327,11 +263,6 @@ impl<S: Storage + 'static> ClusterNode<S> {
     pub fn subscribe_local(&self) -> broadcast::Receiver<InvalidationEnvelope> {
         self.tx.subscribe()
     }
-}
-
-/// The backend LSN an envelope carries (0 when malformed).
-fn envelope_lsn(env: &InvalidationEnvelope) -> u64 {
-    env.inv.as_ref().map(|i| i.backend_lsn).unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -229,12 +229,14 @@ async fn handler<S: Storage + 'static>(
         vec![]
     } else {
         match since_lsn {
-            Some(n) => match cluster.replay_since(n) {
+            // D25: replay consults the named change-log seam.
+            Some(n) => match cluster.change_log().replay_since(n) {
                 Replay::Fresh(envs) => envs,
                 Replay::TooOld => {
                     let mut resp = (http::StatusCode::CONFLICT, "Resync Required").into_response();
-                    if let Ok(v) = http::HeaderValue::from_str(&cluster.replay_floor().to_string())
-                    {
+                    if let Ok(v) = http::HeaderValue::from_str(
+                        &cluster.change_log().replay_floor().to_string(),
+                    ) {
                         resp.headers_mut().insert("x-exocortex-min-lsn", v);
                     }
                     return resp;
