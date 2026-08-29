@@ -132,8 +132,16 @@ impl EntityExtractor {
                 // memory mentioning two files yielded one entity and
                 // find_by_entity silently missed the memory for the other.
                 let pat = pattern_of(type_idx, mi);
-                for m in pat.find_iter(&text) {
-                    let raw = m.as_str().trim();
+                for caps in pat.captures_iter(&text) {
+                    // Prefer the pattern's own name capture (the declared
+                    // identifier) over the whole match: `fn foo` and `foo()`
+                    // are the SAME Function, and `struct Foo` canonicalizes
+                    // on `Foo`, so mention form never splits identity.
+                    let raw = caps
+                        .get(1)
+                        .map(|group| group.as_str())
+                        .unwrap_or_else(|| caps.get(0).expect("whole match").as_str())
+                        .trim();
                     hits.push(raw.to_string());
                 }
             }
@@ -184,6 +192,7 @@ fn pattern_of(type_idx: usize, pattern_idx: usize) -> &'static regex::Regex {
 /// Canonicalize a raw match per its type (lowercase/trim/path-normalize).
 fn canonicalize(type_name: &str, raw: &str) -> String {
     match type_name {
+        "Function" => raw.trim_end_matches("()").to_string(),
         "Technology" | "Concept" | "Project" => raw.to_lowercase(),
         "Url" => raw.trim_end_matches(['.', ',']).to_string(),
         _ => raw.to_string(),
@@ -205,4 +214,38 @@ pub fn intern_name(interner: &mut Rodeo, name: &str) -> Spur {
 pub fn attach_entities(m: &mut Memory, extractor: &EntityExtractor) {
     let ids = extractor.entity_ids(&m.content, &m.tags);
     m.context.entities = ids.into_iter().collect();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mention_form_never_splits_entity_identity() {
+        let extractor = EntityExtractor::new("org");
+        let extracted = extractor.extract(
+            "we added fn parse_input; parse_input() is called twice and struct Foo wraps class Foo",
+            &[],
+        );
+        let functions = extracted
+            .iter()
+            .filter(|(kind, _, _)| *kind == 1)
+            .map(|(_, name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            functions,
+            vec!["parse_input"],
+            "definition and call mentions are one Function"
+        );
+        let classes = extracted
+            .iter()
+            .filter(|(kind, _, _)| *kind == 2)
+            .map(|(_, name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            classes,
+            vec!["Foo"],
+            "struct and class mentions are one Class"
+        );
+    }
 }
