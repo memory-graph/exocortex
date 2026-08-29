@@ -56,29 +56,11 @@ pub struct MemoryJson {
 }
 
 fn unhex(s: &str) -> Result<MemoryId, OpError> {
-    let mut out = [0u8; 16];
-    let bytes = s.as_bytes();
-    if bytes.len() != 32 {
-        return Err(OpError::BadInput("expected 32-char hex id".into()));
-    }
-    for i in 0..16 {
-        out[i] = u8::from_str_radix(
-            std::str::from_utf8(&bytes[i * 2..i * 2 + 2])
-                .map_err(|_| OpError::BadInput("hex".into()))?,
-            16,
-        )
-        .map_err(|_| OpError::BadInput("hex".into()))?;
-    }
-    Ok(MemoryId(out))
+    MemoryId::parse_hex(s).ok_or(OpError::BadInput("expected 32-char hex id".into()))
 }
 
 fn hex32(bytes: &[u8; 16]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(32);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+    MemoryId(*bytes).to_hex()
 }
 
 fn mem_json(m: &Memory) -> MemoryJson {
@@ -988,20 +970,8 @@ impl Operation for PreflightWrapupOp {
             &input.memories,
             &input.edges,
             |id| {
-                let mut out = [0u8; 16];
-                let b = id.as_bytes();
-                if b.len() != 32 {
-                    return None;
-                }
-                for i in 0..16 {
-                    match u8::from_str_radix(std::str::from_utf8(&b[i * 2..i * 2 + 2]).ok()?, 16) {
-                        Ok(v) => out[i] = v,
-                        Err(_) => return None,
-                    }
-                }
-                cache
-                    .get_memory(&org, &exocortex_kernel::MemoryId(out), &vc)
-                    .map(|m| m.memory_type)
+                MemoryId::parse_hex(id)
+                    .and_then(|id| cache.get_memory(&org, &id, &vc).map(|m| m.memory_type))
             },
         ))
     }

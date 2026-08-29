@@ -121,3 +121,21 @@ fn external_identity_is_layout_immune_property() {
         );
     }
 }
+
+#[test]
+fn hex_identity_roundtrip_rejects_non_canonical_forms() {
+    let id = MemoryId::new_v7();
+    let hex = id.to_hex();
+    assert_eq!(hex.len(), 32);
+    assert_eq!(MemoryId::parse_hex(&hex), Some(id));
+    assert_eq!(MemoryId::parse_hex(&hex.to_uppercase()), Some(id));
+    assert_eq!(MemoryId::parse_hex(""), None);
+    assert_eq!(MemoryId::parse_hex(&hex[..31]), None);
+    assert_eq!(MemoryId::parse_hex(&format!("{hex}00")), None);
+    let mut corrupted = hex.clone().into_bytes();
+    corrupted[0] = b'z';
+    assert_eq!(
+        MemoryId::parse_hex(std::str::from_utf8(&corrupted).unwrap()),
+        None
+    );
+}

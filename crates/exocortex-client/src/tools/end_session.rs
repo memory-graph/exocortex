@@ -186,18 +186,8 @@ impl EndSessionTool {
         let pre =
             crate::preflight::validate_batch(&self.ontology, &args.memories, &args.edges, |id| {
                 cache.as_ref().and_then(|c| {
-                    let mut out = [0u8; 16];
-                    let b = id.as_bytes();
-                    if b.len() != 32 {
-                        return None;
-                    }
-                    for i in 0..16 {
-                        out[i] =
-                            u8::from_str_radix(std::str::from_utf8(&b[i * 2..i * 2 + 2]).ok()?, 16)
-                                .ok()?;
-                    }
-                    c.get_memory(&org, &exocortex_kernel::MemoryId(out), &vc)
-                        .map(|m| m.memory_type)
+                    let id = exocortex_kernel::MemoryId::parse_hex(id)?;
+                    c.get_memory(&org, &id, &vc).map(|m| m.memory_type)
                 })
             });
         if !pre.rejections.is_empty() {

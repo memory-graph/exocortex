@@ -54,6 +54,33 @@ impl MemoryId {
     pub fn new_v7() -> Self {
         Self(*uuid::Uuid::now_v7().as_bytes())
     }
+
+    /// Parse the canonical 32-character hex identity form used across the
+    /// MCP/HTTP surface. Case-insensitive hex; anything non-canonical is
+    /// `None` (identity acceptance must not vary by entry point).
+    pub fn parse_hex(s: &str) -> Option<Self> {
+        let bytes = s.as_bytes();
+        if bytes.len() != 32 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let mut out = [0u8; 16];
+        for (index, byte) in out.iter_mut().enumerate() {
+            let hi = (bytes[index * 2] as char).to_digit(16)?;
+            let lo = (bytes[index * 2 + 1] as char).to_digit(16)?;
+            *byte = ((hi << 4) | lo) as u8;
+        }
+        Some(Self(out))
+    }
+
+    /// Lowercase 32-character hex form of this id.
+    pub fn to_hex(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(32);
+        for byte in self.0 {
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
 }
 
 fn update_framed(hasher: &mut blake3::Hasher, value: &[u8]) {

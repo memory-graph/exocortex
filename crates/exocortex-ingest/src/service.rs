@@ -2037,15 +2037,7 @@ fn hex32(bytes: &[u8]) -> String {
 
 /// §4.5: 32-hex id parsing (the same shape preflight uses).
 fn parse_hex_id(s: &str) -> Option<exocortex_kernel::MemoryId> {
-    let b = s.as_bytes();
-    if b.len() != 32 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for i in 0..16 {
-        out[i] = u8::from_str_radix(std::str::from_utf8(&b[i * 2..i * 2 + 2]).ok()?, 16).ok()?;
-    }
-    Some(exocortex_kernel::MemoryId(out))
+    exocortex_kernel::MemoryId::parse_hex(s)
 }
 
 /// D8: the wire enum value -> the kernel's stored enum. Unknown

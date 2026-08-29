@@ -360,19 +360,7 @@ impl ExocortexMcp {
                 ));
             };
             let to = if !e.to_memory_id.is_empty() {
-                let mut out = [0u8; 16];
-                let b = e.to_memory_id.as_bytes();
-                if b.len() != 32
-                    || !e.to_memory_id.chars().all(|c| c.is_ascii_hexdigit())
-                    || (0..16).any(|i| {
-                        u8::from_str_radix(
-                            std::str::from_utf8(&b[i * 2..i * 2 + 2]).unwrap_or("zz"),
-                            16,
-                        )
-                        .inspect(|v| out[i] = *v)
-                        .is_err()
-                    })
-                {
+                let Some(to) = MemoryId::parse_hex(&e.to_memory_id) else {
                     return Err(json_error(
                         "invalid-params",
                         format!(
@@ -380,8 +368,8 @@ impl ExocortexMcp {
                             e.to_memory_id
                         ),
                     ));
-                }
-                MemoryId(out)
+                };
+                to
             } else {
                 let Some((_, to)) = ids.iter().find(|(k, _)| *k == e.to_draft_key) else {
                     return Err(json_error(
@@ -481,18 +469,8 @@ impl ExocortexMcp {
         let org = self.org.to_string();
         let vc = self.vc.clone();
         let result = crate::preflight::validate_batch(&self.ontology, &memories, &edges, |id| {
-            let mut out = [0u8; 16];
-            let b = id.as_bytes();
-            if b.len() != 32 {
-                return None;
-            }
-            for i in 0..16 {
-                out[i] =
-                    u8::from_str_radix(std::str::from_utf8(&b[i * 2..i * 2 + 2]).ok()?, 16).ok()?;
-            }
-            cache
-                .get_memory(&org, &exocortex_kernel::MemoryId(out), &vc)
-                .map(|m| m.memory_type)
+            let id = exocortex_kernel::MemoryId::parse_hex(id)?;
+            cache.get_memory(&org, &id, &vc).map(|m| m.memory_type)
         });
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
