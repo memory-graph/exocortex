@@ -1951,6 +1951,7 @@ mod tests {
             "pub fn root() { let unused = || fence(); let _ = unused; } fn fence() {}\n",
             "pub fn root() { let unused = || -> bool { fence(); true }; let _ = unused; } fn fence() {}\n",
             "pub fn root() { let inner = || { fence(); }; let outer = || { inner(); }; let _ = (inner, outer); } fn fence() {}\n",
+            "pub fn root() { let recursive = || { recursive(); fence(); }; let _ = recursive; } fn fence() {}\n",
             "pub fn root() { let unused = || { fence(); }; #[cfg(any())] unused(); } fn fence() {}\n",
             "pub fn root() { let unused = || { fence(); }; if false { unused(); } } fn fence() {}\n",
         ] {

@@ -720,10 +720,10 @@ pub async fn run_sse_sync(
                         }
                     }
                     Err(SseReadError::ResyncRequired) => {
-                        // R-C6: Resync Required -> targeted rehydration via
-                        // the hook, then resume from the server's replay
-                        // floor. Without advancing `next_lsn` the client
-                        // would 409-loop on the same un-bridgeable gap.
+                        // R-C6: a 409 means the gap is un-bridgeable from
+                        // the replay buffer, so the client full-reseeds via
+                        // the hook (it never resumes from the advertised
+                        // floor — that would silently skip the gap).
                         tracing::warn!("409 resync required");
                         needs_seed = true;
                         reconnect_reason = "409 resync";
