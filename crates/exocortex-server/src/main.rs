@@ -183,6 +183,13 @@ fn standalone_main(
 ) -> anyhow::Result<()> {
     let (bin, module) =
         supervisor::resolve_paths(args.redis_server_bin.clone(), args.falkordb_module.clone())?;
+    let cluster_secret =
+        resolve_cluster_secret(std::env::var("EXOCORTEX_CLUSTER_SECRET").ok().as_deref())?;
+    // §4.3 data-plane privacy: the store token is derived before spawning
+    // so the server's --requirepass and the client URLs share one source.
+    let store_token = exocortex_wire::signing::content_digest_hex(
+        &exocortex_wire::signing::derive_supervised_store_token(&cluster_secret),
+    );
     let port = supervisor::free_port()?;
     let data_home = args.standalone_data_dir.clone().unwrap_or(data_home()?);
     let cfg = supervisor::SupervisorConfig {
@@ -192,6 +199,7 @@ fn standalone_main(
         data_dir: data_home,
         port,
         max_restarts: 3,
+        auth_token: Some(store_token),
     };
     let mut supervised = supervisor::spawn_supervised(&cfg)?;
     tracing::info!(port = supervised.port, "embedded FalkorDB ready");
@@ -199,8 +207,6 @@ fn standalone_main(
         return verify_deployed_rules(&ontology, "mcp-standalone");
     }
 
-    let cluster_secret =
-        resolve_cluster_secret(std::env::var("EXOCORTEX_CLUSTER_SECRET").ok().as_deref())?;
     let producer_key = exocortex_wire::signing::decode_hex32(
         &std::env::var("EXOCORTEX_HMAC_KEY")
             .map_err(|_| anyhow::anyhow!("EXOCORTEX_HMAC_KEY is required for mcp-standalone"))?,
@@ -230,8 +236,8 @@ fn standalone_main(
         address.ip().is_loopback(),
         "mcp-standalone backend bind must be loopback"
     );
-    let falkor_url = format!("falkor://127.0.0.1:{}", supervised.port);
-    let redis_url = format!("redis://127.0.0.1:{}", supervised.port);
+    let (falkor_url, redis_url) =
+        supervisor::supervised_store_urls(supervised.port, cfg.auth_token.as_deref());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

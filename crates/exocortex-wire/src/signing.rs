@@ -50,6 +50,17 @@ pub fn derive_sse_client_key(cluster_key: &[u8; 32], token: &str) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
+/// Derive the per-boot access token for the embedded (zero-setup) store.
+/// The supervised redis-server binds loopback only, but loopback is shared
+/// with every other local process; this token keeps the personal graph
+/// private to this boot without adding user-facing secret plumbing (§4.3).
+pub fn derive_supervised_store_token(cluster_key: &[u8; 32]) -> [u8; 32] {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(cluster_key).expect("HMAC accepts any key length");
+    mac.update(b"supervised-store:");
+    mac.finalize().into_bytes().into()
+}
+
 fn unsigned_envelope_bytes(envelope: &InvalidationEnvelope) -> Vec<u8> {
     let mut unsigned = envelope.clone();
     unsigned.hmac.clear();

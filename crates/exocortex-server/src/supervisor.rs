@@ -27,6 +27,10 @@ pub struct SupervisorConfig {
     /// Where to publish the chosen port so clients can discover it
     /// (CS5: the ephemeral port was previously only a tracing line).
     pub port_file: Option<PathBuf>,
+    /// Per-boot `--requirepass` token for the supervised store. Loopback
+    /// is shared with every local process; without it any of them owns
+    /// the graph (§4.3 data-plane privacy).
+    pub auth_token: Option<String>,
 }
 
 /// Where the supervised server landed.
@@ -39,6 +43,8 @@ pub struct SupervisedServer {
     pub port: u16,
     /// Restarts performed since spawn (CS5).
     pub restarts: u32,
+    /// The access token the server enforces, if any (shutdown needs it).
+    auth_token: Option<String>,
 }
 
 impl Drop for SupervisedServer {
@@ -46,7 +52,7 @@ impl Drop for SupervisedServer {
         // Preserve the embedded graph across wrapper restarts. Redis performs
         // a final synchronous snapshot before exit; a bounded hard kill is
         // only the fallback for a wedged child.
-        request_shutdown(self.port);
+        request_shutdown(self.port, self.auth_token.as_deref());
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             if self.child.try_wait().ok().flatten().is_some() {
@@ -79,7 +85,7 @@ impl SupervisedServer {
                     "supervised server crashed; restarting"
                 );
                 self.child = spawn_child(cfg)?;
-                if !wait_ping(cfg.port, &mut self.child)? {
+                if !wait_ping(cfg, &mut self.child)? {
                     anyhow::bail!("supervised server restart did not answer PING");
                 }
             }
@@ -92,10 +98,13 @@ impl SupervisedServer {
 
 /// Spawn the raw child (CS5: shared by spawn + restart).
 fn spawn_child(cfg: &SupervisorConfig) -> anyhow::Result<Child> {
-    Command::new(&cfg.redis_server_bin)
+    let mut command = Command::new(&cfg.redis_server_bin);
+    command
         .args([
             "--port",
             &cfg.port.to_string(),
+            "--bind",
+            "127.0.0.1",
             "--save",
             "1 1",
             "--appendonly",
@@ -106,7 +115,11 @@ fn spawn_child(cfg: &SupervisorConfig) -> anyhow::Result<Child> {
         ])
         .arg(&cfg.data_dir)
         .arg("--loadmodule")
-        .arg(&cfg.falkordb_module)
+        .arg(&cfg.falkordb_module);
+    if let Some(token) = &cfg.auth_token {
+        command.arg("--requirepass").arg(token);
+    }
+    command
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -114,13 +127,13 @@ fn spawn_child(cfg: &SupervisorConfig) -> anyhow::Result<Child> {
 }
 
 /// Wait for PING with the startup deadline; errors if the child exits.
-fn wait_ping(port: u16, child: &mut Child) -> anyhow::Result<bool> {
+fn wait_ping(cfg: &SupervisorConfig, child: &mut Child) -> anyhow::Result<bool> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if child.try_wait()?.is_some() {
             anyhow::bail!("supervised redis-server exited during startup");
         }
-        if ping(port) {
+        if ping(cfg.port, cfg.auth_token.as_deref()) {
             return Ok(true);
         }
         if Instant::now() > deadline {
@@ -165,44 +178,81 @@ pub fn resolve_paths(
 /// Spawn the supervised FalkorDB server and wait for it to answer PING.
 /// CS5 (audit): the chosen port is written to `cfg.port_file` (if set) so
 /// clients can discover where the supervised store landed — previously it
-/// existed only in a tracing line.
+/// existed only in a tracing line. The file is private to this user: the
+/// port names a data plane that (with an auth token) only this boot can
+/// use.
 pub fn spawn_supervised(cfg: &SupervisorConfig) -> anyhow::Result<SupervisedServer> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let mut child = spawn_child(cfg)?;
-    if !wait_ping(cfg.port, &mut child)? {
+    if !wait_ping(cfg, &mut child)? {
         let _ = child.kill();
         anyhow::bail!("supervised FalkorDB server did not answer PING within 10s");
     }
     if let Some(path) = &cfg.port_file {
-        std::fs::write(path, cfg.port.to_string())?;
+        exocortex_storage::bounded_io::atomic_write_private(
+            path,
+            cfg.port.to_string().as_bytes(),
+            "supervised port",
+        )?;
     }
     tracing::info!(port = cfg.port, "supervised FalkorDB server up");
     Ok(SupervisedServer {
         child,
         port: cfg.port,
         restarts: 0,
+        auth_token: cfg.auth_token.clone(),
     })
 }
 
-/// Minimal inline PING without a redis dependency.
-fn ping(port: u16) -> bool {
+/// Connection URLs for the supervised store: the per-boot token rides the
+/// URL authority so the storage clients authenticate without separate
+/// plumbing. Returns unauthenticated URLs when no token is configured.
+pub fn supervised_store_urls(port: u16, auth_token: Option<&str>) -> (String, String) {
+    let authority = auth_token
+        .map(|token| format!(":{token}@"))
+        .unwrap_or_default();
+    (
+        format!("falkor://{authority}127.0.0.1:{port}"),
+        format!("redis://{authority}127.0.0.1:{port}"),
+    )
+}
+
+/// Minimal inline AUTH + PING without a redis dependency. The token rides
+/// an inline command, so it must not contain spaces (callers pass hex).
+fn ping(port: u16, auth_token: Option<&str>) -> bool {
     use std::io::{Read, Write};
     let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
         return false;
     };
+    let mut buf = [0u8; 128];
+    if let Some(token) = auth_token {
+        if s.write_all(format!("AUTH {token}\r\n").as_bytes()).is_err() {
+            return false;
+        }
+        let Ok(n) = s.read(&mut buf) else {
+            return false;
+        };
+        if !buf[..n].starts_with(b"+OK") {
+            return false;
+        }
+    }
     if s.write_all(b"PING\r\n").is_err() {
         return false;
     }
-    let mut buf = [0u8; 64];
     let Ok(n) = s.read(&mut buf) else {
         return false;
     };
     buf[..n].windows(4).any(|w| w == b"PONG" || w == b"+PON")
 }
 
-fn request_shutdown(port: u16) {
-    use std::io::Write as _;
+fn request_shutdown(port: u16, auth_token: Option<&str>) {
+    use std::io::{Read as _, Write as _};
     if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+        if let Some(token) = auth_token {
+            let _ = stream.write_all(format!("AUTH {token}\r\n").as_bytes());
+            // Drain the AUTH reply so SHUTDOWN is parsed as its own command.
+            let _ = stream.read(&mut [0u8; 64]);
+        }
         let _ = stream.write_all(b"SHUTDOWN SAVE\r\n");
     }
 }
@@ -231,6 +281,7 @@ mod tests {
             port: 0,
             max_restarts: 2,
             port_file: None,
+            auth_token: None,
         };
         let mut server = SupervisedServer {
             child: Command::new("/bin/sleep")
@@ -241,6 +292,7 @@ mod tests {
                 .unwrap(),
             port: 0,
             restarts: 0,
+            auth_token: None,
         };
         // Kill the live child so the loop sees a crash and restarts it.
         server.child.kill().unwrap();
@@ -283,6 +335,7 @@ mod tests {
             child,
             port: 0,
             restarts: 0,
+            auth_token: None,
         };
         drop(server);
         // The child must be gone: kill(pid) fails with ESRCH (or the pid
@@ -303,5 +356,60 @@ mod tests {
     fn free_port_returns_open_port() {
         let port = free_port().unwrap();
         assert!(port > 0);
+    }
+
+    #[test]
+    fn supervised_store_urls_embed_the_per_boot_token() {
+        let (falkor, redis) = supervised_store_urls(16379, Some("a1b2c3"));
+        assert_eq!(falkor, "falkor://:a1b2c3@127.0.0.1:16379");
+        assert_eq!(redis, "redis://:a1b2c3@127.0.0.1:16379");
+        let (falkor, redis) = supervised_store_urls(16379, None);
+        assert_eq!(falkor, "falkor://127.0.0.1:16379");
+        assert_eq!(redis, "redis://127.0.0.1:16379");
+    }
+
+    /// §4.3 data-plane privacy, live leg: with a token configured, the
+    /// supervised server refuses unauthenticated commands and answers the
+    /// authenticated handshake. Skips loudly without a local server
+    /// binary (CI runs this topology through docker-compose instead).
+    #[test]
+    fn supervised_store_rejects_unauthenticated_local_peers() {
+        let (Ok(bin), Ok(module)) = (
+            std::env::var("EXOCORTEX_REDIS_SERVER"),
+            std::env::var("EXOCORTEX_FALKORDB_MODULE"),
+        ) else {
+            eprintln!(
+                "SKIP supervised_store_rejects_unauthenticated_local_peers: \
+                 EXOCORTEX_REDIS_SERVER/EXOCORTEX_FALKORDB_MODULE absent; live suite unexecuted"
+            );
+            return;
+        };
+        let data_dir =
+            std::env::temp_dir().join(format!("exocortex-supervisor-auth-{}", std::process::id()));
+        let cfg = SupervisorConfig {
+            redis_server_bin: bin.into(),
+            falkordb_module: module.into(),
+            data_dir: data_dir.clone(),
+            port: free_port().unwrap(),
+            max_restarts: 0,
+            port_file: None,
+            auth_token: Some("5f4d3c2b1a5f4d3c2b1a5f4d3c2b1a5f4d3c2b1a5f4d3c2b1a".into()),
+        };
+        let server = spawn_supervised(&cfg).expect("supervised server with auth starts");
+        let refused = {
+            use std::io::{Read, Write};
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+            stream.write_all(b"PING\r\n").unwrap();
+            let mut reply = [0u8; 64];
+            let n = stream.read(&mut reply).unwrap();
+            reply[..n].windows(6).any(|window| window == b"NOAUTH")
+        };
+        assert!(refused, "an unauthenticated local peer is refused");
+        assert!(
+            ping(server.port, cfg.auth_token.as_deref()),
+            "the authenticated handshake still answers"
+        );
+        drop(server);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }
