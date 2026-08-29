@@ -131,6 +131,30 @@ actions! {
 
 The kernel-generated MCP tool for `AttachRuleFinding` gets a typed schema, a preflight tool, and the same rejection-code discipline as the wrapup path. Every Action produces an audit row keyed by its name.
 
+**RESOLVED by PX2-S1 (2026-08-29), outcome (a): both sections are
+expressible in plain `macro_rules!` — no proc-macro, no new
+dependencies.** The `macros.rs:93` constraint is about capturing
+NON-Rust DSL text for a downstream text compiler (Crepe), where only
+the source string survives; Rust bodies need the opposite treatment
+and `macro_rules!` provides it. The executable proof
+(`crates/exocortex-kernel/tests/actions_macro_spike.rs`) demonstrates:
+(1) `actions!` bodies — semicolons, nested braces with interior
+semicolons, and references to pack-emitted enums — capture as
+`$($body:tt)*` (or `:block` for whole Rust bodies; a `:ty` fragment
+may not be followed by `->`, so signatures capture as token groups)
+and re-emit into generated functions that type-check in the pack
+crate, so "Actions are typed transforms" and the visibility-ceiling
+guarantee stay compile-time properties; (2) `functions!`
+`datalog!`/`scheme!` bodies capture exactly like `crepe_rules!`
+(matcher-level braces align with the invocation's brace group, so the
+capture cannot swallow the closing brace) and `stringify!` downstream.
+Two mechanical notes for the implementer: tt-muncher accumulators must
+stay `tt` (an `expr` accumulator re-parses non-Rust bodies and
+fails), and the catch-all entry arm must be declared AFTER the
+recursion arms or it shadows them. `macro_rules!` cannot splice
+identifiers, so per-verb constants become registry arrays pairing
+names with sources.
+
 **Unvalidated assumption — resolve before starting 1a.** That sketch assumes `actions!` bodies can be written in `macro_rules!`. `crates/exocortex-kernel/src/macros.rs:93` records the opposite constraint for the section next door: *"`macro_rules!` cannot tokenize past `;` inside a body, so the whole block is captured as text"* — which is why `CREPE_RULES_SRC` is a `stringify!`. The body above is semicolon-separated statements inside a body: the same shape. `functions!` is likely safer, since `datalog!` and `scheme!` bodies are already text compiled downstream by the reasoning and Steel engines; `actions!` is the exposed one, because an Action body constructs pack-typed memories and edges and there is no crate downstream of the pack that could compile that text. If the constraint holds, this deliverable needs a proc-macro — a new crate, new dependencies, and a materially larger D2 — and, more importantly, if bodies end up untyped then P3's "typed transforms" and this section's visibility-ceiling guarantee stop being compile-time properties. Master plan **PX2-S1** is the spike; it is not blocked by Wave 0.
 
 **Functions.** A pack-registered Function is a typed read with a compiled body (Datalog fragment or Scheme program), a signature, and a latency budget in the same `P50_BUDGET_US` / `P99_BUDGET_US` shape the kernel `Function` trait already declares. The kernel dispatches it, enforces the visibility filter of the caller, and returns typed results. No LLM.

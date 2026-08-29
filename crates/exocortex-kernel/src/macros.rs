@@ -89,9 +89,13 @@ macro_rules! pack {
             $crate::__kind_rows!(@rows [] $($kentries)*);
 
         /// Pack-local Crepe rules, verbatim source (§7.18). Rule ids are
-        /// extracted from this source deterministically at build time;
-        /// `macro_rules!` cannot tokenize past `;` inside a body, so the
-        /// whole block is captured as text.
+        /// extracted from this source deterministically at build time.
+        /// The block is captured as TEXT because Crepe is not Rust and
+        /// only the downstream `crepe_rules!` compiler can parse it.
+        /// (PX2-S1 sharpened this note: `macro_rules!` CAN tokenize
+        /// past `;` — `$($x:tt)*` and `:block` both do — the text
+        /// capture here serves the downstream text compiler, which
+        /// token structure would not.)
         pub static CREPE_RULES_SRC: &'static str = stringify!($($crepe_src)*);
 
         #[doc = concat!("Build the `PackDef` for pack `", $name, "`. The value is deterministic for a given pack version; the fingerprint over it is stable across processes.")]
