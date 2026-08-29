@@ -1070,6 +1070,13 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "create_memory_type_id_index",
+        read_only: false,
+        required_params: &[],
+        cypher: "CREATE INDEX FOR (m:Memory) ON (m.memory_type_id)",
+    });
+
+    reg!(Template {
         id: "repair_memory_attribute_index_v1",
         read_only: false,
         required_params: &[],

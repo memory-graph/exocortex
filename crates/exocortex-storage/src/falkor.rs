@@ -494,6 +494,7 @@ impl FalkorStorage {
         this.migrate_schema().await?;
         this.repair_legacy_memories().await?;
         this.ensure_memory_attribute_index().await?;
+        this.ensure_memory_type_id_index().await?;
         this.ensure_dreams_cycle_success_index().await?;
         Ok(this)
     }
@@ -807,6 +808,24 @@ impl FalkorStorage {
                 &serde_json::json!({}),
                 false,
             )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(StorageError::Backend(detail))
+                if detail.contains("already indexed") || detail.contains("already exists") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Region working-set queries filter on `memory_type_id` (Dreams runs
+    /// them at least twice per fired region); without this index each pass
+    /// is a full label scan over the org.
+    async fn ensure_memory_type_id_index(&self) -> Result<(), StorageError> {
+        match self
+            .run_template("create_memory_type_id_index", &serde_json::json!({}), false)
             .await
         {
             Ok(_) => Ok(()),
