@@ -404,7 +404,9 @@ async fn org_backup_main(args: Args) -> anyhow::Result<()> {
                 ontology.clone(),
             )
             .await?;
-            let (m, r) = org_backup::export_org(&storage, org, &fingerprint, path).await?;
+            let (m, r) =
+                org_backup::export_org(&storage, org, &fingerprint, &ontology.summary, path)
+                    .await?;
             println!("{m} memories, {r} relationships -> {}", path.display());
         } else if args.storage == "memory" {
             anyhow::bail!("--storage=memory is non-durable; export from falkor:// instead");

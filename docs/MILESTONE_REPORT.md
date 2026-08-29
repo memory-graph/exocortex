@@ -468,6 +468,17 @@ proto-sync-guarded copy).
   cardinality contract. The implementation reports `reason="capacity"` and
   keeps region identity in protected operational state, so dashboards must
   aggregate overflow rather than group it by raw region.
+- **The audit ledger stamps the compatibility fingerprint, not the build
+  fingerprint.** OC-PRD D1 places the build hash "in `--verify`, `/health`,
+  diagnostics, and the audit ledger"; R-T21 stamps every audited Action with
+  "the `OntologyFingerprint` current at execution". Those two sentences
+  disagree once the fingerprint splits, and the audit row shape (persisted,
+  assertion-coupled, `[u8; 32]`) predates the split. Resolution: the ledger
+  keeps stamping the value R-T21 names — now the compatibility fingerprint,
+  which is the ontology actually in force — while the build fingerprint
+  surfaces in `exocortex --verify` and `/health/cluster`. Per-write build
+  attribution stays out per OC-PRD open question 1's assumption (diagnostics
+  only) until a real incident wants it.
 - **The v1 `storage-conformance` command is a target-suite umbrella, not the
   bug-PRD §2.1 shared corpus.** It always runs the in-memory storage crate suite
   and, when `FALKOR_URL` is present, separately executes the live Falkor

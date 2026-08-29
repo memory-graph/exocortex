@@ -52,11 +52,14 @@ run — read the gate's own output before claiming it passed.
 
 ## Fingerprint changes mean you broke something
 
-`cargo xtask fingerprint` must stay byte-stable at `e1f7d17b…ddc9b2`. If
-it moves and you did not deliberately change the ontology, that is the
-signal — do not update the golden to make the gate green. An intended
-ontology change updates the golden, `AGENTS.md`, and the master plan in
-the same commit.
+`cargo xtask fingerprint` prints two lines (OC-PRD D1): line 1 is the
+compatibility fingerprint (`d60a2467…4ef52`) — the "if this moved you
+broke something" value; line 2 is the build fingerprint
+(`e1f7d17b…ddc9b2`, the unchanged v1-scheme value) which only reports.
+If the compatibility line moves and you did not deliberately change the
+ontology, that is the signal — do not update the golden to make the
+gate green. An intended ontology change updates the golden, `AGENTS.md`,
+and the master plan in the same commit.
 
 ## Iterating vs. claiming done
 

@@ -52,6 +52,9 @@ pub struct FalkorStorage {
     node_id: SmolStr,
     org_id: SmolStr,
     ontology: Arc<Ontology>,
+    /// Compatibility fingerprints recognized from producers (OC-PRD
+    /// D2): current first, then the pinned record's history.
+    recognized: Vec<[u8; 32]>,
     lsn_key: String,
     channel: String,
     publication_claim_seq: AtomicU64,
@@ -252,36 +255,60 @@ fn relationship_from_value(v: &FalkorValue) -> Result<Relationship, StorageError
         .map_err(|error| StorageError::Backend(format!("bad rel props_json: {error}")))
 }
 
-fn decode_persisted_fingerprint(
-    rows: &[Vec<FalkorValue>],
-) -> Result<Option<[u8; 32]>, StorageError> {
+/// Read the raw persisted pin value (OC-PRD D4). `None` means the
+/// graph has no pin row yet; any non-string value is corruption.
+/// Whether the string is a legacy v1 64-hex value or a scheme-2 JSON
+/// record is decided by the kernel's `parse_pin`.
+fn read_persisted_pin_value(rows: &[Vec<FalkorValue>]) -> Result<Option<String>, StorageError> {
     let Some(value) = rows.first().and_then(|row| row.first()) else {
         return Ok(None);
     };
     let FalkorValue::String(encoded) = value else {
         return Err(StorageError::CorruptMetadata {
             key: "ontology_fingerprint",
-            detail: "expected a 64-character hexadecimal string".into(),
+            detail: "expected a hexadecimal string or a scheme-2 record".into(),
         });
     };
-    if encoded.len() != 64 {
+    Ok(Some(encoded.clone()))
+}
+
+/// Build the recognized list (current first, then accepted history,
+/// deduplicated; OC-PRD D2 producer window).
+fn recognized_list<'a>(
+    current: impl Iterator<Item = String> + 'a,
+    accepted: &'a [String],
+) -> Result<Vec<[u8; 32]>, StorageError> {
+    let mut out = Vec::new();
+    for entry in current.chain(accepted.iter().cloned()) {
+        let fp = parse_hex_fingerprint(&entry)?;
+        if !out.contains(&fp) {
+            out.push(fp);
+        }
+    }
+    Ok(out)
+}
+
+/// Parse one 64-hex entry of a pin record's accepted history.
+fn parse_hex_fingerprint(value: &str) -> Result<[u8; 32], StorageError> {
+    let mut out = [0u8; 32];
+    if value.len() != 64 {
         return Err(StorageError::CorruptMetadata {
             key: "ontology_fingerprint",
             detail: format!(
-                "expected 64 hexadecimal characters, found {}",
-                encoded.len()
+                "accepted entry must be 64 hex characters, found {}",
+                value.len()
             ),
         });
     }
-    let mut fingerprint = [0u8; 32];
-    for (index, byte) in fingerprint.iter_mut().enumerate() {
-        let pair = &encoded[index * 2..index * 2 + 2];
-        *byte = u8::from_str_radix(pair, 16).map_err(|_| StorageError::CorruptMetadata {
-            key: "ontology_fingerprint",
-            detail: format!("invalid hexadecimal byte at offset {}", index * 2),
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).map_err(|_| {
+            StorageError::CorruptMetadata {
+                key: "ontology_fingerprint",
+                detail: format!("invalid hexadecimal byte at offset {i}"),
+            }
         })?;
     }
-    Ok(Some(fingerprint))
+    Ok(out)
 }
 
 fn decode_settled_ingest(row: &[FalkorValue]) -> Result<SettledIngestBatch, StorageError> {
@@ -440,7 +467,7 @@ impl FalkorStorage {
             .get_multiplexed_async_connection()
             .await
             .map_err(|e| StorageError::Backend(e.to_string()))?;
-        let this = Self {
+        let mut this = Self {
             client,
             graph: cfg.graph_name,
             redis_client,
@@ -448,6 +475,7 @@ impl FalkorStorage {
             node_id: cfg.node_id,
             org_id: cfg.org_id.clone(),
             ontology,
+            recognized: Vec::new(),
             lsn_key: format!("exocortex:{}:lsn", cfg.org_id),
             channel: format!("exocortex:{}:inv", cfg.org_id),
             publication_claim_seq: AtomicU64::new(0),
@@ -499,40 +527,45 @@ impl FalkorStorage {
         Ok(this)
     }
 
-    /// Read the persisted fingerprint. If empty, write ours. If present and
-    /// different, refuse to start (R-D5).
-    async fn pin_fingerprint(&self, graph_exists: bool) -> Result<(), StorageError> {
+    /// Read the persisted ontology pin. If absent, write ours (schema
+    /// guarded). If present, consult the kernel's node-to-graph
+    /// compatibility policy (OC-PRD D2): a legacy v1 value matching
+    /// this build's v1-scheme recomputation migrates to a scheme-2
+    /// record; a pinned summary this runtime is a superset of advances
+    /// the pin (retaining the prior fingerprint for the producer
+    /// rolling window); anything else refuses to start (R-D5).
+    async fn pin_fingerprint(&mut self, graph_exists: bool) -> Result<(), StorageError> {
         // FalkorDB refuses read queries on a graph key that does not exist
         // yet; only read the pinned fingerprint once the graph has data.
-        let rows = if graph_exists {
-            self.run_template("read_fingerprint", &serde_json::json!({}), true)
-                .await?
-        } else {
-            vec![]
-        };
-        let stored = decode_persisted_fingerprint(&rows)?;
-        let runtime = self.ontology.fingerprint.0;
-        match stored {
-            None => {
-                let hexfp = {
-                    use std::fmt::Write as _;
-                    let mut out = String::with_capacity(64);
-                    for b in runtime {
-                        let _ = write!(out, "{b:02x}");
-                    }
-                    out
-                };
+        const MAX_PIN_ATTEMPTS: usize = 8;
+        let mut graph_exists = graph_exists;
+        for _ in 0..MAX_PIN_ATTEMPTS {
+            let rows = if graph_exists {
+                self.run_template("read_fingerprint", &serde_json::json!({}), true)
+                    .await?
+            } else {
+                vec![]
+            };
+            let raw = read_persisted_pin_value(&rows)?;
+            let Some(stored) = raw else {
+                // Fresh pin: create under the schema guard, exactly one
+                // initializer wins (R-T21 CAS).
+                let record = exocortex_kernel::PinnedOntology::describing(&self.ontology);
+                let value = serde_json::to_string(&record)
+                    .map_err(|e| StorageError::Backend(format!("encode pin record: {e}")))?;
                 let rows = self
                     .run_template(
                         "write_fingerprint_if_schema_compatible",
                         &serde_json::json!({
-                            "fp": hexfp,
+                            "fp": value,
                             "max_schema": STORAGE_SCHEMA_VERSION,
                         }),
                         false,
                     )
                     .await?;
                 if rows.is_empty() {
+                    // Lost the create race or the schema guard rejected
+                    // us; re-read and re-evaluate before deciding.
                     let schema = self
                         .run_template("read_schema_version", &serde_json::json!({}), true)
                         .await?;
@@ -540,21 +573,103 @@ impl FalkorStorage {
                     let fingerprint = self
                         .run_template("read_fingerprint", &serde_json::json!({}), true)
                         .await?;
-                    return match decode_persisted_fingerprint(&fingerprint)? {
-                        Some(storage) => {
-                            Err(StorageError::FingerprintMismatch { storage, runtime })
+                    match read_persisted_pin_value(&fingerprint)? {
+                        Some(_) => {
+                            // A racing initializer created the graph
+                            // under us; evaluate their pin, not another
+                            // create.
+                            graph_exists = true;
+                            continue;
                         }
-                        None => Err(StorageError::Backend(
-                            "fingerprint pin was rejected by schema guard".into(),
-                        )),
+                        None => {
+                            return Err(StorageError::Backend(
+                                "fingerprint pin was rejected by schema guard".into(),
+                            ))
+                        }
+                    }
+                }
+                tracing::info!(
+                    fingerprint = %hex_digest(&self.ontology.fingerprint.0),
+                    "pinned ontology fingerprint"
+                );
+                self.recognized = vec![self.ontology.fingerprint.0];
+                return Ok(());
+            };
+            let pin = exocortex_kernel::compatibility::parse_pin(&stored).map_err(|e| {
+                StorageError::CorruptMetadata {
+                    key: "ontology_fingerprint",
+                    detail: e.to_string(),
+                }
+            })?;
+            let accepted = match &pin {
+                exocortex_kernel::PersistedPin::V2(record) => record.accepted.clone(),
+                exocortex_kernel::PersistedPin::LegacyV1(fp) => vec![hex_digest(fp)],
+                exocortex_kernel::PersistedPin::Absent => Vec::new(),
+            };
+            match exocortex_kernel::admit_node_graph(pin, &self.ontology) {
+                Ok(exocortex_kernel::NodeGraphDecision::Satisfied) => {
+                    let current = Some(hex_digest(&self.ontology.fingerprint.0));
+                    self.recognized = recognized_list(current.into_iter(), &accepted)?;
+                    return Ok(());
+                }
+                Ok(exocortex_kernel::NodeGraphDecision::Advance(next))
+                | Ok(exocortex_kernel::NodeGraphDecision::Migrate(next)) => {
+                    let to = serde_json::to_string(&next)
+                        .map_err(|e| StorageError::Backend(format!("encode pin record: {e}")))?;
+                    let rows = self
+                        .run_template(
+                            "replace_fingerprint_record",
+                            &serde_json::json!({
+                                "from": stored,
+                                "to": to,
+                                "max_schema": STORAGE_SCHEMA_VERSION,
+                            }),
+                            false,
+                        )
+                        .await?;
+                    if rows.is_empty() {
+                        // Another writer moved the pin under us (or the
+                        // schema guard rejected the replacement);
+                        // re-read and re-evaluate.
+                        continue;
+                    }
+                    self.recognized = recognized_list(
+                        std::iter::once(next.compatibility.clone()),
+                        &next.accepted,
+                    )?;
+                    tracing::info!(
+                        fingerprint = %next.compatibility,
+                        "advanced pinned ontology fingerprint"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    return match error {
+                        exocortex_kernel::CompatibilityError::CorruptRecord(detail) => {
+                            Err(StorageError::CorruptMetadata {
+                                key: "ontology_fingerprint",
+                                detail,
+                            })
+                        }
+                        other => match other.hash_pair() {
+                            Some((storage, runtime)) => {
+                                Err(StorageError::FingerprintMismatch { storage, runtime })
+                            }
+                            // NotASuperset carries structure, not hashes;
+                            // synthesize the pair from the pinned claim so
+                            // the refusal shape stays R-D5's.
+                            None => Err(StorageError::FingerprintMismatch {
+                                storage: [0; 32],
+                                runtime: self.ontology.fingerprint.0,
+                            }),
+                        },
                     };
                 }
-                tracing::info!(fingerprint = %hexfp, "pinned ontology fingerprint");
-                Ok(())
             }
-            Some(storage) if storage == runtime => Ok(()),
-            Some(storage) => Err(StorageError::FingerprintMismatch { storage, runtime }),
         }
+        Err(StorageError::Backend(
+            "ontology pin could not converge: repeated compare-and-set races".into(),
+        ))
     }
 
     async fn migrate_schema(&self) -> Result<(), StorageError> {
@@ -4200,6 +4315,9 @@ impl Storage for FalkorStorage {
     fn ontology_fingerprint(&self) -> [u8; 32] {
         self.ontology.fingerprint.0
     }
+    fn recognized_ontology_fingerprints(&self) -> Vec<[u8; 32]> {
+        self.recognized.clone()
+    }
 }
 
 impl FalkorStorage {
@@ -4351,20 +4469,52 @@ mod fingerprint_decode_tests {
 
     #[test]
     fn malformed_persisted_fingerprint_is_not_missing() {
-        assert_eq!(decode_persisted_fingerprint(&[]).unwrap(), None);
-        for value in [
-            FalkorValue::String("0".repeat(63)),
-            FalkorValue::String(format!("{}zz", "0".repeat(62))),
-            FalkorValue::I64(7),
+        assert_eq!(read_persisted_pin_value(&[]).unwrap(), None);
+        // Non-string values are corruption at the decode boundary.
+        assert!(matches!(
+            read_persisted_pin_value(&[vec![FalkorValue::I64(7)]]),
+            Err(StorageError::CorruptMetadata {
+                key: "ontology_fingerprint",
+                ..
+            })
+        ));
+        // String values defer to the kernel pin parser, which fails
+        // closed on short hex, bad hex, malformed JSON, and foreign
+        // schemes (OC-PRD D4 tri-state).
+        for malformed in [
+            "0".repeat(63),
+            format!("{}zz", "0".repeat(62)),
+            "{not json".to_string(),
+            "{\"scheme\":3}".to_string(),
         ] {
-            assert!(matches!(
-                decode_persisted_fingerprint(&[vec![value]]),
-                Err(StorageError::CorruptMetadata {
-                    key: "ontology_fingerprint",
-                    ..
-                })
-            ));
+            assert!(exocortex_kernel::compatibility::parse_pin(&malformed).is_err());
         }
+        // A well-formed legacy value and a scheme-2 record both parse.
+        let legacy = "e".repeat(64);
+        assert!(matches!(
+            exocortex_kernel::compatibility::parse_pin(&legacy),
+            Ok(exocortex_kernel::PersistedPin::LegacyV1(_))
+        ));
+        let record = exocortex_kernel::PinnedOntology {
+            scheme: 2,
+            compatibility: legacy.clone(),
+            build: legacy.clone(),
+            summary: exocortex_kernel::OntologySummary {
+                memory_types: vec!["Problem".into()],
+                entity_types: vec![],
+                kinds: vec![],
+                type_triples: vec![],
+                rule_ids: vec![],
+            },
+            accepted: vec![],
+        };
+        let encoded = serde_json::to_string(&record).unwrap();
+        assert!(matches!(
+            exocortex_kernel::compatibility::parse_pin(&encoded),
+            Ok(exocortex_kernel::PersistedPin::V2(_))
+        ));
+        // The recognized list builder rejects corrupt accepted entries.
+        assert!(recognized_list(std::iter::once(legacy.clone()), &["zz".into()]).is_err());
     }
 
     #[test]

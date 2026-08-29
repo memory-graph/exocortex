@@ -405,8 +405,18 @@ impl<S: Storage> IngestServer<S> {
         self.producer_key(&b.org_id, &b.source_uri, &b.producer_id)
     }
 
-    fn ontology_matches(&self, b: &IngestBatch) -> bool {
-        b.ontology_fingerprint.as_slice() == self.ontology.fingerprint.0.as_slice()
+    fn ontology_matches(&self, b: &IngestBatch) -> Result<(), String> {
+        // OC-PRD D2 (ingest row): the producer's compatibility
+        // fingerprint must be current or recognized from the pinned
+        // record's rolling-upgrade history — a producer may know less
+        // than the server, never more. The error text is the legible
+        // rejection a subset node owes a superset producer (D3).
+        exocortex_kernel::admit_producer_batch(
+            &b.ontology_fingerprint,
+            &self.ontology,
+            &self.storage.recognized_ontology_fingerprints(),
+        )
+        .map_err(|e| e.to_string())
     }
 
     fn request_principal<T>(
@@ -1040,11 +1050,11 @@ impl<S: Storage + 'static> IngestServer<S> {
                 "checksum mismatch",
             ));
         }
-        if !self.ontology_matches(batch) {
+        if let Err(detail) = self.ontology_matches(batch) {
             return Err(ack_reject_all(
                 batch,
                 RejectCode::IncompatibleOntology,
-                "ontology fingerprint mismatch",
+                &detail,
             ));
         }
         if self

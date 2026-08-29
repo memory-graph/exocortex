@@ -38,21 +38,33 @@ pub struct Backup {
     pub version: u32,
     /// RFC 3339 export time.
     pub created_at: String,
-    /// Hex of the effective ontology fingerprint at export time.
+    /// Hex of the effective ontology fingerprint at export time (the
+    /// compatibility level since OC-PRD D1).
     pub ontology_fingerprint: String,
+    /// The structured ontology summary at export time (OC-PRD D2
+    /// backup row): present in every post-OC export, absent in
+    /// pre-OC documents (which keep the legacy exact-match gate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ontology_summary: Option<exocortex_kernel::OntologySummary>,
     /// Every WAL entry, in local-LSN order, in the WAL's own row shape.
     pub entries: Vec<WalEntry>,
 }
 
 /// Export every entry to `path` (pretty JSON, LSN order). Returns the
 /// entry count.
-pub fn export(wal: &Wal, fingerprint: &str, path: &std::path::Path) -> Result<usize> {
+pub fn export(
+    wal: &Wal,
+    fingerprint: &str,
+    summary: &exocortex_kernel::OntologySummary,
+    path: &std::path::Path,
+) -> Result<usize> {
     let entries = wal.entries().context("read WAL for backup")?;
     let doc = Backup {
         format: FORMAT.into(),
         version: VERSION,
         created_at: chrono::Utc::now().to_rfc3339(),
         ontology_fingerprint: fingerprint.into(),
+        ontology_summary: Some(summary.clone()),
         entries,
     };
     let n = doc.entries.len();
@@ -96,12 +108,28 @@ pub fn import(
         "backup version {} unsupported (this build reads {VERSION})",
         doc.version
     );
-    let expected = hex(&ontology.fingerprint.0);
-    anyhow::ensure!(
-        doc.ontology_fingerprint == expected,
-        "ontology fingerprint mismatch: backup {} vs binary {expected} — the backup was written against a different pack set",
-        doc.ontology_fingerprint
-    );
+    // OC-PRD D2 (backup row): superset accepted, because every draft
+    // is revalidated against the current rulebook below before the WAL
+    // is touched. Post-OC documents prove their subset structurally;
+    // pre-OC documents carry only the v1-scheme hash and keep exact
+    // equality against this build's recomputation.
+    let verdict = match &doc.ontology_summary {
+        Some(summary) => exocortex_kernel::admit_backup(
+            exocortex_kernel::BackupOntology::Summarized { summary },
+            ontology,
+        ),
+        None => exocortex_kernel::admit_backup(
+            exocortex_kernel::BackupOntology::Legacy {
+                fingerprint_hex: &doc.ontology_fingerprint,
+            },
+            ontology,
+        ),
+    };
+    if let Err(error) = verdict {
+        anyhow::bail!(
+            "ontology mismatch: {error} — the backup was written against a different pack set"
+        );
+    }
     // Revalidate every draft against the one rulebook before touching
     // the WAL. Any rejection aborts the whole import.
     for (i, e) in doc.entries.iter().enumerate() {
@@ -129,15 +157,6 @@ pub fn import(
         imported,
         first_local_lsn: first,
     })
-}
-
-fn hex(b: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(b.len() * 2);
-    for x in b {
-        let _ = write!(s, "{x:02x}");
-    }
-    s
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ cargo xtask gen-playbook
 cargo xtask no-llm
 cargo xtask proto-sync
 cargo xtask signing-hygiene
+cargo xtask compatibility-policy
 cargo xtask metrics-hygiene
 cargo xtask wire-standalone
 cargo xtask bench

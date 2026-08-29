@@ -166,7 +166,7 @@ fn main() -> anyhow::Result<()> {
     };
     if let Some(path) = &args.export {
         let wal = wal::Wal::open(&data_dir.join("wal"))?;
-        let n = exocortex_client::backup::export(&wal, &fingerprint_hex, path)?;
+        let n = exocortex_client::backup::export(&wal, &fingerprint_hex, &ontology.summary, path)?;
         println!("{n} entries -> {}", path.display());
         return Ok(());
     }
@@ -475,6 +475,23 @@ fn verify(
 ) -> anyhow::Result<()> {
     let mut red = 0usize;
 
+    // 0. Ontology identity (OC-PRD D1): the compatibility fingerprint
+    // gates; the build fingerprint reports. Both printed so two
+    // installs can be compared field by field.
+    {
+        use std::fmt::Write as _;
+        let mut compat = String::with_capacity(64);
+        for b in ontology.fingerprint.0 {
+            let _ = write!(compat, "{b:02x}");
+        }
+        let mut build = String::with_capacity(64);
+        for b in ontology.build_fingerprint.0 {
+            let _ = write!(build, "{b:02x}");
+        }
+        println!("  ok    ontology: compatibility {compat}");
+        println!("  ok    ontology: build         {build}");
+    }
+
     // 1. Playbook installed and current.
     let version_file = data_dir.join("version.txt");
     let installed = std::fs::read_to_string(&version_file).unwrap_or_default();
@@ -546,7 +563,10 @@ fn verify(
                 .await
                 .map_err(|e| e.to_string())?
                 .into_inner();
-            Ok(fp.fingerprint.as_slice() == ontology.fingerprint.0.as_slice())
+            // R-D5 client↔backend admission; the rule itself is the
+            // kernel's peer policy (OC-PRD D2) — exact
+            // compatibility-fingerprint equality.
+            Ok(exocortex_kernel::admit_peer(&fp.fingerprint, &ontology.fingerprint.0).is_ok())
         });
         match outcome {
             Ok(true) => println!("  ok    backend: {backend} reachable, fingerprint matches"),

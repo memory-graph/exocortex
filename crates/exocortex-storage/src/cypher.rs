@@ -1369,6 +1369,25 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
     });
 
     reg!(Template {
+        id: "replace_fingerprint_record",
+        read_only: false,
+        required_params: &["from", "to", "max_schema"],
+        // OC-PRD D4: atomic v1->v2 migration and superset pin advance.
+        // The `m.value = $from` predicate makes this a compare-and-set;
+        // a racing writer changes the outcome to zero rows, which the
+        // caller treats as "re-read and re-evaluate".
+        cypher: r#"
+            MERGE (v:_ExocortexMeta {key: 'schema_version'})
+            ON CREATE SET v.value = 0
+            WITH v WHERE v.value <= toInteger($max_schema)
+            MERGE (m:_ExocortexMeta {key: 'ontology_fingerprint'})
+            WITH m WHERE m.value = $from
+            SET m.value = $to
+            RETURN m.value
+        "#,
+    });
+
+    reg!(Template {
         id: "write_fingerprint_if_schema_compatible",
         read_only: false,
         required_params: &["fp", "max_schema"],

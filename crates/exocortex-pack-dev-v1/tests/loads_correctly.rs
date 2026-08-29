@@ -99,15 +99,28 @@ fn inverse_materialization_pairs_are_symmetric() {
 #[test]
 fn golden_fingerprint_is_pinned() {
     let onto = load_registered_packs().unwrap();
-    let mut hex = String::with_capacity(64);
+    let mut compat = String::with_capacity(64);
     for b in onto.fingerprint.0 {
         use std::fmt::Write as _;
-        let _ = write!(hex, "{b:02x}");
+        let _ = write!(compat, "{b:02x}");
     }
-    let golden = include_str!("dev_v1_fingerprint.txt").trim();
+    let mut build = String::with_capacity(64);
+    for b in onto.build_fingerprint.0 {
+        use std::fmt::Write as _;
+        let _ = write!(build, "{b:02x}");
+    }
+    // OC-PRD 0f: the golden names both levels — line 1 gates
+    // (compatibility), line 2 reports (build, the v1-scheme value).
+    let mut lines = include_str!("dev_v1_fingerprint.txt").lines();
+    let compat_golden = lines.next().unwrap().trim();
+    let build_golden = lines.next().unwrap().trim();
     assert_eq!(
-        hex, golden,
+        compat, compat_golden,
         "ontology drift: regenerate the golden file deliberately"
+    );
+    assert_eq!(
+        build, build_golden,
+        "build fingerprint drift: the v1-scheme value must stay byte-stable"
     );
 }
 

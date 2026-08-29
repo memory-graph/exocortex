@@ -1152,6 +1152,7 @@ dependencies = [
  "chitchat",
  "chrono",
  "eventsource-client",
+ "exocortex-ingest",
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
  "exocortex-server",
@@ -1164,6 +1165,7 @@ dependencies = [
  "smol_str",
  "thiserror 1.0.69",
  "tokio",
+ "tonic",
  "tracing",
 ]
 

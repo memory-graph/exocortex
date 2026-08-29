@@ -297,13 +297,15 @@ impl<S: Storage + 'static> ClusterNode<S> {
     }
 
     /// Peer admission (§9.1): wire version, ontology fingerprint, HMAC.
+    /// The fingerprint rule is the kernel's cluster-peer policy
+    /// (OC-PRD D2): exact compatibility-fingerprint equality, because
+    /// an invalidation cannot be revalidated.
     pub fn admit(&self, env: &InvalidationEnvelope) -> Result<(), ClusterError> {
         if env.wire_version != WIRE_VERSION {
             return Err(ClusterError::WireMismatch);
         }
-        if env.ontology_fingerprint.as_slice() != self.fp.0.as_slice() {
-            return Err(ClusterError::OntologyMismatch);
-        }
+        exocortex_kernel::admit_peer(&env.ontology_fingerprint, &self.fp.0)
+            .map_err(|_| ClusterError::OntologyMismatch)?;
         self.verify_hmac(env)?;
         Ok(())
     }

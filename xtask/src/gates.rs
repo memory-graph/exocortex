@@ -106,6 +106,10 @@ fn reviewed_outbound_dependency(manifest: &str, package: &str) -> bool {
 pub(crate) const STORAGE_LIVE_CANARIES: &[(&str, &str)] = &[
     ("integration", "roundtrip_memory"),
     ("fencing_live", "stale_lease_write_is_fenced_live"),
+    (
+        "fingerprint_migration",
+        "legacy_v1_pin_boots_migrates_and_reboots",
+    ),
 ];
 
 pub(crate) fn validate_storage_targets(root: &Path) -> Result<()> {
@@ -1058,15 +1062,21 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
             columns.len() == 6,
             "matrix line {line_number} must have six tab-separated columns"
         );
-        let criterion: u8 = columns[0].parse().map_err(|_| {
-            anyhow::anyhow!("matrix line {line_number} has a non-numeric criterion")
-        })?;
-        anyhow::ensure!(
-            (1..=30).contains(&criterion),
-            "criterion {criterion} is outside §23"
+        // §23 carries numeric ids 1..=30; the OC-PRD success criteria
+        // ride the same matrix under the `oc` namespace (S1-S6).
+        let is_core = matches!(columns[0].parse::<u8>(), Ok(n) if (1..=30).contains(&n));
+        let is_oc = matches!(
+            columns[0].as_bytes(),
+            [b'o', b'c', n] if (b'1'..=b'6').contains(n)
         );
         anyhow::ensure!(
-            seen.insert(criterion),
+            is_core || is_oc,
+            "criterion {} is outside §23 (1..=30) or the OC-PRD S-rows (oc1..=oc6)",
+            columns[0]
+        );
+        let criterion = columns[0].to_string();
+        anyhow::ensure!(
+            seen.insert(criterion.clone()),
             "criterion {criterion} is duplicated"
         );
         anyhow::ensure!(
@@ -1130,22 +1140,30 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
                     "criterion {criterion} evidence symbol `{needle}` is absent from {relative}"
                 );
                 validate_executable_evidence(
-                    root, criterion, relative, needle, &source, columns[3], columns[4],
+                    root, &criterion, relative, needle, &source, columns[3], columns[4],
                 )?;
             }
         }
     }
+    // §23's own 30 criteria plus the OC-PRD S-rows (oc namespace).
+    let core = seen.iter().filter(|c| !c.starts_with("oc")).count();
     anyhow::ensure!(
-        seen.len() == 30,
-        "acceptance matrix covers {} of 30 criteria",
-        seen.len()
+        core == 30,
+        "acceptance matrix covers {} of 30 §23 criteria",
+        core
+    );
+    let oc = seen.iter().filter(|c| c.starts_with("oc")).count();
+    anyhow::ensure!(
+        (1..=6).contains(&oc),
+        "acceptance matrix covers {} of the 6 OC-PRD S-rows",
+        oc
     );
     Ok(())
 }
 
 fn validate_executable_evidence(
     root: &Path,
-    criterion: u8,
+    criterion: &str,
     relative: &str,
     needle: &str,
     source: &str,
@@ -1589,6 +1607,53 @@ fn package_name(line: &str) -> Option<&str> {
         .find(|token| token.starts_with(char::is_alphanumeric))
 }
 
+/// OC-PRD S3: every compatibility-fingerprint comparison consults the
+/// D2 policy table — `exocortex_kernel::compatibility` (or its
+/// wire-side projection `exocortex_wire::compatibility` for kernel-free
+/// components). A production source that compares fingerprint bytes
+/// directly is a boundary that did not declare its rule.
+pub(crate) fn compatibility_policy_violations(root: &Path) -> Result<Vec<String>> {
+    const HOMES: &[&str] = &[
+        "crates/exocortex-kernel/src/compatibility.rs",
+        "crates/exocortex-wire/src/compatibility.rs",
+    ];
+    let mut files = Vec::new();
+    walk_files(&root.join("crates"), &mut files, &["rs"])?;
+    let mut violations = Vec::new();
+    for path in files {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let in_src = rel.contains("/src/");
+        if !in_src || HOMES.contains(&rel.as_str()) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)?;
+        let code = strip_comments_and_strings(&source);
+        for line in code.lines() {
+            let compares = line.contains("==") || line.contains("!=");
+            let touches_fingerprint = [
+                "ontology_fingerprint",
+                ".fingerprint",
+                "fingerprint.0",
+                "fp.0",
+                "build_fingerprint",
+            ]
+            .iter()
+            .any(|needle| line.contains(needle));
+            if compares && touches_fingerprint {
+                violations.push(format!(
+                    "{rel}: raw fingerprint comparison outside the policy table: {}",
+                    line.trim()
+                ));
+            }
+        }
+    }
+    Ok(violations)
+}
+
 pub(crate) fn signing_hygiene_violations(root: &Path) -> Result<Vec<String>> {
     let mut files = Vec::new();
     walk_files(&root.join("crates"), &mut files, &["rs"])?;
@@ -1842,6 +1907,42 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_policy_rejects_raw_fingerprint_comparisons() {
+        let root = fixture("compat-policy");
+        // A boundary that compares fingerprint bytes directly instead
+        // of consulting the policy table.
+        write(
+            &root,
+            "crates/exocortex-example/src/gate.rs",
+            "fn check(env: &Envelope, mine: &[u8; 32]) -> bool {
+    env.ontology_fingerprint.as_slice() == mine.as_slice()
+}
+",
+        );
+        // Policy-homed comparisons never trip.
+        write(
+            &root,
+            "crates/exocortex-kernel/src/compatibility.rs",
+            "fn inner(a: &[u8; 32], b: &[u8; 32]) -> bool { a == b }
+",
+        );
+        // Tests and non-src layouts are out of scope.
+        write(
+            &root,
+            "crates/exocortex-example/tests/gate.rs",
+            "assert!(env.ontology_fingerprint.as_slice() == mine.as_slice());
+",
+        );
+        let violations = compatibility_policy_violations(&root).unwrap();
+        assert_eq!(
+            violations.len(),
+            1,
+            "exactly the raw comparison is rejected: {violations:?}"
+        );
+        assert!(violations[0].contains("gate.rs"), "{violations:?}");
+    }
+
+    #[test]
     fn storage_conformance_rejects_missing_empty_and_configured_out_live_targets() {
         let root = fixture("storage");
         write(
@@ -1853,6 +1954,12 @@ mod tests {
         assert!(validate_storage_targets(&root).is_err());
 
         write(&root, "crates/exocortex-storage/tests/fencing_live.rs", "");
+        assert!(validate_storage_targets(&root).is_err());
+        write(
+            &root,
+            "crates/exocortex-storage/tests/fingerprint_migration.rs",
+            "",
+        );
         assert!(validate_storage_targets(&root).is_ok());
         assert!(validate_storage_target_listing("integration", "roundtrip_memory", "").is_err());
         assert!(validate_storage_target_listing(
@@ -2345,6 +2452,12 @@ mod tests {
         for criterion in 1..=30 {
             rows.push_str(&format!(
                 "{criterion}\tverified\trequirement {criterion}\ttests/direct.rs::direct_case\tcargo test direct_case\t-\n"
+            ));
+        }
+        for criterion in 1..=6 {
+            rows.push_str(&format!(
+                "oc{criterion}	verified	requirement oc{criterion}	tests/direct.rs::direct_case	cargo test direct_case	-
+"
             ));
         }
         write(&root, "docs/acceptance/section-23.tsv", &rows);

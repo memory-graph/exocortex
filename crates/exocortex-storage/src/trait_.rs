@@ -708,8 +708,14 @@ pub trait Storage: Send + Sync + 'static {
     fn capabilities(&self) -> StorageCapabilities;
     /// Backend identity: `"falkordb" | "in-memory"`.
     fn backend_id(&self) -> StorageBackendId;
-    /// The pinned `OntologyFingerprint` (R-T21).
+    /// The pinned `OntologyFingerprint` (R-T21) — the compatibility
+    /// level (OC-PRD D1).
     fn ontology_fingerprint(&self) -> [u8; 32];
+    /// Compatibility fingerprints this backend still recognizes from
+    /// producers (OC-PRD D2 ingest row): the current fingerprint first,
+    /// then the pinned record's rolling-upgrade history, most recent
+    /// first. Doubles without a pin return only the current value.
+    fn recognized_ontology_fingerprints(&self) -> Vec<[u8; 32]>;
 }
 
 /// The Chubby-style grace window applied to leases (§9.2).

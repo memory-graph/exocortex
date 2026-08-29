@@ -29,6 +29,9 @@ struct InMemoryInner {
     rels: Mutex<HashMap<RelationshipId, Vec<Relationship>>>,
     rels_by_node: Mutex<HashMap<MemoryId, std::collections::HashSet<RelationshipId>>>,
     ontology: std::sync::Arc<exocortex_kernel::Ontology>,
+    /// Recognized producer fingerprints (OC-PRD D2): current first,
+    /// then a pin-advance history the double cannot derive itself.
+    recognized: Vec<[u8; 32]>,
     /// Chubby-style lease table (§9.2): current holder token per key plus
     /// the monotonic epoch counter — same semantics as the Redis path, so
     /// fencing is exercisable without a live backend.
@@ -136,12 +139,39 @@ impl Clone for InMemoryStorage {
 impl InMemoryStorage {
     /// Build a double over an assembled ontology.
     pub fn new(ontology: std::sync::Arc<exocortex_kernel::Ontology>) -> Self {
+        Self::build(ontology, Vec::new())
+    }
+
+    /// Double for a graph whose pin a superset runtime advanced
+    /// (OC-PRD D3): `history` is the prior compatibility fingerprint
+    /// plus its own accepted list, exactly what `FalkorStorage`
+    /// derives from the persisted record after an advance. Producers
+    /// stamped with any recognized value stay admitted through the
+    /// rolling-upgrade window.
+    pub fn with_recognized_ontology_history(
+        ontology: std::sync::Arc<exocortex_kernel::Ontology>,
+        history: &[[u8; 32]],
+    ) -> Self {
+        let mut recognized = vec![ontology.fingerprint.0];
+        for fp in history {
+            if !recognized.contains(fp) {
+                recognized.push(*fp);
+            }
+        }
+        Self::build(ontology, recognized)
+    }
+
+    fn build(
+        ontology: std::sync::Arc<exocortex_kernel::Ontology>,
+        recognized: Vec<[u8; 32]>,
+    ) -> Self {
         Self {
             inner: std::sync::Arc::new(InMemoryInner {
                 memories: Default::default(),
                 rels: Default::default(),
                 rels_by_node: Default::default(),
                 ontology,
+                recognized,
                 leases: Default::default(),
                 lease_epochs: Default::default(),
                 proposals: Default::default(),
@@ -2199,6 +2229,13 @@ impl Storage for InMemoryStorage {
     }
     fn ontology_fingerprint(&self) -> [u8; 32] {
         self.inner.ontology.fingerprint.0
+    }
+    fn recognized_ontology_fingerprints(&self) -> Vec<[u8; 32]> {
+        if self.inner.recognized.is_empty() {
+            vec![self.inner.ontology.fingerprint.0]
+        } else {
+            self.inner.recognized.clone()
+        }
     }
 }
 

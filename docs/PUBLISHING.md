@@ -113,7 +113,9 @@ is off by default so downstream dep trees stay clean; adapter authors
 opt in with `features = ["testing"]` for their own tests. New dev-deps
 recorded with the crate: `tempfile` (adapter-sdk), `tar` + `flate2`
 (xtask's wire-standalone gate), `axum`/`futures` optional under
-`testing`.
+`testing`, `exocortex-ingest` + `tonic` (exocortex-cluster, for the
+OC-PRD rolling-upgrade acceptance test that drives a real IngestServer;
+both already workspace dependencies, no new external crate).
 
 `exocortex-server` directly depends on `axum-server` with its Rustls feature.
 The shared backend listener serves HTTP, SSE, and gRPC on one TLS socket;

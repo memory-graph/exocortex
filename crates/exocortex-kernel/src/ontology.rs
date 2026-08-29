@@ -24,8 +24,16 @@ pub struct Ontology {
     pub memory_type_names: Vec<SmolStr>,
     /// id → name for entity types.
     pub entity_type_names: Vec<SmolStr>,
-    /// SHA-256 over the effective ontology (§7.17).
+    /// SHA-256 over the effective ontology's meaning (§7.17, OC-PRD D1
+    /// compatibility level). This is the only value that gates.
     pub fingerprint: crate::OntologyFingerprint,
+    /// The full-build hash (OC-PRD D1 build level): v1 algorithm over
+    /// the complete `PackDef` set, release metadata included. Reports;
+    /// never gates.
+    pub build_fingerprint: crate::compatibility::BuildFingerprint,
+    /// The structured inputs of the compatibility fingerprint
+    /// (OC-PRD D3) — what subset/superset verdicts are decided over.
+    pub summary: crate::compatibility::OntologySummary,
 }
 
 impl Ontology {
@@ -50,28 +58,15 @@ impl Ontology {
             }
         }
 
-        // Deterministic order and pack-id assignment: packs are sorted by
-        // name; pack i receives PackId(i). Pack-space kind ids are then
-        // canonicalized from their provisional `0x8000_0000 | local` form to
-        // `RelKindId::from_pack(PackId(i), local)` (kernel-space ids are
-        // untouched). With a single pack (v1) this is the identity mapping.
-        let mut packs = packs;
-        packs.sort_by(|a, b| a.name.cmp(&b.name));
-        // KP2 (audit): the pack! macro resolves `type_triples!` names
-        // through a PACK-LOCAL id map (the declaration index), while the
-        // ontology assigns type ids with a running offset across packs —
-        // so every triple in any pack after the first evaluated against
-        // the wrong ids. Remap the sides with the same per-pack offset
-        // the id assignment uses.
-        let mt_offsets: Vec<u8> = {
-            let mut v = Vec::with_capacity(packs.len());
-            let mut acc: u8 = 0;
-            for p in &packs {
-                v.push(acc);
-                acc = acc.saturating_add(p.memory_type_names.len() as u8);
-            }
-            v
-        };
+        // Deterministic order and pack-id assignment (shared with the
+        // fingerprint path so both always agree): packs are sorted by
+        // name; pack i receives PackId(i). Pack-space kind ids are
+        // canonicalized from their provisional `0x8000_0000 | local`
+        // form to `RelKindId::from_pack(PackId(i), local)` (kernel-space
+        // ids are untouched). KP2 (audit): triple sides carry pack-local
+        // ids and are remapped with the same per-pack running offset the
+        // id assignment uses.
+        let packs = crate::compatibility::canonicalized(&packs);
         // KP2: duplicate memory-type names (and separately entity-type
         // names) across packs are a registration error, not a silent
         // last-writer-wins. The two namespaces are distinct id spaces —
@@ -87,36 +82,6 @@ impl Ontology {
         }
         check(packs.iter().flat_map(|p| p.memory_type_names.iter()))?;
         check(packs.iter().flat_map(|p| p.entity_type_names.iter()))?;
-        for (i, p) in packs.iter_mut().enumerate() {
-            let slot = (i as u32) << 16;
-            let mt_offset = mt_offsets[i];
-            for k in p.kinds.iter_mut() {
-                if !k.id.is_kernel() {
-                    k.id = RelKindId(0x8000_0000 | slot | k.id.local_part());
-                }
-                if let Some(inv) = k.inverse {
-                    if !inv.is_kernel() {
-                        k.inverse = Some(RelKindId(0x8000_0000 | slot | inv.local_part()));
-                    }
-                }
-            }
-            for t in p.type_triples.iter_mut() {
-                if !t.kind.is_kernel() {
-                    t.kind = RelKindId(0x8000_0000 | slot | t.kind.local_part());
-                }
-                // KP2: triple sides carry pack-local ids; shift them into
-                // ontology space with this pack's offset.
-                let remap = |side: &mut Option<Vec<u8>>| {
-                    if let Some(xs) = side {
-                        for x in xs {
-                            *x = mt_offset.saturating_add(*x);
-                        }
-                    }
-                };
-                remap(&mut t.from_types);
-                remap(&mut t.to_types);
-            }
-        }
 
         // R-Pk2 groundwork: duplicate kind detection, then kernel-constant
         // coverage.
@@ -161,7 +126,9 @@ impl Ontology {
                 entity_type_names.push(name.clone());
             }
         }
-        let fingerprint = crate::OntologyFingerprint::compute(&packs);
+        let summary = crate::compatibility::OntologySummary::of_canonical_packs(&packs);
+        let fingerprint = summary.compatibility_fingerprint();
+        let build_fingerprint = crate::compatibility::build_fingerprint(&packs);
         Ok(Self {
             packs,
             kinds_by_id,
@@ -171,6 +138,8 @@ impl Ontology {
             memory_type_names,
             entity_type_names,
             fingerprint,
+            build_fingerprint,
+            summary,
         })
     }
 

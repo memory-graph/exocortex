@@ -56,6 +56,15 @@ pub struct HealthSnapshot {
     pub cluster_feed_failures: u64,
 }
 
+fn hex64(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// The HTTP binding: operation routes + auth + observability.
 pub struct HttpBind {
     ctx: Arc<OpContext>,
@@ -141,18 +150,34 @@ impl HttpBind {
         let health_cluster = self.health.clone();
         let health_sync = self.health.clone();
         let health_hydration = self.health.clone();
+        let identity = self.ctx.ontology.clone();
         let ctx = self.ctx.clone();
         protected = protected
             .route(
                 "/health/cluster",
                 get(move || {
                     let h = health_cluster.load_full();
+                    let identity = identity.clone();
                     async move {
+                        // OC-PRD D1: the compatibility fingerprint gates;
+                        // the build fingerprint reports (diagnostics
+                        // surface for "same binary?" questions).
+                        let (compat, build) = match identity
+                            .as_ref()
+                            .map(|o| (hex64(&o.fingerprint.0), hex64(&o.build_fingerprint.0)))
+                        {
+                            Some((c, b)) => {
+                                (serde_json::Value::String(c), serde_json::Value::String(b))
+                            }
+                            None => (serde_json::Value::Null, serde_json::Value::Null),
+                        };
                         axum::Json(serde_json::json!({
                             "node_id": h.node_id,
                             "leader_node_id": h.leader_node_id,
                             "lease_epoch": h.lease_epoch,
                             "backend_lsn": h.backend_lsn,
+                            "compatibility_fingerprint": compat,
+                            "build_fingerprint": build,
                             "feed_ready": h.cluster_feed_ready,
                             "feed_epoch": h.cluster_feed_epoch,
                             "feed_failures": h.cluster_feed_failures,

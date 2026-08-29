@@ -505,7 +505,10 @@ impl AdapterSession {
                 }
                 Disposition::Fatal => {
                     if code == exocortex_wire::ingest::v1::RejectCode::IncompatibleOntology {
-                        // R8: re-negotiate to name both fingerprints.
+                        // R8: re-negotiate to name both fingerprints. The
+                        // comparison is the wire-side AdapterSdk policy
+                        // (OC-PRD D2): drift between the negotiated and
+                        // current compatibility fingerprints is fatal.
                         let got = client
                             .fingerprint(authenticated_request(
                                 &self.config.auth_token,
@@ -518,9 +521,20 @@ impl AdapterSession {
                             got.try_into().map_err(|v: Vec<u8>| SdkError::InvalidUnit {
                                 detail: format!("fingerprint len {}", v.len()),
                             })?;
-                        return Err(SdkError::FingerprintMismatch {
-                            expected: self.fingerprint,
-                            got,
+                        if exocortex_wire::compatibility::negotiated_fingerprint_still_current(
+                            &self.fingerprint,
+                            &got,
+                        )
+                        .is_err()
+                        {
+                            return Err(SdkError::FingerprintMismatch {
+                                expected: self.fingerprint,
+                                got,
+                            });
+                        }
+                        return Err(SdkError::Fatal {
+                            code: row.code,
+                            detail: row.detail.clone(),
                         });
                     }
                     return Err(SdkError::Fatal {

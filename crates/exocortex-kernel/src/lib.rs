@@ -20,6 +20,10 @@ mod macros;
 
 /// Typed writes — the four kernel Actions (§7.11).
 pub mod actions;
+/// OC-PRD: the two-level fingerprint and the per-boundary
+/// compatibility policy (compat/build hashes, structured summary,
+/// subset/superset verdicts, the six boundary rules).
+pub mod compatibility;
 /// The write-path input shapes: `MemoryDraft`, `EdgeHint` (§7.14).
 pub mod draft;
 /// Typed entities a memory is about (§7.2).
@@ -49,6 +53,11 @@ pub mod validator;
 /// The required `Visibility` label and its ordering (§7.7).
 pub mod visibility;
 
+pub use compatibility::{
+    admit_backup, admit_node_graph, admit_peer, admit_producer_batch, BackupOntology,
+    BuildFingerprint, CompatibilityError, CompatibilityFingerprint, NodeGraphDecision,
+    OntologySummary, PersistedPin, PinnedOntology, MAX_ACCEPTED_FINGERPRINTS,
+};
 pub use draft::{EdgeHint, MemoryDraft};
 pub use error::{KernelError, KernelResult};
 pub use fingerprint::OntologyFingerprint;

@@ -129,4 +129,7 @@ impl Storage for NoBackendStorage {
     fn ontology_fingerprint(&self) -> [u8; 32] {
         [0u8; 32]
     }
+    fn recognized_ontology_fingerprints(&self) -> Vec<[u8; 32]> {
+        Vec::new()
+    }
 }

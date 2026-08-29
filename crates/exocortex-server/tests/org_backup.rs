@@ -89,6 +89,7 @@ fn backup_document(
         created_at: chrono::Utc::now().to_rfc3339(),
         org_id: "org".into(),
         ontology_fingerprint: fingerprint_hex(ontology),
+        ontology_summary: Some(ontology.summary.clone()),
         memories,
         relationships,
     }
@@ -183,7 +184,9 @@ async fn org_round_trip_is_byte_faithful_across_storage_instances() {
 
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("org.json");
-    let (nm, nr) = org_backup::export_org(&a, "org", &fp, &file).await.unwrap();
+    let (nm, nr) = org_backup::export_org(&a, "org", &fp, &onto.summary, &file)
+        .await
+        .unwrap();
     // 2 memories + the edge and its R-T4 inverse companion (the write
     // path materialized it at upsert time; the backup carries the store
     // as it is).
@@ -283,11 +286,15 @@ async fn fingerprint_mismatch_aborts_before_any_write() {
     a.upsert_memory(&test_mem("x", 9)).await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("org.json");
-    org_backup::export_org(&a, "org", &fp, &file).await.unwrap();
+    org_backup::export_org(&a, "org", &fp, &onto.summary, &file)
+        .await
+        .unwrap();
 
-    // Tamper.
+    // Tamper the ontology identity (OC-PRD D2): the summary is the
+    // load-bearing field on post-OC documents; the hex is a report.
     let mut doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    doc["ontology_summary"]["memory_types"][0] = serde_json::json!("NotARealType");
     doc["ontology_fingerprint"] = serde_json::json!("0".repeat(64));
     std::fs::write(&file, serde_json::to_string(&doc).unwrap()).unwrap();
 
@@ -295,7 +302,7 @@ async fn fingerprint_mismatch_aborts_before_any_write() {
     let err = org_backup::import_org(&b, &onto, "org", &file)
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("fingerprint"));
+    assert!(err.to_string().contains("ontology"));
     let (b_mems, _) = rows(&b).await;
     assert!(b_mems.is_empty(), "gate runs before the first upsert");
 }
@@ -308,7 +315,9 @@ async fn org_mismatch_aborts() {
     a.upsert_memory(&test_mem("x", 3)).await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("org.json");
-    org_backup::export_org(&a, "org", &fp, &file).await.unwrap();
+    org_backup::export_org(&a, "org", &fp, &onto.summary, &file)
+        .await
+        .unwrap();
 
     let b = InMemoryStorage::new(onto.clone());
     let err = org_backup::import_org(&b, &onto, "other-org", &file)
@@ -325,7 +334,9 @@ async fn re_import_converges_without_duplicates() {
     a.upsert_memory(&test_mem("x", 4)).await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("org.json");
-    org_backup::export_org(&a, "org", &fp, &file).await.unwrap();
+    org_backup::export_org(&a, "org", &fp, &onto.summary, &file)
+        .await
+        .unwrap();
 
     let b = InMemoryStorage::new(onto.clone());
     let region = RegionKey {
@@ -403,6 +414,7 @@ async fn invalid_late_relationship_rolls_back_the_entire_org_import() {
         created_at: chrono::Utc::now().to_rfc3339(),
         org_id: "org".into(),
         ontology_fingerprint: fingerprint_hex(&onto),
+        ontology_summary: Some(onto.summary.clone()),
         memories: vec![memory.clone()],
         relationships: vec![relationship],
     };

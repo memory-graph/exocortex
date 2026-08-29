@@ -45,8 +45,13 @@ pub struct OrgBackup {
     /// The org this graph serves (storage-scoped; recorded for the
     /// restore target to assert).
     pub org_id: String,
-    /// Hex of the effective ontology fingerprint at export time.
+    /// Hex of the effective ontology fingerprint at export time (the
+    /// compatibility level since OC-PRD D1).
     pub ontology_fingerprint: String,
+    /// The structured ontology summary at export time (OC-PRD D2
+    /// backup row); absent in pre-OC documents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ontology_summary: Option<exocortex_kernel::OntologySummary>,
     /// Every memory row, in the kernel row shape.
     pub memories: Vec<Memory>,
     /// Every relationship row, in the kernel row shape.
@@ -68,6 +73,7 @@ pub async fn export_org<S: Storage>(
     storage: &S,
     org_id: &str,
     fingerprint: &str,
+    summary: &exocortex_kernel::OntologySummary,
     path: &std::path::Path,
 ) -> Result<(usize, usize)> {
     let mut memories = Vec::new();
@@ -102,6 +108,7 @@ pub async fn export_org<S: Storage>(
         created_at: chrono::Utc::now().to_rfc3339(),
         org_id: org_id.into(),
         ontology_fingerprint: fingerprint.into(),
+        ontology_summary: Some(summary.clone()),
         memories,
         relationships,
     };
@@ -139,12 +146,27 @@ pub async fn import_org<S: Storage>(
         "org mismatch: backup serves `{}`, target serves `{org_id}`",
         doc.org_id
     );
-    let expected = hex(&ontology.fingerprint.0);
-    anyhow::ensure!(
-        doc.ontology_fingerprint == expected,
-        "ontology fingerprint mismatch: backup {} vs binary {expected} — the backup was written against a different pack set",
-        doc.ontology_fingerprint
-    );
+    // OC-PRD D2 (backup row): superset accepted — every row is
+    // revalidated by `validate_restore_document` below before the
+    // first upsert. Post-OC documents prove their subset
+    // structurally; pre-OC documents keep exact v1-scheme equality.
+    let verdict = match &doc.ontology_summary {
+        Some(summary) => exocortex_kernel::admit_backup(
+            exocortex_kernel::BackupOntology::Summarized { summary },
+            ontology,
+        ),
+        None => exocortex_kernel::admit_backup(
+            exocortex_kernel::BackupOntology::Legacy {
+                fingerprint_hex: &doc.ontology_fingerprint,
+            },
+            ontology,
+        ),
+    };
+    if let Err(error) = verdict {
+        anyhow::bail!(
+            "ontology mismatch: {error} — the backup was written against a different pack set"
+        );
+    }
     validate_restore_document(ontology, org_id, &doc)?;
     let canonical = serde_json::to_vec(&doc).context("canonicalize governed backup identity")?;
     let import_key = hex(&exocortex_wire::signing::content_digest(&canonical));

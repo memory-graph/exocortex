@@ -11,10 +11,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Compute + print the effective OntologyFingerprint of the pack set
-    /// that would be linked into `exocortex-server`. Used in CI to detect
+    /// Compute and print the effective two-level fingerprint
+    /// (compatibility + build, OC-PRD D1) of the pack set that would
+    /// be linked into `exocortex-server`. Used in CI to detect
     /// unintended ontology drift between commits.
-    Fingerprint,
+    ///
+    /// Pass --verify-metadata-independence for the OC-PRD S1
+    /// regression (release metadata cannot gate data).
+    Fingerprint {
+        /// Prove a version/kernel_min-only edit leaves the
+        /// compatibility fingerprint byte-identical.
+        #[arg(long)]
+        verify_metadata_independence: bool,
+    },
     /// Generate MCP + OpenAPI schemas from the operation registry.
     /// Fails if generated schemas are out of date (CI gate). Pass --write to
     /// regenerate and commit the goldens.
@@ -50,6 +59,10 @@ enum Cmd {
     ProtoSync,
     WireStandalone,
     SigningHygiene,
+    /// OC-PRD S3: every fingerprint comparison goes through the
+    /// per-boundary policy table (kernel or wire homes); no production
+    /// source compares fingerprint bytes directly.
+    CompatibilityPolicy,
     /// Metrics expose no identity labels or caller-controlled cardinality.
     MetricsHygiene,
     /// GATE1 (audit §2.1): one storage suite, both backends — the double
@@ -78,7 +91,9 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Fingerprint => fingerprint(),
+        Cmd::Fingerprint {
+            verify_metadata_independence,
+        } => fingerprint(verify_metadata_independence),
         Cmd::GenSchemas { write } => gen_schemas(write),
         Cmd::GenPlaybook { write } => gen_playbook(write),
         Cmd::KernelPurity => kernel_purity(),
@@ -88,6 +103,7 @@ fn main() -> Result<()> {
         Cmd::ProtoSync => proto_sync(),
         Cmd::WireStandalone => wire_standalone(),
         Cmd::SigningHygiene => signing_hygiene(),
+        Cmd::CompatibilityPolicy => compatibility_policy(),
         Cmd::MetricsHygiene => metrics_hygiene(),
         Cmd::StorageConformance => storage_conformance(),
         Cmd::WritePathParity => write_path_parity(),
@@ -871,6 +887,8 @@ fn storage_conformance() -> Result<()> {
                 "integration",
                 "--test",
                 "fencing_live",
+                "--test",
+                "fingerprint_migration",
             ],
             &[],
         )?;
@@ -975,21 +993,57 @@ fn artifact_equivalence() -> Result<()> {
 }
 
 /// `cargo xtask fingerprint` — compute and print the effective
-/// `OntologyFingerprint` of the linked pack set. Must be byte-stable across
-/// runs on the same commit (M1 acceptance).
-fn fingerprint() -> Result<()> {
+/// two-level fingerprint of the linked pack set (OC-PRD D1): line 1 is
+/// the compatibility fingerprint (the gate; "if this moved you broke
+/// something"), line 2 the build fingerprint (the v1-scheme value,
+/// report-only). Both must be byte-stable across runs on the same
+/// commit (M1 acceptance). `--verify-metadata-independence`
+/// additionally proves S1: a release-metadata-only edit leaves the
+/// compatibility fingerprint byte-identical while the build
+/// fingerprint moves.
+fn fingerprint(verify_metadata_independence: bool) -> Result<()> {
     // Force-link the pack crate so its inventory ctor (`.init_array`) runs in
     // this binary; an unreferenced dependency is not linked.
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
     let onto = exocortex_kernel::pack::load_registered_packs()?;
-    let fp = onto.fingerprint.0;
-    let mut hex = String::with_capacity(fp.len() * 2);
-    for b in fp {
-        use std::fmt::Write as _;
+    let compat = to_hex(&onto.fingerprint.0);
+    let build = to_hex(&onto.build_fingerprint.0);
+    println!("{compat}");
+    println!("{build}");
+    if verify_metadata_independence {
+        let mut bumped = exocortex_pack_dev_v1::pack_def();
+        bumped.version = exocortex_kernel::PackVersion {
+            major: bumped.version.major + 1,
+            minor: 99,
+            patch: 99,
+        };
+        bumped.kernel_min = exocortex_kernel::PackVersion {
+            major: 1,
+            minor: 99,
+            patch: 0,
+        };
+        let grown =
+            exocortex_kernel::Ontology::from_packs(vec![bumped]).map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(
+            grown.fingerprint == onto.fingerprint,
+            "S1 FAILED: a metadata-only edit moved the compatibility fingerprint"
+        );
+        anyhow::ensure!(
+            grown.build_fingerprint != onto.build_fingerprint,
+            "S1 FAILED: a metadata-only edit left the build fingerprint unchanged (check the probe)"
+        );
+        println!("metadata-independence ok: compatibility stable, build moved");
+    }
+    Ok(())
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         let _ = write!(hex, "{b:02x}");
     }
-    println!("{hex}");
-    Ok(())
+    hex
 }
 
 /// `cargo xtask gen-schemas` — emit MCP tool + OpenAPI catalogues from the
@@ -1443,6 +1497,23 @@ fn wire_version() -> anyhow::Result<String> {
 ///  2. No producer submits a blank checksum: every `IngestBatch`
 ///     construction site with `checksum: String::new()` must be
 ///     followed by prepare_batch/canonical_checksum before submit.
+fn compatibility_policy() -> anyhow::Result<()> {
+    let violations = gates::compatibility_policy_violations(std::path::Path::new("."))?;
+    anyhow::ensure!(
+        violations.is_empty(),
+        "compatibility-policy FAILED:
+{}",
+        violations.join(
+            "
+"
+        )
+    );
+    println!(
+        "compatibility-policy ok: every fingerprint comparison consults the OC-PRD D2 policy table"
+    );
+    Ok(())
+}
+
 fn signing_hygiene() -> anyhow::Result<()> {
     let violations = gates::signing_hygiene_violations(std::path::Path::new("."))?;
     anyhow::ensure!(

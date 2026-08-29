@@ -254,11 +254,18 @@ fn fingerprint_mismatch_aborts_cleanly() {
         .status
         .success());
 
-    // Tamper with the fingerprint.
-    let mut doc: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    doc["ontology_fingerprint"] = serde_json::json!("0".repeat(64));
+    // Tamper with the ontology: a foreign summary (OC-PRD D2) on the
+    // modern path, and — in a second leg — a legacy-shaped document
+    // whose v1-scheme fingerprint no longer matches.
+    let original = std::fs::read_to_string(&file).unwrap();
+    let mut doc: serde_json::Value = serde_json::from_str(&original).unwrap();
+    doc["ontology_summary"]["memory_types"][0] = serde_json::json!("NotARealType");
     std::fs::write(&file, serde_json::to_string(&doc).unwrap()).unwrap();
+    let legacy_file = src.join("legacy.json");
+    let mut legacy: serde_json::Value = serde_json::from_str(&original).unwrap();
+    legacy["ontology_summary"].take();
+    legacy["ontology_fingerprint"] = serde_json::json!("0".repeat(64));
+    std::fs::write(&legacy_file, serde_json::to_string(&legacy).unwrap()).unwrap();
 
     // Seed the destination with one real write, so "untouched" is
     // observable.
@@ -273,7 +280,12 @@ fn fingerprint_mismatch_aborts_cleanly() {
     let out = Client::run_oneshot(&dst, "--import", &file);
     assert!(!out.status.success(), "mismatched import must fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("fingerprint"), "reason surfaces: {stderr}");
+    assert!(stderr.contains("ontology"), "reason surfaces: {stderr}");
+    let out = Client::run_oneshot(&dst, "--import", &legacy_file);
+    assert!(
+        !out.status.success(),
+        "legacy-shaped mismatched import must fail"
+    );
 
     let mut c = Client::spawn_serving(&dst);
     let mut msgs = init_msgs();
@@ -282,6 +294,46 @@ fn fingerprint_mismatch_aborts_cleanly() {
     let _init = c.read_line();
     let hits = hits_of(&c.read_line());
     assert_eq!(hits.len(), 1, "target WAL untouched (its own write only)");
+}
+
+/// OC-PRD S6 (docs/prd/ontology-compatibility-prd.md): restores stop
+/// expiring. A backup written under `{dev-v1}` restores into a binary
+/// running `{dev-v1 + appended type}` (every draft revalidated
+/// against the current rulebook); an id-shifting ontology still
+/// refuses, which per-draft revalidation alone cannot detect.
+#[test]
+fn superset_ontology_restores_subset_backup() {
+    let src = tempdir();
+    let file = src.join("memories.json");
+    {
+        let mut c = Client::spawn_serving(&src);
+        let mut msgs = init_msgs();
+        msgs.push(end_session_msg(80));
+        c.send_all(&msgs);
+        let _init = c.read_line();
+        assert!(c.read_line().get("result").is_some());
+    }
+    assert!(Client::run_oneshot(&src, "--export", &file)
+        .status
+        .success());
+
+    let mut grown = exocortex_pack_dev_v1::pack_def();
+    grown.memory_type_names.push("FutureThing".into());
+    let grown = exocortex_kernel::Ontology::from_packs(vec![grown]).unwrap();
+
+    let dst = tempdir();
+    let wal = exocortex_client::wal::Wal::open(&dst.join("wal")).unwrap();
+    let report = exocortex_client::backup::import(&wal, &grown, &file)
+        .expect("subset backup restores into the superset binary");
+    assert_eq!(report.imported, 1);
+
+    // Insertion shifts positional ids: the backup's summary is no
+    // longer a subset, even though every name still resolves.
+    let mut shifted = exocortex_pack_dev_v1::pack_def();
+    shifted.memory_type_names.insert(0, "AlphaHazard".into());
+    let shifted = exocortex_kernel::Ontology::from_packs(vec![shifted]).unwrap();
+    let err = exocortex_client::backup::import(&wal, &shifted, &file).unwrap_err();
+    assert!(err.to_string().contains("superset"), "{err}");
 }
 
 /// AC4: an empty WAL exports a valid empty backup; importing it is a

@@ -32,4 +32,6 @@ exocortex-server = { workspace = true }
 exocortex-storage = { workspace = true, features = ["testing"] }
 chrono = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
+exocortex-ingest = { workspace = true }
+tonic = { workspace = true }
 tokio = { workspace = true }

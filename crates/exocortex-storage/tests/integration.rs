@@ -1550,17 +1550,13 @@ itest!(fingerprint_mismatch_aborts_startup, {
     let s = connect("node-1").await;
     let graph = s.graph_name_clone();
     drop(s);
-    // Second process with a DIFFERENT ontology (extra pack kind) must refuse.
+    // Second process with a MEANING-CHANGED ontology (an existing kind
+    // renamed: stored rows labelled by the old name would silently
+    // re-resolve) must refuse. Since OC-PRD D3, an APPENDED kind at an
+    // unused id is a non-event instead — see
+    // appended_kind_boots_as_a_superset below.
     let mut altered = pack_def();
-    altered.kinds.push(exocortex_kernel::RelMeta {
-        id: exocortex_kernel::RelKindId(0x8000_0000 | 0x0200),
-        display_name: "DriftKind".into(),
-        bucket: exocortex_kernel::RelBucket::Extension(9),
-        inverse: None,
-        bidirectional: false,
-        default_strength: 0.5,
-        computed_only: false,
-    });
+    altered.kinds[4].display_name = "DriftedRenamedKind".into();
     let onto2 = Arc::new(exocortex_kernel::Ontology::from_packs(vec![altered]).unwrap());
     let url = falkor_url().unwrap();
     let cfg = FalkorConfig {
@@ -1584,6 +1580,47 @@ itest!(fingerprint_mismatch_aborts_startup, {
     );
 });
 
+itest!(appended_kind_boots_as_a_superset, {
+    // OC-PRD D3: appending a kind at an unused id cannot reinterpret
+    // stored rows, so booting it against the pinned graph is allowed
+    // and advances the pin (retaining the prior fingerprint for the
+    // producer rolling window).
+    let s = connect("superset-1").await;
+    let graph = s.graph_name_clone();
+    let prior = s.recognized_ontology_fingerprints();
+    assert_eq!(prior.len(), 1);
+    drop(s);
+    let mut grown = pack_def();
+    grown.kinds.push(exocortex_kernel::RelMeta {
+        id: exocortex_kernel::RelKindId(0x8000_0000 | 0x0200),
+        display_name: "FutureKind".into(),
+        bucket: exocortex_kernel::RelBucket::Extension(9),
+        inverse: None,
+        bidirectional: false,
+        default_strength: 0.5,
+        computed_only: false,
+    });
+    let onto2 = Arc::new(exocortex_kernel::Ontology::from_packs(vec![grown]).unwrap());
+    let url = falkor_url().unwrap();
+    let cfg = FalkorConfig {
+        falkor_url: url.clone(),
+        redis_url: std::env::var("REDIS_URL")
+            .unwrap_or_else(|_| url.replacen("falkor://", "redis://", 1)),
+        graph_name: graph,
+        org_id: "test-org".into(),
+        node_id: "superset-2".into(),
+    };
+    let s2 = FalkorStorage::connect(cfg, onto2.clone())
+        .await
+        .expect("superset runtime boots");
+    let recognized = s2.recognized_ontology_fingerprints();
+    assert_eq!(
+        recognized,
+        vec![onto2.fingerprint.0, prior[0]],
+        "advance retains the prior fingerprint"
+    );
+});
+
 itest!(
     concurrent_initializers_cannot_overwrite_the_winning_fingerprint,
     {
@@ -1598,9 +1635,13 @@ itest!(
             node_id: node.into(),
         };
         let first_ontology = ontology();
-        let mut incompatible = exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap();
-        incompatible.fingerprint.0[0] ^= 0xff;
-        let incompatible = Arc::new(incompatible);
+        // Structurally incompatible (an existing kind renamed), not a
+        // forged hash: since OC-PRD the pin compares ontology
+        // structure, which is strictly stronger than hash equality.
+        let mut incompatible_pack = pack_def();
+        incompatible_pack.kinds[4].display_name = "OtherName".into();
+        let incompatible =
+            Arc::new(exocortex_kernel::Ontology::from_packs(vec![incompatible_pack]).unwrap());
         let (first, second) = tokio::join!(
             FalkorStorage::connect(config("fingerprint-cas-a"), first_ontology),
             FalkorStorage::connect(config("fingerprint-cas-b"), incompatible),

@@ -253,7 +253,9 @@ pub async fn hydrate_and_start_backend_sync(
 
 /// Verify an envelope: wire version, fingerprint, HMAC-SHA256 over fields
 /// 1..4 (R-W4). Same scheme as `ClusterNode::admit`, inlined so the client
-/// crate needs no cluster dependency.
+/// crate needs no cluster dependency. The fingerprint rule is the
+/// kernel's SSE-subscriber policy (OC-PRD D2): exact
+/// compatibility-fingerprint equality.
 pub fn verify_envelope(
     hmac_key: &[u8; 32],
     fingerprint: &[u8; 32],
@@ -262,8 +264,8 @@ pub fn verify_envelope(
     if env.wire_version != WIRE_VERSION {
         return Err(SyncError::Rejected("wire version mismatch".into()));
     }
-    if env.ontology_fingerprint.as_slice() != fingerprint {
-        return Err(SyncError::Rejected("ontology fingerprint mismatch".into()));
+    if let Err(error) = exocortex_kernel::admit_peer(&env.ontology_fingerprint, fingerprint) {
+        return Err(SyncError::Rejected(error.to_string()));
     }
     if !exocortex_wire::signing::verify_invalidation_envelope(hmac_key, env) {
         return Err(SyncError::Rejected("hmac verification failed".into()));
