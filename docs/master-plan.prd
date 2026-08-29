@@ -88,9 +88,9 @@ to v2 in the PRD's own terms.
 **Closure baseline (2026-08-28, Round 6 closed):** 485 tests / 0 failed
 across 67 targets (`cargo test --workspace --features
 exocortex-adapter-sdk/testing --no-fail-fast`). Full gate matrix green:
-fmt, clippy, deny, tests, 18 `cargo xtask` gates plus mock-provider-audit
-and storage-conformance (live legs executed with `FALKOR_URL`/`REDIS_URL`
-set: Falkor integration 48, fencing 7, fire_live 15), kernel-purity,
+fmt, clippy, deny, tests, all 18 `cargo xtask` gates listed in AGENTS.md (live legs executed with
+`FALKOR_URL`/`REDIS_URL`
+set: Falkor integration 48, fencing 8, fire_live 15), kernel-purity,
 fingerprint `e1f7d17b…ddc9b2` (unchanged), gen-schemas, gen-playbook
 (48/47; 299 words), bench SLOs including the live Falkor indexed-read p99
 (11.4 ms). Chaos leader-kill: node2 -> node1 in 1,384 ms, zero old-LSN
@@ -582,6 +582,7 @@ idea:
 | R6-R290 | Strict review: the R6-R275 retained-identity chain was tested only at its two ends — no test crossed the `settle_writes_once` distributed branch with the retain flag, so a dropped pass-through would leave every suite green | Codex (resumed run) | Done — live `engine_settlement_retain_flag_reaches_the_distributed_queue` drives a distributed `DreamsEngine` through `on_writes_once` → `settle_writes_once(retain=true)` and proves the fence advanced to the generation while the processed-events marker survived (dropping the flag in lib.rs fails the `(1, 5)` assertion); live Redis fire suite now 15/15 (this commit) |
 | R6-R291 | Strict review: the live Redis fire suite could go dark with zero signal — the `integration` feature is not part of the standard workspace run, no gate or canary covered it (the SDK's identical trap got a failing canary in round 3), and three closure rows cite it as evidence | Codex (resumed run) | Done — `cargo xtask storage-conformance` now also executes `-p exocortex-dreams --features integration --test fire_live` when `REDIS_URL` is set and prints a loud `live Redis fire suite UNEXECUTED` line otherwise; AGENTS.md's gate line and CLAUDE.md's test-invocation trap note record both env vars; the gate passes end-to-end with both live backends (integration 48 + fencing_live 8 + fire 15) (this commit) |
 | R6-R293 | Verification pass over the remediation: comment drift, a missing self-reference fixture, and two stale suite counts | Codex (resumed run) | Done — the client 409 comment no longer claims header-based resume it never performs, the nested-closure fixtures cover a self-invoking closure, and the R6-R279/R6-R291 counts state their exact suites; xtask (25) and client suites pass (this commit) |
+| R6-R294 | Closure-verdict review: fencing suite undercounted (7 vs the actual 8), one historical sentence read as present-tense contradiction, a stale RELEASE BLOCKED pointer in the Palantir PRD, an imprecise EntityId disposition justification, and redundant gate arithmetic phrasing | Codex (resumed run) | Done — all five closure-doc defects corrected (counts, historical labeling, past-tense pointer, injectivity rationale, gate phrasing); no code changed (this commit) |
 | R6-R292 | Strict review doc-truth: the plan header named a stale review frontier (R6-R228), R6-B28 cited a nonexistent fixture name, MILESTONE_REPORT W9 recorded a dependency state IN10 later reversed, and AGENTS.md's gate list omitted the on-demand §23 #19 `mock-provider-audit` command | Codex (resumed run) | Done — the header states the current promotion frontier through R6-R291, the citation names the actual `storage_conformance_rejects_missing_empty_and_configured_out_live_targets` fixture, W9 carries the IN10 amendment, and AGENTS.md lists `mock-provider-audit` with its transitive-enforcement note (this commit) |
 | R6-Q2 | Resolve final strict-review verification questions with executable evidence: indirect secret logging, discovery change-feed publication, and authoritative action-pin provenance | Codex | Done — discovery delivery became R6-R36; sentinel credential capture is clean; GitHub's commit API confirms every action pin |
 
