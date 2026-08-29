@@ -26,12 +26,18 @@ pub const BLOCK_WORD_LIMIT: usize = 300;
 
 /// `sha256:<hex>` content hash of the compiled playbook (D3).
 pub fn playbook_hash() -> String {
-    format!("sha256:{}", hex(&sha256(PLAYBOOK.as_bytes())))
+    format!(
+        "sha256:{}",
+        exocortex_wire::signing::content_digest_hex(PLAYBOOK.as_bytes())
+    )
 }
 
 /// `sha256:<hex>` content hash of the instruction block (D3).
 pub fn block_hash() -> String {
-    format!("sha256:{}", hex(&sha256(BLOCK.as_bytes())))
+    format!(
+        "sha256:{}",
+        exocortex_wire::signing::content_digest_hex(BLOCK.as_bytes())
+    )
 }
 
 /// D5: install the playbook under the OS data home (or `--data-dir`),
@@ -82,22 +88,6 @@ pub fn install(data_dir: &Path) -> std::io::Result<Option<String>> {
 /// shape: whitespace-separated tokens).
 pub fn block_word_count() -> usize {
     BLOCK.split_whitespace().count()
-}
-
-fn sha256(data: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(data);
-    h.finalize().into()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 #[cfg(test)]
