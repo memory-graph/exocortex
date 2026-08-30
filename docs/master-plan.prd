@@ -107,6 +107,21 @@ items are promoted into this file, tracked to done, and never silently
 dropped. Anything not listed here is either shipped or explicitly deferred
 to v2 in the PRD's own terms.
 
+**Baseline (2026-08-29, Wave 0 + Wave 1 four-fifths):** 523 tests / 0
+failed across the workspace (`cargo test --workspace --features
+exocortex-adapter-sdk/testing --no-fail-fast`). `scripts/verify-release.sh`
+exit 0 with 22 gate commands — two new this session:
+`cargo xtask compatibility-policy` (OC-PRD S3) and `cargo xtask
+seam-inventory` (PX3, 32 rows). Fingerprint is two-level (OC-PRD):
+compatibility `d60a2467…4ef52` gates, build `e1f7d17b…ddc9b2` reports
+(the v1 value, unchanged through the split). Live legs executed
+against the local harness: storage integration 48/49 (the single
+failure is the pre-existing local-container absence of `GRAPH.PROFILE`
+— reproduced on clean main before any of this session's commits), plus
+`fingerprint_migration` 3/3 and fencing 8/8 through
+`cargo xtask storage-conformance`. §23 criterion 26 moved
+deferred→verified (PX1); the OC-PRD S-criteria ride rows oc1–oc6.
+
 **Closure baseline (2026-08-28, Round 6 closed):** 485 tests / 0 failed
 across 67 targets (`cargo test --workspace --features
 exocortex-adapter-sdk/testing --no-fail-fast`). Full gate matrix green:
@@ -302,10 +317,12 @@ idea:
 
 ## In progress
 
-Nothing is in progress. The table below is the closed Round 6 detail
-ledger (every row Done or Verified safe, evidence inline; the summary
-rows live in the Done section). A new item enters here only when work
-actually starts.
+Nothing is in progress. PX2 (pack-registered Actions and Functions
+end-to-end) is the next accepted item to start; its macro mechanics are
+de-risked by the PX2-S1 decision. The table below is the closed Round 6
+detail ledger (every row Done or Verified safe, evidence inline; the
+summary rows live in the Done section). A new item enters here only
+when work actually starts.
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
