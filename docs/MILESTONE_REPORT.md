@@ -540,3 +540,34 @@ Deviations recorded for the pack-registered Actions/Functions delivery
   AGENTS.md, and CLAUDE.md updated in the same change (per the OC-PRD
   managed-change discipline Wave 0 was built for).
 
+## Wave 2 opener — D21 steps a+d (2026-08-30, later)
+
+Deviations and recorded boundaries for the adapter-contract landing:
+
+- **Projection required for table flavors only** (`iceberg` / `delta` /
+  `parquet-dir`). The PRD's A1 says no adapter submits undeclared;
+  applying that to `session` sources would have broken the client and
+  every shipped producer. The Mintlify docs adapter's compliance
+  migration (declared projection over `exocortex:` frontmatter) is
+  tracked work, not silently forced.
+- **The declared source schema is adapter-authored.** The server derives
+  the schema hash from the columns the adapter declares; it does not
+  introspect the source. A lying adapter could under-declare. This is
+  the same trust position as the rest of registration (HMAC'd, audited)
+  and is what keeps D21-a implementable without per-source introspection
+  machinery.
+- **Graph-share bound is declared, stored, and audited but not
+  evaluated** — the PRD's own open question 1 marks ingest-side
+  evaluation as assumption-grade with Dreams correcting; nothing cheaper
+  than a per-submit graph count exists, so enforcement waits for that
+  decision rather than shipping an approximation nobody asked for.
+- **Snapshot rewind history is in-memory** (bounded, per service). The
+  durable cursor/snapshot record is open question 3, owned by D20 (CDC)
+  where rewinds are structural rather than exceptional.
+- **Wire additions:** `ProjectionDescriptor` (+ field/bounds/column
+  messages, registration field 8) and reject codes 15-17
+  (`SOURCE_REWOUND`, `SCHEMA_DRIFT`, `PROJECTION_BOUND_EXCEEDED`) —
+  additive; corrections table, playbook rejects table (now 18), and the
+  exhaustive reject manifest extended in the same change. New storage
+  seam `append_audit` (standalone audit rows; the schema-extension
+  verdict writes exactly one).

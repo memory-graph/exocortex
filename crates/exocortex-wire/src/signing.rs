@@ -265,6 +265,7 @@ pub fn registration(
         ceiling,
         source_flavor: source_flavor.into(),
         producer_kind: producer_kind.into(),
+        projection: None,
         producer: Some(crate::ingest::v1::ProducerIdentity {
             node_id: node_id.into(),
             agent_id: String::new(),

@@ -86,6 +86,103 @@ pub struct AdapterConfig {
     pub cursor_path: PathBuf,
     /// Retry policy for transient failures (§18.2 obligation 6).
     pub retry: RetryPolicy,
+    /// D21-a (adapter-contract PRD §3.1): the declared projection. What
+    /// subset of the source this adapter may bring in, the field mapping
+    /// `mapping_version` versions, and the bounds that stop the window
+    /// rather than truncate it. Table-shaped flavors MUST declare one;
+    /// the server refuses their registration without it.
+    pub projection: Option<Projection>,
+}
+
+/// The projection an adapter declares (D21-a): selector, field mapping,
+/// the source schema it was authored against, and bounds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Projection {
+    /// What subset of the source is in scope, in the source's own terms
+    /// (a table + predicate, a slot list, a frontmatter key...).
+    pub selector: String,
+    /// Source field -> ontology target. The artifact `mapping_version`
+    /// versions.
+    pub fields: Vec<ProjectionField>,
+    /// The source schema at mapping time: (column, data type). The
+    /// server derives the schema hash from this; a change under the same
+    /// name is the dangerous case and fails closed.
+    pub source_schema: Vec<SourceColumn>,
+    /// Bumps on every deliberate selector/field/schema change.
+    pub mapping_version: u32,
+    /// Declared bounds (D21-a): window, run, and graph share.
+    pub bounds: ProjectionBounds,
+    /// The source snapshot the schema was observed at. A later batch
+    /// naming an already-superseded snapshot is a rewind.
+    pub last_snapshot_id: String,
+}
+
+/// One mapped field: source column -> ontology target.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectionField {
+    /// Column / key, in the source's own terms.
+    pub source_field: String,
+    /// Ontology memory-type name.
+    pub memory_type: String,
+    /// Relationship kind name; empty when the field maps to attributes.
+    pub kind: String,
+}
+
+/// One source column at mapping time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceColumn {
+    /// Column name.
+    pub name: String,
+    /// Source-declared type.
+    pub data_type: String,
+}
+
+/// Declared projection bounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProjectionBounds {
+    /// Rows one submit window may carry. Exceeding stops the window with
+    /// the cursor untouched.
+    pub max_rows_per_window: u64,
+    /// Rows one adapter run may bring, total.
+    pub max_rows_per_run: u64,
+    /// Share of the org graph this source may occupy, in percent.
+    /// Declared and audited; the Dreams-side evaluation is the recorded
+    /// deferral (adapter-contract PRD open question 1).
+    pub max_graph_share_percent: u32,
+}
+
+impl Projection {
+    /// Convert to the wire descriptor (registration payload).
+    pub fn to_wire(&self) -> exocortex_wire::ingest::v1::ProjectionDescriptor {
+        use exocortex_wire::ingest::v1 as wire;
+        wire::ProjectionDescriptor {
+            selector: self.selector.clone(),
+            fields: self
+                .fields
+                .iter()
+                .map(|f| wire::ProjectionField {
+                    source_field: f.source_field.clone(),
+                    memory_type: f.memory_type.clone(),
+                    kind: f.kind.clone(),
+                })
+                .collect(),
+            source_schema: self
+                .source_schema
+                .iter()
+                .map(|c| wire::SourceColumn {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                })
+                .collect(),
+            mapping_version: self.mapping_version,
+            bounds: Some(wire::ProjectionBounds {
+                max_rows_per_window: self.bounds.max_rows_per_window,
+                max_rows_per_run: self.bounds.max_rows_per_run,
+                max_graph_share_percent: self.bounds.max_graph_share_percent,
+            }),
+            last_snapshot_id: self.last_snapshot_id.clone(),
+        }
+    }
 }
 
 impl AdapterConfig {
@@ -107,6 +204,7 @@ impl AdapterConfig {
             max_batch_bytes: 4 * 1024 * 1024,
             cursor_path: std::env::temp_dir().join(format!("{producer_id}.cursor")),
             retry: RetryPolicy::default(),
+            projection: None,
         }
     }
 }
@@ -208,6 +306,26 @@ pub enum SdkError {
         /// The component's draft keys.
         draft_keys: Vec<String>,
     },
+    /// D21-a: the submission exceeds a declared projection bound. The
+    /// window stops with the cursor untouched; never truncated silently.
+    #[error("projection bound `{bound}` exceeded: {value} rows, declared {declared}")]
+    ProjectionBoundExceeded {
+        /// Which bound was hit (`max_rows_per_window` | `max_rows_per_run`).
+        bound: &'static str,
+        /// Rows observed.
+        value: u64,
+        /// The declared ceiling.
+        declared: u64,
+    },
+    /// D21-d: the source was rewound behind data already ingested
+    /// (snapshot rollback / slot reset). Needs an operator; never retry.
+    #[error("source rewound: snapshot {observed} follows already-ingested {last}")]
+    SourceRewound {
+        /// The snapshot the window observed.
+        observed: String,
+        /// The newest snapshot already ingested this session.
+        last: String,
+    },
     /// The unit itself is malformed (dangling draft reference, snapshot
     /// row without external key) — rejected before the wire.
     #[error("invalid batch unit: {detail}")]
@@ -243,6 +361,11 @@ pub struct AdapterSession {
     ceiling: i32,
     cursor: Option<String>,
     sleep: SleepFn,
+    /// D21-a: rows submitted this run (per-run bound numerator).
+    rows_this_run: u64,
+    /// D21-d: snapshot ids observed this session, oldest first, bounded —
+    /// a window naming an already-superseded snapshot is a rewind.
+    seen_snapshots: Vec<String>,
 }
 
 impl AdapterSession {
@@ -294,6 +417,7 @@ impl AdapterSession {
                 hmac_signature: vec![],
                 client_metadata: None,
             }),
+            projection: config.projection.as_ref().map(|p| p.to_wire()),
         };
         exocortex_wire::signing::sign_registration(&config.hmac_key, &mut registration);
         let registered = client
@@ -315,6 +439,8 @@ impl AdapterSession {
             ceiling: registered,
             cursor,
             sleep,
+            rows_this_run: 0,
+            seen_snapshots: Vec::new(),
         })
     }
 
@@ -346,6 +472,47 @@ impl AdapterSession {
         let span =
             tracing::info_span!("adapter_submit_window", producer = %self.config.producer_id);
         let _guard = span.enter();
+        // D21-a/d: bounds and rewind are enforced BEFORE any wire traffic
+        // (A2/A3) — a bound hit stops the window with the cursor untouched,
+        // and a rewound source needs an operator, not a submission.
+        if let Some(projection) = &self.config.projection {
+            let window_rows: u64 = units.iter().map(|unit| unit.memories.len() as u64).sum();
+            if window_rows > projection.bounds.max_rows_per_window {
+                return Err(SdkError::ProjectionBoundExceeded {
+                    bound: "max_rows_per_window",
+                    value: window_rows,
+                    declared: projection.bounds.max_rows_per_window,
+                });
+            }
+            let run_rows = self.rows_this_run.saturating_add(window_rows);
+            if run_rows > projection.bounds.max_rows_per_run {
+                return Err(SdkError::ProjectionBoundExceeded {
+                    bound: "max_rows_per_run",
+                    value: run_rows,
+                    declared: projection.bounds.max_rows_per_run,
+                });
+            }
+            // Rewind: every unit's snapshot must be the newest one seen, or
+            // newer. A snapshot already superseded this session means the
+            // source moved backwards.
+            for unit in &units {
+                if let Some(snapshot) = &unit.snapshot {
+                    if let Some(last) = self.seen_snapshots.last() {
+                        if &snapshot.snapshot_id != last
+                            && self
+                                .seen_snapshots
+                                .iter()
+                                .any(|seen| seen == &snapshot.snapshot_id)
+                        {
+                            return Err(SdkError::SourceRewound {
+                                observed: snapshot.snapshot_id.clone(),
+                                last: last.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         // Split first — an unsplittable/invalid unit must fail before any
         // wire traffic. Then STAMP and SIGN, and verify the R-I2 budget
         // against the actual submitted bytes: the split-time estimate
@@ -469,9 +636,23 @@ impl AdapterSession {
             }
         }
 
-        // Every batch settled: advance the cursor exactly once (R12).
+        // Every batch settled: advance the cursor exactly once (R12) and
+        // record the window's rows/snapshots against the projection
+        // bounds and the rewind detector (D21-a/d).
         save_cursor(&self.config.cursor_path, cursor)?;
         self.cursor = Some(cursor.to_string());
+        let window_rows: u64 = units.iter().map(|unit| unit.memories.len() as u64).sum();
+        self.rows_this_run = self.rows_this_run.saturating_add(window_rows);
+        for unit in &units {
+            if let Some(snapshot) = &unit.snapshot {
+                if self.seen_snapshots.last() != Some(&snapshot.snapshot_id) {
+                    self.seen_snapshots.push(snapshot.snapshot_id.clone());
+                    if self.seen_snapshots.len() > 16 {
+                        self.seen_snapshots.remove(0);
+                    }
+                }
+            }
+        }
         outcome.cursor_advanced = true;
         Ok(outcome)
     }

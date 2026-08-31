@@ -237,6 +237,15 @@ pub trait Storage: Send + Sync + 'static {
             "audited relationship deletion unsupported".into(),
         ))
     }
+    /// Append one standalone immutable audit event (D21-d: the
+    /// schema-extension verdict writes exactly one row). Storage assigns
+    /// its LSN.
+    async fn append_audit(&self, audit: &AuditEvent) -> crate::Result<CommitRecord> {
+        let _ = audit;
+        Err(StorageError::Backend(
+            "standalone audit append unsupported".into(),
+        ))
+    }
     /// Atomically upsert a batch of memories and relationships AND append
     /// the required audit event in one storage operation (PX2: the
     /// pack-Action framework's commit boundary — the framework cannot

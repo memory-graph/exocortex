@@ -328,6 +328,7 @@ impl EndSessionTool {
             producer_id: "session-wrapup".into(),
             ceiling: 3,
             source_flavor: "session".into(),
+            projection: None,
             producer_kind: exocortex_wire::ingest::v1::ProducerKind::CodingAgent.into(),
             producer: Some(ProducerIdentity {
                 node_id: self.node_id.clone(),

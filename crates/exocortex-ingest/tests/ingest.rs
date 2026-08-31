@@ -98,6 +98,70 @@ async fn registered(srv: &IngestServer<InMemoryStorage>, ceiling: i32) {
     .unwrap();
 }
 
+// D21-a: table-shaped sources register with a declared projection whose
+// derived schema hash the test snapshots carry verbatim.
+fn table_columns() -> Vec<(String, String)> {
+    vec![
+        ("row_key".to_string(), "string".to_string()),
+        ("payload".to_string(), "string".to_string()),
+    ]
+}
+
+fn table_schema_hash_bytes() -> Vec<u8> {
+    let hex = exocortex_ingest::service::projection_schema_hash(&table_columns());
+    (0..32)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+        .collect()
+}
+
+fn register_table_source(srv: &IngestServer<InMemoryStorage>, source_uri: &str, producer_id: &str) {
+    use exocortex_wire::ingest::v1::{
+        ProjectionBounds, ProjectionDescriptor, ProjectionField, SourceColumn,
+    };
+    let columns = table_columns();
+    let mut r = RegisterSourceRequest {
+        org_id: "org".into(),
+        source_uri: source_uri.into(),
+        producer_id: producer_id.into(),
+        ceiling: 3,
+        source_flavor: "iceberg".into(),
+        producer_kind: 4,
+        producer: Some(ProducerIdentity {
+            node_id: "test-node".into(),
+            agent_id: String::new(),
+            adapter_id: String::new(),
+            hmac_signature: vec![],
+            client_metadata: None,
+        }),
+        projection: Some(ProjectionDescriptor {
+            selector: "table:all".into(),
+            fields: vec![ProjectionField {
+                source_field: "row_key".into(),
+                memory_type: "Fix".into(),
+                kind: String::new(),
+            }],
+            source_schema: columns
+                .iter()
+                .map(|(n, t)| SourceColumn {
+                    name: n.clone(),
+                    data_type: t.clone(),
+                })
+                .collect(),
+            mapping_version: 1,
+            bounds: Some(ProjectionBounds {
+                max_rows_per_window: 256,
+                max_rows_per_run: 100_000,
+                max_graph_share_percent: 50,
+            }),
+            last_snapshot_id: "s1".into(),
+        }),
+    };
+    exocortex_wire::signing::sign_registration(&[5u8; 32], &mut r);
+    futures::executor::block_on(async {
+        srv.register_source(tonic::Request::new(r)).await.unwrap();
+    });
+}
+
 #[tokio::test]
 async fn e2e_valid_batch_accepted_with_monotonic_lsn() {
     let srv = server();
@@ -311,6 +375,18 @@ fn reject_code_target_manifest_is_exhaustive_and_executable() {
             RejectCode::ResourceLimitExceeded => (
                 "ingest",
                 "resource_ceiling_rejects_before_ontology_or_storage_work",
+            ),
+            RejectCode::SourceRewound => (
+                "schema_evolution",
+                "rewound_snapshot_is_rejected_with_its_own_code",
+            ),
+            RejectCode::SchemaDrift => (
+                "schema_evolution",
+                "drifted_schema_hash_rejects_every_row_until_re_registration",
+            ),
+            RejectCode::ProjectionBoundExceeded => (
+                "schema_evolution",
+                "bound_exceeded_rejects_the_batch_naming_the_bound",
             ),
         }
     }
@@ -750,25 +826,14 @@ async fn unknown_memory_type_rejected() {
 #[tokio::test]
 async fn external_batch_without_key_rejected_and_with_key_deterministic() {
     let srv = server();
-    srv.register_source(tonic::Request::new(exocortex_wire::signing::registration(
-        &[5u8; 32],
-        "org",
-        "session://s1",
-        "session-wrapup",
-        3,
-        "iceberg",
-        "test-node",
-        exocortex_wire::ingest::v1::ProducerKind::AnalyticsAdapter,
-    )))
-    .await
-    .unwrap();
+    register_table_source(&srv, "session://s1", "session-wrapup");
     let mut d = draft("k", "Fix", 1);
     d.external_key = None;
     let mut b = batch(vec![d]);
     b.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
     b.snapshot = Some(exocortex_wire::ingest::v1::ExternalSnapshotInfo {
         snapshot_id: "s1".into(),
-        schema_hash: vec![0; 32],
+        schema_hash: table_schema_hash_bytes(),
         source_flavor: "iceberg".into(),
     });
     let b = sign(b, [5u8; 32]);
@@ -793,7 +858,7 @@ async fn external_batch_without_key_rejected_and_with_key_deterministic() {
     b2.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
     b2.snapshot = Some(exocortex_wire::ingest::v1::ExternalSnapshotInfo {
         snapshot_id: "s1".into(),
-        schema_hash: vec![0; 32],
+        schema_hash: table_schema_hash_bytes(),
         source_flavor: "iceberg".into(),
     });
     let b2 = sign(b2, [5u8; 32]);
@@ -819,18 +884,7 @@ async fn authenticated_temporal_and_external_edge_provenance_survive_exactly() {
     use futures::StreamExt;
 
     let srv = server();
-    srv.register_source(tonic::Request::new(exocortex_wire::signing::registration(
-        &[5u8; 32],
-        "org",
-        "iceberg://catalog/table",
-        "iceberg-adapter",
-        3,
-        "iceberg",
-        "test-node",
-        exocortex_wire::ingest::v1::ProducerKind::AnalyticsAdapter,
-    )))
-    .await
-    .unwrap();
+    register_table_source(&srv, "iceberg://catalog/table", "iceberg-adapter");
 
     let observed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
     let recorded = std::time::UNIX_EPOCH + std::time::Duration::from_secs(200);
@@ -859,7 +913,7 @@ async fn authenticated_temporal_and_external_edge_provenance_survive_exactly() {
     b.recorded_at = Some(recorded.into());
     b.snapshot = Some(exocortex_wire::ingest::v1::ExternalSnapshotInfo {
         snapshot_id: "snapshot-9".into(),
-        schema_hash: vec![9; 32],
+        schema_hash: table_schema_hash_bytes(),
         source_flavor: "iceberg".into(),
     });
     b.relationships = vec![exocortex_wire::ingest::v1::RelationshipDraft {
@@ -1478,6 +1532,7 @@ async fn unsigned_registration_is_unauthenticated() {
             producer_id: "attacker".into(),
             ceiling: 3,
             source_flavor: "custom".into(),
+            projection: None,
             producer: None,
             producer_kind: 5,
         }))
@@ -1520,6 +1575,7 @@ async fn legitimate_producer_survives_registration_flood() {
                 producer_id: format!("attacker-{i}"),
                 ceiling: 3,
                 source_flavor: "custom".into(),
+                projection: None,
                 producer: None,
                 producer_kind: 5,
             }))

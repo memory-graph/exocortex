@@ -133,6 +133,7 @@ async fn fixture_adapter_completes_the_protocol_out_of_process() {
         max_batch_bytes: 4 * 1024 * 1024,
         cursor_path: dir.path().join("oop.cursor"),
         retry: exocortex_adapter_sdk::RetryPolicy::default(),
+        projection: None,
     };
 
     let mut session = AdapterSession::connect(cfg).await.expect("handshake");

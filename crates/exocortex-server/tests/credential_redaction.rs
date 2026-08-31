@@ -100,6 +100,7 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
             producer_id: "safe-producer".into(),
             ceiling: 3,
             source_flavor: "custom".into(),
+            projection: None,
             producer: Some(ProducerIdentity {
                 node_id: "safe-node".into(),
                 agent_id: String::new(),

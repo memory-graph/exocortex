@@ -345,6 +345,7 @@ async fn unspecified_producer_kind_is_rejected() {
             producer_id: "session-wrapup".into(),
             ceiling: 3,
             source_flavor: "session".into(),
+            projection: None,
             producer_kind: 0,
             producer: Some(ProducerIdentity {
                 node_id: "n".into(),

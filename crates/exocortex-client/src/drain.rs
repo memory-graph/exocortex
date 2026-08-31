@@ -71,6 +71,7 @@ pub async fn drain_once(
             producer_id: batch.producer_id.clone(),
             ceiling: batch.ceiling,
             source_flavor: "session".into(),
+            projection: None,
             producer_kind: exocortex_wire::ingest::v1::ProducerKind::CodingAgent.into(),
             producer: Some(ProducerIdentity {
                 node_id: node_id.to_string(),

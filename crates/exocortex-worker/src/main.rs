@@ -170,6 +170,7 @@ async fn run_fixture(args: Args) -> anyhow::Result<()> {
         hmac_key,
         max_batch_bytes: 4 * 1024 * 1024,
         cursor_path,
+        projection: None,
         retry: exocortex_adapter_sdk::RetryPolicy::default(),
     };
 

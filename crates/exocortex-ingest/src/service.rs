@@ -34,6 +34,51 @@ const REGISTRY_LRU_CAP: usize = 1000;
 // pack declares it (`computed_only_kinds!`), the boundary reads it. No
 // string literal here to drift from the pack.
 
+/// D21-a: the projection stored against a registered source (the
+/// persisted form of the wire `ProjectionDescriptor`). `schema_hash` is
+/// the canonical digest over the declared column set — the value every
+/// batch's `ExternalSnapshot.schema_hash` must match (D21-d).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredProjection {
+    /// What subset of the source is in scope, in the source's own terms.
+    pub selector: String,
+    /// (source_field, memory_type, kind) — the mapping `mapping_version` versions.
+    pub fields: Vec<(String, String, String)>,
+    /// (column, data type) at mapping time.
+    pub columns: Vec<(String, String)>,
+    /// Canonical digest over `columns` (hex, 32 bytes).
+    pub schema_hash: String,
+    /// Bumped on every deliberate selector/field/schema change.
+    pub mapping_version: u32,
+    /// Rows one submit window may carry (server enforces per batch).
+    pub max_rows_per_window: u64,
+    /// Declared graph-share bound (percent); Dreams-side evaluation is
+    /// the recorded deferral.
+    pub max_graph_share_percent: u32,
+}
+
+/// Canonical digest over a declared column set (D21-d): sorted
+/// (name, type) pairs, NUL-separated, through the ONE wire digest.
+pub fn projection_schema_hash(columns: &[(String, String)]) -> String {
+    let mut sorted = columns.to_vec();
+    sorted.sort();
+    let mut preimage = String::new();
+    for (name, data_type) in &sorted {
+        preimage.push_str(name);
+        preimage.push('\u{0}');
+        preimage.push_str(data_type);
+        preimage.push('\u{0}');
+    }
+    exocortex_wire::signing::content_digest_hex(preimage.as_bytes())
+}
+
+/// Table-shaped flavors whose registrations REQUIRE a declared projection
+/// (D21-a). `session`, `custom`, and the shipped docs flavor are exempt
+/// in v1 — the Mintlify adapter's compliance migration is tracked work.
+pub fn projection_required(flavor: &str) -> bool {
+    matches!(flavor, "iceberg" | "delta" | "parquet-dir")
+}
+
 /// The registered source: its ceiling (R-I3) and its declared producer
 /// kind (D8). The kind is stored ONCE at first registration and rides
 /// every provenance row the source asserts — retrofitting producer
@@ -52,6 +97,9 @@ pub struct SourceEntry {
     /// with no flavor and therefore receive no grouping.
     #[serde(default)]
     pub flavor: SmolStrLike,
+    /// D21-a: the declared projection (table-shaped flavors only).
+    #[serde(default)]
+    pub projection: Option<StoredProjection>,
 }
 
 /// Immutable administrator policy for one exact producer identity.
@@ -150,6 +198,12 @@ pub struct IngestServer<S: Storage> {
     post_ingest_notify: Arc<tokio::sync::Notify>,
     /// D6 grouping rules selected by the registered source flavor.
     grouping_rules: Arc<Vec<crate::grouping::GroupingRule>>,
+    /// D21-d: snapshot ids observed per source, newest last, bounded —
+    /// a batch naming an already-superseded snapshot is a rewind. In
+    /// memory by design; the durable cursor/snapshot record is D20's
+    /// open question 3.
+    #[allow(clippy::type_complexity)]
+    seen_snapshots: Arc<Mutex<HashMap<(String, String, String), Vec<String>>>>,
 }
 
 /// One ring entry.
@@ -208,6 +262,7 @@ impl<S: Storage> Clone for IngestServer<S> {
             submit_permits: self.submit_permits.clone(),
             post_ingest_notify: self.post_ingest_notify.clone(),
             grouping_rules: self.grouping_rules.clone(),
+            seen_snapshots: self.seen_snapshots.clone(),
         }
     }
 }
@@ -224,6 +279,7 @@ impl<S: Storage> IngestServer<S> {
             sources: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(REGISTRY_LRU_CAP).unwrap(),
             ))),
+            seen_snapshots: Arc::new(Mutex::new(HashMap::new())),
             sources_file: None,
             source_registry_error: None,
             source_persistence: Arc::new(Mutex::new(())),
@@ -1117,6 +1173,58 @@ impl<S: Storage + 'static> IngestServer<S> {
                 "snapshot source_flavor differs from the registered source",
             ));
         }
+        // D21-a/d: the declared projection governs the submission. Bound,
+        // schema-hash, and rewind verdicts are cheap registry checks —
+        // they run with the other pre-validation admission rules.
+        if let Some(projection) = &source.projection {
+            let rows = batch.memories.len() as u64;
+            if projection.max_rows_per_window > 0 && rows > projection.max_rows_per_window {
+                return Err(ack_reject_all(
+                    batch,
+                    RejectCode::ProjectionBoundExceeded,
+                    &format!(
+                        "batch carries {rows} rows; the declared max_rows_per_window is {}",
+                        projection.max_rows_per_window
+                    ),
+                ));
+            }
+            if let Some(snapshot) = &batch.snapshot {
+                let mut hex = String::with_capacity(64);
+                for byte in &snapshot.schema_hash {
+                    use std::fmt::Write as _;
+                    let _ = write!(hex, "{byte:02x}");
+                }
+                if !hex.eq_ignore_ascii_case(&projection.schema_hash) {
+                    return Err(ack_reject_all(
+                        batch,
+                        RejectCode::SchemaDrift,
+                        "snapshot schema_hash differs from the registered mapping — re-register the projection deliberately with a bumped mapping_version",
+                    ));
+                }
+                let key = (
+                    batch.org_id.clone(),
+                    batch.source_uri.clone(),
+                    batch.producer_id.clone(),
+                );
+                let seen = self.seen_snapshots.lock().unwrap();
+                if let Some(history) = seen.get(&key) {
+                    if let Some(last) = history.last() {
+                        if &snapshot.snapshot_id != last
+                            && history.iter().any(|id| id == &snapshot.snapshot_id)
+                        {
+                            return Err(ack_reject_all(
+                                batch,
+                                RejectCode::SourceRewound,
+                                &format!(
+                                    "snapshot {} was already superseded by {} — the source was rewound and needs an operator",
+                                    snapshot.snapshot_id, last
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         Ok(source)
     }
 
@@ -1759,6 +1867,23 @@ impl<S: Storage + 'static> IngestServer<S> {
         assigned_lsn: u64,
         accepted: u32,
     ) -> IngestAck {
+        // D21-d: remember the settled snapshot so a later batch naming an
+        // older one is a rewind, not a replay.
+        if let Some(snapshot) = &batch.snapshot {
+            let key = (
+                batch.org_id.clone(),
+                batch.source_uri.clone(),
+                batch.producer_id.clone(),
+            );
+            let mut seen = self.seen_snapshots.lock().unwrap();
+            let history = seen.entry(key).or_default();
+            if history.last() != Some(&snapshot.snapshot_id) {
+                history.push(snapshot.snapshot_id.clone());
+                if history.len() > 16 {
+                    history.remove(0);
+                }
+            }
+        }
         let keyed = batch
             .memories
             .iter()
@@ -1977,6 +2102,9 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
         // completion order therefore cannot differ from durable replacement
         // order, while the map guard is still released before filesystem I/O.
         let _persistence = self.source_persistence.lock().unwrap();
+        // D21-d: set when a deliberate re-registration extends the schema
+        // with additions only — one audit row is written below.
+        let mut schema_extended: Option<StoredProjection> = None;
         let (effective, candidate, source_rows) = {
             let sources = self.sources.lock().unwrap();
             let mut candidate = sources.clone();
@@ -2016,18 +2144,144 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                     "source_flavor differs from the existing registration",
                 ));
             }
+            // D21-a: table-shaped sources declare their projection at
+            // registration — an undeclared adapter cannot submit.
+            let stored_projection = if projection_required(&declared_flavor) {
+                let Some(descriptor) = &r.projection else {
+                    return Err(Status::invalid_argument(
+                        "table-shaped source requires a declared projection: selector, field mapping, source schema, bounds (adapter-contract D21-a)",
+                    ));
+                };
+                let columns: Vec<(String, String)> = descriptor
+                    .source_schema
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone()))
+                    .collect();
+                let fields: Vec<(String, String, String)> = descriptor
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.source_field.clone(),
+                            f.memory_type.clone(),
+                            f.kind.clone(),
+                        )
+                    })
+                    .collect();
+                for (source_field, _, _) in &fields {
+                    if !columns.iter().any(|(name, _)| name == source_field) {
+                        return Err(Status::failed_precondition(
+                            "projection maps a field absent from the declared source schema (indistinguishable from a removed or renamed column — fail closed)",
+                        ));
+                    }
+                }
+                let incoming = StoredProjection {
+                    selector: descriptor.selector.clone(),
+                    fields,
+                    columns,
+                    schema_hash: projection_schema_hash(
+                        &descriptor
+                            .source_schema
+                            .iter()
+                            .map(|c| (c.name.clone(), c.data_type.clone()))
+                            .collect::<Vec<_>>(),
+                    ),
+                    mapping_version: descriptor.mapping_version,
+                    max_rows_per_window: descriptor
+                        .bounds
+                        .as_ref()
+                        .map(|b| b.max_rows_per_window)
+                        .unwrap_or(0),
+                    max_graph_share_percent: descriptor
+                        .bounds
+                        .as_ref()
+                        .map(|b| b.max_graph_share_percent)
+                        .unwrap_or(0),
+                };
+                match &existing.as_ref().and_then(|entry| entry.projection.clone()) {
+                    None => Some(incoming),
+                    Some(previous) => {
+                        if &incoming != previous {
+                            if incoming.mapping_version <= previous.mapping_version {
+                                return Err(Status::failed_precondition(
+                                    "projection change requires a mapping_version bump (D21-a)",
+                                ));
+                            }
+                            // D21-d verdict table, evaluated over the
+                            // deliberate re-registration's column diff.
+                            for (name, data_type) in &previous.columns {
+                                match incoming
+                                    .columns
+                                    .iter()
+                                    .find(|(new_name, _)| new_name == name)
+                                {
+                                    None => {
+                                        return Err(Status::failed_precondition(format!(
+                                            "mapped-adjacent column `{name}` was removed or renamed — fail closed until the mapping is re-authored"
+                                        )))
+                                    }
+                                    Some((_, new_type)) if new_type != data_type => {
+                                        return Err(Status::failed_precondition(format!(
+                                            "column `{name}` was retyped ({data_type} -> {new_type}) — fail closed until the mapping is re-authored"
+                                        )))
+                                    }
+                                    Some(_) => {}
+                                }
+                            }
+                            // Only additions reached here: accept and
+                            // audit (one row, below).
+                            schema_extended = Some(incoming.clone());
+                        }
+                        Some(incoming)
+                    }
+                }
+            } else {
+                // Exempt flavors ignore any supplied projection (it is
+                // not stored, not audited, and not enforced).
+                None
+            };
             let entry = SourceEntry {
                 ceiling,
                 kind,
                 flavor,
+                projection: stored_projection,
             };
-            candidate.put(key, entry.clone());
+            candidate.put(key.clone(), entry.clone());
             let rows = Self::source_rows(&candidate);
             (entry, candidate, rows)
         };
         self.persist_source_rows(&source_rows)
             .map_err(|_| Status::internal("source registry persistence failed"))?;
         *self.sources.lock().unwrap() = candidate;
+        // The persistence sequencer must not be held across the audit
+        // await below (the guard is not Send).
+        drop(_persistence);
+        // D21-d: an accepted extension (columns added, nothing mapped
+        // touched) writes EXACTLY ONE audit row — the record that the
+        // schema grew without a mapping bump.
+        if let Some(projection) = schema_extended {
+            let audit = exocortex_storage::AuditEvent {
+                action: "schema_extended".into(),
+                actor: key.2.clone().into(),
+                org_id: key.0.clone().into(),
+                input_digest: *blake3::hash(
+                    format!(
+                        "{}|{}|{}",
+                        key.1, projection.schema_hash, projection.mapping_version
+                    )
+                    .as_bytes(),
+                )
+                .as_bytes(),
+                output_ids: Default::default(),
+                fingerprint: self.storage.ontology_fingerprint(),
+                lease_epoch: None,
+                recorded_at: chrono::Utc::now(),
+            };
+            self.storage
+                .append_audit(&audit)
+                .await
+                .map_err(|_| Status::internal("schema-extension audit append failed"))?;
+        }
         Ok(Response::new(RegisterSourceResponse {
             ceiling: effective.ceiling as i32,
         }))

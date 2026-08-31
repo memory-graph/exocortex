@@ -28,6 +28,36 @@ message RegisterSourceRequest {
   // free string would persist typos into append-only provenance forever.
   // Registration rejects UNSPECIFIED — every producer must declare.
   ProducerKind producer_kind = 7;
+  // D21-a (adapter-contract PRD §3.1): the declared projection — what
+  // subset of the source this adapter is entitled to bring in, the field
+  // mapping `mapping_version` versions, and the bounds that stop the
+  // window instead of letting a table silently dominate the graph.
+  // REQUIRED for table-shaped flavors ("iceberg" | "delta" |
+  // "parquet-dir"); "session" and "custom" are exempt in v1 (the shipped
+  // docs adapter migrates separately).
+  ProjectionDescriptor projection = 8;
+}
+message ProjectionField {
+  string source_field = 1; // column / key, in the source's own terms
+  string memory_type = 2;  // ontology target type name
+  string kind        = 3;  // relationship name, or "" when the field maps to attributes only
+}
+message SourceColumn {
+  string name      = 1;
+  string data_type = 2;   // source-declared type; a change under the same name is the dangerous case
+}
+message ProjectionBounds {
+  uint64 max_rows_per_window = 1;  // rows one submit window may carry
+  uint64 max_rows_per_run    = 2;  // rows one adapter run may bring, total
+  uint32 max_graph_share_percent = 3; // share of the org graph this source may occupy (declared; Dreams-side evaluation is the recorded deferral)
+}
+message ProjectionDescriptor {
+  string   selector = 1;             // what subset is in scope, in the source's own terms
+  repeated ProjectionField fields = 2; // the artifact mapping_version versions
+  repeated SourceColumn source_schema = 3; // columns at mapping time; the schema hash derives from this
+  uint32   mapping_version = 4;
+  ProjectionBounds bounds = 5;
+  string   last_snapshot_id = 6;     // source snapshot the schema was observed at
 }
 message RegisterSourceResponse { Visibility ceiling = 1; }
 
@@ -172,6 +202,17 @@ enum RejectCode {
   // rather than lossy-coerced.
   INVALID_EXTERNAL_KEY = 13;
   RESOURCE_LIMIT_EXCEEDED = 14; // fixed request/content/tag/edge ceilings
+  // D21-d (adapter-contract PRD §3.4): the source was rewound — snapshot
+  // rollback, slot reset. The cursor is monotonic and the source is not;
+  // this needs an operator, not a retry.
+  SOURCE_REWOUND = 15;
+  // D21-d: the batch's snapshot schema_hash differs from the schema the
+  // mapping was registered against. Every row fails closed until the
+  // projection is deliberately re-registered with a mapping_version bump.
+  SCHEMA_DRIFT = 16;
+  // D21-a: the submission exceeds a declared projection bound (rows per
+  // window). The window stops; it is never truncated silently.
+  PROJECTION_BOUND_EXCEEDED = 17;
 }
 message SubmitOne { oneof body { IngestBatch batch = 1; } }
 message SubmitAck { IngestAck ack = 1; }

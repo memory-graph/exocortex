@@ -46,6 +46,7 @@ pub struct MockState {
     ceiling: Arc<Mutex<i32>>,
     fingerprint: Arc<Mutex<[u8; 32]>>,
     submitted: Arc<Mutex<Vec<IngestBatch>>>,
+    registrations: Arc<Mutex<Vec<RegisterSourceRequest>>>,
 }
 
 /// A running mock server.
@@ -70,6 +71,7 @@ impl MockServer {
             ceiling: Arc::new(Mutex::new(ceiling)),
             fingerprint: Arc::new(Mutex::new(fingerprint)),
             submitted: Arc::new(Mutex::new(Vec::new())),
+            registrations: Arc::new(Mutex::new(Vec::new())),
         };
         let svc = IngestServiceServer::new(MockService(state.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -104,6 +106,12 @@ impl MockServer {
     /// Every submitted batch, in order.
     pub fn submitted(&self) -> Vec<IngestBatch> {
         self.state.submitted.lock().unwrap().clone()
+    }
+
+    /// Every registration request, in order (D21-a: the projection
+    /// arrives here).
+    pub fn registrations(&self) -> Vec<RegisterSourceRequest> {
+        self.state.registrations.lock().unwrap().clone()
     }
 
     /// Queue more script entries (mid-run additions).
@@ -147,9 +155,10 @@ impl IngestService for MockService {
 
     async fn register_source(
         &self,
-        _req: Request<RegisterSourceRequest>,
+        req: Request<RegisterSourceRequest>,
     ) -> Result<Response<RegisterSourceResponse>, Status> {
         self.0.calls.lock().unwrap().push("register");
+        self.0.registrations.lock().unwrap().push(req.into_inner());
         Ok(Response::new(RegisterSourceResponse {
             ceiling: *self.0.ceiling.lock().unwrap(),
         }))

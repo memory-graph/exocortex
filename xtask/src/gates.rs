@@ -1075,9 +1075,13 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
             columns[0].as_bytes(),
             [b'p', b'x', n] if (b'1'..=b'8').contains(n)
         );
+        let is_ac = matches!(
+            columns[0].as_bytes(),
+            [b'a', b'c', n] if (b'1'..=b'5').contains(n)
+        );
         anyhow::ensure!(
-            is_core || is_oc || is_px,
-            "criterion {} is outside §23 (1..=30), the OC-PRD S-rows (oc1..=oc6), or the PX2 rows (px1..=px8)",
+            is_core || is_oc || is_px || is_ac,
+            "criterion {} is outside §23 (1..=30), the OC/PX2/AC rows",
             columns[0]
         );
         let criterion = columns[0].to_string();
@@ -1155,7 +1159,7 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
     // the PX2 pack-verb rows (px namespace).
     let core = seen
         .iter()
-        .filter(|c| !c.starts_with("oc") && !c.starts_with("px"))
+        .filter(|c| !c.starts_with("oc") && !c.starts_with("px") && !c.starts_with("ac"))
         .count();
     anyhow::ensure!(
         core == 30,
@@ -1173,6 +1177,12 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
         (1..=8).contains(&px),
         "acceptance matrix covers {} of the 8 PX2 pack-verb rows",
         px
+    );
+    let ac = seen.iter().filter(|c| c.starts_with("ac")).count();
+    anyhow::ensure!(
+        (1..=5).contains(&ac),
+        "acceptance matrix covers {} of the 5 adapter-contract rows",
+        ac
     );
     Ok(())
 }
@@ -1822,6 +1832,12 @@ pub(crate) const SEAM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "exocortex-ingest",
         "tests/round1_e2e.rs",
         "dreams_cycle_over_ingested_data",
+    ),
+    (
+        "ingest-schema-evolution",
+        "exocortex-ingest",
+        "tests/schema_evolution.rs",
+        "drifted_schema_hash_rejects_every_row_until_re_registration",
     ),
     (
         "write-path-parity",
@@ -2835,6 +2851,12 @@ fn unclaimed() {}
         for criterion in 1..=8 {
             rows.push_str(&format!(
                 "px{criterion}	verified	requirement px{criterion}	tests/direct.rs::direct_case	cargo test direct_case	-
+"
+            ));
+        }
+        for criterion in 1..=5 {
+            rows.push_str(&format!(
+                "ac{criterion}	verified	requirement ac{criterion}	tests/direct.rs::direct_case	cargo test direct_case	-
 "
             ));
         }

@@ -2663,6 +2663,18 @@ impl Storage for FalkorStorage {
         })
     }
 
+    async fn append_audit(&self, audit: &AuditEvent) -> Result<CommitRecord, StorageError> {
+        let lsn = self.next_lsn().await?;
+        let now = Utc::now();
+        self.run_template("batch_audit_append", &Self::audit_params(audit, lsn), false)
+            .await?;
+        Ok(CommitRecord {
+            lsn,
+            committed_at: now,
+            node_id: None,
+            edge_id: None,
+        })
+    }
     async fn delete_relationship_audited(
         &self,
         id: &RelationshipId,

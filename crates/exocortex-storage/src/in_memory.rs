@@ -823,6 +823,24 @@ impl Storage for InMemoryStorage {
             edge_id: None,
         })
     }
+    async fn append_audit(&self, audit: &AuditEvent) -> Result<CommitRecord, StorageError> {
+        let lsn = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            let lsn = self.next_lsn();
+            self.inner
+                .audits
+                .lock()
+                .unwrap()
+                .push(Self::audit_value(audit, lsn));
+            lsn
+        };
+        Ok(CommitRecord {
+            lsn,
+            committed_at: chrono::Utc::now(),
+            node_id: None,
+            edge_id: None,
+        })
+    }
     async fn delete_relationship_audited(
         &self,
         id: &RelationshipId,

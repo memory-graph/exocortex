@@ -98,6 +98,18 @@ pub fn guidance(code: RejectCode) -> RejectGuidance {
             disposition: Disposition::Fatal,
             correction: "Ontology fingerprint mismatch — client and backend run different packs. Surface to the user; not fixable by you.",
         },
+        SourceRewound => RejectGuidance {
+            disposition: Disposition::Fatal,
+            correction: "The source was rewound (snapshot rollback / slot reset) behind data already ingested. This needs an operator to reconcile the cursor — never retry.",
+        },
+        SchemaDrift => RejectGuidance {
+            disposition: Disposition::Fatal,
+            correction: "Source schema no longer matches the registered mapping (column removed, retyped, or renamed). Re-register the projection deliberately with a bumped mapping_version.",
+        },
+        ProjectionBoundExceeded => RejectGuidance {
+            disposition: Disposition::Fatal,
+            correction: "Submission exceeds a declared projection bound. Narrow the selector or raise the bound via a mapping_version bump — never truncate silently.",
+        },
     }
 }
 
