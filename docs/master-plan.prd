@@ -1,5 +1,22 @@
 # Exocortex — Master Plan
 
+**Status (2026-08-30, Wave 2 three items deep):** Wave 1 is closed and
+Wave 2 has landed its three locally-unblocked items, each as its own
+green commit: **D21 steps a+d** (the adapter contract's unblocking pair
+— projection declaration + schema-evolution policy; b/c/e remain),
+**D18** (the git-history adapter, the zero-friction real-data demo),
+and **D13** (deterministic entity resolution — the same external row
+from two producers converges on one join point, no fuzzy matching).
+Four commits on main this wave-cycle: `9ef75a6` (PX2), `32481b0`
+(D21-a+d), `0e7d976` (D18), `fb1a61a` (D13). What remains in Wave 2 is
+**D21-b/c/e** (PreflightBatch, the fingerprint-stamped rulebook
+manifest, the `adapter-contract` gate — all locally unblocked), then
+**D19** (SaaS adapters; needs external credentials), **D1** (table
+adapters; needs the arrow/parquet dependency decision recorded in
+PUBLISHING), and **PX4** (needs the `loanlight-engineering/docs`
+checkout). Wave 3 unchanged (PX5 explorer now unblocked by PX6; D6/D7/
+D20/D22-D24).
+
 **Status (2026-08-30, night — D13 shipped):** deterministic entity
 resolution. `EntityId::from_external(org, table_uuid, logical_pk)` — a
 domain-separated, length-prefixed digest over the EXTERNAL coordinates,
@@ -173,6 +190,22 @@ items are promoted into this file, tracked to done, and never silently
 dropped. Anything not listed here is either shipped or explicitly deferred
 to v2 in the PRD's own terms.
 
+**Baseline (2026-08-30, Wave 2 three items deep):** 564 tests / 0
+failed across the workspace (mandatory feature run; +22 over the Wave 1
+baseline: 9 schema-evolution, 4 SDK projection, 8 git-adapter, 1 D13
+cross-producer join, plus fixtures). All 22 gate commands green at every
+commit; `scripts/verify-release.sh` exit 0. Seam inventory 34 (+
+kernel-pack-verbs, ingest-schema-evolution, adapter-sdk-projection,
+adapter-git-history; PX2's kernel row and the D21 rows each cost their
+suite, per the bijection). Fingerprint unchanged since PX2's intended
+move: compatibility `2c3ec388…5c23` gates, build `18dbf33b…49f5`
+(composed dev-v1 + mortgage-v1). Acceptance matrix carries oc1-oc6,
+px1-px8, and ac1/ac4 verified with ac2/ac3/ac5 tracked to D21-b/c/e.
+New seams this wave: `upsert_batch_audited` + `append_audit` (storage),
+`EntityId::from_external` (kernel), three wire reject codes
+(15-17), and one new crate (`exocortex-adapter-git`, no new external
+dependencies).
+
 **Baseline (2026-08-30, Wave 1 complete):** 542 tests / 0 failed across
 the workspace (mandatory feature flag run). All 22 gate commands green
 including `seam-inventory` (33 seams — kernel-pack-verbs added) and the
@@ -254,7 +287,7 @@ A PRD that is not listed here is not accepted work.
 | `docs/prd/mintlify-docs-integration-prd.md` | The docs producer's ingest contract | Shipped as its own repo (ML1); first real-corpus run is PX4, Wave 2 |
 | `docs/prd/backup-restore-prd.md` | `--export` / `--import`, fingerprint-gated, all-or-nothing | Shipped (BR-PRD rows in Done); its restore gate is relaxed by OC-PRD |
 | `docs/prd/ontology-compatibility-prd.md` | How two components decide they may exchange data: the fingerprint, its six enforcement sites, and their migration | **Shipped** (Wave 0; OC-PRD rows in Done) |
-| `docs/prd/exocortex-palantir-expansion-prd.md` | Second pack, pack-registered Actions/Functions, seam inventory, first real docs run, read-only explorer | **Waves 1-3** as PX1-PX6 |
+| `docs/prd/exocortex-palantir-expansion-prd.md` | Second pack, pack-registered Actions/Functions, seam inventory, first real docs run, read-only explorer | **Wave 1 complete** (PX1-PX3, PX6, PX2 all closed); PX4 is Wave 2, PX5 is Wave 3 |
 | `docs/bug-prd-codebase-audit.md` | The 70-defect audit and its fix order | Closed in sweep rounds 4-5 |
 | `docs/bug-prd-standalone-readback.md` | Zero-setup mode's write→read loop | Closed (SR-PRD) |
 | `docs/bug-prd-external-key-identity.md` | `ExternalKey` identity stability | Closed |
@@ -392,12 +425,15 @@ idea:
 
 ## In progress
 
-Nothing is in progress. Wave 1 is complete (PX2 closed); the next
-accepted work is Wave 2, starting with **D21** (the adapter contract —
-it blocks D1/D19/D20). The table below is the closed Round 6 detail
-ledger (every row Done or Verified safe, evidence inline; the summary
-rows live in the Done section). A new item enters here only when work
-actually starts.
+Nothing is in progress. Wave 1 is complete (PX2 closed) and Wave 2 has
+shipped D21-a+d, D18, and D13; the next accepted work is **D21-b/c/e**
+(the adapter preflight, the rulebook manifest, the contract gate —
+locally unblocked), then D19/D1/PX4 (each blocked on external
+resources: SaaS credentials, the parquet dependency decision, the docs
+checkout). The table below is the closed Round 6 detail ledger (every
+row Done or Verified safe, evidence inline; the summary rows live in
+the Done section). A new item enters here only when work actually
+starts.
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
@@ -971,14 +1007,16 @@ renumbered, only re-waved.
   exchange data at all. It comes first because Wave 1 moves the fingerprint
   whether or not anyone planned for it, and Wave 0 is the difference between a
   managed change and a fleet-wide surprise. `OC-PRD`.
-- **Wave 1 — ontology verbs and modularity.** The pack seam becomes a
-  product: typed domain verbs, a second pack, and the seam set that keeps
-  both honest. Everything else reads better once this lands.
-- **Wave 2 — data breadth.** The claim that matters most and the one the
-  repo is weakest on: point Exocortex at data that is not a coding
-  session. Structured-source adapters plus the deterministic half of
-  entity resolution, which is what makes a graph of documents into a model
-  of a world.
+- **Wave 1 — ontology verbs and modularity** (complete). The pack seam
+  became a product: typed domain verbs, a second pack, and the seam set
+  that keeps both honest. Everything else reads better once this lands.
+- **Wave 2 — data breadth** (three items in: D21-a+d, D18, D13). The
+  claim that matters most and the one the repo is weakest on: point
+  Exocortex at data that is not a coding session. Structured-source
+  adapters plus the deterministic half of entity resolution, which is
+  what makes a graph of documents into a model of a world — the
+  deterministic half shipped; the SaaS/table adapters and the docs run
+  remain.
 - **Wave 3 — surface and operability.** Make the graph visible and the
   node observable.
 - **Wave 4 — scale.** Prove the numbers past 100k before anyone bets an
