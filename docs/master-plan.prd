@@ -1,7 +1,8 @@
 # Exocortex — Master Plan
 
 **Status (2026-08-31, later — Wave 3 locally-unblocked set shipped):** On top
-of D21's closure, three Wave 3 items landed as their own green changes:
+of D21's closure, three Wave 3 items landed as their own green changes
+(all of this session's work is commit `b10e2a7`, gate-verified):
 **D23** resolved (LLM boundary = option a, made executable by the additive
 `PRODUCER_KIND_EXTRACTED` end to end), **D7** shipped
 (`resolve_contradiction` — the human decision over a `Contradicts` edge:
@@ -1066,15 +1067,16 @@ renumbered, only re-waved.
 - **Wave 1 — ontology verbs and modularity** (complete). The pack seam
   became a product: typed domain verbs, a second pack, and the seam set
   that keeps both honest. Everything else reads better once this lands.
-- **Wave 2 — data breadth** (three items in: D21-a+d, D18, D13). The
-  claim that matters most and the one the repo is weakest on: point
-  Exocortex at data that is not a coding session. Structured-source
-  adapters plus the deterministic half of entity resolution, which is
-  what makes a graph of documents into a model of a world — the
-  deterministic half shipped; the SaaS/table adapters and the docs run
-  remain.
-- **Wave 3 — surface and operability.** Make the graph visible and the
-  node observable.
+- **Wave 2 — data breadth** (D21 complete, D18 and D13 in; D19/D1/PX4/D17
+  remain, each gated on an external input). The claim that matters most
+  and the one the repo is weakest on: point Exocortex at data that is not
+  a coding session. Structured-source adapters plus the deterministic
+  half of entity resolution, which is what makes a graph of documents
+  into a model of a world — the deterministic half shipped and the
+  adapter contract that governs the rest is complete; the SaaS/table
+  adapters and the docs run remain.
+- **Wave 3 — surface and operability** (D23, D7, D22 in; PX5, D24, D6,
+  D20 remain). Make the graph visible and the node observable.
 - **Wave 4 — scale.** Prove the numbers past 100k before anyone bets an
   org on them.
 - **Wave 5 — multi-tenant and federated.** The capabilities that only
