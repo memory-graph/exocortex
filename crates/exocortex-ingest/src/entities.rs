@@ -210,9 +210,31 @@ pub fn intern_name(interner: &mut Rodeo, name: &str) -> Spur {
     interner.get_or_intern(name)
 }
 
-/// Attach extracted entities to a memory (server-side, R-T18).
+/// Attach entities to a memory (server-side, R-T18):
+/// (1) name-based extraction from content and tags, and
+/// (2) D13 — the external-identity join point: a snapshot memory whose
+/// provenance carries an `ExternalKey` also references the entity id
+/// derived from its `(table_uuid, logical_pk)`, so the same external row
+/// ingested through DIFFERENT producers converges on one entity with no
+/// fuzzy matching. Deterministic; `mapping_version` deliberately does
+/// not fork the join (the row is the same row).
 pub fn attach_entities(m: &mut Memory, extractor: &EntityExtractor) {
-    let ids = extractor.entity_ids(&m.content, &m.tags);
+    let mut ids = extractor.entity_ids(&m.content, &m.tags);
+    if let exocortex_kernel::Provenance::ExternalSnapshot(snapshot) = &m.provenance {
+        // B8: the kernel stores table_uuid as its canonical hex rendering
+        // (lossless for raw-byte identities) — the join key is that
+        // rendering's bytes, so every producer of the same table derives
+        // the same entity id.
+        if !snapshot.external_key.table_uuid.is_empty() {
+            ids.push(EntityId::from_external(
+                &extractor.org_id,
+                snapshot.external_key.table_uuid.as_bytes(),
+                snapshot.external_key.logical_pk.as_slice(),
+            ));
+        }
+    }
+    ids.sort();
+    ids.dedup();
     m.context.entities = ids.into_iter().collect();
 }
 

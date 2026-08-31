@@ -1,5 +1,17 @@
 # Exocortex — Master Plan
 
+**Status (2026-08-30, night — D13 shipped):** deterministic entity
+resolution. `EntityId::from_external(org, table_uuid, logical_pk)` — a
+domain-separated, length-prefixed digest over the EXTERNAL coordinates,
+deliberately independent of source, producer, name, and mapping version
+(the row is the same row) — and ingest stamps it onto every
+snapshot-provenance memory beside the name-extracted entities. The same
+external row arriving through two producers now converges on one join
+point with zero fuzzy matching, and `find_by_entity` returns both
+producers' memories (pinned by a cross-producer test). The
+name-based space and the external space cannot collide. The fuzzy/
+probabilistic half stays D17, unstarted, as designed.
+
 **Status (2026-08-30, night — D18 shipped):** the git-history adapter
 (`crates/exocortex-adapter-git`) — the cheapest real adapter and the
 strongest zero-friction demo — runs against any local checkout:
@@ -988,7 +1000,7 @@ renumbered, only re-waved.
 | D10 | **4** | Wire-protocol throughput fan-out + additive-change rollout tests | §23 #23, round-2 H10 |
 | D11 | **4** | Partition-and-heal live run (leader-kill convergence OBSERVED: 4/4 in 1290-1448ms; the partition leg remains manual) | §3 M5 AC, round-2 H10 |
 | D12 | **1** | Round-3 accepted residue (R1/R2 above): bridge reconcile loop, cursor fsync, checksum preimage hardening, persistent batch-dedup, WAL replay rebuild — **superseded in part**: persistent batch-dedup closed by W7, WAL replay rebuild+sign closed by W1 (the drain signs fresh, never replays stored signatures) | round-3 review M3/M6-M15 |
-| D13 | **2** | **Deterministic entity resolution** — resolve the same real-world entity across producers by shared external identity (`ExternalKey`, typed entities as convergent join points), not by fuzzy matching. Explicitly NOT the ML half: no corpus, no labelled set, no model. Without this the graph is a collection of documents rather than a model of a world, which is the core ontology claim. Fuzzy/probabilistic ER is a separate later item, and `NearDuplicateApplicant` stays a Dreams-computed proposal in the meantime | palantir-expansion PRD §5; core PRD §24 |
+| D13 | **2** | **Deterministic entity resolution** — resolve the same real-world entity across producers by shared external identity (`ExternalKey`, typed entities as convergent join points), not by fuzzy matching. Explicitly NOT the ML half: no corpus, no labelled set, no model. Without this the graph is a collection of documents rather than a model of a world, which is the core ontology claim. Fuzzy/probabilistic ER is a separate later item, and `NearDuplicateApplicant` stays a Dreams-computed proposal in the meantime | palantir-expansion PRD §5; core PRD §24 | **Done** — kernel `EntityId::from_external` (domain-separated from the name space, length-prefixed so table/pk boundaries cannot blur, org-scoped; `ids.rs::external_entity_identity_is_deterministic_and_domain_separated`); ingest `attach_entities` stamps the external join point on every snapshot-provenance memory over the canonical hex table rendering (B8); cross-producer convergence + retrieval pinned in `schema_evolution.rs::external_identity_joins_across_producers`; `mapping_version` deliberately does not fork the join (the row is the same row) |
 | D14 | **4** | Org-scale benchmarks past the existing 100k suite (10M memories) — forces the embedding-store decision, so it waits for a deployment that demands it rather than leading one | palantir-expansion PRD §5, §24 |
 | D15 | **5** | Row-level ACLs beyond the five visibility labels (inheritance chains, an authorization DSL) | palantir-expansion PRD §5, §24 |
 | D16 | **5** | Ontology branching / PRs against the ontology — only meaningful once a third pack is proposed by someone outside the org | palantir-expansion PRD §5, §24 |

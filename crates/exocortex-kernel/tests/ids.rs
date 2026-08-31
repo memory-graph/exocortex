@@ -139,3 +139,38 @@ fn hex_identity_roundtrip_rejects_non_canonical_forms() {
         None
     );
 }
+
+/// D13: external-identity entity ids are deterministic, source- and
+/// name-independent, and cannot collide with the name-based space.
+#[test]
+fn external_entity_identity_is_deterministic_and_domain_separated() {
+    use exocortex_kernel::EntityId;
+    let a = EntityId::from_external("org", b"table-hex", b"row-1");
+    let b = EntityId::from_external("org", b"table-hex", b"row-1");
+    assert_eq!(a, b, "same external coordinates converge");
+    assert_ne!(
+        a,
+        EntityId::from_external("org", b"table-hex", b"row-2"),
+        "a different row diverges"
+    );
+    assert_ne!(
+        a,
+        EntityId::from_external("org", b"other-table", b"row-1"),
+        "a different table diverges"
+    );
+    assert_ne!(
+        a,
+        EntityId::from_external("other-org", b"table-hex", b"row-1"),
+        "org scoping holds"
+    );
+    // Length-prefixed preimage: (t, p) pairs cannot blur across the
+    // boundary the way plain concatenation would.
+    assert_ne!(
+        EntityId::from_external("org", b"ab", b"c"),
+        EntityId::from_external("org", b"a", b"bc")
+    );
+    // Domain separation from the name-based space.
+    assert_ne!(a, EntityId::from_parts("org", 0, "row-1"));
+    // mapping_version deliberately does NOT fork the join point — the
+    // row is the same row (documented contract; callers never pass it).
+}

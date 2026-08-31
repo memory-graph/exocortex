@@ -571,3 +571,22 @@ Deviations and recorded boundaries for the adapter-contract landing:
   exhaustive reject manifest extended in the same change. New storage
   seam `append_audit` (standalone audit rows; the schema-extension
   verdict writes exactly one).
+
+## D13 closeout — deterministic entity resolution (2026-08-30, night)
+
+- **The external join key is the canonical hex table rendering** (B8),
+  not the raw uuid bytes: the kernel stores `ExternalKey.table_uuid`
+  as its hex rendering, so the join derives from the same bytes every
+  producer's coordinates normalize to. Length-prefixed preimage —
+  `(table, pk)` pairs cannot blur the way concatenation would.
+- **`mapping_version` deliberately does not fork the join point.** A
+  bumped mapping re-authors how a row MAPS onto memories; the row itself
+  is unchanged, so convergence is preserved across mapping evolution.
+- **The join point carries no entity TYPE.** dev-v1 entity types are a
+  name-extraction vocabulary; external rows converge by identity alone
+  (`context.entities` is an id set). Typing external rows is adapter
+  projection material, not kernel material.
+- **Unprincipled writes remain invisible** (fail-closed tenancy): the
+  cross-producer test injects an authenticated principal, matching
+  production topology — principal-less dev writes carry no tenant and
+  are invisible to scoped reads by design.

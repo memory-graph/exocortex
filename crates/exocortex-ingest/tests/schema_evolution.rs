@@ -76,10 +76,19 @@ async fn register(
     srv: &IngestServer<InMemoryStorage>,
     descriptor: Option<ProjectionDescriptor>,
 ) -> Result<(), tonic::Status> {
+    register_as(srv, "table-adapter", "iceberg://lake/events", descriptor).await
+}
+
+async fn register_as(
+    srv: &IngestServer<InMemoryStorage>,
+    producer: &str,
+    source_uri: &str,
+    descriptor: Option<ProjectionDescriptor>,
+) -> Result<(), tonic::Status> {
     let mut r = RegisterSourceRequest {
         org_id: "org".into(),
-        source_uri: "iceberg://lake/events".into(),
-        producer_id: "table-adapter".into(),
+        source_uri: source_uri.into(),
+        producer_id: producer.into(),
         ceiling: 3,
         source_flavor: "iceberg".into(),
         producer_kind: 4,
@@ -372,4 +381,151 @@ async fn rewound_snapshot_is_rejected_with_its_own_code() {
         "{:#?}",
         ack.rejections
     );
+}
+
+// ---------------------------------------------------------------------------
+// D13: deterministic entity resolution. The same external row ingested
+// through two different producers converges on ONE external-identity
+// entity — no fuzzy matching, no name dependence, no source dependence.
+// ---------------------------------------------------------------------------
+
+/// Two snapshot memories over the SAME (table_uuid, logical_pk) from
+/// different sources share the external join point; retrieval by that
+/// entity returns both (the graph is a model of a world, not a pile of
+/// documents).
+#[tokio::test]
+async fn external_identity_joins_across_producers() {
+    use exocortex_wire::ingest::v1::{ExternalKey, ExternalSnapshotInfo};
+
+    let srv = server();
+    register(&srv, Some(projection(1, V1_SCHEMA, 10)))
+        .await
+        .unwrap();
+    // The second producer registers its own mirror source (same declared
+    // schema shape — the projection contract is per source).
+    register_as(
+        &srv,
+        "mirror-adapter",
+        "iceberg://mirror/events",
+        Some(projection(1, V1_SCHEMA, 10)),
+    )
+    .await
+    .unwrap();
+    let hash = schema_hash_of(V1_SCHEMA);
+
+    let submit_from = |producer: &str, source_uri: &str, batch_id: &str, title: &str| {
+        let mut memories = Vec::new();
+        for (i, name) in [title, title].iter().enumerate() {
+            memories.push(exocortex_wire::ingest::v1::MemoryDraft {
+                draft_key: format!("k{i}"),
+                id: String::new(),
+                memory_type: "Fix".into(),
+                title: (*name).into(),
+                content: format!("content for {name}"),
+                tags: vec![],
+                visibility: 3,
+                valid_from: None,
+                valid_until: None,
+                external_key: Some(ExternalKey {
+                    table_uuid: vec![9u8; 16],
+                    logical_pk: format!("row-{}", name.len()),
+                    mapping_version: 1,
+                }),
+            });
+        }
+        let _ = memories.pop(); // one memory per batch
+        let mut b = table_batch(
+            "snap-1",
+            1,
+            hash.clone(),
+            srv.ontology.fingerprint.0.to_vec(),
+        );
+        b.producer_id = producer.into();
+        b.source_uri = source_uri.into();
+        b.batch_id = batch_id.into();
+        b.memories = memories;
+        b.snapshot = Some(ExternalSnapshotInfo {
+            snapshot_id: format!("snap-{batch_id}"),
+            schema_hash: hash.clone(),
+            source_flavor: "iceberg".into(),
+        });
+        exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
+        b
+    };
+
+    // Same row, two producers, two sources.
+    for (producer, source, batch) in [
+        ("table-adapter", "iceberg://lake/events", "d13-a"),
+        ("mirror-adapter", "iceberg://mirror/events", "d13-b"),
+    ] {
+        let mut request =
+            tonic::Request::new(submit_from(producer, source, batch, "same external row"));
+        request
+            .extensions_mut()
+            .insert(exocortex_storage::VisibilityContext {
+                user_id: "alice".into(),
+                org_id: "org".into(),
+                project_ids: Default::default(),
+                team_ids: Default::default(),
+                max_visibility: exocortex_kernel::Visibility::Org,
+            });
+        let ack = srv.submit(request).await.unwrap().into_inner();
+        assert_eq!(ack.accepted, 1, "{:#?}", ack.rejections);
+    }
+
+    // The external join point: derive it the way ingest did (over the
+    // canonical hex rendering of the table uuid, B8) and query.
+    let table_hex: String = hex_of(&[9u8; 16]);
+    let entity = exocortex_kernel::EntityId::from_external("org", table_hex.as_bytes(), b"row-17");
+    use exocortex_storage::{MemoryFilter, Storage as _};
+    let filter = MemoryFilter {
+        limit: 20,
+        visibility_ctx: exocortex_storage::VisibilityContext {
+            user_id: "alice".into(),
+            org_id: "org".into(),
+            project_ids: Default::default(),
+            team_ids: Default::default(),
+            max_visibility: exocortex_kernel::Visibility::Org,
+        },
+        ..MemoryFilter::default()
+    };
+    let rows = srv.storage.find_by_entity(&entity, &filter).await.unwrap();
+    eprintln!(
+        "rows: {:?}",
+        rows.iter().map(|m| m.title.to_string()).collect::<Vec<_>>()
+    );
+    let joined: Vec<&str> = rows.iter().map(|m| m.title.as_str()).collect();
+    assert_eq!(
+        joined.len(),
+        2,
+        "both producers' memories hang off the one external entity: {joined:?}"
+    );
+
+    // Divergence: a different logical_pk is a different row.
+    let other_row =
+        exocortex_kernel::EntityId::from_external("org", table_hex.as_bytes(), b"row-99");
+    let none = srv
+        .storage
+        .find_by_entity(&other_row, &filter)
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+    let other_table_hex: String = hex_of(&[8u8; 16]);
+    let other_table =
+        exocortex_kernel::EntityId::from_external("org", other_table_hex.as_bytes(), b"row-17");
+    assert_ne!(entity, other_table);
+    // Domain separation from the name-based space.
+    assert_ne!(
+        entity,
+        exocortex_kernel::EntityId::from_parts("org", 0, "row-17")
+    );
+}
+
+fn hex_of(bytes: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }

@@ -132,6 +132,31 @@ impl EntityId {
         out.copy_from_slice(&h.finalize().as_bytes()[..16]);
         Self(out)
     }
+
+    /// D13 (deterministic entity resolution): the entity id for an
+    /// EXTERNAL row, keyed by its external identity — `(table_uuid,
+    /// logical_pk)` — under a domain separator of its own, deliberately
+    /// independent of both the ingesting SOURCE and any NAME. Two
+    /// memories from different producers that carry the same external
+    /// coordinates therefore converge on one join point with no fuzzy
+    /// matching anywhere; a different `mapping_version` deliberately
+    /// does NOT fork the entity (the row is the same row), while a
+    /// different `logical_pk` or table diverges. The name-based
+    /// [`EntityId::from_parts`] space and this space cannot collide
+    /// (different separators).
+    pub fn from_external(org_id: &str, table_uuid: &[u8], logical_pk: &[u8]) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(b"entity-ext-v1\x1e");
+        h.update(org_id.as_bytes());
+        h.update(b"\x1e");
+        h.update(&(table_uuid.len() as u32).to_le_bytes());
+        h.update(table_uuid);
+        h.update(&(logical_pk.len() as u32).to_le_bytes());
+        h.update(logical_pk);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&h.finalize().as_bytes()[..16]);
+        Self(out)
+    }
 }
 
 /// Pack identity — 16-bit registry id assigned at kernel load time.
