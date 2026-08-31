@@ -4,16 +4,19 @@ set -euo pipefail
 
 source_root=$(git rev-parse --show-toplevel)
 fixture=$(mktemp -d)
-trap 'rm -rf "$fixture"' EXIT
+# ENOTEMPTY teardown races on shared-runner filesystems: retry, then
+# let the runner's temp cleanup take whatever is left (never fail a
+# green run on housekeeping).
+trap 'rm -rf "$fixture" 2>/dev/null || { sleep 1; rm -rf "$fixture"; } 2>/dev/null || true' EXIT
 mkdir -p "$fixture/repo/scripts" "$fixture/repo/fake-bin" "$fixture/repo/crates"
 cp "$source_root/scripts/publish.sh" "$fixture/repo/scripts/publish.sh"
 cp "$source_root/scripts/verify-release.sh" "$fixture/repo/scripts/verify-release.sh"
 
 order=(
-  exocortex-kernel exocortex-pack-dev-v1 exocortex-wire
+  exocortex-kernel exocortex-pack-dev-v1 exocortex-pack-mortgage-v1 exocortex-wire
   exocortex-adapter-sdk exocortex-storage exocortex-cache
-  exocortex-reasoning exocortex-cluster exocortex-ingest exocortex-ops
-  exocortex-dreams exocortex-server exocortex-client exocortex-worker
+  exocortex-reasoning exocortex-cluster exocortex-dreams exocortex-ingest
+  exocortex-ops exocortex-server exocortex-client exocortex-worker
 )
 printf '[workspace]\n' > "$fixture/repo/Cargo.toml"
 printf '# lock\n' > "$fixture/repo/Cargo.lock"
@@ -33,7 +36,7 @@ printf '%s\n' "$*" >> "$PUBLISH_TEST_LOG"
 if [ "$1" = metadata ]; then
   python3 - <<'PY'
 import json, pathlib, re
-names = "exocortex-kernel exocortex-pack-dev-v1 exocortex-wire exocortex-adapter-sdk exocortex-storage exocortex-cache exocortex-reasoning exocortex-cluster exocortex-ingest exocortex-ops exocortex-dreams exocortex-server exocortex-client exocortex-worker".split()
+names = "exocortex-kernel exocortex-pack-dev-v1 exocortex-pack-mortgage-v1 exocortex-wire exocortex-adapter-sdk exocortex-storage exocortex-cache exocortex-reasoning exocortex-cluster exocortex-dreams exocortex-ingest exocortex-ops exocortex-server exocortex-client exocortex-worker".split()
 packages = []
 for name in names:
     manifest = pathlib.Path("crates", name, "Cargo.toml").read_text()
