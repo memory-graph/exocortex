@@ -31,6 +31,7 @@ fn boot_router() -> (axum::Router, Arc<InMemoryStorage>) {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
 
         ontology: None,
+        ingest_preflight: None,
     });
     let bind = exocortex_server::http_bind::HttpBind::new(
         ctx,

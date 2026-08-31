@@ -38,6 +38,31 @@ pub struct OpContext {
     /// surfaces that never validate writes; the preflight operation
     /// fails loudly rather than guessing when it is unset.
     pub ontology: Option<std::sync::Arc<exocortex_kernel::Ontology>>,
+    /// D21-b (adapter-contract PRD D2): the backend's ingest service, for
+    /// `preflight_batch`'s dry run of the real Submit path. `None` on
+    /// surfaces with no ingest path (standalone MCP); the operation fails
+    /// loudly rather than approximating with a second validator.
+    pub ingest_preflight: Option<std::sync::Arc<dyn IngestPreflight>>,
+}
+
+/// D21-b (adapter-contract PRD D2): the handle `preflight_batch` uses to
+/// run the ingest service's own admission + validation over a
+/// representative sample. The implementation signs the batch server-side
+/// as its registered producer (the caller is an authenticated principal,
+/// not a producer) and commits nothing. Implemented by the backend node;
+/// deliberately NOT in this crate — the trait object is wiring, the
+/// verdict semantics live with Submit.
+#[async_trait]
+pub trait IngestPreflight: Send + Sync {
+    /// Dry-run `batch`: stamp registration-derived fields, sign as the
+    /// registered producer, and run the full Submit verdict path without
+    /// committing. Returns the ack a real submission would produce with
+    /// `assigned_lsn` 0.
+    async fn preflight_signed(
+        &self,
+        principal: &VisibilityContext,
+        batch: exocortex_wire::ingest::v1::IngestBatch,
+    ) -> Result<exocortex_wire::ingest::v1::IngestAck, OpError>;
 }
 
 impl OpContext {
@@ -58,6 +83,7 @@ impl OpContext {
             cache,
             deadline: chrono::Utc::now() + budget,
             ontology: None,
+            ingest_preflight: None,
         }
     }
 
@@ -70,6 +96,12 @@ impl OpContext {
     /// Attach the effective ontology (preflight-capable surfaces).
     pub fn with_ontology(mut self, ontology: std::sync::Arc<exocortex_kernel::Ontology>) -> Self {
         self.ontology = Some(ontology);
+        self
+    }
+
+    /// Attach the backend ingest service (D21-b `preflight_batch`).
+    pub fn with_ingest_preflight(mut self, handle: std::sync::Arc<dyn IngestPreflight>) -> Self {
+        self.ingest_preflight = Some(handle);
         self
     }
 

@@ -590,3 +590,17 @@ Deviations and recorded boundaries for the adapter-contract landing:
   cross-producer test injects an authenticated principal, matching
   production topology — principal-less dev writes carry no tenant and
   are invisible to scoped reads by design.
+
+## D23 — LLM boundary decision (recorded 2026-08-31)
+
+Resolved as **option (a): LLM as an external producer.** The `no LLM
+inside` invariant (R-D6/CR-19) is unchanged and still CI-enforced:
+extraction runs out-of-process in adapter repos, emits typed drafts
+through the signed ingest path, and carries the distinguishing
+`PRODUCER_KIND_EXTRACTED` (wire enum value 6; kernel
+`ProducerKind::Extracted`) so its output is distinguishable in stored
+provenance and filterable/revocable as a class at query time. Nothing
+in this workspace links, calls, or embeds an LLM. Option (b) — LLM
+inside the node — would be an invariant reversal and requires an
+explicit record here; none exists. No PRD conflict; the core PRD's §24
+deferral of semantic search stands.

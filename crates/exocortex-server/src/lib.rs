@@ -6,6 +6,7 @@
 #![warn(missing_docs, rust_2018_idioms)]
 
 pub mod backend;
+pub mod corpus_export;
 pub mod http_bind;
 pub mod org_backup;
 pub mod principal;

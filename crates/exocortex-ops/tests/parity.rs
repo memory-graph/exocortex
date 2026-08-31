@@ -181,6 +181,7 @@ fn ctx_with_storage() -> (OpContext, Memory, Arc<InMemoryStorage>) {
             deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
 
             ontology: None,
+            ingest_preflight: None,
         },
         m,
         storage,
@@ -525,6 +526,7 @@ async fn audit_ledger_is_org_scoped() {
         let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
         OpContext {
             ontology: None,
+            ingest_preflight: None,
             visibility_ctx: ops_vc(org, "alice", Visibility::Org),
             audit_admin: true,
             storage: Arc::new(InMemoryStorage::new(ontology())),
@@ -598,6 +600,7 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
 
         ontology: None,
+        ingest_preflight: None,
     };
     let err = exocortex_ops::operations::GetMemory
         .handle(
@@ -628,6 +631,7 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
 
         ontology: None,
+        ingest_preflight: None,
     };
     let out = exocortex_ops::operations::GetMemory
         .handle(
@@ -683,6 +687,7 @@ async fn promote_visibility_denies_invisible_target() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
 
         ontology: None,
+        ingest_preflight: None,
     };
     let err = exocortex_ops::operations::PromoteVisibilityOp
         .handle(
@@ -727,6 +732,7 @@ async fn promote_visibility_denies_target_above_caller_ceiling() {
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ontology: None,
+        ingest_preflight: None,
     };
     let error = exocortex_ops::operations::PromoteVisibilityOp
         .handle(
@@ -783,6 +789,7 @@ async fn expired_deadline_returns_deadline_exceeded() {
         deadline: chrono::Utc::now() - chrono::Duration::seconds(1), // already spent
 
         ontology: None,
+        ingest_preflight: None,
     };
     let err = exocortex_ops::operations::GetMemory
         .handle(
@@ -868,6 +875,7 @@ async fn superseded_state_is_visible_on_reads() {
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ontology: Some(onto),
+        ingest_preflight: None,
     };
 
     // get_memory: the stale row names its successor.
@@ -1035,6 +1043,7 @@ async fn retract_edge_closes_audits_and_refuses_invisible_endpoints() {
         storage: storage.clone(),
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        ingest_preflight: None,
     };
     let out = RetractEdgeOp
         .handle(
@@ -1087,6 +1096,7 @@ async fn retract_edge_closes_audits_and_refuses_invisible_endpoints() {
         storage: storage.clone(),
         cache: Arc::new(cache2),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        ingest_preflight: None,
     };
     let err = RetractEdgeOp
         .handle(
@@ -1158,6 +1168,7 @@ async fn get_chain_walks_derived_evidence_and_explain_edge_renders() {
         storage: storage.clone(),
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        ingest_preflight: None,
     };
 
     let chain = GetChainOp
@@ -1251,6 +1262,7 @@ async fn verb_ctx(onto: &Arc<exocortex_kernel::Ontology>) -> OpContext {
         storage: Arc::new(InMemoryStorage::new(onto.clone())),
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        ingest_preflight: None,
     }
 }
 
@@ -1493,4 +1505,176 @@ async fn pack_author_cannot_bypass_the_visibility_ceiling() {
         matches!(err, exocortex_ops::OpError::Unauthorized(ref d) if d.contains("ceiling")),
         "{err:?}"
     );
+}
+
+/// D21-b: `preflight_batch` fails LOUDLY on surfaces with no ingest path
+/// (standalone MCP) rather than approximating Submit's verdicts with a
+/// second validator.
+#[tokio::test]
+async fn preflight_batch_requires_the_backend_ingest_surface() {
+    let (ctx, _m) = ctx_sync();
+    let entry = entries()
+        .into_iter()
+        .find(|e| e.name == "preflight_batch")
+        .expect("preflight_batch registered");
+    let err = (entry.handler)(
+        entry,
+        &ctx,
+        serde_json::json!({
+            "org_id": "org",
+            "source_uri": "custom://x",
+            "producer_id": "p",
+            "memories": []
+        }),
+    )
+    .await
+    .expect_err("no ingest handle on this surface");
+    assert!(err.to_string().contains("backend ingest surface"), "{err}");
+}
+
+/// D7 (§23 #13): `resolve_contradiction` — a human decision over a
+/// `Contradicts` edge closes the edge, supersedes the loser to the
+/// stale-belief floor (never deletes), writes the decision to the audit
+/// ledger in the same commit, and refuses everything else (wrong kind,
+/// already resolved, invisible endpoints, empty note).
+#[tokio::test]
+async fn resolve_contradiction_supersedes_closes_and_audits() {
+    use exocortex_ops::operations::{ResolveContradictionInput, ResolveContradictionOp};
+    use exocortex_storage::Storage as _;
+
+    let onto = ontology();
+    let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let mut a = mem("contradiction-a");
+    let mut b = mem("contradiction-b");
+    a.context.tenant_id = Some("org".into());
+    b.context.tenant_id = Some("org".into());
+    storage.upsert_memory(&a).await.unwrap();
+    storage.upsert_memory(&b).await.unwrap();
+    let kind = onto.kind_id("Contradicts").expect("Contradicts registered");
+    let mut edge = rel_between(a.id, b.id, false);
+    edge.kind = kind;
+    edge.id = exocortex_kernel::RelationshipId::derive(a.id, kind, b.id, None);
+    storage.upsert_relationship(&edge).await.unwrap();
+
+    let ctx = OpContext {
+        visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        audit_admin: false,
+        storage: storage.clone(),
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        ontology: Some(onto.clone()),
+        ingest_preflight: None,
+    };
+
+    let mut hex = String::with_capacity(32);
+    for byte in edge.id.0 {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    let out = ResolveContradictionOp
+        .handle(
+            &ctx,
+            ResolveContradictionInput {
+                edge_id: hex.clone(),
+                resolution: "from".into(),
+                note: "A reproduces; B was a stale cache observation".into(),
+            },
+        )
+        .await
+        .expect("resolution commits");
+    assert_eq!(out.resolution, "from");
+    assert_eq!(out.superseded.as_deref(), Some(b.id.to_hex()).as_deref());
+    assert!(out.audit_lsn > 0);
+
+    // The edge is closed; the loser is at the stale-belief floor, alive.
+    let closed = storage.get_relationship(&edge.id).await.unwrap().unwrap();
+    assert!(
+        closed.valid_until.is_some(),
+        "resolved contradictions close"
+    );
+    let loser = storage.get_memory(&b.id).await.unwrap().unwrap();
+    let floor = exocortex_kernel::memory::derived_confidence(true, 0, 0);
+    assert!(
+        loser.confidence.partial_cmp_score(&floor) != std::cmp::Ordering::Greater,
+        "superseded, not deleted: {loser:?}"
+    );
+    let winner = storage.get_memory(&a.id).await.unwrap().unwrap();
+    assert_eq!(winner.confidence, a.confidence, "the winner stands");
+    // The decision is in the ledger.
+    let rows = storage.audit_range("org", 0, 1000).await.unwrap();
+    assert!(
+        rows.iter().any(|r| r["action"] == "resolve_contradiction"),
+        "audit row lands with the commit: {rows:?}"
+    );
+
+    // Already resolved: refused by name.
+    let err = ResolveContradictionOp
+        .handle(
+            &ctx,
+            ResolveContradictionInput {
+                edge_id: hex,
+                resolution: "to".into(),
+                note: "again".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already resolved"), "{err}");
+
+    // Wrong kind: refused. "neither" on a fresh edge: closes, supersedes
+    // nothing.
+    let mut other = rel_between(a.id, b.id, false);
+    other.id = exocortex_kernel::RelationshipId::derive(
+        a.id,
+        exocortex_kernel::kinds::SOLVES,
+        b.id,
+        Some("d7"),
+    );
+    storage.upsert_relationship(&other).await.unwrap();
+    let mut other_hex = String::with_capacity(32);
+    for byte in other.id.0 {
+        use std::fmt::Write as _;
+        let _ = write!(other_hex, "{byte:02x}");
+    }
+    let err = ResolveContradictionOp
+        .handle(
+            &ctx,
+            ResolveContradictionInput {
+                edge_id: other_hex.clone(),
+                resolution: "from".into(),
+                note: "n".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not Contradicts"), "{err}");
+
+    let mut neither_edge = rel_between(a.id, b.id, false);
+    neither_edge.kind = kind;
+    neither_edge.id = exocortex_kernel::RelationshipId::derive(a.id, kind, b.id, Some("neither"));
+    storage.upsert_relationship(&neither_edge).await.unwrap();
+    let mut neither_hex = String::with_capacity(32);
+    for byte in neither_edge.id.0 {
+        use std::fmt::Write as _;
+        let _ = write!(neither_hex, "{byte:02x}");
+    }
+    let out = ResolveContradictionOp
+        .handle(
+            &ctx,
+            ResolveContradictionInput {
+                edge_id: neither_hex,
+                resolution: "neither".into(),
+                note: "both hold under different scopes".into(),
+            },
+        )
+        .await
+        .expect("neither commits");
+    assert_eq!(out.superseded, None, "nothing superseded");
+    let closed = storage
+        .get_relationship(&neither_edge.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(closed.valid_until.is_some());
 }

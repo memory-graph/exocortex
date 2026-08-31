@@ -20,6 +20,9 @@ smallvec = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 http = { workspace = true }
+# D21-b: `preflight_batch` constructs wire batch timestamps (the mirror
+# of `MemoryDraft.valid_from`); the type is already the workspace pin.
+prost-types = { workspace = true }
 serde_json = { workspace = true }
 exocortex-kernel = { workspace = true }
 exocortex-wire = { workspace = true }

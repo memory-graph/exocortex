@@ -82,6 +82,11 @@ pub enum ProducerKind {
     AnalyticsAdapter,
     /// Anything else; the escape hatch.
     Custom,
+    /// D23 (option a): an out-of-process extraction producer. The
+    /// extraction itself (LLM or otherwise) runs in an adapter, never in
+    /// this workspace; this kind makes its output distinguishable in
+    /// stored provenance so reads can filter or revoke it as a class.
+    Extracted,
 }
 
 /// External-system coordinates carried on every ingested assertion (R-T16a).

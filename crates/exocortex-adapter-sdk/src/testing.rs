@@ -47,6 +47,15 @@ pub struct MockState {
     fingerprint: Arc<Mutex<[u8; 32]>>,
     submitted: Arc<Mutex<Vec<IngestBatch>>>,
     registrations: Arc<Mutex<Vec<RegisterSourceRequest>>>,
+    /// D21-b: batches received through Preflight (never committed).
+    preflighted: Arc<Mutex<Vec<IngestBatch>>>,
+    /// D21-c: serve the manifest envelope with a STALE fingerprint (the
+    /// degrade-path test).
+    stale_manifest_fingerprint: Arc<std::sync::atomic::AtomicBool>,
+    /// D21-c: serve manifests at all. OFF by default — most adapter tests
+    /// exercise the no-manifest degrade path, and a canned rulebook that
+    /// omits a real adapter's types would reject its drafts locally.
+    serve_manifest: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A running mock server.
@@ -72,6 +81,9 @@ impl MockServer {
             fingerprint: Arc::new(Mutex::new(fingerprint)),
             submitted: Arc::new(Mutex::new(Vec::new())),
             registrations: Arc::new(Mutex::new(Vec::new())),
+            preflighted: Arc::new(Mutex::new(Vec::new())),
+            stale_manifest_fingerprint: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            serve_manifest: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let svc = IngestServiceServer::new(MockService(state.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -114,6 +126,11 @@ impl MockServer {
         self.state.registrations.lock().unwrap().clone()
     }
 
+    /// Every preflighted batch, in order (D21-b — dry runs only).
+    pub fn preflighted(&self) -> Vec<IngestBatch> {
+        self.state.preflighted.lock().unwrap().clone()
+    }
+
     /// Queue more script entries (mid-run additions).
     pub fn push_script(&self, entries: Vec<MockSubmit>) {
         self.state.script.lock().unwrap().extend(entries);
@@ -132,6 +149,26 @@ impl MockServer {
     /// Stop the server.
     pub fn stop(self) {
         self.handle.abort();
+    }
+
+    /// D21-c: serve validation manifests (a small canned rulebook). Off
+    /// by default; tests of the manifest path enable it explicitly.
+    pub fn enable_manifest(&self) {
+        self.state
+            .serve_manifest
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// D21-c: serve the manifest envelope with a fingerprint that does
+    /// NOT match the one `Fingerprint` reports — the SDK must degrade to
+    /// server-side validation rather than trust it.
+    pub fn serve_stale_manifest_fingerprint(&self) {
+        self.state
+            .serve_manifest
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.state
+            .stale_manifest_fingerprint
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -209,5 +246,86 @@ impl IngestService for MockService {
         _req: Request<Streaming<SubmitOne>>,
     ) -> Result<Response<Self::SubmitStreamStream>, Status> {
         Err(Status::unimplemented("streaming not mocked"))
+    }
+
+    /// D21-b: record the dry run and answer with the accept-all verdict
+    /// (`assigned_lsn` 0 — preflight assigns nothing). Script-driven
+    /// rejection rows apply to Submit only; a dry run's rejections come
+    /// from real validation, which the mock does not perform.
+    async fn preflight(&self, req: Request<IngestBatch>) -> Result<Response<IngestAck>, Status> {
+        self.0.calls.lock().unwrap().push("preflight");
+        let batch = req.into_inner();
+        self.0.preflighted.lock().unwrap().push(batch.clone());
+        Ok(Response::new(IngestAck {
+            batch_id: batch.batch_id,
+            accepted: (batch.memories.len() + batch.relationships.len()) as u32,
+            rejected: 0,
+            rejections: vec![],
+            assigned_lsn: 0,
+            similar_to: vec![],
+        }))
+    }
+
+    /// D21-c: serve a small canned rulebook stamped with the mock's
+    /// fingerprint (or a stale one when the knob is set). The canned
+    /// content is enough for the interpreter tests: one type, one kind,
+    /// one triple, a title bound.
+    async fn get_validation_manifest(
+        &self,
+        _req: Request<exocortex_wire::ingest::v1::ManifestRequest>,
+    ) -> Result<Response<exocortex_wire::ingest::v1::ManifestResponse>, Status> {
+        if !self
+            .0
+            .serve_manifest
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Status::unimplemented(
+                "manifest not configured on this mock (enable_manifest)",
+            ));
+        }
+        self.0.calls.lock().unwrap().push("manifest");
+        let mut fingerprint = *self.0.fingerprint.lock().unwrap();
+        if self
+            .0
+            .stale_manifest_fingerprint
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            fingerprint[0] = fingerprint[0].wrapping_add(1);
+        }
+        let manifest = exocortex_wire::manifest::ValidationManifest {
+            manifest_version: exocortex_wire::manifest::MANIFEST_VERSION,
+            compatibility_fingerprint: {
+                let mut hex = String::with_capacity(64);
+                for byte in fingerprint {
+                    use std::fmt::Write as _;
+                    let _ = write!(hex, "{byte:02x}");
+                }
+                hex
+            },
+            memory_types: vec![exocortex_wire::manifest::ManifestMemoryType {
+                name: "General".into(),
+                id: 0,
+            }],
+            kinds: vec![exocortex_wire::manifest::ManifestKind {
+                id: 1,
+                name: "RelatedTo".into(),
+                computed_only: false,
+                default_strength: 0.3,
+            }],
+            type_triples: vec![exocortex_wire::manifest::ManifestTriple {
+                kind: 1,
+                from_types: None,
+                to_types: None,
+            }],
+            title_min_chars: 1,
+            title_max_chars: 200,
+            registered_ceiling: Some(3),
+        };
+        Ok(Response::new(
+            exocortex_wire::ingest::v1::ManifestResponse {
+                manifest_json: serde_json::to_string(&manifest).unwrap(),
+                compatibility_fingerprint: fingerprint.to_vec(),
+            },
+        ))
     }
 }

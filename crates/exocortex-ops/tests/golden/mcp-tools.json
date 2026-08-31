@@ -264,6 +264,247 @@
     "name": "exocortex.preflight_action"
   },
   {
+    "description": "preflight_batch",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "PreflightExternalKeyRow": {
+          "description": "External identity coordinates (R-T18a): 32-hex table uuid + logical pk.",
+          "properties": {
+            "logical_pk": {
+              "description": "The row's logical primary key, in the source's own terms.",
+              "type": "string"
+            },
+            "mapping_version": {
+              "default": 0,
+              "description": "The mapping version the coordinates were minted under.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "table_uuid": {
+              "description": "32-hex (16 bytes).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "logical_pk",
+            "table_uuid"
+          ],
+          "type": "object"
+        },
+        "PreflightMemoryRow": {
+          "description": "One sample memory row (wire `MemoryDraft` shape, JSON-friendly).",
+          "properties": {
+            "content": {
+              "description": "Free-text content.",
+              "type": "string"
+            },
+            "draft_key": {
+              "description": "Producer-local id; relationships link via draft keys.",
+              "type": "string"
+            },
+            "external_key": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/PreflightExternalKeyRow"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Required when `snapshot` is present (R-T16a)."
+            },
+            "memory_type": {
+              "description": "MUST resolve to a registered MemoryType.",
+              "type": "string"
+            },
+            "tags": {
+              "default": [],
+              "description": "Lowercase tags.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": {
+              "description": "1..=200 chars (R-T5).",
+              "type": "string"
+            },
+            "valid_from": {
+              "default": null,
+              "description": "RFC3339; absent = recorded_at (R-T7).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "valid_until": {
+              "default": null,
+              "description": "RFC3339; absent = open-ended.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "visibility": {
+              "description": "\"private\"|\"project\"|\"team\"|\"org\" — the registration's ceiling caps this.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "content",
+            "draft_key",
+            "memory_type",
+            "title",
+            "visibility"
+          ],
+          "type": "object"
+        },
+        "PreflightRelationshipRow": {
+          "description": "One sample edge (wire `RelationshipDraft` shape).",
+          "properties": {
+            "confidence": {
+              "default": 0.0,
+              "description": "0.0..1.0; 0 = default.",
+              "format": "float",
+              "type": "number"
+            },
+            "context": {
+              "default": "",
+              "description": "Free-text edge context.",
+              "type": "string"
+            },
+            "from_draft_key": {
+              "description": "Source draft key.",
+              "type": "string"
+            },
+            "kind": {
+              "description": "MUST resolve to a registered kind.",
+              "type": "string"
+            },
+            "strength": {
+              "default": 0.0,
+              "description": "0.0..1.0; 0 = RelMeta default.",
+              "format": "float",
+              "type": "number"
+            },
+            "to_draft_key": {
+              "default": "",
+              "description": "Target draft key within this sample — or empty when `to_memory_id` is set.",
+              "type": "string"
+            },
+            "to_memory_id": {
+              "default": "",
+              "description": "An EXISTING memory by 32-hex id (cross-batch edge).",
+              "type": "string"
+            },
+            "visibility": {
+              "default": "",
+              "description": "\"private\"|\"project\"|\"team\"|\"org\"; empty = the registered ceiling.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "from_draft_key",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "PreflightSnapshotRow": {
+          "description": "The external snapshot the sample was observed at (R-T16a).",
+          "properties": {
+            "schema_hash": {
+              "description": "64-hex (32 bytes) — must match the registered mapping's schema hash.",
+              "type": "string"
+            },
+            "snapshot_id": {
+              "description": "Source snapshot id (rewind detection names it).",
+              "type": "string"
+            },
+            "source_flavor": {
+              "description": "\"iceberg\" | \"delta\" | \"parquet-dir\" | \"custom\".",
+              "type": "string"
+            }
+          },
+          "required": [
+            "schema_hash",
+            "snapshot_id",
+            "source_flavor"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "Input for `preflight_batch`.",
+      "properties": {
+        "memories": {
+          "description": "The representative sample.",
+          "items": {
+            "$ref": "#/definitions/PreflightMemoryRow"
+          },
+          "type": "array"
+        },
+        "node_id": {
+          "default": "",
+          "description": "Producer node id for the dry-run identity (cosmetic; nothing commits).",
+          "type": "string"
+        },
+        "org_id": {
+          "description": "The REAL registration the dry run runs under (org-scoped; the authenticated principal must belong to it).",
+          "type": "string"
+        },
+        "producer_id": {
+          "description": "Registered producer id.",
+          "type": "string"
+        },
+        "project_id": {
+          "default": "",
+          "description": "Requested project scope for Project-visibility samples — the same `ClientMetadata` contract a real submission carries; the server verifies the principal's membership.",
+          "type": "string"
+        },
+        "relationships": {
+          "default": [],
+          "description": "The sample's edges.",
+          "items": {
+            "$ref": "#/definitions/PreflightRelationshipRow"
+          },
+          "type": "array"
+        },
+        "snapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PreflightSnapshotRow"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Present iff the producer is external-source."
+        },
+        "source_uri": {
+          "description": "Registered source URI.",
+          "type": "string"
+        },
+        "team_id": {
+          "default": "",
+          "description": "Requested team scope for Team-visibility samples (same contract).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "memories",
+        "org_id",
+        "producer_id",
+        "source_uri"
+      ],
+      "title": "PreflightBatchInput",
+      "type": "object"
+    },
+    "name": "exocortex.preflight_batch"
+  },
+  {
     "description": "preflight_wrapup",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -398,6 +639,35 @@
       "type": "object"
     },
     "name": "exocortex.promote_visibility"
+  },
+  {
+    "description": "resolve_contradiction",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `resolve_contradiction`.",
+      "properties": {
+        "edge_id": {
+          "description": "Hex id of the open `Contradicts` edge being resolved.",
+          "type": "string"
+        },
+        "note": {
+          "description": "The human rationale, kept verbatim in the audit ledger.",
+          "type": "string"
+        },
+        "resolution": {
+          "description": "\"from\" keeps the edge's from-memory and supersedes the to-memory; \"to\" the mirror; \"neither\" supersedes nothing (both stand, the contradiction is acknowledged and closed).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "edge_id",
+        "note",
+        "resolution"
+      ],
+      "title": "ResolveContradictionInput",
+      "type": "object"
+    },
+    "name": "exocortex.resolve_contradiction"
   },
   {
     "description": "retract_edge",

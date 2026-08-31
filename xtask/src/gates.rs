@@ -1840,6 +1840,18 @@ pub(crate) const SEAM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "drifted_schema_hash_rejects_every_row_until_re_registration",
     ),
     (
+        "ingest-preflight",
+        "exocortex-ingest",
+        "tests/preflight.rs",
+        "preflight_verdicts_match_submit_verdicts_row_for_row",
+    ),
+    (
+        "ingest-manifest-parity",
+        "exocortex-ingest",
+        "tests/manifest_parity.rs",
+        "manifest_verdicts_agree_row_for_row",
+    ),
+    (
         "write-path-parity",
         "exocortex-ingest",
         "tests/write_path_parity.rs",
@@ -2193,6 +2205,149 @@ fn strip_comments_and_strings(source: &str) -> String {
     String::from_utf8(out).expect("source started as UTF-8")
 }
 
+/// D21-e (adapter-contract PRD D5): the contract conformance registry.
+/// Every obligation the PRD places on adapters and the SDK is pinned to
+/// a canary in real source; every adapter crate in the workspace is
+/// claimed by a row. A new adapter that skips the contract fails CI —
+/// the same shape (and failure mode) as the seam inventory.
+///
+/// Row shape: (obligation, crate, file, canary).
+pub(crate) const ADAPTER_CONTRACT: &[(&str, &str, &str, &str)] = &[
+    // (a) Projection discipline — every workspace adapter declares one.
+    (
+        "projection-declared",
+        "exocortex-adapter-git",
+        "src/lib.rs",
+        "fn projection(",
+    ),
+    // (a) Bounds stop the window before the wire (SDK-side, A2).
+    (
+        "bounds-enforced",
+        "exocortex-adapter-sdk",
+        "src/lib.rs",
+        "max_rows_per_window",
+    ),
+    // (b) PreflightBatch shares Submit's implementation, verbatim parity.
+    (
+        "preflight-shares-submit",
+        "exocortex-ingest",
+        "tests/preflight.rs",
+        "preflight_verdicts_match_submit_verdicts_row_for_row",
+    ),
+    (
+        "preflight-commits-nothing",
+        "exocortex-ingest",
+        "tests/preflight.rs",
+        "preflight_commits_nothing_and_leaves_no_idempotency_claim",
+    ),
+    // (b) The registry face is parity-covered like every operation.
+    (
+        "preflight-registry-parity",
+        "exocortex-server",
+        "tests/http_parity.rs",
+        "preflight_batch_answers_identically_over_http_and_the_registry",
+    ),
+    // (c) The rulebook as data: published, fingerprinted, interpreted.
+    (
+        "manifest-published",
+        "exocortex-wire",
+        "proto/ingest.proto",
+        "rpc GetValidationManifest",
+    ),
+    (
+        "manifest-scheme-refused",
+        "exocortex-wire",
+        "src/manifest.rs",
+        "manifest_version != MANIFEST_VERSION",
+    ),
+    (
+        "manifest-interpreter-parity",
+        "exocortex-ingest",
+        "tests/manifest_parity.rs",
+        "manifest_verdicts_agree_row_for_row",
+    ),
+    (
+        "manifest-local-validation",
+        "exocortex-adapter-sdk",
+        "src/lib.rs",
+        "validate_units",
+    ),
+    // (d) Every row of the D4 verdict table has a test.
+    (
+        "schema-policy-unmapped-add",
+        "exocortex-ingest",
+        "tests/schema_evolution.rs",
+        "unmapped_addition_is_accepted_and_writes_exactly_one_audit_row",
+    ),
+    (
+        "schema-policy-fail-closed",
+        "exocortex-ingest",
+        "tests/schema_evolution.rs",
+        "mapped_column_removal_retype_and_rename_fail_closed",
+    ),
+    (
+        "schema-policy-drift",
+        "exocortex-ingest",
+        "tests/schema_evolution.rs",
+        "drifted_schema_hash_rejects_every_row_until_re_registration",
+    ),
+    (
+        "schema-policy-rewind",
+        "exocortex-ingest",
+        "tests/schema_evolution.rs",
+        "rewound_snapshot_is_rejected_with_its_own_code",
+    ),
+];
+
+/// Validate the adapter contract statically: every row resolves to a
+/// real file carrying its canary, and every `crates/exocortex-adapter-*`
+/// directory is claimed by at least one projection-declared row.
+pub(crate) fn adapter_contract_violations(root: &Path) -> Result<Vec<String>> {
+    let mut violations = Vec::new();
+    let mut claimed: std::collections::BTreeSet<String> = Default::default();
+    for (obligation, package, file, canary) in ADAPTER_CONTRACT {
+        let path = root.join("crates").join(package).join(file);
+        if !path.is_file() {
+            violations.push(format!(
+                "obligation `{obligation}`: crates/{package}/{file} does not exist"
+            ));
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)?;
+        if !source.contains(canary) {
+            violations.push(format!(
+                "obligation `{obligation}`: canary `{canary}` is absent from crates/{package}/{file}"
+            ));
+        }
+        if *obligation == "projection-declared" {
+            claimed.insert(package.to_string());
+        }
+    }
+    // The bijection direction: an adapter crate nobody claimed is a
+    // contract gap. (exocortex-adapter-sdk is the contract itself, not an
+    // adapter; every ADAPTER crate must declare a projection.)
+    if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
+        for entry in entries {
+            let name = entry?.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some(adapter) = name.strip_prefix("exocortex-adapter-") {
+                if adapter == "sdk" {
+                    continue;
+                }
+                if !claimed.contains(name) {
+                    violations.push(format!(
+                        "adapter crate `{name}` is not claimed by a projection-declared row — \
+                         declare a projection and add it to ADAPTER_CONTRACT"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(violations)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2212,6 +2367,34 @@ mod tests {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn adapter_contract_rejects_missing_canaries_and_unclaimed_adapters() {
+        let root = fixture("adapter-contract");
+        // A claimed adapter with its canary present.
+        write(
+            &root,
+            "crates/exocortex-adapter-git/src/lib.rs",
+            "pub fn projection(max_window: u64) -> u8 { max_window as u8 }",
+        );
+        // An adapter crate nobody claimed: the bijection direction fires.
+        write(
+            &root,
+            "crates/exocortex-adapter-new/src/lib.rs",
+            "// ships without declaring anything",
+        );
+        let violations = adapter_contract_violations(&root).unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("exocortex-adapter-new") && v.contains("projection-declared")),
+            "unclaimed adapter must be named: {violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.contains("does not exist")),
+            "missing obligation files must be named: {violations:?}"
+        );
     }
 
     #[test]

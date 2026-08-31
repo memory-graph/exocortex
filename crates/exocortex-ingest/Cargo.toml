@@ -49,6 +49,9 @@ fastembed = ["dep:fastembed", "dep:image"]
 
 [dev-dependencies]
 exocortex-client = { workspace = true }
+# D21-c: the manifest-parity golden table drives the SDK's interpreter
+# (the rulebook-as-data reader) against this server's verdicts.
+exocortex-adapter-sdk = { workspace = true }
 exocortex-storage = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["test-util"] }
 blake3 = { workspace = true }

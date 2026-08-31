@@ -2022,3 +2022,76 @@ async fn duplicate_replay_dedup_survives_restart() {
     }
     assert_eq!(after, before, "restart replay must not commit another row");
 }
+
+/// D23 (LLM boundary decision, option a): an OUT-OF-PROCESS extraction
+/// producer registers under `PRODUCER_KIND_EXTRACTED` and its committed
+/// rows carry that kind in provenance — distinguishable as a class, so
+/// reads can filter or revoke extraction output without touching any
+/// other producer's rows. The node itself stays deterministic (R-D6):
+/// the extraction ran in an adapter, before the wire.
+#[tokio::test]
+async fn extraction_producers_are_stamped_distinguishably() {
+    use exocortex_storage::Storage as _;
+    let srv = server();
+    srv.register_source(tonic::Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "custom://llm-extractor",
+        "llm-extractor",
+        3,
+        "custom",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::Extracted,
+    )))
+    .await
+    .unwrap();
+
+    let memory = draft("x", "Fix", 1);
+    let b = IngestBatch {
+        org_id: "org".into(),
+        source_uri: "custom://llm-extractor".into(),
+        producer_id: "llm-extractor".into(),
+        batch_id: "extracted-1".into(),
+        mapping_version: "custom:1".into(),
+        ontology_fingerprint: srv.ontology.fingerprint.0.to_vec(),
+        ceiling: 3,
+        checksum: String::new(),
+        observed_at: None,
+        recorded_at: None,
+        snapshot: None,
+        memories: vec![memory],
+        relationships: vec![],
+        producer: Some(ProducerIdentity {
+            node_id: "node".into(),
+            agent_id: String::new(),
+            adapter_id: "llm-extractor".into(),
+            hmac_signature: vec![],
+            client_metadata: None,
+        }),
+    };
+    let ack = srv
+        .submit(tonic::Request::new(sign(b, [5u8; 32])))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ack.accepted, 1, "rejections: {:#?}", ack.rejections);
+
+    use futures::StreamExt as _;
+    let mut stream = srv.storage.stream_all_memories().await;
+    let mut stored = Vec::new();
+    while let Some(row) = stream.next().await {
+        stored.push(row.unwrap());
+    }
+    assert_eq!(stored.len(), 1);
+    match &stored[0].provenance {
+        exocortex_kernel::Provenance::Asserted {
+            producer_kind: Some(kind),
+            ..
+        } => assert_eq!(
+            *kind,
+            exocortex_kernel::ProducerKind::Extracted,
+            "extraction output is distinguishable in provenance"
+        ),
+        other => panic!("expected asserted provenance with a kind, got {other:?}"),
+    }
+}

@@ -205,3 +205,159 @@ async fn rewound_snapshot_errors_before_submission() {
     assert_eq!(mock.submitted().len(), submits_before);
     assert_eq!(std::fs::read_to_string(&cursor).unwrap(), "cursor-2");
 }
+
+/// D21-b: `AdapterSession::preflight` sends the same split/stamped/signed
+/// batches as a real submission (through the Preflight RPC), reports the
+/// verdicts, and mutates NO session state — the cursor stays absent, and
+/// a subsequent `submit_window` still works with the cursor advancing
+/// from nothing. Hitting the declared window bound stops the dry run
+/// before any wire traffic, naming the bound (A2).
+#[tokio::test(flavor = "multi_thread")]
+async fn preflight_sends_signed_batches_and_touches_no_state() {
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::config(&mock.url(), dir.path().join("cursor.json"));
+    let mut session = exocortex_adapter_sdk::AdapterSession::connect_with(cfg, instant_sleep())
+        .await
+        .unwrap();
+
+    let acks = session
+        .preflight(vec![common::unit("dry-1", &["a", "b"])])
+        .await
+        .unwrap();
+    assert_eq!(acks.len(), 1);
+    assert_eq!(acks[0].accepted, 2);
+    assert_eq!(acks[0].assigned_lsn, 0, "dry runs assign no LSN");
+
+    let calls = mock.calls();
+    assert!(calls.contains(&"preflight".to_string()), "{calls:?}");
+    assert!(!calls.contains(&"submit".to_string()), "{calls:?}");
+    // Session state untouched: no cursor yet.
+    assert_eq!(session.cursor(), None);
+    let preflighted = mock.preflighted();
+    assert_eq!(preflighted.len(), 1);
+    // The dry-run batch carried a real signature over a real checksum.
+    assert!(
+        exocortex_wire::signing::verify_signature(&[0u8; 32], &preflighted[0]),
+        "preflight batches are signed like submits"
+    );
+
+    // The same units still submit cleanly afterwards: the dry run claimed
+    // no batch id and advanced nothing.
+    let outcome = session
+        .submit_window(vec![common::unit("dry-1", &["a", "b"])], "c1")
+        .await
+        .unwrap();
+    assert_eq!(outcome.accepted, 2);
+    assert_eq!(session.cursor(), Some("c1"));
+    mock.stop();
+}
+
+/// D21-b/A2: a dry run over the declared window bound stops before any
+/// wire traffic and names the bound — the same pre-wire enforcement a
+/// real submission gets.
+#[tokio::test(flavor = "multi_thread")]
+async fn preflight_over_the_window_bound_stops_before_wire() {
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = table_config(
+        &mock.url(),
+        dir.path().join("cursor.json"),
+        table_projection(2, 100),
+    );
+    let mut session = exocortex_adapter_sdk::AdapterSession::connect_with(cfg, instant_sleep())
+        .await
+        .unwrap();
+
+    let err = session
+        .preflight(vec![common::unit("big", &["a", "b", "c"])])
+        .await
+        .unwrap_err();
+    match err {
+        SdkError::ProjectionBoundExceeded {
+            bound,
+            value,
+            declared,
+        } => {
+            assert_eq!(bound, "max_rows_per_window");
+            assert_eq!(value, 3);
+            assert_eq!(declared, 2);
+        }
+        other => panic!("expected the named bound, got {other:?}"),
+    }
+    assert!(
+        !mock.calls().contains(&"preflight".to_string()),
+        "no wire traffic: {:?}",
+        mock.calls()
+    );
+    mock.stop();
+}
+
+/// D21-c: connect pulls the validation manifest; a manifest whose
+/// fingerprint does not match the negotiated ontology is refused with a
+/// warning and the session degrades to server-side validation (A3).
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_holds_the_manifest_and_degrades_on_a_stale_one() {
+    let mock = MockServer::start().await;
+    mock.enable_manifest();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::config(&mock.url(), dir.path().join("cursor.json"));
+    let session = exocortex_adapter_sdk::AdapterSession::connect_with(cfg, instant_sleep())
+        .await
+        .unwrap();
+    assert!(
+        session.manifest().is_some(),
+        "the matching manifest is held"
+    );
+    assert!(mock.calls().contains(&"manifest".to_string()));
+
+    mock.stop();
+    let mock = MockServer::start().await;
+    mock.serve_stale_manifest_fingerprint();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::config(&mock.url(), dir.path().join("cursor.json"));
+    let session = exocortex_adapter_sdk::AdapterSession::connect_with(cfg, instant_sleep())
+        .await
+        .unwrap();
+    assert!(
+        session.manifest().is_none(),
+        "a stale manifest is refused, not trusted"
+    );
+    mock.stop();
+}
+
+/// D21-c: with a manifest held, a mapping error stops the window LOCALLY
+/// — before any wire traffic, cursor untouched — with the server's own
+/// verdict vocabulary.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_manifest_rejection_stops_the_window_before_the_wire() {
+    let mock = MockServer::start().await;
+    mock.enable_manifest();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::config(&mock.url(), dir.path().join("cursor.json"));
+    let mut session = exocortex_adapter_sdk::AdapterSession::connect_with(cfg, instant_sleep())
+        .await
+        .unwrap();
+    assert!(session.manifest().is_some());
+
+    // The mock's canned rulebook knows only "General"/"RelatedTo"; this
+    // unit names a type the rulebook does not carry.
+    let mut bad = common::unit("bad-1", &["a"]);
+    bad.memories[0].memory_type = "NoSuchType".into();
+    let err = session.submit_window(vec![bad], "c1").await.unwrap_err();
+    match err {
+        SdkError::LocalRejections { rejects } => {
+            assert_eq!(rejects.len(), 1);
+            assert_eq!(rejects[0].0, "a");
+            assert_eq!(rejects[0].1, "UnknownMemoryType");
+        }
+        other => panic!("expected local rejections, got {other:?}"),
+    }
+    assert_eq!(session.cursor(), None, "cursor untouched");
+    assert!(
+        !mock.calls().contains(&"submit".to_string()),
+        "no wire traffic: {:?}",
+        mock.calls()
+    );
+    mock.stop();
+}

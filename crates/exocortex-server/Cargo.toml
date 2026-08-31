@@ -19,6 +19,8 @@ name = "exocortex-node"
 path = "src/main.rs"
 
 [dependencies]
+# D21-b: the registry preflight handle implements the ops async trait.
+async-trait = { workspace = true }
 exocortex-kernel = { workspace = true }
 exocortex-storage = { workspace = true }
 exocortex-cache = { workspace = true }

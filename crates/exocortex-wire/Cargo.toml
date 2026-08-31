@@ -15,6 +15,9 @@ prost-types = { workspace = true }
 tonic       = { workspace = true }
 bytes       = { workspace = true }
 serde       = { workspace = true }
+# D21-c: the validation manifest serializes to the JSON document the SDK
+# parses (already the workspace pin).
+serde_json   = { workspace = true }
 blake3      = { workspace = true }
 hmac        = { workspace = true }
 sha2        = { workspace = true }

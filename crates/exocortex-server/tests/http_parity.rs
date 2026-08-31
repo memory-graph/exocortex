@@ -152,6 +152,25 @@ async fn every_operation_answers_over_http_with_auth() {
         lsn: exocortex_kernel::LSN::new_local(0),
     };
     storage.upsert_relationship(&derived_edge).await.unwrap();
+    // D7: an open Contradicts edge for resolve_contradiction's parity pass.
+    let contradiction_edge = {
+        let mut edge = derived_edge.clone();
+        edge.kind = onto.kind_id("Contradicts").expect("Contradicts registered");
+        edge.id = exocortex_kernel::RelationshipId::derive(a.id, edge.kind, b.id, None);
+        edge
+    };
+    storage
+        .upsert_relationship(&contradiction_edge)
+        .await
+        .unwrap();
+    let contradiction_edge_hex = {
+        use std::fmt::Write as _;
+        let mut hex = String::with_capacity(32);
+        for byte in contradiction_edge.id.0 {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex
+    };
     let derived_edge_hex = {
         use std::fmt::Write as _;
         let mut hex = String::with_capacity(32);
@@ -187,6 +206,7 @@ async fn every_operation_answers_over_http_with_auth() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         // D2: preflight needs the effective rulebook.
         ontology: Some(ontology()),
+        ingest_preflight: None,
     });
 
     let principals = Arc::new(
@@ -245,6 +265,11 @@ async fn every_operation_answers_over_http_with_auth() {
                     "reason": "http parity probe",
                 })
             }
+            "resolve_contradiction" => serde_json::json!({
+                "edge_id": contradiction_edge_hex,
+                "resolution": "neither",
+                "note": "http parity probe",
+            }),
             "get_chain" => serde_json::json!({ "memory": hex(&a.id), "max_depth": 2 }),
             "explain_edge" => serde_json::json!({ "edge": derived_edge_hex }),
             // PX2: a dry-run whose typed verdict is deterministic under the
@@ -275,6 +300,11 @@ async fn every_operation_answers_over_http_with_auth() {
         // block below: the shared admin ctx is Org-scoped, deliberately
         // outside these verbs' declared ceilings.
         if entry.pack.is_some() {
+            continue;
+        }
+        // D21-b: `preflight_batch` needs a real ingest registration; it is
+        // covered by its own parity test below with the backend handle.
+        if entry.name == "preflight_batch" {
             continue;
         }
         let input = input_for(entry.name);
@@ -318,6 +348,21 @@ async fn every_operation_answers_over_http_with_auth() {
         // permanently consumes the first id. Relationship identity depends on
         // endpoints and kind, so the stable outputs remain directly comparable.
         let mut http_input = input.clone();
+        if entry.name == "resolve_contradiction" {
+            // Resolution permanently closes its edge: give HTTP a second
+            // open Contradicts edge with identical shape.
+            let mut http_edge = derived_edge.clone();
+            http_edge.kind = onto.kind_id("Contradicts").unwrap();
+            http_edge.id =
+                exocortex_kernel::RelationshipId::derive(a.id, http_edge.kind, b.id, Some("http"));
+            storage.upsert_relationship(&http_edge).await.unwrap();
+            let mut hex = String::with_capacity(32);
+            use std::fmt::Write as _;
+            for byte in http_edge.id.0 {
+                let _ = write!(hex, "{byte:02x}");
+            }
+            http_input["edge_id"] = serde_json::Value::String(hex);
+        }
         if entry.name == "retract_edge" {
             // Retraction permanently closes its edge: give HTTP a
             // second open edge with identical shape so both surfaces
@@ -476,6 +521,26 @@ fn parity_check(name: &str, http_out: &serde_json::Value, direct: &serde_json::V
                 assert_eq!(http_out[field], direct[field], "{name}: {field}");
             }
         }
+        "resolve_contradiction" => {
+            // The two surfaces resolve two independently created open
+            // Contradicts edges, so ids and audit LSNs differ by
+            // construction; both must record the same resolution shape
+            // with a concrete audit commit.
+            for output in [http_out, direct] {
+                assert_eq!(
+                    output["resolution"].as_str(),
+                    Some("neither"),
+                    "{name}: resolution echoed"
+                );
+                assert_eq!(output["superseded"], serde_json::Value::Null, "{name}");
+                assert_eq!(
+                    output["edge_id"].as_str().map(str::len),
+                    Some(32),
+                    "{name}: edge id"
+                );
+                assert!(output["audit_lsn"].as_u64().unwrap_or(0) > 0);
+            }
+        }
         "retract_edge" => {
             // The two surfaces close two independently created open
             // edges, so ids and audit LSNs differ by construction; both
@@ -542,6 +607,130 @@ fn query_of(v: &serde_json::Value) -> String {
         .join("&")
 }
 
+/// D21-b (adapter-contract PRD D2): `preflight_batch` — the registry dry
+/// run over a REAL registration answers byte-identically over HTTP and
+/// the typed handler (CR-9), reports Submit's own verdicts with the
+/// shared correction vocabulary, and commits nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn preflight_batch_answers_identically_over_http_and_the_registry() {
+    use exocortex_wire::ingest::v1::ingest_service_server::IngestService as _;
+
+    let onto = ontology();
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let (cache, _writer) = LocalCache::new(16 * 1024 * 1024);
+
+    // A REAL registration on a real ingest server over the same storage.
+    let ingest = Arc::new(exocortex_ingest::IngestServer::new(
+        storage.clone(),
+        onto.clone(),
+        [7u8; 32],
+    ));
+    let mut registration = exocortex_wire::ingest::v1::RegisterSourceRequest {
+        org_id: "org".into(),
+        source_uri: "custom://parity-probe".into(),
+        producer_id: "parity-probe".into(),
+        ceiling: 1,
+        source_flavor: "custom".into(),
+        producer_kind: 5,
+        producer: Some(exocortex_wire::ingest::v1::ProducerIdentity {
+            node_id: "node".into(),
+            agent_id: String::new(),
+            adapter_id: "adapter".into(),
+            hmac_signature: vec![],
+            client_metadata: None,
+        }),
+        projection: None,
+    };
+    exocortex_wire::signing::sign_registration(&[7u8; 32], &mut registration);
+    ingest
+        .register_source(tonic::Request::new(registration))
+        .await
+        .unwrap();
+
+    let mut scope = ops_vc("org", "alice", Visibility::Org);
+    scope.project_ids = std::iter::once("p1".into()).collect();
+    let ctx = Arc::new(OpContext {
+        visibility_ctx: scope,
+        audit_admin: true,
+        storage: storage.clone() as Arc<dyn exocortex_storage::Storage>,
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        ontology: Some(onto.clone()),
+        ingest_preflight: Some(exocortex_server::backend::preflight_handle(ingest.clone())),
+    });
+    let principals = Arc::new(
+        exocortex_server::principal::PrincipalRegistry::single_with_audit_admin(
+            "test-only-preflight-bearer-token-000".into(),
+            ctx.visibility_ctx.clone(),
+            true,
+        )
+        .unwrap(),
+    );
+    let bind = HttpBind::with_principals(ctx.clone(), principals);
+    let app = bind.router(None);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let entry = entries()
+        .into_iter()
+        .find(|e| e.name == "preflight_batch")
+        .expect("preflight_batch registered");
+    // A sample with one clean row and one mapping error: the verdict must
+    // name the bad row with the shared vocabulary and a correction.
+    let input = serde_json::json!({
+        "org_id": "org",
+        "source_uri": "custom://parity-probe",
+        "producer_id": "parity-probe",
+        "project_id": "p1",
+        "memories": [
+            { "draft_key": "ok", "memory_type": "Fix", "title": "Fixed the parity gap",
+              "content": "c", "tags": [], "visibility": "project" },
+            { "draft_key": "broken", "memory_type": "NotAType", "title": "mapping typo",
+              "content": "c", "tags": [], "visibility": "project" }
+        ],
+        "relationships": []
+    });
+    let audit_before = storage.audit_range("org", 0, 1000).await.unwrap().len();
+    let typed = (entry.handler)(entry, &ctx, input.clone())
+        .await
+        .expect("typed surface");
+    let (status, over_http, raw) = http(
+        addr,
+        "POST",
+        "/v1/preflight_batch",
+        Some("test-only-preflight-bearer-token-000"),
+        Some(&input),
+    )
+    .await;
+    assert_eq!(status, 200, "{raw}");
+    assert_eq!(typed, over_http, "byte-identical across surfaces");
+    assert_eq!(typed["committed"], false, "preflight commits nothing");
+    // Batch-atomic like Submit: one bad row rejects the batch, so both
+    // rows count as would-reject while the named rejection is the cause.
+    assert_eq!(typed["would_reject"], 2);
+    let rejections = typed["rejections"].as_array().unwrap();
+    assert_eq!(rejections.len(), 1);
+    assert_eq!(rejections[0]["draft_key"], "broken");
+    assert_eq!(rejections[0]["code"], "UnknownMemoryType");
+    assert!(!rejections[0]["correction"].as_str().unwrap().is_empty());
+    assert_eq!(
+        storage.audit_range("org", 0, 1000).await.unwrap().len(),
+        audit_before,
+        "no audit row from the dry run"
+    );
+
+    // The org guard: a principal may not dry-run another org.
+    let mut foreign = input.clone();
+    foreign["org_id"] = serde_json::Value::String("other-org".into());
+    let err = (entry.handler)(entry, &ctx, foreign)
+        .await
+        .expect_err("cross-org preflight refused");
+    assert!(err.to_string().contains("another org"), "{err}");
+}
+
 /// PX2 acceptance: pack Actions and Functions ride the SAME parity walk
 /// in the same shape as kernel ops — HTTP output byte-identical to the
 /// typed handler's. Pack verbs declare their own ceilings
@@ -580,6 +769,7 @@ async fn pack_verbs_answer_identically_over_http_and_the_registry() {
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ontology: Some(onto.clone()),
+        ingest_preflight: None,
     });
     let principals = Arc::new(
         exocortex_server::principal::PrincipalRegistry::single_with_audit_admin(

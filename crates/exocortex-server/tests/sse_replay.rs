@@ -523,6 +523,7 @@ async fn backend_router_rejects_token_query_without_bearer() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
 
         ontology: None,
+        ingest_preflight: None,
     });
     let bind = exocortex_server::http_bind::HttpBind::new(
         ctx,

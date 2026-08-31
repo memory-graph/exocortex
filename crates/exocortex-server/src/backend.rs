@@ -12,7 +12,7 @@ use exocortex_cache::LocalCache;
 use exocortex_cluster::ClusterNode;
 use exocortex_ingest::IngestServer;
 use exocortex_kernel::{Ontology, OntologyFingerprint};
-use exocortex_ops::OpContext;
+use exocortex_ops::{IngestPreflight, OpContext};
 use exocortex_storage::{LeaseKey, Storage};
 use futures::{FutureExt, Stream, StreamExt};
 
@@ -232,6 +232,62 @@ where
             }
         }
     }
+}
+
+/// D21-b (adapter-contract PRD D2): the registry-face dry-run handle. The
+/// ctx is built BEFORE the ingest server (the HTTP bind + health handle
+/// must exist before hydration), so the concrete server arrives through a
+/// late-bound cell — the listener serves no request until the router is
+/// assembled at the end of startup, by which point the cell is set.
+struct RegistryPreflight<S: Storage> {
+    server: Arc<tokio::sync::OnceCell<Arc<IngestServer<S>>>>,
+}
+
+#[async_trait::async_trait]
+impl<S: Storage + 'static> IngestPreflight for RegistryPreflight<S> {
+    async fn preflight_signed(
+        &self,
+        principal: &exocortex_storage::VisibilityContext,
+        mut batch: exocortex_wire::ingest::v1::IngestBatch,
+    ) -> Result<exocortex_wire::ingest::v1::IngestAck, exocortex_ops::OpError> {
+        let server = self
+            .server
+            .get()
+            .ok_or_else(|| exocortex_ops::OpError::Other("ingest surface not ready".into()))?;
+        // The registration is authoritative: stamp the real ceiling,
+        // fingerprint, and signature (server-side impersonation of the
+        // registered producer — the caller is an authenticated principal
+        // and nothing commits).
+        let entry = server
+            .source_entry(&batch.org_id, &batch.source_uri, &batch.producer_id)
+            .map_err(exocortex_ops::OpError::Other)?;
+        batch.ceiling = match entry.ceiling {
+            exocortex_kernel::Visibility::Private => 0,
+            exocortex_kernel::Visibility::Project => 1,
+            exocortex_kernel::Visibility::Team => 2,
+            // PUBLIC is reserved; v1 read paths treat it as ORG (R-T11).
+            exocortex_kernel::Visibility::Org | exocortex_kernel::Visibility::Public => 3,
+        };
+        batch.ontology_fingerprint = server.ontology.fingerprint.0.to_vec();
+        let key = server
+            .producer_signing_key(&batch.org_id, &batch.source_uri, &batch.producer_id)
+            .map_err(exocortex_ops::OpError::Other)?;
+        exocortex_wire::signing::prepare_batch(&key, &mut batch);
+        server
+            .preflight_batch(Some(principal), &batch)
+            .await
+            .map_err(|status| exocortex_ops::OpError::Other(status.message().to_string()))
+    }
+}
+
+/// D21-b: a preflight handle over an already-built ingest server (tests
+/// and embedders; the node itself uses the late-bound cell above).
+pub fn preflight_handle<S: Storage + 'static>(
+    server: Arc<IngestServer<S>>,
+) -> Arc<dyn IngestPreflight> {
+    Arc::new(RegistryPreflight {
+        server: Arc::new(tokio::sync::OnceCell::from(server)),
+    })
 }
 
 async fn reseed_cache_with_retry<S: Storage>(
@@ -490,6 +546,11 @@ async fn run_backend_node_inner<S: Storage + 'static>(
     }
     // Op context + HTTP bind are created before hydration because the
     // change-feed bridge stamps its acknowledged publication frontier here.
+    // D21-b: the preflight handle is late-bound — the ingest server is
+    // constructed after reasoning/Dreams below, and the router (the only
+    // thing that can serve a request) is assembled at the very end.
+    let preflight_server: Arc<tokio::sync::OnceCell<Arc<IngestServer<S>>>> =
+        Arc::new(tokio::sync::OnceCell::new());
     let ctx = Arc::new(OpContext {
         visibility_ctx: exocortex_ops::operations::ops_vc(
             &org,
@@ -503,6 +564,9 @@ async fn run_backend_node_inner<S: Storage + 'static>(
         // D2: the backend serves preflight over HTTP (CR-9); the rulebook
         // is the same ontology the ingest path validates against.
         ontology: Some(ontology.clone()),
+        ingest_preflight: Some(Arc::new(RegistryPreflight {
+            server: preflight_server.clone(),
+        })),
     });
     let bind = HttpBind::with_principals(ctx, args.principals.clone());
     let health = bind.health_handle();
@@ -805,6 +869,8 @@ async fn run_backend_node_inner<S: Storage + 'static>(
         let ingest = Arc::new(ingest.clone());
         tokio::spawn(async move { ingest.run_post_ingest_effects().await })
     };
+    // D21-b: the registry preflight face now sees the fully-built server.
+    let _ = preflight_server.set(Arc::new(ingest.clone()));
 
     // One listener: gRPC routes + HTTP ops + SSE + observability.
 

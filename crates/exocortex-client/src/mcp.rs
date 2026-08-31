@@ -106,6 +106,9 @@ impl ExocortexMcp {
             cache: self.cache.clone(),
             deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
             ontology: Some(self.ontology.clone()),
+            // D21-b: no ingest surface in standalone mode — `preflight_batch`
+            // fails loudly rather than approximating Submit's verdicts.
+            ingest_preflight: None,
         })
     }
 

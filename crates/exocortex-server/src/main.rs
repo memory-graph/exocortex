@@ -3,6 +3,7 @@
 //! `--mode mcp-standalone`: local, no backend; process-local FalkorDB via the
 //! supervisor (§4.3). `--mode backend-node` / `--mode embedded` land with M5+.
 
+mod corpus_export;
 mod org_backup;
 mod supervisor;
 
@@ -137,6 +138,13 @@ struct Args {
     /// BR2 one-shot: restore an org backup file into storage, exit.
     #[arg(long)]
     import_org: Option<std::path::PathBuf>,
+    /// D22 one-shot: export a training-corpus cut (memories/edges/
+    /// lineage JSONL + manifest) into a directory, exit.
+    #[arg(long)]
+    export_corpus: Option<std::path::PathBuf>,
+    /// D22: the cut time for --export-corpus (RFC3339); absent = now.
+    #[arg(long)]
+    corpus_as_of: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -161,6 +169,13 @@ fn main() -> anyhow::Result<()> {
             .enable_all()
             .build()?;
         return runtime.block_on(org_backup_main(args));
+    }
+    // D22 one-shot: the training-corpus cut, then exit.
+    if let Some(dir) = args.export_corpus.clone() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return runtime.block_on(corpus_export_main(args, dir));
     }
 
     match args.mode {
@@ -444,6 +459,53 @@ async fn org_backup_main(args: Args) -> anyhow::Result<()> {
             anyhow::bail!("one-shot import needs --storage=falkor://host:port");
         }
     }
+    Ok(())
+}
+
+/// D22: `--export-corpus <dir> [--corpus-as-of RFC3339]` — stream the
+/// bi-temporal cut out of the selected storage and exit.
+async fn corpus_export_main(args: Args, dir: std::path::PathBuf) -> anyhow::Result<()> {
+    require_linked_ontology_pack();
+    let ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
+    let as_of = match &args.corpus_as_of {
+        Some(raw) => Some(
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map_err(|e| anyhow::anyhow!("--corpus-as-of is not RFC3339: {e}"))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+    let org = args.org.as_str();
+    let graph_name = args
+        .graph_name
+        .clone()
+        .unwrap_or_else(|| format!("exocortex-{org}"));
+    let Some((falkor_url, redis_url)) = resolve_falkor_urls(
+        &args.storage,
+        args.allow_private_network_plaintext_data_plane,
+    )?
+    else {
+        anyhow::bail!("one-shot corpus export needs --storage=falkor://host:port")
+    };
+    let storage = exocortex_storage::FalkorStorage::connect(
+        exocortex_storage::FalkorConfig {
+            falkor_url,
+            redis_url,
+            graph_name,
+            org_id: org.into(),
+            node_id: format!("node-{}", std::process::id()).into(),
+        },
+        ontology.clone(),
+    )
+    .await?;
+    let manifest = crate::corpus_export::export_corpus(&storage, &ontology, as_of, &dir).await?;
+    println!(
+        "{} memories, {} edges -> {} (as of {})",
+        manifest.memories,
+        manifest.edges,
+        dir.display(),
+        manifest.as_of.as_deref().unwrap_or("now")
+    );
     Ok(())
 }
 

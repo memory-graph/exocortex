@@ -133,6 +133,15 @@ OC-PRD rolling-upgrade acceptance test that drives a real IngestServer;
 both already workspace dependencies, no new external crate).
 
 `exocortex-server` directly depends on `axum-server` with its Rustls feature.
+
+D21 (adapter-contract PRD) additions, all already workspace pins: the
+`exocortex-wire` manifest module serializes its JSON through `serde_json`
+(published dep list grows by that one crate); the SDK's `testing` feature
+optionally gains `serde_json` for the canned manifest; `exocortex-ops`
+gains `prost-types` (wire batch timestamps on the `preflight_batch`
+operation); `exocortex-server` gains `async-trait` (the registry preflight
+handle); `exocortex-ingest` dev-depends on `exocortex-adapter-sdk` for the
+manifest-parity golden table. No new external crate anywhere.
 The shared backend listener serves HTTP, SSE, and gRPC on one TLS socket;
 Axum's built-in `serve` helper accepts only a plaintext `TcpListener`, so the
 TLS listener is an explicit runtime dependency rather than application code

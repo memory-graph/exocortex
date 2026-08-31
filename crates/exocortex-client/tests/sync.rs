@@ -679,6 +679,7 @@ async fn sse_feed_observed_by_client_cache_within_500ms() {
         cache: Arc::new(server_cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
         ontology: Some(onto.clone()),
+        ingest_preflight: None,
     });
     let bind = exocortex_server::http_bind::HttpBind::new(
         ctx,
@@ -1035,6 +1036,7 @@ async fn production_backend_sync_hydrates_before_ready_and_stays_live() {
         cache: Arc::new(server_cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
         ontology: Some(onto.clone()),
+        ingest_preflight: None,
     });
     let bind = exocortex_server::http_bind::HttpBind::new(
         ctx,

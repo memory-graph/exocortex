@@ -16,6 +16,7 @@ cargo xtask proto-sync
 cargo xtask signing-hygiene
 cargo xtask compatibility-policy
 cargo xtask seam-inventory
+cargo xtask adapter-contract
 cargo xtask metrics-hygiene
 cargo xtask wire-standalone
 cargo xtask bench

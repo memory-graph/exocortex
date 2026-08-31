@@ -669,6 +669,7 @@ async fn mcp_get_memory_shape_matches_registry() {
         storage: Arc::new(exocortex_client::no_backend::NoBackendStorage),
         cache: cache.clone(),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        ingest_preflight: None,
     });
     let entry = exocortex_ops::entries()
         .into_iter()

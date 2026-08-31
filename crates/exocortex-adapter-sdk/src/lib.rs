@@ -36,9 +36,11 @@ use std::path::PathBuf;
 
 pub use classify::{classify, Disposition};
 use exocortex_wire::ingest::v1::{
-    ingest_service_client::IngestServiceClient, IngestAck, RejectRow,
+    ingest_service_client::IngestServiceClient, IngestAck, IngestBatch, RejectRow,
 };
 pub use retry::{instant_sleep, real_sleep, SleepFn};
+pub mod manifest;
+pub use manifest::{validate_unit, validate_units, LocalReject};
 
 fn authenticated_request<T>(token: &str, message: T) -> Result<tonic::Request<T>, SdkError> {
     let value = format!("Bearer {token}")
@@ -333,6 +335,14 @@ pub enum SdkError {
         /// What was wrong.
         detail: String,
     },
+    /// D21-c: manifest-interpreted local rejections — the rulebook as
+    /// data names the rows the server would reject, before any wire
+    /// traffic. Mapping errors stop the window (cursor untouched).
+    #[error("local rejections: {rejects:?}")]
+    LocalRejections {
+        /// (draft_key, RejectCode name, detail) per offending row.
+        rejects: Vec<(String, String, String)>,
+    },
     /// Fatal session-level rejection (`Unauthorized`, `UnknownSource`,
     /// `IncompatibleOntology`).
     #[error("fatal: {code} {detail}")]
@@ -366,6 +376,10 @@ pub struct AdapterSession {
     /// D21-d: snapshot ids observed this session, oldest first, bounded —
     /// a window naming an already-superseded snapshot is a rewind.
     seen_snapshots: Vec<String>,
+    /// D21-c: the compiled rulebook, when the server served one whose
+    /// compatibility fingerprint matched the negotiated ontology.
+    /// `None` = server-side validation (the fallback, never a guess).
+    manifest: Option<exocortex_wire::manifest::ValidationManifest>,
 }
 
 impl AdapterSession {
@@ -400,7 +414,7 @@ impl AdapterSession {
             .await?
             .into_inner()
             .fingerprint;
-        let fingerprint = fp.try_into().map_err(|v: Vec<u8>| SdkError::InvalidUnit {
+        let fingerprint: [u8; 32] = fp.try_into().map_err(|v: Vec<u8>| SdkError::InvalidUnit {
             detail: format!("server fingerprint is {} bytes, expected 32", v.len()),
         })?;
         let mut registration = exocortex_wire::ingest::v1::RegisterSourceRequest {
@@ -432,6 +446,52 @@ impl AdapterSession {
             });
         }
         let cursor = load_cursor(&config.cursor_path)?;
+        // D21-c: pull the rulebook as data. A manifest whose fingerprint
+        // does not match the negotiated one — or that fails to parse —
+        // degrades to server-side validation with a warning, never a
+        // guess and never a failed run (A3, PRD open question 2).
+        let manifest = {
+            match client
+                .get_validation_manifest(authenticated_request(
+                    &config.auth_token,
+                    exocortex_wire::ingest::v1::ManifestRequest {
+                        org_id: config.org_id.clone(),
+                        source_uri: config.source_uri.clone(),
+                        producer_id: config.producer_id.clone(),
+                    },
+                )?)
+                .await
+            {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    if response.compatibility_fingerprint != fingerprint.to_vec() {
+                        tracing::warn!(
+                            "manifest fingerprint does not match the negotiated ontology; \
+                             degrading to server-side validation"
+                        );
+                        None
+                    } else {
+                        match exocortex_wire::manifest::parse_manifest(&response.manifest_json) {
+                            Ok(manifest) => Some(manifest),
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "manifest unparseable; degrading to server-side validation"
+                                );
+                                None
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "validation manifest unavailable; degrading to server-side validation"
+                    );
+                    None
+                }
+            }
+        };
         Ok(Self {
             config,
             client,
@@ -441,6 +501,7 @@ impl AdapterSession {
             sleep,
             rows_this_run: 0,
             seen_snapshots: Vec::new(),
+            manifest,
         })
     }
 
@@ -457,6 +518,11 @@ impl AdapterSession {
     /// The durable cursor, if a window has ever settled.
     pub fn cursor(&self) -> Option<&str> {
         self.cursor.as_deref()
+    }
+
+    /// The compiled rulebook this session holds, if any (D21-c).
+    pub fn manifest(&self) -> Option<&exocortex_wire::manifest::ValidationManifest> {
+        self.manifest.as_ref()
     }
 
     /// Submit one window of units (R9-R14). Returns the settled outcome;
@@ -513,6 +579,13 @@ impl AdapterSession {
                 }
             }
         }
+        // D21-c: the rulebook as data runs BEFORE the wire when a
+        // manifest is held — mapping errors stop the window with the
+        // server's own verdicts, cursor untouched (A3). No manifest =
+        // server-side validation, unchanged.
+        if let Some(manifest) = &self.manifest {
+            manifest::validate_units(manifest, self.ceiling, &units)?;
+        }
         // Split first — an unsplittable/invalid unit must fail before any
         // wire traffic. Then STAMP and SIGN, and verify the R-I2 budget
         // against the actual submitted bytes: the split-time estimate
@@ -520,55 +593,7 @@ impl AdapterSession {
         // (round-3 C3 — the old post-check ran pre-stamp and was dead
         // code). Over-budget batches re-split with the observed
         // headroom subtracted.
-        let mut budget = self.config.max_batch_bytes;
-        let mut all_batches;
-        loop {
-            all_batches = Vec::new();
-            for unit in &units {
-                all_batches.extend(split::split_unit(&self.config.producer_id, unit, budget)?);
-            }
-            use prost::Message;
-            let mut headroom_violation = None;
-            for b in &mut all_batches {
-                b.org_id = self.config.org_id.clone();
-                b.source_uri = self.config.source_uri.clone();
-                b.producer_id = self.config.producer_id.clone();
-                b.mapping_version = self.config.source_flavor.clone();
-                b.ceiling = self.ceiling;
-                b.ontology_fingerprint = self.fingerprint.to_vec();
-                if let Some(p) = b.producer.as_mut() {
-                    p.node_id = self.config.node_id.clone();
-                    p.agent_id = self.config.producer_id.clone();
-                    p.adapter_id = self.config.adapter_id.clone();
-                }
-                exocortex_wire::signing::prepare_batch(&self.config.hmac_key, b);
-                if b.encoded_len() > self.config.max_batch_bytes {
-                    headroom_violation = Some(b.encoded_len() - self.config.max_batch_bytes);
-                    break;
-                }
-            }
-            match headroom_violation {
-                None => break,
-                Some(over) => {
-                    // Subtract the worst observed overshoot (plus slack)
-                    // and re-split smaller. Bounded: each iteration
-                    // shrinks the budget by >= 1 byte; a single memory
-                    // that cannot fit even alone surfaces as
-                    // `Unsplittable` from split_unit.
-                    let next = budget.saturating_sub(over + 16).max(64);
-                    if next == budget {
-                        // Cannot shrink further: genuinely unsplittable.
-                        let keys: Vec<String> = all_batches
-                            .iter()
-                            .flat_map(|b| b.memories.iter().map(|m| m.draft_key.clone()))
-                            .collect();
-                        return Err(SdkError::Unsplittable { draft_keys: keys });
-                    }
-                    tracing::debug!(over, next, "re-splitting under tightened R-I2 budget");
-                    budget = next;
-                }
-            }
-        }
+        let mut all_batches = self.prepare_batches(&units)?;
 
         let mut outcome = WindowOutcome::default();
         {
@@ -655,6 +680,104 @@ impl AdapterSession {
         }
         outcome.cursor_advanced = true;
         Ok(outcome)
+    }
+
+    /// Split, stamp, and sign exactly as `submit_window` does — the ONE
+    /// batch-construction path, shared with [`Self::preflight`] (D21-b) so
+    /// a dry run sends byte-identical batches to a real submission.
+    fn prepare_batches(&self, units: &[BatchUnit]) -> Result<Vec<IngestBatch>, SdkError> {
+        let mut budget = self.config.max_batch_bytes;
+        loop {
+            let mut all_batches = Vec::new();
+            for unit in units {
+                all_batches.extend(split::split_unit(&self.config.producer_id, unit, budget)?);
+            }
+            use prost::Message;
+            let mut headroom_violation = None;
+            for b in &mut all_batches {
+                b.org_id = self.config.org_id.clone();
+                b.source_uri = self.config.source_uri.clone();
+                b.producer_id = self.config.producer_id.clone();
+                b.mapping_version = self.config.source_flavor.clone();
+                b.ceiling = self.ceiling;
+                b.ontology_fingerprint = self.fingerprint.to_vec();
+                if let Some(p) = b.producer.as_mut() {
+                    p.node_id = self.config.node_id.clone();
+                    p.agent_id = self.config.producer_id.clone();
+                    p.adapter_id = self.config.adapter_id.clone();
+                }
+                exocortex_wire::signing::prepare_batch(&self.config.hmac_key, b);
+                if b.encoded_len() > self.config.max_batch_bytes {
+                    headroom_violation = Some(b.encoded_len() - self.config.max_batch_bytes);
+                    break;
+                }
+            }
+            match headroom_violation {
+                None => return Ok(all_batches),
+                Some(over) => {
+                    // Subtract the worst observed overshoot (plus slack)
+                    // and re-split smaller. Bounded: each iteration
+                    // shrinks the budget by >= 1 byte; a single memory
+                    // that cannot fit even alone surfaces as
+                    // `Unsplittable` from split_unit.
+                    let next = budget.saturating_sub(over + 16).max(64);
+                    if next == budget {
+                        // Cannot shrink further: genuinely unsplittable.
+                        let keys: Vec<String> = all_batches
+                            .iter()
+                            .flat_map(|b| b.memories.iter().map(|m| m.draft_key.clone()))
+                            .collect();
+                        return Err(SdkError::Unsplittable { draft_keys: keys });
+                    }
+                    tracing::debug!(over, next, "re-splitting under tightened R-I2 budget");
+                    budget = next;
+                }
+            }
+        }
+    }
+
+    /// D21-b (adapter-contract PRD D2): dry-run a sample against the real
+    /// registration — the verdicts a [`Self::submit_window`] submission of
+    /// the same units would produce, committing nothing. Sends the SAME
+    /// split/stamped/signed batches through the `Preflight` RPC with no
+    /// retry loop (mapping iteration wants immediate feedback, not
+    /// backoff) and mutates NO session state: the cursor, the per-run row
+    /// count, and the rewind history are untouched — preflighting a
+    /// sample must never change what a later window does.
+    pub async fn preflight(&mut self, units: Vec<BatchUnit>) -> Result<Vec<IngestAck>, SdkError> {
+        let span = tracing::info_span!("adapter_preflight", producer = %self.config.producer_id);
+        let _guard = span.enter();
+        if let Some(projection) = &self.config.projection {
+            let window_rows: u64 = units.iter().map(|unit| unit.memories.len() as u64).sum();
+            if window_rows > projection.bounds.max_rows_per_window {
+                return Err(SdkError::ProjectionBoundExceeded {
+                    bound: "max_rows_per_window",
+                    value: window_rows,
+                    declared: projection.bounds.max_rows_per_window,
+                });
+            }
+        }
+        // D21-c: the local pass names what the manifest can honestly
+        // judge before any wire traffic; cross-batch targets and other
+        // server-only checks ride the RPC below.
+        if let Some(manifest) = &self.manifest {
+            manifest::validate_units(manifest, self.ceiling, &units)?;
+        }
+        let batches = self.prepare_batches(&units)?;
+        let mut acks = Vec::with_capacity(batches.len());
+        let mut client = self.client.clone();
+        for batch in batches {
+            let ack = client
+                .preflight(authenticated_request(&self.config.auth_token, batch)?)
+                .await
+                .map_err(|status| SdkError::Fatal {
+                    code: status.code() as i32,
+                    detail: status.message().to_string(),
+                })?
+                .into_inner();
+            acks.push(ack);
+        }
+        Ok(acks)
     }
 
     /// Classify an ack. Fatal rows abort the session; a rate-limited ack

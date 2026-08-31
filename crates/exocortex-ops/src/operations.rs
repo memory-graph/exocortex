@@ -987,6 +987,387 @@ register_operation!(
     crate::preflight::PreflightResult
 );
 
+/// D21-b (adapter-contract PRD D2): `preflight_batch` — dry-run the
+/// ingest Submit path over a representative sample under a REAL
+/// registration, committing nothing. The handler delegates to the
+/// backend's ingest service through [`crate::IngestPreflight`], so the
+/// verdicts are the ones Submit itself produces — one implementation,
+/// one rejection vocabulary (the same RejectCode + correction table
+/// `preflight_wrapup` and `preflight_action` report).
+#[derive(Default)]
+pub struct PreflightBatchOp;
+
+/// One sample memory row (wire `MemoryDraft` shape, JSON-friendly).
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct PreflightMemoryRow {
+    /// Producer-local id; relationships link via draft keys.
+    pub draft_key: String,
+    /// MUST resolve to a registered MemoryType.
+    pub memory_type: String,
+    /// 1..=200 chars (R-T5).
+    pub title: String,
+    /// Free-text content.
+    pub content: String,
+    /// Lowercase tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// "private"|"project"|"team"|"org" — the registration's ceiling caps this.
+    pub visibility: String,
+    /// RFC3339; absent = recorded_at (R-T7).
+    #[serde(default)]
+    pub valid_from: Option<String>,
+    /// RFC3339; absent = open-ended.
+    #[serde(default)]
+    pub valid_until: Option<String>,
+    /// Required when `snapshot` is present (R-T16a).
+    #[serde(default)]
+    pub external_key: Option<PreflightExternalKeyRow>,
+}
+
+/// One sample edge (wire `RelationshipDraft` shape).
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct PreflightRelationshipRow {
+    /// Source draft key.
+    pub from_draft_key: String,
+    /// Target draft key within this sample — or empty when `to_memory_id` is set.
+    #[serde(default)]
+    pub to_draft_key: String,
+    /// An EXISTING memory by 32-hex id (cross-batch edge).
+    #[serde(default)]
+    pub to_memory_id: String,
+    /// MUST resolve to a registered kind.
+    pub kind: String,
+    /// 0.0..1.0; 0 = RelMeta default.
+    #[serde(default)]
+    pub strength: f32,
+    /// 0.0..1.0; 0 = default.
+    #[serde(default)]
+    pub confidence: f32,
+    /// Free-text edge context.
+    #[serde(default)]
+    pub context: String,
+    /// "private"|"project"|"team"|"org"; empty = the registered ceiling.
+    #[serde(default)]
+    pub visibility: String,
+}
+
+/// The external snapshot the sample was observed at (R-T16a).
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct PreflightSnapshotRow {
+    /// Source snapshot id (rewind detection names it).
+    pub snapshot_id: String,
+    /// 64-hex (32 bytes) — must match the registered mapping's schema hash.
+    pub schema_hash: String,
+    /// "iceberg" | "delta" | "parquet-dir" | "custom".
+    pub source_flavor: String,
+}
+
+/// External identity coordinates (R-T18a): 32-hex table uuid + logical pk.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct PreflightExternalKeyRow {
+    /// 32-hex (16 bytes).
+    pub table_uuid: String,
+    /// The row's logical primary key, in the source's own terms.
+    pub logical_pk: String,
+    /// The mapping version the coordinates were minted under.
+    #[serde(default)]
+    pub mapping_version: u32,
+}
+
+/// Input for `preflight_batch`.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct PreflightBatchInput {
+    /// The REAL registration the dry run runs under (org-scoped; the
+    /// authenticated principal must belong to it).
+    pub org_id: String,
+    /// Registered source URI.
+    pub source_uri: String,
+    /// Registered producer id.
+    pub producer_id: String,
+    /// Producer node id for the dry-run identity (cosmetic; nothing commits).
+    #[serde(default)]
+    pub node_id: String,
+    /// Requested project scope for Project-visibility samples — the same
+    /// `ClientMetadata` contract a real submission carries; the server
+    /// verifies the principal's membership.
+    #[serde(default)]
+    pub project_id: String,
+    /// Requested team scope for Team-visibility samples (same contract).
+    #[serde(default)]
+    pub team_id: String,
+    /// The representative sample.
+    pub memories: Vec<PreflightMemoryRow>,
+    /// The sample's edges.
+    #[serde(default)]
+    pub relationships: Vec<PreflightRelationshipRow>,
+    /// Present iff the producer is external-source.
+    #[serde(default)]
+    pub snapshot: Option<PreflightSnapshotRow>,
+}
+
+/// One verdict row — the wire `RejectRow` plus its deterministic correction.
+#[derive(Serialize, JsonSchema)]
+pub struct PreflightRejectRow {
+    /// Producer-local key of the offending row.
+    pub draft_key: String,
+    /// `RejectCode` name (the shared vocabulary).
+    pub code: String,
+    /// What exactly failed.
+    pub detail: String,
+    /// Deterministic remediation (the same guidance table Submit reports).
+    pub correction: String,
+}
+
+/// The dry-run verdict for `preflight_batch`.
+#[derive(Serialize, JsonSchema)]
+pub struct PreflightBatchOutput {
+    /// The dry-run batch id (deterministic over the sample).
+    pub batch_id: String,
+    /// Rows a real submission would commit.
+    pub would_accept: u32,
+    /// Rows a real submission would reject.
+    pub would_reject: u32,
+    /// The rejection rows with corrections.
+    pub rejections: Vec<PreflightRejectRow>,
+    /// Always false: preflight assigns no LSN, writes no audit row,
+    /// moves no cursor.
+    pub committed: bool,
+}
+
+fn visibility_label_to_wire(label: &str) -> Result<i32, OpError> {
+    match label.to_lowercase().as_str() {
+        "" | "org" => Ok(3),
+        "private" => Ok(0),
+        "project" => Ok(1),
+        "team" => Ok(2),
+        other => Err(OpError::BadInput(format!(
+            "unknown visibility `{other}` (expected private|project|team|org)"
+        ))),
+    }
+}
+
+fn parse_ts(s: &Option<String>) -> Result<Option<prost_types::Timestamp>, OpError> {
+    s.as_deref()
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map(|dt| prost_types::Timestamp {
+                    seconds: dt.timestamp(),
+                    nanos: dt.timestamp_subsec_nanos() as i32,
+                })
+                .map_err(|e| OpError::BadInput(format!("invalid RFC3339 timestamp `{raw}`: {e}")))
+        })
+        .transpose()
+}
+
+fn parse_hex_bytes(s: &str, want: usize, what: &str) -> Result<Vec<u8>, OpError> {
+    let bytes = s.as_bytes();
+    if bytes.len() != want * 2 {
+        return Err(OpError::BadInput(format!(
+            "{what} must be {want} bytes ({} hex chars), got {} chars",
+            want * 2,
+            bytes.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(want);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16);
+        let lo = (bytes[i + 1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(hi), Some(lo)) => out.push((hi * 16 + lo) as u8),
+            _ => {
+                return Err(OpError::BadInput(format!(
+                    "{what} is not valid hex near byte {}",
+                    i / 2
+                )))
+            }
+        }
+        i += 2;
+    }
+    Ok(out)
+}
+
+#[async_trait]
+impl Operation for PreflightBatchOp {
+    type Input = PreflightBatchInput;
+    type Output = PreflightBatchOutput;
+    fn name(&self) -> &'static str {
+        "preflight_batch"
+    }
+    fn mcp_tool_name(&self) -> &'static str {
+        "exocortex.preflight_batch"
+    }
+    fn http_method(&self) -> http::Method {
+        http::Method::POST
+    }
+    fn http_path(&self) -> &'static str {
+        "/v1/preflight_batch"
+    }
+    async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        ctx.check_deadline()?;
+        let handle = ctx.ingest_preflight.clone().ok_or_else(|| {
+            OpError::Unauthorized(
+                "preflight_batch requires the backend ingest surface — standalone mode has no Submit path to dry-run"
+                    .into(),
+            )
+        })?;
+        if ctx.visibility_ctx.org_id.as_str() != input.org_id {
+            return Err(OpError::Unauthorized(
+                "authenticated principal cannot preflight another org".into(),
+            ));
+        }
+        let now = chrono::Utc::now();
+        let now_ts = prost_types::Timestamp {
+            seconds: now.timestamp(),
+            nanos: now.timestamp_subsec_nanos() as i32,
+        };
+        let memories = input
+            .memories
+            .iter()
+            .map(|m| {
+                let external_key = m
+                    .external_key
+                    .as_ref()
+                    .map(|k| {
+                        Ok::<_, OpError>(exocortex_wire::ingest::v1::ExternalKey {
+                            table_uuid: parse_hex_bytes(
+                                &k.table_uuid,
+                                16,
+                                "external_key.table_uuid",
+                            )?,
+                            logical_pk: k.logical_pk.clone(),
+                            mapping_version: k.mapping_version,
+                        })
+                    })
+                    .transpose()?;
+                Ok(exocortex_wire::ingest::v1::MemoryDraft {
+                    draft_key: m.draft_key.clone(),
+                    id: String::new(),
+                    memory_type: m.memory_type.clone(),
+                    title: m.title.clone(),
+                    content: m.content.clone(),
+                    tags: m.tags.clone(),
+                    visibility: visibility_label_to_wire(&m.visibility)?,
+                    valid_from: parse_ts(&m.valid_from)?,
+                    valid_until: parse_ts(&m.valid_until)?,
+                    external_key,
+                })
+            })
+            .collect::<Result<Vec<_>, OpError>>()?;
+        let relationships = input
+            .relationships
+            .iter()
+            .map(|r| {
+                Ok(exocortex_wire::ingest::v1::RelationshipDraft {
+                    from_draft_key: r.from_draft_key.clone(),
+                    to_draft_key: r.to_draft_key.clone(),
+                    kind: r.kind.clone(),
+                    strength: r.strength,
+                    confidence: r.confidence,
+                    context: r.context.clone(),
+                    visibility: visibility_label_to_wire(&r.visibility)?,
+                    to_memory_id: r.to_memory_id.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, OpError>>()?;
+        let snapshot = input
+            .snapshot
+            .as_ref()
+            .map(|s| {
+                Ok(exocortex_wire::ingest::v1::ExternalSnapshotInfo {
+                    snapshot_id: s.snapshot_id.clone(),
+                    schema_hash: parse_hex_bytes(&s.schema_hash, 32, "snapshot.schema_hash")?,
+                    source_flavor: s.source_flavor.clone(),
+                })
+            })
+            .transpose()?;
+        let batch_id = {
+            // Deterministic dry-run id: nothing commits, but equal samples
+            // name themselves identically in the verdict output.
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(input.org_id.as_bytes());
+            hasher.update(input.source_uri.as_bytes());
+            hasher.update(input.producer_id.as_bytes());
+            hasher.update(&serde_json::to_vec(&input).map_err(|e| OpError::Other(e.to_string()))?);
+            let digest = hasher.finalize();
+            let bytes = digest.as_bytes();
+            let mut hex = String::with_capacity(8);
+            for byte in &bytes[..4] {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{byte:02x}");
+            }
+            format!("preflight-{hex}")
+        };
+        let batch = exocortex_wire::ingest::v1::IngestBatch {
+            org_id: input.org_id.clone(),
+            source_uri: input.source_uri.clone(),
+            producer_id: input.producer_id.clone(),
+            batch_id,
+            mapping_version: "preflight".into(),
+            ontology_fingerprint: vec![],
+            ceiling: 0,
+            checksum: String::new(),
+            observed_at: Some(now_ts),
+            recorded_at: Some(now_ts),
+            snapshot,
+            memories,
+            relationships,
+            producer: Some(exocortex_wire::ingest::v1::ProducerIdentity {
+                node_id: if input.node_id.is_empty() {
+                    "preflight".into()
+                } else {
+                    input.node_id.clone()
+                },
+                agent_id: String::new(),
+                adapter_id: input.producer_id.clone(),
+                hmac_signature: vec![],
+                client_metadata: Some(exocortex_wire::ingest::v1::ClientMetadata {
+                    playbook_version: "preflight".into(),
+                    client_version: "preflight".into(),
+                    harness_hint: String::new(),
+                    project_id: input.project_id.clone(),
+                    team_id: input.team_id.clone(),
+                }),
+            }),
+        };
+        let ack = handle.preflight_signed(&ctx.visibility_ctx, batch).await?;
+        let rejections = ack
+            .rejections
+            .iter()
+            .map(|row| {
+                let code = exocortex_wire::ingest::v1::RejectCode::try_from(row.code)
+                    .unwrap_or(exocortex_wire::ingest::v1::RejectCode::Unknown);
+                PreflightRejectRow {
+                    draft_key: row.draft_key.clone(),
+                    code: format!("{code:?}"),
+                    detail: row.detail.clone(),
+                    correction: exocortex_wire::corrections::guidance(code)
+                        .correction
+                        .into(),
+                }
+            })
+            .collect();
+        Ok(PreflightBatchOutput {
+            batch_id: ack.batch_id,
+            would_accept: ack.accepted,
+            would_reject: ack.rejected,
+            rejections,
+            committed: false,
+        })
+    }
+}
+
+register_operation!(
+    PreflightBatchOp,
+    "preflight_batch",
+    "exocortex.preflight_batch",
+    POST,
+    "/v1/preflight_batch",
+    PreflightBatchInput,
+    PreflightBatchOutput
+);
+
 // ---- PX6: the three kernel-catalogue entries that had no registered
 // operation (GetChain, ExplainEdge, RetractEdge). Every kernel
 // Action/Function now has exactly one operation-side implementation;
@@ -1113,6 +1494,195 @@ register_operation!(
     "/v1/retract_edge",
     RetractEdgeInput,
     RetractEdgeOutput
+);
+
+/// D7 (§23 #13, round-2 H14): `resolve_contradiction` — record a human
+/// resolution over a `Contradicts` edge. The winner stands; the loser is
+/// superseded to derived-floor confidence (the same stale-belief
+/// semantics the commit path applies to `Replaces`/`Contradicts`
+/// targets); the contradiction edge itself closes so it stops firing the
+/// detector; and the decision — resolution, note, actor — lands in the
+/// audit ledger in the SAME atomic commit (R6-B18 discipline). Every
+/// resolution is reversible history, never a destructive edit.
+#[derive(Default)]
+pub struct ResolveContradictionOp;
+
+/// Input for `resolve_contradiction`.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct ResolveContradictionInput {
+    /// Hex id of the open `Contradicts` edge being resolved.
+    pub edge_id: String,
+    /// "from" keeps the edge's from-memory and supersedes the to-memory;
+    /// "to" the mirror; "neither" supersedes nothing (both stand, the
+    /// contradiction is acknowledged and closed).
+    pub resolution: String,
+    /// The human rationale, kept verbatim in the audit ledger.
+    pub note: String,
+}
+
+/// Output for `resolve_contradiction`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ResolveContradictionOutput {
+    /// The closed contradiction edge.
+    pub edge_id: String,
+    /// What was recorded.
+    pub resolution: String,
+    /// The superseded memory (hex), when the resolution named a winner.
+    pub superseded: Option<String>,
+    /// The audit record written in the same commit.
+    pub audit_lsn: u64,
+}
+
+#[async_trait]
+impl Operation for ResolveContradictionOp {
+    type Input = ResolveContradictionInput;
+    type Output = ResolveContradictionOutput;
+    fn name(&self) -> &'static str {
+        "resolve_contradiction"
+    }
+    fn mcp_tool_name(&self) -> &'static str {
+        "exocortex.resolve_contradiction"
+    }
+    fn http_method(&self) -> http::Method {
+        http::Method::POST
+    }
+    fn http_path(&self) -> &'static str {
+        "/v1/resolve_contradiction"
+    }
+    async fn handle(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output, OpError> {
+        ctx.check_deadline()?;
+        if input.note.trim().is_empty() {
+            return Err(OpError::BadInput(
+                "contradiction resolution requires a note".into(),
+            ));
+        }
+        let resolution = match input.resolution.as_str() {
+            "from" | "to" | "neither" => input.resolution.as_str(),
+            other => {
+                return Err(OpError::BadInput(format!(
+                    "unknown resolution `{other}` (expected from|to|neither)"
+                )))
+            }
+        };
+        let ontology = ctx.ontology.clone().ok_or_else(|| {
+            OpError::Other(
+                "resolve_contradiction requires the effective ontology (surface misconfiguration)"
+                    .into(),
+            )
+        })?;
+        let id = rel_unhex(&input.edge_id)?;
+        let edge = ctx
+            .storage
+            .get_relationship(&id)
+            .await
+            .map_err(|e| OpError::Storage(e.to_string()))?
+            .ok_or(OpError::NotFound)?;
+        if edge.valid_until.is_some() {
+            return Err(OpError::BadInput(
+                "contradiction edge is already resolved".into(),
+            ));
+        }
+        let kind_name = ontology
+            .kinds_by_id
+            .get(&edge.kind)
+            .map(|kind| kind.display_name.as_str())
+            .unwrap_or("");
+        if kind_name != "Contradicts" {
+            return Err(OpError::BadInput(format!(
+                "edge is `{kind_name}`, not Contradicts — resolution is a contradiction-record operation"
+            )));
+        }
+        // IN2 pattern: the caller must see BOTH endpoints before deciding
+        // between them.
+        let endpoints = ctx
+            .storage
+            .get_visible_memories(&[edge.from, edge.to], &ctx.visibility_ctx)
+            .await
+            .map_err(|e| OpError::Storage(e.to_string()))?;
+        if endpoints.len() != 2 {
+            return Err(OpError::Unauthorized(
+                "caller may not see both endpoints of this contradiction".into(),
+            ));
+        }
+        let now = chrono::Utc::now();
+        // The loser is superseded to the stale-belief floor — the exact
+        // treatment materialize_commit_rows gives Replaces/Contradicts
+        // targets — never deleted.
+        let confidence_floor = exocortex_kernel::memory::derived_confidence(true, 0, 0);
+        let mut superseded = None;
+        let mut memories = Vec::new();
+        if resolution != "neither" {
+            let winner = if resolution == "from" {
+                edge.from
+            } else {
+                edge.to
+            };
+            let loser = if resolution == "from" {
+                edge.to
+            } else {
+                edge.from
+            };
+            let loser_row = endpoints
+                .iter()
+                .find(|memory| memory.id == loser)
+                .cloned()
+                .ok_or(OpError::NotFound)?;
+            if loser_row.confidence.partial_cmp_score(&confidence_floor)
+                == std::cmp::Ordering::Greater
+            {
+                let mut stale = loser_row;
+                stale.confidence = confidence_floor;
+                stale.recorded_at = now;
+                memories.push(stale);
+            }
+            superseded = Some(loser.to_hex());
+            let _ = winner;
+        }
+        // Close the contradiction edge: it is resolved and must stop
+        // firing the detector. The row is a new version, not an edit.
+        let mut closed = edge;
+        closed.valid_until = Some(now);
+        closed.recorded_at = now;
+        let record = crate::audit::AuditRecord {
+            action: "resolve_contradiction".into(),
+            actor: ctx.visibility_ctx.user_id.clone(),
+            org_id: ctx.visibility_ctx.org_id.clone(),
+            input_digest: crate::audit::digest_input(&serde_json::json!({
+                "edge_id": input.edge_id,
+                "resolution": resolution,
+                "note": input.note,
+            })),
+            output_ids: [input.edge_id.clone().into()]
+                .into_iter()
+                .chain(superseded.clone().map(smol_str::SmolStr::from))
+                .collect(),
+            fingerprint: ctx.storage.ontology_fingerprint(),
+            lease_epoch: None,
+            recorded_at: now,
+        };
+        let commits = ctx
+            .storage
+            .upsert_batch_audited(&memories, &[closed], &record)
+            .await
+            .map_err(|e| OpError::Storage(e.to_string()))?;
+        let audit_lsn = commits.last().map(|commit| commit.lsn).unwrap_or_default();
+        Ok(ResolveContradictionOutput {
+            edge_id: input.edge_id,
+            resolution: resolution.into(),
+            superseded,
+            audit_lsn,
+        })
+    }
+}
+
+register_operation!(
+    ResolveContradictionOp,
+    "resolve_contradiction",
+    "exocortex.resolve_contradiction",
+    POST,
+    "/v1/resolve_contradiction",
+    ResolveContradictionInput,
+    ResolveContradictionOutput
 );
 
 /// `get_chain` (§7.12 `GetChain`): the provenance chain for a memory —

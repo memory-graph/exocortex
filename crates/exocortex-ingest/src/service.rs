@@ -1436,12 +1436,149 @@ impl<S: Storage + 'static> IngestServer<S> {
         if !rejections.is_empty() {
             return Ok(Err(Self::reject_rows(batch, rejections)));
         }
-        self.embed_memories(&mut memories).await;
+        // Embedding is deliberately OUTSIDE validate_batch (D21-b): a
+        // preflight runs the identical verdict path and embedding has no
+        // effect on any verdict — committing it to validation would burn
+        // the embedder on every dry run. Submit embeds after validation.
         Ok(Ok(ValidatedBatch {
             memories,
             relationships,
             loaded,
         }))
+    }
+
+    /// D21-b (adapter-contract PRD D2): the Submit pipeline through
+    /// validation, committing nothing. The SAME admission, registration,
+    /// and verdict code a real submission runs — `admit_batch`,
+    /// `registered_source`, `validate_batch` — stopped before
+    /// materialization: no LSN, no audit row, no idempotency claim, no
+    /// replay consult (replay is a transport property, not a data
+    /// verdict), no `similar_to` (commit-side). Verdicts are
+    /// submit-identical by construction; `assigned_lsn` is always 0.
+    pub async fn preflight_batch(
+        &self,
+        principal: Option<&VisibilityContext>,
+        batch: &IngestBatch,
+    ) -> Result<IngestAck, Status> {
+        let _submit_permit = match self.admit_batch(batch) {
+            Ok(permit) => permit,
+            Err(ack) => return Ok(ack),
+        };
+        let source = match self.registered_source(batch) {
+            Ok(source) => source,
+            Err(ack) => return Ok(ack),
+        };
+        match self.validate_batch(batch, &source, principal).await? {
+            Ok(validated) => Ok(IngestAck {
+                batch_id: batch.batch_id.clone(),
+                accepted: (validated.memories.len() + validated.relationships.len()) as u32,
+                rejected: 0,
+                rejections: vec![],
+                assigned_lsn: 0,
+                similar_to: vec![],
+            }),
+            Err(ack) => Ok(ack),
+        }
+    }
+
+    /// D21-b: the registered source entry for dry-run stamping. The
+    /// registration is authoritative — a preflight runs under the REAL
+    /// ceiling and kind, never caller-declared ones.
+    pub fn source_entry(
+        &self,
+        org: &str,
+        source_uri: &str,
+        producer_id: &str,
+    ) -> Result<SourceEntry, String> {
+        if let Some(error) = &self.source_registry_error {
+            return Err(format!("source registry unavailable: {error}"));
+        }
+        self.sources
+            .lock()
+            .unwrap()
+            .get(&(
+                org.to_owned(),
+                source_uri.to_owned(),
+                producer_id.to_owned(),
+            ))
+            .cloned()
+            .ok_or_else(|| "producer not registered".to_string())
+    }
+
+    /// D21-c (adapter-contract PRD D3): compile the rulebook as data —
+    /// the ontology's type/kind/triple tables plus the requesting
+    /// source's REGISTERED ceiling, stamped with the compatibility
+    /// fingerprint. The registration lookup is best-effort BY DESIGN: an
+    /// unknown source yields `registered_ceiling: None` and the adapter
+    /// degrades to server-side validation rather than trusting a ceiling
+    /// it could not confirm (A3).
+    pub fn validation_manifest(
+        &self,
+        org: &str,
+        source_uri: &str,
+        producer_id: &str,
+    ) -> Result<exocortex_wire::manifest::ValidationManifest, Status> {
+        let summary = &self.ontology.summary;
+        let registered_ceiling =
+            self.source_entry(org, source_uri, producer_id)
+                .ok()
+                .map(|entry| match entry.ceiling {
+                    exocortex_kernel::Visibility::Private => 0,
+                    exocortex_kernel::Visibility::Project => 1,
+                    exocortex_kernel::Visibility::Team => 2,
+                    exocortex_kernel::Visibility::Org | exocortex_kernel::Visibility::Public => 3,
+                });
+        let mut manifest = exocortex_wire::manifest::ValidationManifest {
+            manifest_version: exocortex_wire::manifest::MANIFEST_VERSION,
+            compatibility_fingerprint: hex32(&self.ontology.fingerprint.0),
+            memory_types: summary
+                .memory_types
+                .iter()
+                .enumerate()
+                .map(|(id, name)| exocortex_wire::manifest::ManifestMemoryType {
+                    name: name.to_string(),
+                    id: id as u8,
+                })
+                .collect(),
+            kinds: summary
+                .kinds
+                .iter()
+                .map(|kind| exocortex_wire::manifest::ManifestKind {
+                    id: kind.id,
+                    name: kind.name.clone(),
+                    computed_only: kind.computed_only,
+                    default_strength: kind.default_strength,
+                })
+                .collect(),
+            type_triples: summary
+                .type_triples
+                .iter()
+                .map(|triple| exocortex_wire::manifest::ManifestTriple {
+                    kind: triple.kind,
+                    from_types: triple.from_types.clone(),
+                    to_types: triple.to_types.clone(),
+                })
+                .collect(),
+            // R-T5/KP3: title bounds are char counts, not bytes.
+            title_min_chars: 1,
+            title_max_chars: 200,
+            registered_ceiling,
+        };
+        manifest.memory_types.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(manifest)
+    }
+
+    /// D21-b: the producer's signing key, for server-side signing of a
+    /// principal-initiated dry run (the caller is an authenticated
+    /// principal impersonating the registered producer; nothing commits).
+    pub fn producer_signing_key(
+        &self,
+        org: &str,
+        source_uri: &str,
+        producer_id: &str,
+    ) -> Result<[u8; 32], String> {
+        self.producer_key(org, source_uri, producer_id)
+            .map_err(|error| error.message().to_string())
     }
 
     fn materialize_commit_rows(
@@ -1933,13 +2070,14 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             Ok(source) => source,
             Err(ack) => return Ok(Response::new(ack)),
         };
-        let validated = match self
+        let mut validated = match self
             .validate_batch(&batch, &source, principal.as_ref())
             .await?
         {
             Ok(validated) => validated,
             Err(ack) => return Ok(Response::new(ack)),
         };
+        self.embed_memories(&mut validated.memories).await;
         let rows = self.materialize_commit_rows(&batch, &source.flavor, validated);
         let (assigned_lsn, accepted) = match self.commit_rows(&batch, &rows).await? {
             Ok(commit) => commit,
@@ -1950,6 +2088,23 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
     }
 
     type SubmitStreamStream = futures::stream::BoxStream<'static, Result<SubmitAck, Status>>;
+
+    /// D21-b: dry-run Submit — the caller's own HMAC, the full verdict
+    /// path, zero commit.
+    async fn preflight(&self, req: Request<IngestBatch>) -> Result<Response<IngestAck>, Status> {
+        let principal = self.request_principal(&req)?;
+        let batch = req.into_inner();
+        if principal
+            .as_ref()
+            .is_some_and(|context| context.org_id.as_str() != batch.org_id)
+        {
+            return Err(Status::permission_denied(
+                "authenticated principal cannot preflight another org",
+            ));
+        }
+        let ack = self.preflight_batch(principal.as_ref(), &batch).await?;
+        Ok(Response::new(ack))
+    }
 
     async fn submit_stream(
         &self,
@@ -2033,6 +2188,31 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                 .map(|p| p.name.to_string())
                 .collect(),
         }))
+    }
+
+    /// D21-c: pull the rulebook as data (see `validation_manifest`).
+    async fn get_validation_manifest(
+        &self,
+        req: Request<exocortex_wire::ingest::v1::ManifestRequest>,
+    ) -> Result<Response<exocortex_wire::ingest::v1::ManifestResponse>, Status> {
+        self.request_principal(&req)?;
+        let r = req.into_inner();
+        if self
+            .org_guard
+            .as_ref()
+            .is_some_and(|guard| guard.as_str() != r.org_id)
+        {
+            return Err(Status::permission_denied("org does not match this node"));
+        }
+        let manifest = self.validation_manifest(&r.org_id, &r.source_uri, &r.producer_id)?;
+        let manifest_json =
+            serde_json::to_string(&manifest).map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(
+            exocortex_wire::ingest::v1::ManifestResponse {
+                manifest_json,
+                compatibility_fingerprint: self.ontology.fingerprint.0.to_vec(),
+            },
+        ))
     }
 
     async fn register_source(
@@ -2315,6 +2495,7 @@ fn wire_kind_to_kernel(v: i32) -> Option<exocortex_kernel::ProducerKind> {
         3 => Some(ProducerKind::DocsAdapter),
         4 => Some(ProducerKind::AnalyticsAdapter),
         5 => Some(ProducerKind::Custom),
+        6 => Some(ProducerKind::Extracted),
         _ => None,
     }
 }

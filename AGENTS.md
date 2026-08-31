@@ -105,6 +105,7 @@ cargo xtask kernel-purity   # kernel purity + SDK single-dep + worker kernel-ban
 cargo xtask fingerprint     # two-level (OC-PRD D1): line 1 compatibility 2c3ec388…5c23 gates; line 2 build 18dbf33b…49f5 reports (v1 value, unchanged)
 cargo xtask compatibility-policy  # every fingerprint comparison consults the OC-PRD D2 policy table
 cargo xtask seam-inventory   # PX3: declared seams <-> conformance suites bijection
+cargo xtask adapter-contract  # D21-e: projection/manifest/schema-policy canaries + adapter-crate bijection
 cargo xtask gen-schemas     # schema drift vs goldens
 cargo xtask gen-playbook    # playbook facts drift vs pack + RejectCode; block <= 300 words
 cargo xtask no-llm

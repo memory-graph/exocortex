@@ -18,11 +18,14 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+# D21-c: the testing mock serializes a canned validation manifest; the
+# interpreter itself parses through exocortex-wire (no direct dep).
+serde_json = { workspace = true, optional = true }
 
 [features]
 # Mock IngestService for adapter authors' own tests (R18). Behind a
 # feature so downstream dep trees stay clean by default.
-testing = ["dep:axum", "dep:futures"]
+testing = ["dep:axum", "dep:futures", "dep:serde_json"]
 
 [dev-dependencies]
 tokio = { workspace = true }

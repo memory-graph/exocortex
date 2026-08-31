@@ -91,6 +91,12 @@ enum Cmd {
     DeploymentAcceptance,
     /// PRD §23.2: non-Rust ontology catalogues are generated from the pack.
     OntologySurfaces,
+    /// D21-e (adapter-contract PRD D5): every adapter in the workspace
+    /// declares a projection, honours its bounds, carries (or fetches)
+    /// the validation manifest, and the D4 schema-policy verdict table
+    /// is fully tested — pinned canary per obligation, bijection with
+    /// the adapter crates.
+    AdapterContract,
 }
 
 fn main() -> Result<()> {
@@ -118,7 +124,59 @@ fn main() -> Result<()> {
         Cmd::AcceptanceCoverage => acceptance_coverage(),
         Cmd::DeploymentAcceptance => deployment_acceptance(),
         Cmd::OntologySurfaces => ontology_surfaces(),
+        Cmd::AdapterContract => adapter_contract(),
     }
+}
+
+/// D21-e (adapter-contract PRD D5): static conformance first (the
+/// registry), then the contract's own suites execute.
+fn adapter_contract() -> Result<()> {
+    let violations = gates::adapter_contract_violations(std::path::Path::new("."))?;
+    anyhow::ensure!(
+        violations.is_empty(),
+        "adapter-contract FAILED:
+{}",
+        violations.join(
+            "
+"
+        )
+    );
+    // The contract's suites (skip nothing — all hermetic).
+    run(
+        &[
+            "test",
+            "-p",
+            "exocortex-ingest",
+            "--test",
+            "preflight",
+            "--test",
+            "manifest_parity",
+            "--test",
+            "schema_evolution",
+        ],
+        &[],
+    )?;
+    run(
+        &[
+            "test",
+            "-p",
+            "exocortex-adapter-sdk",
+            "--features",
+            "testing",
+            "--test",
+            "projection",
+        ],
+        &[],
+    )?;
+    run(
+        &["test", "-p", "exocortex-server", "--test", "http_parity"],
+        &[],
+    )?;
+    println!(
+        "adapter-contract ok: {} obligations, each with a canary; every adapter crate claimed",
+        gates::ADAPTER_CONTRACT.len()
+    );
+    Ok(())
 }
 
 fn deployment_acceptance() -> Result<()> {

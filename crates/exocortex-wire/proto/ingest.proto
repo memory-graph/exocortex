@@ -14,6 +14,34 @@ service IngestService {
   rpc RegisterSource(RegisterSourceRequest) returns (RegisterSourceResponse);
   // Fetch the currently accepted ontology fingerprint before submitting.
   rpc Fingerprint(FingerprintRequest) returns (FingerprintResponse);
+  // D21-b (adapter-contract PRD D2): dry-run Submit. Runs the full
+  // admission + validation path under the caller's own producer HMAC and
+  // returns the verdicts a real submission would produce, committing
+  // nothing — no LSN, no audit row, no idempotency claim, no cursor
+  // movement. `assigned_lsn` is always 0; `similar_to` (computed at
+  // commit) is always empty. A preflight does not consult the
+  // idempotency registry: replay is a transport property, not a data
+  // verdict, so preflighting an already-committed batch_id reports the
+  // fresh verdicts.
+  rpc Preflight(IngestBatch) returns (IngestAck);
+  // D21-c (adapter-contract PRD D3): pull the rulebook as data. The
+  // response carries the compiled validation manifest (JSON) and the
+  // compatibility fingerprint it was stamped with. Pull-and-cache keyed
+  // by fingerprint (PRD open question 2's recorded assumption): an
+  // adapter re-pulls when the negotiated fingerprint moves; a manifest
+  // that does not match the negotiated fingerprint is refused and the
+  // adapter degrades to server-side validation with a warning.
+  rpc GetValidationManifest(ManifestRequest) returns (ManifestResponse);
+}
+
+message ManifestRequest {
+  string org_id      = 1;  // scopes the source lookup
+  string source_uri  = 2;  // optional: name a registration to inline its ceiling
+  string producer_id = 3;
+}
+message ManifestResponse {
+  string manifest_json            = 1;  // the compiled rulebook (wire::manifest shape)
+  bytes  compatibility_fingerprint = 2;  // 32 bytes; must equal the negotiated value
 }
 
 message RegisterSourceRequest {
@@ -154,6 +182,15 @@ enum ProducerKind {
   PRODUCER_KIND_DOCS_ADAPTER   = 3;
   PRODUCER_KIND_ANALYTICS_ADAPTER = 4;
   PRODUCER_KIND_CUSTOM         = 5;
+  // D23 (master plan, LLM boundary decision, option a): an OUT-OF-PROCESS
+  // extraction producer — extraction (LLM or otherwise) runs in an
+  // adapter repo, never inside this node (R-D6/CR-19 unchanged and still
+  // CI-enforced here). Its output arrives as typed drafts through this
+  // same signed path, stamped with this kind so it is distinguishable in
+  // provenance and filterable/revocable at query time. Additive: older
+  // servers reject registrations carrying it (fail closed), which is the
+  // correct rolling-upgrade behavior for a new producer class.
+  PRODUCER_KIND_EXTRACTED      = 6;
 }
 
 message IngestAck {
