@@ -1057,6 +1057,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "exocortex-adapter-git"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "exocortex-adapter-sdk",
+ "exocortex-wire",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "exocortex-adapter-sdk"
 version = "0.2.2"
 dependencies = [

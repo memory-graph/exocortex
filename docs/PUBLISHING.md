@@ -58,6 +58,11 @@ workspace license/repository metadata applies).
   boundary, and CR-8 keeps the reasoning crate's rule path
   serialization-free. No new workspace-external dependency: `steel-core`
   was already a workspace dependency of `exocortex-reasoning`.
+- `exocortex-adapter-git` (D18) adds NO new external dependencies: it
+  shells out to the local `git` binary (offline, deterministic) and
+  rides `exocortex-adapter-sdk` + `blake3` (both already workspace deps);
+  `tempfile` is a dev-only test fixture dependency. It publishes
+  independently of the server (adapter crates are leaf binaries).
 - `exocortex-pack-mortgage-v1` is a workspace dependency of the server,
   client, xtask, and ops (dev) so its verbs ride the one operation
   registry in every linked binary (PX2 §4.3); it is the second pack and

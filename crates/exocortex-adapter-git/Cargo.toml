@@ -1,0 +1,27 @@
+# crates/exocortex-adapter-git/Cargo.toml
+[package]
+name    = "exocortex-adapter-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Git-history adapter: commits and files into the dev-v1 ontology through the signed Ingestion Protocol (D18). No auth, no network, no LLM — `git log` transcription only."
+
+[[bin]]
+name = "exocortex-adapter-git"
+path = "src/main.rs"
+
+[dependencies]
+exocortex-adapter-sdk = { workspace = true }
+exocortex-wire = { workspace = true }
+tokio = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+tempfile = "3"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+exocortex-adapter-sdk = { workspace = true, features = ["testing"] }
+
