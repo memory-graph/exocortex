@@ -7,12 +7,23 @@ planned for `ghcr.io`).
 ## crates.io
 
 All 14 crate names were verified available (2026-08-25;
-exocortex-adapter-sdk joined with A1). Crates share one workspace version and
+exocortex-adapter-sdk joined with A1).
+
+**0.3.0 (2026-08-31)** — the adapter-contract wave, additive throughout:
+wire gains the `Preflight` and `GetValidationManifest` RPCs and the
+validation-manifest module (+`serde_json`, recorded below); the SDK
+gains `AdapterSession::preflight` and the manifest interpreter; the
+operation registry gains `preflight_batch` and `resolve_contradiction`
+(+`prost-types`); the server gains `--export-corpus` (+`async-trait`
+handle); the wire producer-kind enum gains `EXTRACTED` (value 6 — older
+servers reject it fail-closed, the correct rolling-upgrade behavior).
+The ontology fingerprint is unchanged: no pack content moved.
+**0.2.2 (2026-08-27)** — memory backup/restore (`--export`/`--import`). Crates share one workspace version and
 must publish in dependency order. The supported entry point is the fail-closed
 repository script:
 
 ```sh
-PUBLISH_VERSION=0.2.2 scripts/publish.sh
+PUBLISH_VERSION=0.3.0 scripts/publish.sh
 ```
 
 It refuses dirty manifests/lockfiles and mixed package versions, runs the full
@@ -81,8 +92,8 @@ source/license coordinates ride the packaged `RUNTIME-MANIFEST.txt`.
 
 ## Binaries
 
-- **Installer (primary)**: tag push (`git tag v0.2.2 && git push
-  memory-graph v0.2.2`) triggers `.github/workflows/release.yml` —
+- **Installer (primary)**: tag push (`git tag v0.3.0 && git push
+  memory-graph v0.3.0`) triggers `.github/workflows/release.yml` —
   cross-platform release builds (macOS arm64 on `macos-14`, Intel on the
   native `macos-15-intel` runner, and Linux x64) for all three binaries,
   sha256 checksums, and an

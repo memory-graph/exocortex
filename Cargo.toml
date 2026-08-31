@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.2.2"
+version      = "0.3.0"
 edition      = "2021"
 rust-version = "1.85"   # M0 deviation: rmcp requires edition 2024 (Rust >= 1.85); see rust-toolchain.toml
 license      = "AGPL-3.0-or-later"
@@ -123,22 +123,22 @@ proptest    = "1"
 regex       = "1"
 
 # --- internal ---
-exocortex-kernel = { path = "crates/exocortex-kernel", version = "0.2.2" }
-exocortex-pack-dev-v1 = { path = "crates/exocortex-pack-dev-v1", version = "0.2.2" }
-exocortex-pack-mortgage-v1 = { path = "crates/exocortex-pack-mortgage-v1", version = "0.2.2" }
-exocortex-wire = { path = "crates/exocortex-wire", version = "0.2.2" }
-exocortex-adapter-sdk = { path = "crates/exocortex-adapter-sdk", version = "0.2.2" }
-exocortex-adapter-git = { path = "crates/exocortex-adapter-git", version = "0.2.2" }
-exocortex-storage = { path = "crates/exocortex-storage", version = "0.2.2" }
-exocortex-cache = { path = "crates/exocortex-cache", version = "0.2.2" }
-exocortex-reasoning = { path = "crates/exocortex-reasoning", version = "0.2.2" }
-exocortex-cluster = { path = "crates/exocortex-cluster", version = "0.2.2" }
-exocortex-ingest = { path = "crates/exocortex-ingest", version = "0.2.2" }
-exocortex-ops = { path = "crates/exocortex-ops", version = "0.2.2" }
-exocortex-dreams = { path = "crates/exocortex-dreams", version = "0.2.2" }
-exocortex-worker = { path = "crates/exocortex-worker", version = "0.2.2" }
-exocortex-server = { path = "crates/exocortex-server", version = "0.2.2" }
-exocortex-client = { path = "crates/exocortex-client", version = "0.2.2" }
+exocortex-kernel = { path = "crates/exocortex-kernel", version = "0.3.0" }
+exocortex-pack-dev-v1 = { path = "crates/exocortex-pack-dev-v1", version = "0.3.0" }
+exocortex-pack-mortgage-v1 = { path = "crates/exocortex-pack-mortgage-v1", version = "0.3.0" }
+exocortex-wire = { path = "crates/exocortex-wire", version = "0.3.0" }
+exocortex-adapter-sdk = { path = "crates/exocortex-adapter-sdk", version = "0.3.0" }
+exocortex-adapter-git = { path = "crates/exocortex-adapter-git", version = "0.3.0" }
+exocortex-storage = { path = "crates/exocortex-storage", version = "0.3.0" }
+exocortex-cache = { path = "crates/exocortex-cache", version = "0.3.0" }
+exocortex-reasoning = { path = "crates/exocortex-reasoning", version = "0.3.0" }
+exocortex-cluster = { path = "crates/exocortex-cluster", version = "0.3.0" }
+exocortex-ingest = { path = "crates/exocortex-ingest", version = "0.3.0" }
+exocortex-ops = { path = "crates/exocortex-ops", version = "0.3.0" }
+exocortex-dreams = { path = "crates/exocortex-dreams", version = "0.3.0" }
+exocortex-worker = { path = "crates/exocortex-worker", version = "0.3.0" }
+exocortex-server = { path = "crates/exocortex-server", version = "0.3.0" }
+exocortex-client = { path = "crates/exocortex-client", version = "0.3.0" }
 
 [profile.release]
 lto            = "fat"
