@@ -135,6 +135,17 @@ is pinned 1.85.0. Live-backend suites (`--features integration` with
 - Commit messages: `area: what and why` (one line under 72 chars);
   explain the *why* in the body when non-obvious.
 - One PR-sized change per commit; never amend merged history.
+- **Agents may push and release autonomously** (standing authorization;
+  the owner opts into fully autonomous development). Preconditions, in
+  order: the full gate matrix green on the exact tree being pushed
+  (`scripts/verify-release.sh` exit 0), the master plan current, and a
+  clean working tree. Releases follow [PUBLISHING.md](PUBLISHING.md):
+  tag `v<version>` and push it (triggers the installer/release
+  workflow), then `PUBLISH_VERSION=<version> scripts/publish.sh` for
+  crates.io. When the live-backend legs or the Docker chaos harness
+  were NOT executed (no `FALKOR_URL`/`REDIS_URL`, no compose run), say
+  so in the release note — local gates green is the floor, not the
+  whole bar.
 - Every accepted fix carries a test that fails without it. Review
   rounds (`docs/reviews/`) verify fixes AND their verify-clauses.
 - Fingerprint changes mean an ontology change — if you didn't intend
