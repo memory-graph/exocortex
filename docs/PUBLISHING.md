@@ -52,6 +52,16 @@ workspace license/repository metadata applies).
 - `exocortex-storage` depends on `exocortex-wire` only to reuse the canonical
   signing-owned content digest for durable Dreams settlement effect identity;
   this prevents a second checksum implementation at the storage boundary.
+- `exocortex-ops` depends on `steel-core` (PX2) to execute pack-registered
+  Function `scheme` bodies through the same embedded interpreter the
+  reasoning crate's explain engine uses; JSON is native at this operation
+  boundary, and CR-8 keeps the reasoning crate's rule path
+  serialization-free. No new workspace-external dependency: `steel-core`
+  was already a workspace dependency of `exocortex-reasoning`.
+- `exocortex-pack-mortgage-v1` is a workspace dependency of the server,
+  client, xtask, and ops (dev) so its verbs ride the one operation
+  registry in every linked binary (PX2 §4.3); it is the second pack and
+  publishes in the pack wave alongside dev-v1.
 - `cargo publish -p exocortex-kernel --dry-run` passes (verified:
   packages, compiles from the packaged tarball, uploads cleanly)
 

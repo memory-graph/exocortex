@@ -1063,15 +1063,21 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
             "matrix line {line_number} must have six tab-separated columns"
         );
         // §23 carries numeric ids 1..=30; the OC-PRD success criteria
-        // ride the same matrix under the `oc` namespace (S1-S6).
+        // ride the same matrix under the `oc` namespace (S1-S6); PX2's
+        // pack-verb criteria ride it under the `px` namespace (px1..=px8,
+        // palantir-expansion PRD §3.2 acceptance).
         let is_core = matches!(columns[0].parse::<u8>(), Ok(n) if (1..=30).contains(&n));
         let is_oc = matches!(
             columns[0].as_bytes(),
             [b'o', b'c', n] if (b'1'..=b'6').contains(n)
         );
+        let is_px = matches!(
+            columns[0].as_bytes(),
+            [b'p', b'x', n] if (b'1'..=b'8').contains(n)
+        );
         anyhow::ensure!(
-            is_core || is_oc,
-            "criterion {} is outside §23 (1..=30) or the OC-PRD S-rows (oc1..=oc6)",
+            is_core || is_oc || is_px,
+            "criterion {} is outside §23 (1..=30), the OC-PRD S-rows (oc1..=oc6), or the PX2 rows (px1..=px8)",
             columns[0]
         );
         let criterion = columns[0].to_string();
@@ -1145,8 +1151,12 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
             }
         }
     }
-    // §23's own 30 criteria plus the OC-PRD S-rows (oc namespace).
-    let core = seen.iter().filter(|c| !c.starts_with("oc")).count();
+    // §23's own 30 criteria plus the OC-PRD S-rows (oc namespace) plus
+    // the PX2 pack-verb rows (px namespace).
+    let core = seen
+        .iter()
+        .filter(|c| !c.starts_with("oc") && !c.starts_with("px"))
+        .count();
     anyhow::ensure!(
         core == 30,
         "acceptance matrix covers {} of 30 §23 criteria",
@@ -1157,6 +1167,12 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
         (1..=6).contains(&oc),
         "acceptance matrix covers {} of the 6 OC-PRD S-rows",
         oc
+    );
+    let px = seen.iter().filter(|c| c.starts_with("px")).count();
+    anyhow::ensure!(
+        (1..=8).contains(&px),
+        "acceptance matrix covers {} of the 8 PX2 pack-verb rows",
+        px
     );
     Ok(())
 }
@@ -1638,6 +1654,12 @@ pub(crate) const SEAM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "exocortex-kernel",
         "tests/actions_macro_spike.rs",
         "actions_bodies_expand_and_type_check",
+    ),
+    (
+        "kernel-pack-verbs",
+        "exocortex-kernel",
+        "tests/pack_verbs.rs",
+        "pack_actions_register_with_typed_bodies_and_ceilings",
     ),
     (
         "kernel-ids",
@@ -2807,6 +2829,12 @@ fn unclaimed() {}
         for criterion in 1..=6 {
             rows.push_str(&format!(
                 "oc{criterion}	verified	requirement oc{criterion}	tests/direct.rs::direct_case	cargo test direct_case	-
+"
+            ));
+        }
+        for criterion in 1..=8 {
+            rows.push_str(&format!(
+                "px{criterion}	verified	requirement px{criterion}	tests/direct.rs::direct_case	cargo test direct_case	-
 "
             ));
         }

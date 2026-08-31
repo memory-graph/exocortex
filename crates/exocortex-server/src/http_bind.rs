@@ -316,7 +316,7 @@ fn op_route(
             };
             metrics::counter!("exocortex_http_requests_total", "op" => entry.name).increment(1);
             let started = std::time::Instant::now();
-            let out = (entry.handler)(&ctx, input).await;
+            let out = (entry.handler)(entry, &ctx, input).await;
             metrics::histogram!("exocortex_ops_duration_seconds", "op" => entry.name)
                 .record(started.elapsed().as_secs_f64());
             match out {
@@ -424,9 +424,10 @@ mod tests {
     }
 
     fn sentinel_storage_error(
+        _entry: &'static exocortex_ops::OperationEntry,
         _ctx: &OpContext,
         _input: serde_json::Value,
-    ) -> futures::future::BoxFuture<'_, Result<serde_json::Value, OpError>> {
+    ) -> futures::future::BoxFuture<'static, Result<serde_json::Value, OpError>> {
         Box::pin(async { Err(OpError::Storage(HTTP_STORAGE_SENTINEL.into())) })
     }
 
@@ -524,6 +525,7 @@ mod tests {
             http_path: "/v1/test/sentinel-storage-error",
             input_schema: schema_source.input_schema,
             output_schema: schema_source.output_schema,
+            pack: None,
             handler: sentinel_storage_error,
         }));
         let extra = Router::new().route(

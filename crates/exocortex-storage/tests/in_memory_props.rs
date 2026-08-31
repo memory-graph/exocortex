@@ -1158,3 +1158,39 @@ async fn bounded_region_seams_filter_before_limit_and_keep_closed_relationships(
     assert!(relationships.iter().any(|row| row.id == relationship.id));
     assert!(store.memories_in_region(&region, 1).await.is_err());
 }
+
+/// PX2: `upsert_batch_audited` commits rows AND their audit event in one
+/// storage operation — a per-row failure lands neither (R6-B18).
+#[tokio::test]
+async fn audited_batch_upsert_is_atomic_with_its_audit_row() {
+    let storage = InMemoryStorage::new(ontology());
+    let mut a = base_memory("a".into(), "content".into(), 3, 3);
+    a.context.user_id = Some("user".into());
+    let mut b = base_memory("b".into(), "content".into(), 3, 3);
+    b.context.user_id = Some("user".into());
+    let rel = base_relationship(a.id, b.id);
+    let records = storage
+        .upsert_batch_audited(&[a.clone(), b.clone()], &[rel], &audit("pack.verb"))
+        .await
+        .unwrap();
+    // Two memories + the relationship + its R-T4 inverse companion.
+    assert_eq!(records.len(), 4);
+    let rows = storage.audit_range("org", 0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1, "exactly one audit row");
+    assert_eq!(rows[0]["action"], "pack.verb");
+    assert_eq!(rows[0]["lsn"], records.last().unwrap().lsn);
+
+    // A per-row failure (missing endpoint) commits NOTHING — not the
+    // other rows, not the audit event.
+    let orphan = base_relationship(a.id, MemoryId::new_v7());
+    let before = storage.audit_range("org", 0, 10).await.unwrap().len();
+    assert!(storage
+        .upsert_batch_audited(&[a.clone()], &[orphan], &audit("pack.verb"))
+        .await
+        .is_err());
+    assert_eq!(
+        storage.audit_range("org", 0, 10).await.unwrap().len(),
+        before,
+        "no audit row without the rows"
+    );
+}

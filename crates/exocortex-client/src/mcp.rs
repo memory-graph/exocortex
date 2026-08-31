@@ -126,6 +126,7 @@ impl ExocortexMcp {
             .find(|e| e.mcp_tool_name == "exocortex.search_memories")
             .expect("search_memories registered");
         let out = (entry.handler)(
+            entry,
             &self.registry_ctx(),
             serde_json::to_value(exocortex_ops::operations::SearchInput {
                 query,
@@ -165,6 +166,7 @@ impl ExocortexMcp {
             .find(|e| e.mcp_tool_name == "exocortex.get_memory")
             .expect("get_memory registered");
         let out = (entry.handler)(
+            entry,
             &self.registry_ctx(),
             serde_json::to_value(exocortex_ops::operations::GetMemoryInput { id })
                 .map_err(|e| e.to_string())?,
@@ -191,6 +193,7 @@ impl ExocortexMcp {
             .find(|e| e.mcp_tool_name == "exocortex.find_related")
             .expect("find_related registered");
         let out = (entry.handler)(
+            entry,
             &self.registry_ctx(),
             serde_json::to_value(exocortex_ops::operations::FindRelatedInput {
                 anchor,

@@ -35,11 +35,12 @@ inventory::submit! {
     exocortex_ops::OperationEntry {
         name: "playbook_version",
         mcp_tool_name: "exocortex.playbook_version",
+        pack: None,
         http_method: || http::Method::POST,
         http_path: "/v1/playbook_version",
         input_schema: || schemars::schema_for!(serde_json::Value),
         output_schema: || schemars::schema_for!(PlaybookVersionOutput),
-        handler: |ctx, v| Box::pin(async move {
+        handler: |_entry, ctx, v| Box::pin(async move {
             let out = playbook_version_handle(ctx, v).await?;
             serde_json::to_value(out).map_err(|e| OpError::Other(e.to_string()))
         }),

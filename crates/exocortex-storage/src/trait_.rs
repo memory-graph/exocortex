@@ -237,6 +237,22 @@ pub trait Storage: Send + Sync + 'static {
             "audited relationship deletion unsupported".into(),
         ))
     }
+    /// Atomically upsert a batch of memories and relationships AND append
+    /// the required audit event in one storage operation (PX2: the
+    /// pack-Action framework's commit boundary — the framework cannot
+    /// commit rows without their audit row, R6-B18 discipline). On any
+    /// per-row failure the whole batch plus the audit event fail.
+    async fn upsert_batch_audited(
+        &self,
+        memories: &[Memory],
+        relationships: &[Relationship],
+        audit: &AuditEvent,
+    ) -> crate::Result<Vec<CommitRecord>> {
+        let _ = (memories, relationships, audit);
+        Err(StorageError::Backend(
+            "audited batch upsert unsupported".into(),
+        ))
+    }
     /// Persist one immutable server-issued discovery proposal. Reissuing the
     /// same id is idempotent only when every scoped field is identical.
     async fn create_discovery_proposal(&self, proposal: &DiscoveryProposal) -> crate::Result<()> {

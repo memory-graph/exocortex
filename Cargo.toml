@@ -124,6 +124,7 @@ regex       = "1"
 # --- internal ---
 exocortex-kernel = { path = "crates/exocortex-kernel", version = "0.2.2" }
 exocortex-pack-dev-v1 = { path = "crates/exocortex-pack-dev-v1", version = "0.2.2" }
+exocortex-pack-mortgage-v1 = { path = "crates/exocortex-pack-mortgage-v1", version = "0.2.2" }
 exocortex-wire = { path = "crates/exocortex-wire", version = "0.2.2" }
 exocortex-adapter-sdk = { path = "crates/exocortex-adapter-sdk", version = "0.2.2" }
 exocortex-storage = { path = "crates/exocortex-storage", version = "0.2.2" }

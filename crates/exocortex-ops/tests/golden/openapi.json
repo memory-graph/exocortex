@@ -287,6 +287,120 @@
         }
       }
     },
+    "/v1/packs/exocortex-pack-mortgage-v1/AttachRuleFinding": {
+      "post": {
+        "operationId": "exocortex-pack-mortgage-v1.AttachRuleFinding",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "properties": {
+                  "finding_content": {
+                    "type": "string"
+                  },
+                  "finding_title": {
+                    "type": "string"
+                  },
+                  "loan": {
+                    "type": "string"
+                  },
+                  "rule": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "finding_content",
+                  "finding_title",
+                  "loan",
+                  "rule"
+                ],
+                "title": "Input",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/v1/packs/exocortex-pack-mortgage-v1/IsCategoricallyEligible": {
+      "post": {
+        "operationId": "exocortex-pack-mortgage-v1.IsCategoricallyEligible",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "properties": {
+                  "categorical_kind": {
+                    "type": "string"
+                  },
+                  "income_verified": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "categorical_kind",
+                  "income_verified"
+                ],
+                "title": "Input",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/v1/preflight_action": {
+      "post": {
+        "operationId": "preflight_action",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "description": "Input for `preflight_action`.",
+                "properties": {
+                  "input": {
+                    "description": "The typed action input, verbatim."
+                  },
+                  "pack": {
+                    "description": "Owning pack name.",
+                    "type": "string"
+                  },
+                  "verb": {
+                    "description": "Verb name.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "input",
+                  "pack",
+                  "verb"
+                ],
+                "title": "PreflightActionInput",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
     "/v1/preflight_wrapup": {
       "post": {
         "operationId": "preflight_wrapup",

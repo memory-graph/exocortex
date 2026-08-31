@@ -247,6 +247,18 @@ async fn every_operation_answers_over_http_with_auth() {
             }
             "get_chain" => serde_json::json!({ "memory": hex(&a.id), "max_depth": 2 }),
             "explain_edge" => serde_json::json!({ "edge": derived_edge_hex }),
+            // PX2: a dry-run whose typed verdict is deterministic under the
+            // Org-scoped admin ctx (the Project-ceiling verb refuses it).
+            "preflight_action" => serde_json::json!({
+                "pack": "exocortex-pack-mortgage-v1",
+                "verb": "AttachRuleFinding",
+                "input": {
+                    "loan": "0".repeat(32),
+                    "rule": "0".repeat(32),
+                    "finding_title": "t",
+                    "finding_content": "c",
+                },
+            }),
             other => panic!("no test input crafted for op {other}"),
         }
     };
@@ -259,6 +271,12 @@ async fn every_operation_answers_over_http_with_auth() {
         all.len()
     );
     for entry in &all {
+        // Pack verbs are covered by the dedicated Project-scoped parity
+        // block below: the shared admin ctx is Org-scoped, deliberately
+        // outside these verbs' declared ceilings.
+        if entry.pack.is_some() {
+            continue;
+        }
         let input = input_for(entry.name);
         let proposal = (entry.name == "accept_discovery").then(|| DiscoveryProposal {
             discovery_id: "22222222-2222-2222-2222-222222222222".into(),
@@ -291,7 +309,7 @@ async fn every_operation_answers_over_http_with_auth() {
                 .unwrap();
             storage.create_discovery_proposal(proposal).await.unwrap();
         }
-        let expected = (entry.handler)(&ctx, input.clone())
+        let expected = (entry.handler)(entry, &ctx, input.clone())
             .await
             .unwrap_or_else(|e| panic!("{}: handler: {e}", entry.name));
 
@@ -522,4 +540,121 @@ fn query_of(v: &serde_json::Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// PX2 acceptance: pack Actions and Functions ride the SAME parity walk
+/// in the same shape as kernel ops — HTTP output byte-identical to the
+/// typed handler's. Pack verbs declare their own ceilings
+/// (`AttachRuleFinding` is Project), so this block runs against a
+/// Project-scoped principal with Project-visible fixtures.
+#[tokio::test]
+async fn pack_verbs_answer_identically_over_http_and_the_registry() {
+    use exocortex_storage::Storage as _;
+
+    let onto = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![
+            exocortex_pack_dev_v1::pack_def(),
+            exocortex_pack_mortgage_v1::pack_def(),
+        ])
+        .unwrap(),
+    );
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let (cache, _writer) = LocalCache::new(16 * 1024 * 1024);
+
+    // Project-visible fixtures: a loan file and a rule for the finding.
+    let mut loan = mem("loan file 7", 7);
+    loan.memory_type = onto.memory_type_id("LoanApplication").unwrap();
+    loan.visibility = Visibility::Private;
+    loan.context.user_id = Some("alice".into());
+    let mut rule = mem("DTI rule", 8);
+    rule.memory_type = onto.memory_type_id("RuleDefinition").unwrap();
+    rule.visibility = Visibility::Private;
+    rule.context.user_id = Some("alice".into());
+    storage.upsert_memory(&loan).await.unwrap();
+    storage.upsert_memory(&rule).await.unwrap();
+
+    let ctx = Arc::new(OpContext {
+        visibility_ctx: ops_vc("org", "alice", Visibility::Project),
+        audit_admin: false,
+        storage: storage.clone() as Arc<dyn exocortex_storage::Storage>,
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        ontology: Some(onto.clone()),
+    });
+    let principals = Arc::new(
+        exocortex_server::principal::PrincipalRegistry::single_with_audit_admin(
+            "test-only-pack-verb-bearer-token-0000".into(),
+            ctx.visibility_ctx.clone(),
+            true,
+        )
+        .unwrap(),
+    );
+    let bind = HttpBind::with_principals(ctx.clone(), principals);
+    let app = bind.router(None);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let pack_entries: Vec<_> = entries().into_iter().filter(|e| e.pack.is_some()).collect();
+    assert!(
+        pack_entries.len() >= 2,
+        "pack verbs joined the registry, got {}",
+        pack_entries.len()
+    );
+    for entry in pack_entries {
+        let input = match entry.name {
+            "exocortex-pack-mortgage-v1.AttachRuleFinding" => serde_json::json!({
+                "loan": hex(&loan.id),
+                "rule": hex(&rule.id),
+                "finding_title": "DTI over ceiling",
+                "finding_content": "41% against a 43% policy",
+            }),
+            "exocortex-pack-mortgage-v1.IsCategoricallyEligible" => serde_json::json!({
+                "income_verified": true,
+                "categorical_kind": "categorical",
+            }),
+            other => panic!("no parity input crafted for pack verb {other}"),
+        };
+        let typed = (entry.handler)(entry, &ctx, input.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{}: typed: {e}", entry.name));
+        // Stateful parity: the action commits on its first execution, so
+        // the HTTP run re-runs the body fresh — the output SHAPE is
+        // compared (verb/counts), and the audit row is asserted directly.
+        let (status, over_http, raw) = http(
+            addr,
+            "POST",
+            entry.http_path,
+            Some("test-only-pack-verb-bearer-token-0000"),
+            Some(&input),
+        )
+        .await;
+        assert_eq!(status, 200, "{}: {raw}", entry.name);
+        if entry.name.ends_with("AttachRuleFinding") {
+            assert_eq!(typed["verb"], over_http["verb"]);
+            assert_eq!(
+                typed["memories"].as_array().map(Vec::len),
+                over_http["memories"].as_array().map(Vec::len),
+                "committed row count matches across surfaces"
+            );
+            assert_eq!(
+                typed["edges"].as_array().map(Vec::len),
+                over_http["edges"].as_array().map(Vec::len)
+            );
+            let rows = storage.audit_range("org", 0, 100).await.unwrap();
+            assert!(
+                rows.iter()
+                    .any(|r| r["action"] == "exocortex-pack-mortgage-v1.AttachRuleFinding"),
+                "one audit row per call, keyed pack.verb"
+            );
+        } else {
+            assert_eq!(
+                typed, over_http,
+                "{}: byte-identical function output",
+                entry.name
+            );
+        }
+    }
 }

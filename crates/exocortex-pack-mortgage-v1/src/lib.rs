@@ -36,7 +36,8 @@
 //! proposal, never assertable — the same contract as dev-v1's
 //! `SimilarTo` (R-T14).
 
-use exocortex_kernel::pack;
+use exocortex_kernel::verbs::ActionProduct;
+use exocortex_kernel::{pack, KernelError, MemoryId, Visibility};
 
 pack! {
     name: "exocortex-pack-mortgage-v1",
@@ -105,5 +106,69 @@ pack! {
         finding_categorized(finding, txn) <- edge(finding, r, UnderRule), edge(r, txn, Categorizes);
         // M3: a finding made under a superseded rule version.
         finding_via_superseded(finding, old) <- edge(finding, r, UnderRule), edge(r, old, SupersedesRule);
+    }
+
+    // PX2: the pack's own typed verbs. The body is a typed transform
+    // (type-checked here); the framework provenance-stamps, audits,
+    // ceiling-enforces, and commits — the body cannot bypass any of it.
+    actions! {
+        AttachRuleFinding(
+            input: {
+                loan: String,
+                rule: String,
+                finding_title: String,
+                finding_content: String,
+            },
+            min_visibility: Project
+        ) = |ctx, input| {
+            let loan = MemoryId::parse_hex(&input.loan)
+                .ok_or(KernelError::InvalidActionInput("loan must be a 32-hex memory id".into()))?;
+            let rule = MemoryId::parse_hex(&input.rule)
+                .ok_or(KernelError::InvalidActionInput("rule must be a 32-hex memory id".into()))?;
+            let mut product = ActionProduct::new();
+            product.memory(
+                "finding",
+                MemoryType::RuleFinding.id(),
+                &input.finding_title,
+                &input.finding_content,
+                ctx.narrow(Visibility::Project),
+                &["rule-finding"],
+            );
+            product.edge_to_memory("finding", loan, "ConcerningApplication");
+            product.edge_to_memory("finding", rule, "UnderRule");
+            Ok(product)
+        },
+    }
+
+    // v1 pack Functions are pure typed computations (scheme). The
+    // categorical-eligibility decision from a verified-income row.
+    functions! {
+        IsCategoricallyEligible(
+            input: { income_verified: bool, categorical_kind: String }
+        ) -> bool, p50_us: 2000, p99_us: 5000 = scheme {
+            (if (input "income_verified")
+                (equal? (input "categorical_kind") "categorical")
+                #f)
+        },
+    }
+
+    // PX2 §4.2: structured agent guidance, keyed by this pack's own
+    // types/kinds; names resolve at pack-def build time.
+    guidance! {
+        RuleDefinition {
+            when: "authoring or changing a lender rule",
+            link: [Governs => LenderConfiguration, SupersedesRule => RuleDefinition],
+        },
+        RuleFinding {
+            when: "recording a rule's verdict on a loan file",
+            link: [UnderRule => RuleDefinition, ConcerningApplication => LoanApplication],
+        },
+        Transaction {
+            when: "categorizing a bank transaction into an income source",
+            link: [SupportsIncome => IncomeSource],
+        },
+        MergeDuplicateApplicant {
+            caution: "never assert directly - Dreams proposes it (R-T14)",
+        },
     }
 }

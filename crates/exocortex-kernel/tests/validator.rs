@@ -79,6 +79,9 @@ fn test_ontology() -> Ontology {
             },
         ],
         rule_ids: vec![],
+        actions: vec![],
+        functions: vec![],
+        guidance: vec![],
     };
     Ontology::from_packs(vec![pack]).expect("test ontology assembles")
 }

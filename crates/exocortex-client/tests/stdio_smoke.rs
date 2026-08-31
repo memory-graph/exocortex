@@ -675,6 +675,7 @@ async fn mcp_get_memory_shape_matches_registry() {
         .find(|e| e.mcp_tool_name == "exocortex.get_memory")
         .unwrap();
     let reg_out = (entry.handler)(
+        entry,
         &ctx,
         serde_json::to_value(exocortex_ops::operations::GetMemoryInput { id: mid_hex }).unwrap(),
     )
@@ -757,4 +758,75 @@ async fn omitted_session_id_gets_process_minted_default() {
         ids.contains(&server.process_session_id()) && server.process_session_id() != "shared-conv",
         "omitted id gets the process-minted default: {ids:?}"
     );
+}
+
+/// PX2: `--dump-tools` lists EVERY registered operation — kernel ops and
+/// pack-registered verbs — with pack identity, surfaces, and a typed
+/// input schema; `--dump-fingerprint` prints both fingerprint levels.
+#[test]
+fn dump_tools_lists_pack_verbs_with_typed_schemas() {
+    let dir = tempdir();
+    let mut client = Client::spawn_with(|cmd| {
+        cmd.arg("--dump-tools").arg("--data-dir").arg(&dir);
+    });
+    let lines = client.all_stdout_lines();
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).expect("every dump line is JSON"))
+        .collect();
+    let kernel_op = parsed
+        .iter()
+        .find(|v| v["name"] == "search_memories")
+        .expect("kernel ops listed");
+    assert!(kernel_op["pack"].is_null());
+    let action = parsed
+        .iter()
+        .find(|v| v["name"] == "exocortex-pack-mortgage-v1.AttachRuleFinding")
+        .expect("pack action listed");
+    assert_eq!(action["pack"], "exocortex-pack-mortgage-v1");
+    assert_eq!(action["mcp_tool"], "exocortex.pack.AttachRuleFinding");
+    assert!(
+        action["input_schema"]["properties"]["loan"].is_object(),
+        "typed schema rides the listing: {action}"
+    );
+    let function = parsed
+        .iter()
+        .find(|v| v["name"] == "exocortex-pack-mortgage-v1.IsCategoricallyEligible")
+        .expect("pack function listed");
+    assert_eq!(function["pack"], "exocortex-pack-mortgage-v1");
+}
+
+#[test]
+fn dump_fingerprint_prints_both_levels_and_the_pack_count() {
+    let dir = tempdir();
+    let mut client = Client::spawn_with(|cmd| {
+        cmd.arg("--dump-fingerprint").arg("--data-dir").arg(&dir);
+    });
+    let lines = client.all_stdout_lines();
+    assert!(lines.len() >= 4, "{lines:?}");
+    assert!(lines[0].starts_with("compatibility "));
+    assert_eq!(lines[0].len(), "compatibility ".len() + 64);
+    assert!(lines[1].starts_with("build "));
+    assert_eq!(lines[1].len(), "build ".len() + 64);
+    assert_eq!(lines[2], "packs 2");
+    assert!(lines[3].starts_with("verbs "), "{lines:?}");
+    let verbs: usize = lines[3]["verbs ".len()..].trim().parse().unwrap();
+    assert!(
+        verbs >= 2,
+        "the mortgage pack declares an action and a function"
+    );
+}
+
+/// Test helper: drain every stdout line until the one-shot mode exits.
+impl Client {
+    fn all_stdout_lines(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(line) = self.stdout.recv_timeout(Duration::from_secs(10)) {
+            match line {
+                Ok(l) => out.push(l),
+                Err(_) => break,
+            }
+        }
+        out
+    }
 }

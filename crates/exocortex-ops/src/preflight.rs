@@ -397,6 +397,9 @@ fn kernel_correction(e: &exocortex_kernel::KernelError) -> String {
             "Kind name not in this pack. Check the spelling against the catalogue.".to_string()
         }
         KernelError::ScoreOutOfRange(_) => "Scores must be within [0.0, 1.0].".to_string(),
+        KernelError::InvalidActionInput(detail) => {
+            format!("Pack verb input rejected: {detail}.")
+        }
         KernelError::DuplicatePack(_)
         | KernelError::DuplicateKind(_)
         | KernelError::DuplicateTypeName(_)

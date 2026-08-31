@@ -1230,6 +1230,9 @@ fn bench() -> Result<()> {
         ("exocortex-cache", "search"),
         ("exocortex-cache", "updates"),
         ("exocortex-reasoning", "khop"),
+        // PX2: the generated pack-Function SLO harness — enumerates the
+        // `functions!` registry, no per-function bench to hand-write.
+        ("exocortex-ops", "pack_functions"),
     ] {
         println!("==> cargo bench -p {pkg} --bench {bench}");
         let status = std::process::Command::new(&cargo)
@@ -1662,6 +1665,8 @@ fn walk_rss(dir: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
 /// regenerates in place. Facts can no longer drift from the code.
 fn gen_playbook(write: bool) -> Result<()> {
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
+    // PX2: guidance renders from EVERY loaded pack's table.
+    let _ = std::hint::black_box(exocortex_pack_mortgage_v1::pack_def().name.clone());
     let onto = exocortex_kernel::pack::load_registered_packs()?;
     let path = std::path::Path::new("crates/exocortex-client/src/playbook/v1_0_0.md");
     let src = std::fs::read_to_string(path)?;
@@ -1792,6 +1797,54 @@ fn gen_playbook(write: bool) -> Result<()> {
     }
     rejects_section.push_str("<!-- /gen:rejects -->");
 
+    // ---- gen:guidance — structured pack guidance (PX2 §4.2), rendered
+    // from every loaded pack's `guidance!` table, alpha by pack name.
+    // Computed-only kinds are SUBTRACTED (the [r3] hazard): guidance for
+    // a kind no producer may assert would be authoring advice for a
+    // rejection. Rendered into the playbook, NOT the 300-word block.
+    let mut guidance_section = String::from(
+        "<!-- gen:guidance — do not edit by hand; regenerated from the loaded packs' guidance! sections -->\n",
+    );
+    let mut guidance_entries = 0usize;
+    for pack in &onto.packs {
+        if pack.guidance.is_empty() {
+            continue;
+        }
+        guidance_section.push_str(&format!("### {}\n\n", pack.name));
+        for entry in &pack.guidance {
+            let is_computed_kind = onto
+                .kind_id(entry.key.as_str())
+                .and_then(|id| onto.kinds_by_id.get(&id))
+                .is_some_and(|meta| meta.computed_only);
+            if is_computed_kind {
+                continue;
+            }
+            guidance_entries += 1;
+            let kind = if onto.memory_type_id(entry.key.as_str()).is_some() {
+                "memory type"
+            } else {
+                "kind"
+            };
+            guidance_section.push_str(&format!("- **{}** ({}): ", entry.key, kind));
+            if let Some(when) = &entry.when {
+                guidance_section.push_str(&format!("when {when}. "));
+            }
+            if let Some(caution) = &entry.caution {
+                guidance_section.push_str(&format!("CAUTION: {caution}. "));
+            }
+            for link in &entry.links {
+                let arrow = if link.outgoing { "=>" } else { "<=" };
+                guidance_section
+                    .push_str(&format!("link `{} {} {}`. ", link.kind, arrow, link.other));
+            }
+            guidance_section.push('\n');
+        }
+        guidance_section.push('\n');
+    }
+    guidance_section.push_str(&format!(
+        "{guidance_entries} guidance entries; computed-only kinds are never authoring advice.\n<!-- /gen:guidance -->"
+    ));
+
     // ---- splice between the markers ----
     let splice = |src: &str, start_marker: &str, end_marker: &str, new_body: &str| -> String {
         let start = src.find(start_marker).expect("start marker present");
@@ -1800,14 +1853,19 @@ fn gen_playbook(write: bool) -> Result<()> {
     };
     let regenerated = splice(
         &splice(
-            &src,
-            "<!-- gen:kinds",
-            "<!-- /gen:kinds -->",
-            &kinds_section,
+            &splice(
+                &src,
+                "<!-- gen:kinds",
+                "<!-- /gen:kinds -->",
+                &kinds_section,
+            ),
+            "<!-- gen:rejects",
+            "<!-- /gen:rejects -->",
+            &rejects_section,
         ),
-        "<!-- gen:rejects",
-        "<!-- /gen:rejects -->",
-        &rejects_section,
+        "<!-- gen:guidance",
+        "<!-- /gen:guidance -->",
+        &guidance_section,
     );
 
     // ---- block bound + kind claims (§11) ----
@@ -1830,14 +1888,14 @@ fn gen_playbook(write: bool) -> Result<()> {
 
     if write {
         std::fs::write(path, &regenerated)?;
-        println!("gen-playbook: regenerated ({total} kinds, {assertable} assertable; {words}-word block)");
+        println!("gen-playbook: regenerated ({total} kinds, {assertable} assertable; {guidance_entries} guidance entries; {words}-word block)");
         Ok(())
     } else {
         anyhow::ensure!(
             regenerated == src,
-            "gen-playbook: playbook drifted from the ontology/RejectCode — run `cargo xtask gen-playbook --write`"
+            "gen-playbook: playbook drifted from the ontology/RejectCode/guidance — run `cargo xtask gen-playbook --write`"
         );
-        println!("gen-playbook ok ({total} kinds, {assertable} assertable; {words}-word block)");
+        println!("gen-playbook ok ({total} kinds, {assertable} assertable; {guidance_entries} guidance entries; {words}-word block)");
         Ok(())
     }
 }

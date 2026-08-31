@@ -697,6 +697,32 @@ impl Storage for InMemoryStorage {
         }
         Ok(records)
     }
+    async fn upsert_batch_audited(
+        &self,
+        ms: &[Memory],
+        rs: &[Relationship],
+        audit: &AuditEvent,
+    ) -> Result<Vec<CommitRecord>, StorageError> {
+        // Same critical section as the batch (R6-B18 discipline): the
+        // audit row cannot land without the rows, and the rows cannot
+        // commit without their audit (PX2's pack-Action boundary).
+        let (records, invalidations) = {
+            let _gate = self.inner.mutation_gate.lock().unwrap();
+            let (records, invalidations) = self.upsert_batch_locked(ms, rs)?;
+            let lsn = records.last().map(|r| r.lsn).unwrap_or_default();
+            self.inner
+                .audits
+                .lock()
+                .unwrap()
+                .push(Self::audit_value(audit, lsn));
+            (records, invalidations)
+        };
+        for inv in invalidations {
+            self.index_invalidation(&inv);
+            let _ = self.feed.send(inv);
+        }
+        Ok(records)
+    }
     async fn import_batch_once(
         &self,
         import_key: &str,

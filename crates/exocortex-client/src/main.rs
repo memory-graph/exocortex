@@ -50,6 +50,15 @@ struct Args {
     /// stdout and exit (`exocortex-mcp-client --dump-block >> CLAUDE.md`).
     #[arg(long)]
     dump_block: bool,
+    /// PX2: print every registered operation — kernel ops AND
+    /// pack-registered verbs — with its pack identity, surfaces, and
+    /// typed input schema, one JSON line each, then exit.
+    #[arg(long)]
+    dump_tools: bool,
+    /// PX2: print the two-level ontology fingerprint (compatibility +
+    /// build) and the loaded pack set, then exit.
+    #[arg(long)]
+    dump_fingerprint: bool,
     /// D5 (S6): sanity-check the local install. Prints a checklist with
     /// green/red rows; exits with the number of red rows. Never returns
     /// green on a failed known precondition, and never attempts a
@@ -103,6 +112,44 @@ fn main() -> anyhow::Result<()> {
     }
     if args.dump_block {
         print!("{}", exocortex_client::playbook::BLOCK);
+        return Ok(());
+    }
+    // PX2 one-shot modes (registry + fingerprint surfaces).
+    if args.dump_tools {
+        for entry in exocortex_ops::entries() {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "name": entry.name,
+                    "pack": entry.pack,
+                    "mcp_tool": entry.mcp_tool_name,
+                    "http": format!("{} {}", (entry.http_method)(), entry.http_path),
+                    "input_schema": (entry.input_schema)(),
+                })
+            );
+        }
+        return Ok(());
+    }
+    if args.dump_fingerprint {
+        let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
+        let _ = std::hint::black_box(exocortex_pack_mortgage_v1::pack_def().name.clone());
+        let onto = exocortex_kernel::pack::load_registered_packs()?;
+        let hex = |bytes: &[u8; 32]| -> String {
+            use std::fmt::Write as _;
+            let mut out = String::with_capacity(64);
+            for b in bytes {
+                let _ = write!(out, "{b:02x}");
+            }
+            out
+        };
+        println!("compatibility {}", hex(&onto.fingerprint.0));
+        println!("build {}", hex(&onto.build_fingerprint.0));
+        println!("packs {}", onto.packs.len());
+        println!(
+            "verbs {}",
+            exocortex_kernel::verbs::registered_pack_actions().len()
+                + exocortex_kernel::verbs::registered_pack_functions().len()
+        );
         return Ok(());
     }
 

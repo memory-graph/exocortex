@@ -50,6 +50,9 @@ pub mod provenance;
 pub mod relationship;
 /// The type-triple validator and no-widening enforcer (§7.15, R-T11a).
 pub mod validator;
+/// Pack-registered Actions and Functions — the `actions!`/`functions!`/
+/// `guidance!` `pack!` sections and their registrations (PX2).
+pub mod verbs;
 /// The required `Visibility` label and its ordering (§7.7).
 pub mod visibility;
 
@@ -68,4 +71,16 @@ pub use ontology::Ontology;
 pub use pack::{PackDef, PackVersion};
 pub use provenance::{ExternalKey, ExternalSnapshot, ProducerKind, Provenance};
 pub use relationship::{materialize_inverse, Relationship, RelationshipProperties};
+pub use verbs::{
+    registered_pack_actions, registered_pack_functions, ActionContext, ActionEdge, ActionMemory,
+    ActionProduct, ActionTarget, GuidanceEntry, GuidanceLink, PackActionDef, PackFunctionDef,
+};
 pub use visibility::{narrowest_visibility, relationship_visibility, Visibility};
+
+// PX2 hidden re-exports: the `actions!`/`functions!` munchers derive the
+// generated `Input` structs through these paths so a pack crate stays
+// single-dependency (kernel only).
+#[doc(hidden)]
+pub use schemars;
+#[doc(hidden)]
+pub use serde;

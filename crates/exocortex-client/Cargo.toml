@@ -27,6 +27,8 @@ clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
+# PX2: the second pack links in so its verbs ride the one registry.
+exocortex-pack-mortgage-v1 = { workspace = true }
 exocortex-kernel = { workspace = true }
 exocortex-wire = { workspace = true }
 tonic = { workspace = true }

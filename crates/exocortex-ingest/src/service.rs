@@ -2088,6 +2088,7 @@ fn kernel_error_to_reject(e: &exocortex_kernel::KernelError) -> RejectCode {
         KernelError::UnknownKind(_) => RejectCode::UnknownKind,
         KernelError::InvalidTypeTriple { .. } => RejectCode::InvalidTypeTriple,
         KernelError::ScoreOutOfRange(_) => RejectCode::Unknown,
+        KernelError::InvalidActionInput(_) => RejectCode::Unknown,
         KernelError::DuplicatePack(_)
         | KernelError::DuplicateKind(_)
         | KernelError::DuplicateTypeName(_)

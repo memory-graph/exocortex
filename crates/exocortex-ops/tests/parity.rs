@@ -4,6 +4,34 @@
 
 use std::sync::Arc;
 
+// PX2 hostile fixture: an action whose BODY attempts to stamp wider than
+// its declared ceiling. The framework must refuse it no matter what the
+// body produces ("the pack author cannot bypass it").
+exocortex_kernel::pack! {
+    name: "hostile-verbs-pack",
+    version: "0.1.0",
+    kernel_min: "1.0.0",
+    memory_types! { Hazard }
+    entity_types! { Nothing }
+    kinds! {
+        RelatedTo => bucket: Similarity, inverse: Self, bi: true, default_strength: 0.30,
+    }
+    type_triples! {
+        RelatedTo => (_, _),
+    }
+    crepe_rules! {
+    }
+    actions! {
+        StampTooWide(input: { note: String }, min_visibility: Project) = |_ctx, input| {
+            use exocortex_kernel::{ActionProduct, Visibility};
+            let mut product = ActionProduct::new();
+            // The hostile stamp: Org under a Project ceiling, ignoring ctx.
+            product.memory("h", 0, &input.note, &input.note, Visibility::Org, &[]);
+            Ok(product)
+        },
+    }
+}
+
 use exocortex_cache::{GraphSnapshot, LocalCache};
 use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
 use exocortex_ops::operations::{ops_vc, GetMemoryInput, PromoteVisibilityInput};
@@ -119,7 +147,7 @@ async fn both_surfaces_identical_outputs() {
         .expect("get_memory registered");
 
     let input = serde_json::to_value(GetMemoryInput { id: hex(&m.id) }).unwrap();
-    let via_registry = (entry.handler)(&ctx, input.clone())
+    let via_registry = (entry.handler)(entry, &ctx, input.clone())
         .await
         .expect("registry surface");
 
@@ -843,11 +871,12 @@ async fn superseded_state_is_visible_on_reads() {
     };
 
     // get_memory: the stale row names its successor.
-    let out = (exocortex_ops::entries()
+    let entry = exocortex_ops::entries()
         .into_iter()
         .find(|e| e.mcp_tool_name == "exocortex.get_memory")
-        .unwrap()
-        .handler)(
+        .unwrap();
+    let out = (entry.handler)(
+        entry,
         &ctx,
         serde_json::to_value(exocortex_ops::operations::GetMemoryInput {
             id: "01010101010101010101010101010101".into(),
@@ -863,11 +892,12 @@ async fn superseded_state_is_visible_on_reads() {
     );
 
     // search: both hit "Connection pool"; the successor ranks first.
-    let out = (exocortex_ops::entries()
+    let entry = exocortex_ops::entries()
         .into_iter()
         .find(|e| e.mcp_tool_name == "exocortex.search_memories")
-        .unwrap()
-        .handler)(
+        .unwrap();
+    let out = (entry.handler)(
+        entry,
         &ctx,
         serde_json::to_value(exocortex_ops::operations::SearchInput {
             query: "Connection pool".into(),
@@ -1183,5 +1213,284 @@ async fn get_chain_walks_derived_evidence_and_explain_edge_renders() {
     assert!(
         matches!(err, exocortex_ops::OpError::BadInput(_)),
         "asserted edge refused: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PX2: pack-registered verbs on the one registry. The mortgage pack links
+// into this test binary, so its verbs appear in `entries()` and dispatch
+// through the SAME shared handlers MCP and HTTP use.
+// ---------------------------------------------------------------------------
+
+fn composed_ontology() -> Arc<exocortex_kernel::Ontology> {
+    Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![
+            exocortex_pack_dev_v1::pack_def(),
+            exocortex_pack_mortgage_v1::pack_def(),
+        ])
+        .unwrap(),
+    )
+}
+
+fn verb_entry(name: &str) -> &'static exocortex_ops::OperationEntry {
+    entries()
+        .into_iter()
+        .find(|e| e.name == name)
+        .unwrap_or_else(|| panic!("{name} in the registry"))
+}
+
+async fn verb_ctx(onto: &Arc<exocortex_kernel::Ontology>) -> OpContext {
+    // AttachRuleFinding declares min_visibility: Project — the caller must
+    // be WITHIN that ceiling (KP5), so the default verb caller is
+    // Project-scoped.
+    let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
+    OpContext {
+        ontology: Some(onto.clone()),
+        visibility_ctx: ops_vc("org", "alice", Visibility::Project),
+        audit_admin: false,
+        storage: Arc::new(InMemoryStorage::new(onto.clone())),
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+    }
+}
+
+#[tokio::test]
+async fn pack_verbs_join_the_registry_with_pack_identity() {
+    let action = verb_entry("exocortex-pack-mortgage-v1.AttachRuleFinding");
+    assert_eq!(action.pack, Some("exocortex-pack-mortgage-v1"));
+    assert_eq!(action.mcp_tool_name, "exocortex.pack.AttachRuleFinding");
+    assert_eq!(
+        action.http_path,
+        "/v1/packs/exocortex-pack-mortgage-v1/AttachRuleFinding"
+    );
+    let function = verb_entry("exocortex-pack-mortgage-v1.IsCategoricallyEligible");
+    assert_eq!(function.pack, Some("exocortex-pack-mortgage-v1"));
+    // Typed schemas exist for --dump-tools and the OpenAPI goldens.
+    assert!((action.input_schema)().schema.object.is_some());
+    assert!((function.input_schema)().schema.object.is_some());
+}
+
+#[tokio::test]
+async fn pack_action_commits_audits_and_stamps_provenance() {
+    let onto = composed_ontology();
+    let ctx = verb_ctx(&onto).await;
+    // A loan application and a rule definition to attach the finding to.
+    let mut loan = mem("loan file 42");
+    loan.memory_type = onto.memory_type_id("LoanApplication").unwrap();
+    loan.visibility = Visibility::Private;
+    loan.context.tenant_id = Some("org".into());
+    loan.context.user_id = Some("alice".into());
+    let mut rule = mem("DTI ceiling rule");
+    rule.memory_type = onto.memory_type_id("RuleDefinition").unwrap();
+    rule.visibility = Visibility::Private;
+    rule.context.tenant_id = Some("org".into());
+    rule.context.user_id = Some("alice".into());
+    ctx.storage.upsert_memory(&loan).await.unwrap();
+    ctx.storage.upsert_memory(&rule).await.unwrap();
+
+    let entry = verb_entry("exocortex-pack-mortgage-v1.AttachRuleFinding");
+    let out = (entry.handler)(
+        entry,
+        &ctx,
+        serde_json::json!({
+            "loan": hex(&loan.id),
+            "rule": hex(&rule.id),
+            "finding_title": "DTI over ceiling",
+            "finding_content": "41% against a 43% ceiling policy",
+        }),
+    )
+    .await
+    .expect("pack action dispatches through the registry");
+    assert_eq!(out["verb"], "exocortex-pack-mortgage-v1.AttachRuleFinding");
+    assert_eq!(out["memories"].as_array().unwrap().len(), 1);
+    // finding -> loan (ConcerningApplication) + finding -> rule (UnderRule)
+    assert_eq!(out["edges"].as_array().unwrap().len(), 2);
+    let audit_lsn = out["audit_lsn"].as_u64().unwrap();
+
+    // The audit row is keyed pack.verb and carries the caller visibility.
+    let rows = ctx.storage.audit_range("org", 0, 10).await.unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r["action"] == "exocortex-pack-mortgage-v1.AttachRuleFinding")
+        .expect("audit row for the pack action");
+    assert_eq!(row["lsn"].as_u64(), Some(audit_lsn));
+    assert_eq!(row["actor"], "alice");
+
+    // Provenance: the committed memory names the verb as its author.
+    let finding_hex = out["memories"][0].as_str().unwrap();
+    let finding = ctx
+        .storage
+        .get_memory(&MemoryId::parse_hex(finding_hex).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    match &finding.provenance {
+        Provenance::Asserted { author, .. } => {
+            assert_eq!(author, "exocortex-pack-mortgage-v1.AttachRuleFinding")
+        }
+        other => panic!("expected asserted provenance, got {other:?}"),
+    }
+    assert_eq!(
+        finding.memory_type,
+        onto.memory_type_id("RuleFinding").unwrap()
+    );
+}
+
+#[tokio::test]
+async fn pack_action_ceiling_is_framework_enforced() {
+    let onto = composed_ontology();
+    let ctx = verb_ctx(&onto).await;
+    let entry = verb_entry("exocortex-pack-mortgage-v1.AttachRuleFinding");
+    // AttachRuleFinding declares min_visibility: Project — a caller whose
+    // scope is WIDER than the ceiling is refused (KP5: the registration's
+    // typed constant decides, never the caller or the body).
+    let mut wide = verb_ctx(&onto).await;
+    wide.visibility_ctx.max_visibility = Visibility::Org;
+    let err = (entry.handler)(
+        entry,
+        &wide,
+        serde_json::json!({
+            "loan": "0".repeat(32),
+            "rule": "0".repeat(32),
+            "finding_title": "x",
+            "finding_content": "y",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, exocortex_ops::OpError::Unauthorized(_)));
+    let _ = ctx;
+}
+
+#[tokio::test]
+async fn pack_function_dispatches_through_scheme() {
+    let onto = composed_ontology();
+    let ctx = verb_ctx(&onto).await;
+    let entry = verb_entry("exocortex-pack-mortgage-v1.IsCategoricallyEligible");
+    let eligible = (entry.handler)(
+        entry,
+        &ctx,
+        serde_json::json!({ "income_verified": true, "categorical_kind": "categorical" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(eligible, serde_json::json!(true));
+    let ineligible = (entry.handler)(
+        entry,
+        &ctx,
+        serde_json::json!({ "income_verified": false, "categorical_kind": "categorical" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ineligible, serde_json::json!(false));
+}
+
+#[tokio::test]
+async fn preflight_action_shares_the_commit_rulebook() {
+    let onto = composed_ontology();
+    let ctx = verb_ctx(&onto).await;
+    // The body's own input contract fails first (bad hex) — the SAME
+    // BadInput path the commit dispatch would take.
+    let entry = verb_entry("preflight_action");
+    let out = (entry.handler)(
+        entry,
+        &ctx,
+        serde_json::json!({
+            "pack": "exocortex-pack-mortgage-v1",
+            "verb": "AttachRuleFinding",
+            "input": {
+                "loan": "not-hex",
+                "rule": "0".repeat(32),
+                "finding_title": "t",
+                "finding_content": "c",
+            },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["would_accept"], 0);
+    assert_eq!(out["would_reject"], 1);
+    assert_eq!(out["rejections"][0]["code"], "Unknown");
+    assert!(
+        out["rejections"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("32-hex"),
+        "{}",
+        out["rejections"][0]["detail"]
+    );
+}
+
+/// PX2: the scheme evaluator's determinism contract — both paths agree,
+/// the cached VM cannot leak the previous invocation's input, scalars
+/// round-trip, and a broken program is an error, never a panic.
+#[test]
+fn pack_function_scheme_eval_is_deterministic_across_both_paths() {
+    let body = r#"(if (input "income_verified")
+        (equal? (input "categorical_kind") "categorical")
+        #f)"#;
+    let input = serde_json::json!({
+        "income_verified": true,
+        "categorical_kind": "categorical",
+    });
+    assert_eq!(
+        exocortex_ops::eval_pack_function(body, &input).unwrap(),
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        exocortex_ops::eval_pack_function_cached(body, &input).unwrap(),
+        serde_json::json!(true)
+    );
+    let flipped = serde_json::json!({
+        "income_verified": false,
+        "categorical_kind": "categorical",
+    });
+    assert_eq!(
+        exocortex_ops::eval_pack_function_cached(body, &flipped).unwrap(),
+        serde_json::json!(false),
+        "the cached VM re-binds `input` per call"
+    );
+    assert_eq!(
+        exocortex_ops::eval_pack_function_cached(
+            r#"(+ (input "a") 1)"#,
+            &serde_json::json!({ "a": 41 })
+        )
+        .unwrap(),
+        serde_json::json!(42)
+    );
+    assert!(exocortex_ops::eval_pack_function("(undefined-fn)", &input).is_err());
+}
+
+/// PX2 acceptance: the ceiling is enforced by the FRAMEWORK. A body that
+/// stamps `Org` under a `Project` ceiling — ignoring the `ActionContext`
+/// handle entirely — is refused at prepare; nothing commits.
+#[tokio::test]
+async fn pack_author_cannot_bypass_the_visibility_ceiling() {
+    let hostile = exocortex_kernel::verbs::registered_pack_actions()
+        .into_iter()
+        .find(|r| r.pack_name == "hostile-verbs-pack")
+        .expect("hostile fixture registered");
+    assert_eq!(hostile.ceiling, Visibility::Project);
+
+    let mut packs = vec![
+        exocortex_pack_dev_v1::pack_def(),
+        exocortex_pack_mortgage_v1::pack_def(),
+    ];
+    packs.push(pack_def()); // the hostile fixture's own builder
+    let onto = Arc::new(exocortex_kernel::Ontology::from_packs(packs).unwrap());
+    let caller = ops_vc("org", "alice", Visibility::Project);
+    let err = match exocortex_ops::pack_verbs::prepare_pack_action(
+        &onto,
+        hostile,
+        &caller,
+        serde_json::json!({ "note": "hostile" }),
+        &|_| None,
+    ) {
+        Ok(_) => panic!("the hostile stamp must be refused at prepare"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, exocortex_ops::OpError::Unauthorized(ref d) if d.contains("ceiling")),
+        "{err:?}"
     );
 }

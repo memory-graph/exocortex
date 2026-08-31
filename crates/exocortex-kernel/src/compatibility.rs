@@ -63,6 +63,38 @@ pub struct TripleSummary {
     pub to_types: Option<Vec<u8>>,
 }
 
+/// One pack-registered Action's signature inside an [`OntologySummary`]
+/// (PX2 §4.1: signatures join the compatibility hash; bodies never do).
+#[derive(Clone, Debug, Eq, Ord, PartialOrd, PartialEq, Serialize, Deserialize)]
+pub struct ActionVerbSummary {
+    /// Owning pack name.
+    pub pack: String,
+    /// Verb name.
+    pub name: String,
+    /// Declared visibility ceiling.
+    pub ceiling: u8,
+    /// Stringified input type name.
+    pub input_type: String,
+    /// Stringified output type name.
+    pub output_type: String,
+}
+
+/// One pack-registered Function's signature inside an [`OntologySummary`]
+/// (budgets excluded — operational policy, not stored meaning).
+#[derive(Clone, Debug, Eq, Ord, PartialOrd, PartialEq, Serialize, Deserialize)]
+pub struct FunctionVerbSummary {
+    /// Owning pack name.
+    pub pack: String,
+    /// Verb name.
+    pub name: String,
+    /// Engine tag.
+    pub engine: String,
+    /// Stringified input type name.
+    pub input_type: String,
+    /// Stringified output type name.
+    pub output_type: String,
+}
+
 /// The structured inputs of the compatibility fingerprint (OC-PRD D3):
 /// everything two components must agree on for stored meaning to be
 /// preserved. Serializable so it can ride a graph pin, a backup header,
@@ -81,6 +113,12 @@ pub struct OntologySummary {
     pub type_triples: Vec<TripleSummary>,
     /// Rule ids for fingerprinting, in pack order (name-sorted packs).
     pub rule_ids: Vec<String>,
+    /// Pack-registered Action signatures (PX2), sorted by `(pack, name)`.
+    /// Adding a verb to a pack is a superset event (OC-PRD D3); changing
+    /// an existing verb's signature is a compatibility break.
+    pub actions: Vec<ActionVerbSummary>,
+    /// Pack-registered Function signatures (PX2), sorted by `(pack, name)`.
+    pub functions: Vec<FunctionVerbSummary>,
 }
 
 /// The v2 pinned-ontology record persisted in a graph's metadata
@@ -263,12 +301,28 @@ impl OntologySummary {
         let mut kinds = Vec::new();
         let mut type_triples = Vec::new();
         let mut rule_ids = Vec::new();
+        let mut actions = Vec::new();
+        let mut functions = Vec::new();
         for p in packs {
             memory_types.extend(p.memory_type_names.iter().map(|n| n.to_string()));
             entity_types.extend(p.entity_type_names.iter().map(|n| n.to_string()));
             kinds.extend(p.kinds.iter().map(kind_summary));
             type_triples.extend(p.type_triples.iter().map(triple_summary));
             rule_ids.extend(p.rule_ids.iter().map(|n| n.to_string()));
+            actions.extend(p.actions.iter().map(|a| ActionVerbSummary {
+                pack: p.name.to_string(),
+                name: a.name.to_string(),
+                ceiling: a.ceiling as u8,
+                input_type: a.input_type.to_string(),
+                output_type: a.output_type.to_string(),
+            }));
+            functions.extend(p.functions.iter().map(|f| FunctionVerbSummary {
+                pack: p.name.to_string(),
+                name: f.name.to_string(),
+                engine: f.engine.to_string(),
+                input_type: f.input_type.to_string(),
+                output_type: f.output_type.to_string(),
+            }));
         }
         kinds.sort_by_key(|k| k.id);
         type_triples.sort_by(|a, b| {
@@ -277,12 +331,16 @@ impl OntologySummary {
                 .then(a.from_types.cmp(&b.from_types))
                 .then(a.to_types.cmp(&b.to_types))
         });
+        actions.sort();
+        functions.sort();
         Self {
             memory_types,
             entity_types,
             kinds,
             type_triples,
             rule_ids,
+            actions,
+            functions,
         }
     }
 
@@ -334,6 +392,39 @@ impl OntologySummary {
             side(&mut h, &t.to_types);
         }
         str_section(&mut h, &self.rule_ids);
+        // PX2 verb signatures: length-prefixed like every other section,
+        // budgets excluded (operational policy, not stored meaning).
+        let action_verb = |h: &mut Sha256, v: &ActionVerbSummary| {
+            h.update((v.pack.len() as u32).to_le_bytes());
+            h.update(v.pack.as_bytes());
+            h.update((v.name.len() as u32).to_le_bytes());
+            h.update(v.name.as_bytes());
+            h.update([v.ceiling]);
+            h.update((v.input_type.len() as u32).to_le_bytes());
+            h.update(v.input_type.as_bytes());
+            h.update((v.output_type.len() as u32).to_le_bytes());
+            h.update(v.output_type.as_bytes());
+        };
+        h.update((self.actions.len() as u32).to_le_bytes());
+        for v in &self.actions {
+            action_verb(&mut h, v);
+        }
+        let function_verb = |h: &mut Sha256, v: &FunctionVerbSummary| {
+            h.update((v.pack.len() as u32).to_le_bytes());
+            h.update(v.pack.as_bytes());
+            h.update((v.name.len() as u32).to_le_bytes());
+            h.update(v.name.as_bytes());
+            h.update((v.engine.len() as u32).to_le_bytes());
+            h.update(v.engine.as_bytes());
+            h.update((v.input_type.len() as u32).to_le_bytes());
+            h.update(v.input_type.as_bytes());
+            h.update((v.output_type.len() as u32).to_le_bytes());
+            h.update(v.output_type.as_bytes());
+        };
+        h.update((self.functions.len() as u32).to_le_bytes());
+        for v in &self.functions {
+            function_verb(&mut h, v);
+        }
         let out: [u8; 32] = h.finalize().into();
         CompatibilityFingerprint(out)
     }
@@ -370,6 +461,18 @@ impl OntologySummary {
         }
         let ours: std::collections::BTreeSet<_> = self.rule_ids.iter().collect();
         let theirs: std::collections::BTreeSet<_> = superset.rule_ids.iter().collect();
+        if !ours.is_subset(&theirs) {
+            return false;
+        }
+        // PX2: an existing verb must be identical; a superset may only ADD
+        // verbs (the same discipline OC-PRD D3 applies to kinds/triples).
+        let ours: std::collections::BTreeSet<_> = self.actions.iter().collect();
+        let theirs: std::collections::BTreeSet<_> = superset.actions.iter().collect();
+        if !ours.is_subset(&theirs) {
+            return false;
+        }
+        let ours: std::collections::BTreeSet<_> = self.functions.iter().collect();
+        let theirs: std::collections::BTreeSet<_> = superset.functions.iter().collect();
         ours.is_subset(&theirs)
     }
 
@@ -419,6 +522,22 @@ impl OntologySummary {
         let theirs: std::collections::BTreeSet<_> = superset.rule_ids.iter().collect();
         if let Some(r) = ours.difference(&theirs).next() {
             return Some(format!("rule {r:?} is missing"));
+        }
+        let ours: std::collections::BTreeSet<_> = self.actions.iter().collect();
+        let theirs: std::collections::BTreeSet<_> = superset.actions.iter().collect();
+        if let Some(v) = ours.difference(&theirs).next() {
+            return Some(format!(
+                "pack action {}::{} differs or is missing",
+                v.pack, v.name
+            ));
+        }
+        let ours: std::collections::BTreeSet<_> = self.functions.iter().collect();
+        let theirs: std::collections::BTreeSet<_> = superset.functions.iter().collect();
+        if let Some(v) = ours.difference(&theirs).next() {
+            return Some(format!(
+                "pack function {}::{} differs or is missing",
+                v.pack, v.name
+            ));
         }
         None
     }
@@ -794,6 +913,9 @@ mod tests {
                 },
             ],
             rule_ids: vec!["compat_rule".into()],
+            actions: Vec::new(),
+            functions: Vec::new(),
+            guidance: Vec::new(),
         }
     }
 

@@ -36,9 +36,12 @@ commit — a stale plan is a lie about the repo.
 ## Layout
 
 - `crates/exocortex-kernel` — ontology core (types, provenance,
-  visibility, validators, fingerprint). **Zero I/O, no internal deps.**
+  visibility, validators, fingerprint, pack-verb registrations).
+  **Zero I/O, no internal deps.**
 - `crates/exocortex-pack-dev-v1` — the dev-domain ontology pack
   (13/12/48 + Datalog rules D1–D6). Depends only on the kernel.
+- `crates/exocortex-pack-mortgage-v1` — the second pack (PX1): lending
+  domain, `actions!`/`functions!`/`guidance!` verbs (PX2). Kernel only.
 - `crates/exocortex-wire` — protobuf schemas + `signing` (the ONE
   canonical checksum/HMAC implementation) + SSE/cluster envelope types.
 - `crates/exocortex-storage` — the storage seam: `Storage` trait,
@@ -99,7 +102,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --features exocortex-adapter-sdk/testing
 cargo deny check
 cargo xtask kernel-purity   # kernel purity + SDK single-dep + worker kernel-ban
-cargo xtask fingerprint     # two-level (OC-PRD D1): line 1 compatibility d60a2467…4ef52 gates; line 2 build e1f7d17b…ddc9b2 reports (v1 value, unchanged)
+cargo xtask fingerprint     # two-level (OC-PRD D1): line 1 compatibility 2c3ec388…5c23 gates; line 2 build 18dbf33b…49f5 reports (v1 value, unchanged)
 cargo xtask compatibility-policy  # every fingerprint comparison consults the OC-PRD D2 policy table
 cargo xtask seam-inventory   # PX3: declared seams <-> conformance suites bijection
 cargo xtask gen-schemas     # schema drift vs goldens

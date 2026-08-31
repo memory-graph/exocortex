@@ -52,6 +52,9 @@ pub enum KernelError {
     /// re-resolving the shared name to the later pack's id made every
     /// first-pack type triple evaluate against the wrong ids).
     DuplicateTypeName(smol_str::SmolStr),
+    /// A pack verb's typed input could not be decoded (PX2). The framework
+    /// surfaces this as a `BadInput`-class rejection before any body runs.
+    InvalidActionInput(String),
 }
 
 impl std::fmt::Display for KernelError {
@@ -81,6 +84,9 @@ impl std::fmt::Display for KernelError {
                 f,
                 "two packs declare the memory/entity type name `{name}` (KP2)"
             ),
+            KernelError::InvalidActionInput(detail) => {
+                write!(f, "pack verb input rejected: {detail}")
+            }
         }
     }
 }

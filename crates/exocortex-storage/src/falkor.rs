@@ -1898,6 +1898,7 @@ impl FalkorStorage {
     /// guard is one compound GRAPH.QUERY. FalkorDB makes a modifying query
     /// atomic; Redis MULTI/EXEC does not roll back an earlier command when a
     /// later queued command fails (R6-U02).
+    #[allow(clippy::too_many_arguments)] // batch-commit options grew one at a time; each is a distinct guard
     async fn upsert_batch_inner(
         &self,
         ms: &[Memory],
@@ -1906,6 +1907,7 @@ impl FalkorStorage {
         journal: Option<(&FencedRestore, &str)>,
         import_key: Option<&str>,
         publication_claim_token: Option<&str>,
+        audit: Option<&AuditEvent>,
     ) -> Result<Option<FencedBatchCommit>, StorageError> {
         // R-T4 inverse companions join the same transaction.
         let all_rels = self.expand_relationships(rs);
@@ -2004,6 +2006,13 @@ impl FalkorStorage {
                 edge_id: None,
             });
             next += 1;
+        }
+
+        // PX2: the audit event joins the SAME transaction as the rows
+        // (R6-B18) — neither may commit without the other.
+        if let Some(audit) = audit {
+            let last_lsn = next - 1;
+            parts.push(("batch_audit_append", Self::audit_params(audit, last_lsn)));
         }
 
         let mut committed = FencedBatchCommit {
@@ -2311,7 +2320,22 @@ impl Storage for FalkorStorage {
         rs: &[Relationship],
     ) -> Result<Vec<CommitRecord>, StorageError> {
         Ok(self
-            .upsert_batch_inner(ms, rs, None, None, None, None)
+            .upsert_batch_inner(ms, rs, None, None, None, None, None)
+            .await?
+            .expect("ordinary batch cannot take the idempotent no-op path")
+            .records)
+    }
+
+    async fn upsert_batch_audited(
+        &self,
+        ms: &[Memory],
+        rs: &[Relationship],
+        audit: &AuditEvent,
+    ) -> Result<Vec<CommitRecord>, StorageError> {
+        // PX2: one transaction carries rows AND the audit event (the
+        // `audit` parameter joins `upsert_batch_inner`'s parts).
+        Ok(self
+            .upsert_batch_inner(ms, rs, None, None, None, None, Some(audit))
             .await?
             .expect("ordinary batch cannot take the idempotent no-op path")
             .records)
@@ -2340,7 +2364,15 @@ impl Storage for FalkorStorage {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let committed = self
-            .upsert_batch_inner(ms, rs, None, None, Some(operation_key), Some(&claim_token))
+            .upsert_batch_inner(
+                ms,
+                rs,
+                None,
+                None,
+                Some(operation_key),
+                Some(&claim_token),
+                None,
+            )
             .await?
             .is_some();
         let pending_rows = self
@@ -3832,7 +3864,7 @@ impl Storage for FalkorStorage {
         rs: &[Relationship],
         lease: &OwnerLease,
     ) -> Result<FencedBatchCommit, StorageError> {
-        self.upsert_batch_inner(ms, rs, Some(lease), None, None, None)
+        self.upsert_batch_inner(ms, rs, Some(lease), None, None, None, None)
             .await?
             .ok_or_else(|| StorageError::Backend("fenced batch unexpectedly became a no-op".into()))
     }
@@ -3850,6 +3882,7 @@ impl Storage for FalkorStorage {
             rs,
             Some(lease),
             Some((prepared_restore, cycle_id)),
+            None,
             None,
             None,
         )
@@ -4572,6 +4605,8 @@ mod fingerprint_decode_tests {
                 kinds: vec![],
                 type_triples: vec![],
                 rule_ids: vec![],
+                actions: vec![],
+                functions: vec![],
             },
             accepted: vec![],
         };

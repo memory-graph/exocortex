@@ -7,7 +7,9 @@
 #![warn(missing_docs, rust_2018_idioms)]
 
 pub mod audit;
+pub use pack_verbs::{eval_pack_function, eval_pack_function_cached};
 pub mod operations;
+pub mod pack_verbs;
 pub mod preflight;
 
 /// Client-facing shared types (§2.5 routes the client through ops; these
@@ -126,12 +128,15 @@ pub trait Operation: Send + Sync + 'static {
 
 /// Type-erased registration for inventory. Each Operation impl submits one
 /// of these; MCP and HTTP surfaces iterate `inventory::iter::<OperationEntry>`
-/// at startup.
+/// at startup. Pack-registered verbs (PX2 §4.3) join the SAME registry
+/// through `entries()` — one enumeration serves every surface (R-P1/R-P2).
 pub struct OperationEntry {
     /// Stable operation name.
     pub name: &'static str,
     /// MCP tool name.
     pub mcp_tool_name: &'static str,
+    /// Owning pack for pack-registered verbs; `None` for kernel ops.
+    pub pack: Option<&'static str>,
     /// HTTP method constructor.
     pub http_method: fn() -> http::Method,
     /// HTTP path.
@@ -140,9 +145,12 @@ pub struct OperationEntry {
     pub input_schema: fn() -> schemars::schema::RootSchema,
     /// JSON Schema for the output.
     pub output_schema: fn() -> schemars::schema::RootSchema,
-    /// Type-erased handler: JSON in, JSON out.
+    /// Type-erased handler: JSON in, JSON out. Receives the entry itself
+    /// so shared handlers (the pack-verb dispatchers) can read their
+    /// `(pack, verb)` identity without capturing state in a fn pointer.
     #[allow(clippy::type_complexity)]
     pub handler: for<'a> fn(
+        &'static OperationEntry,
         &'a OpContext,
         serde_json::Value,
     )
@@ -169,11 +177,12 @@ macro_rules! register_operation {
             $crate::OperationEntry {
                 name: <$op as $crate::OperationNames>::NAME_OVERRIDE,
                 mcp_tool_name: <$op as $crate::OperationNames>::MCP_NAME_OVERRIDE,
+                pack: ::core::option::Option::None,
                 http_method: <$op as $crate::OperationNames>::http_method_override,
                 http_path: <$op as $crate::OperationNames>::HTTP_PATH_OVERRIDE,
                 input_schema: || schemars::schema_for!($input),
                 output_schema: || schemars::schema_for!($output),
-                handler: |ctx, v| Box::pin(async move {
+                handler: |_entry, ctx, v| Box::pin(async move {
                     let input: $input =
                         serde_json::from_value(v).map_err(|e| $crate::OpError::BadInput(e.to_string()))?;
                     let out = $op::default().handle(ctx, input).await?;
@@ -197,10 +206,17 @@ pub trait OperationNames {
 }
 
 /// Enumerate every registered operation (sorted by name; duplicates reject
-/// in the parity check).
+/// in the parity check). Pack-registered verbs (PX2) are materialized ONCE
+/// into the same registry: the leaked per-verb entries are bounded by the
+/// number of declared verbs, constructed a single time per process, and
+/// reachable from every surface that walks `entries()` — MCP tooling,
+/// OpenAPI goldens, and the parity suites pick them up for free.
 pub fn entries() -> Vec<&'static OperationEntry> {
+    static PACK_ENTRIES: std::sync::OnceLock<Vec<OperationEntry>> = std::sync::OnceLock::new();
+    let pack_entries = PACK_ENTRIES.get_or_init(crate::pack_verbs::registry_entries);
     let mut all: Vec<&'static OperationEntry> =
         inventory::iter::<OperationEntry>.into_iter().collect();
+    all.extend(pack_entries.iter());
     all.sort_by_key(|e| e.name);
     all
 }

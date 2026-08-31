@@ -498,3 +498,45 @@ proto-sync-guarded copy).
   both binaries, the extracted wrapper resolves its sibling runtime without CI
   overrides, and the target passes locally and is mandatory for every supported
   standalone artifact. Installer-layout resolution has separate fixture proof.
+
+## Wave 1 closeout — PX2 pack verbs (2026-08-30)
+
+Deviations recorded for the pack-registered Actions/Functions delivery
+(palantir-expansion PRD §3.2; every shipped surface is executable):
+
+- **`functions!` accepts `scheme` bodies only; `datalog` is a
+  pack-compile error.** The PRD sketch showed `datalog!`/`scheme!`
+  bodies. Crepe compiles Datalog at build time inside the reasoning
+  crate; there is no runtime Datalog interpreter, and an unexecutable
+  registration would be a phantom surface. The error names the
+  constraint and points at `crepe_rules!`. A runtime Datalog evaluator
+  would be new machinery the plan has never accepted.
+- **v1 pack Functions are pure typed computations over their input.**
+  The PRD's "kernel enforces the same read-visibility filter as
+  search_memories" implies graph-fed functions; no generic query
+  contract for handing graph facts to a pack body exists yet. Pure
+  functions read nothing, so the visibility filter holds trivially and
+  an authenticated context is still required. The graph-fed boundary is
+  recorded in the plan row as future work.
+- **Pack-action provenance stamps `ProducerKind::Custom` with
+  `Provenance::Asserted { author: "{pack}.{verb}" }`.** The PRD wanted
+  `producer_kind` distinction; adding a wire `ProducerKind` variant is
+  an additive-but-coordinated proto/golden change this wave did not
+  need. The verb identity rides the author field and the audit action
+  label.
+- **Guidance renders into the playbook, not the composed
+  `CLAUDE.md`/`AGENTS.md` block.** PRD §4.2 says the block; the
+  A-PRD 300-word block gate (299 words today) makes that impossible
+  without weakening a shipped bound. `--dump-playbook` carries the
+  composed guidance; the block is unchanged.
+- **CR-8 boundary kept:** the scheme evaluator lives in `exocortex-ops`
+  (JSON is native at the operation boundary) over the same embedded
+  Steel interpreter; the reasoning crate's rule path stays
+  serialization-free (`reasoning_read_path_has_no_serialization`).
+- **Intended fingerprint move (both levels)** — `PackDef` gained
+  signature-level verb sections, moving every pack's fingerprints once.
+  Over the composed set every linked binary now loads: compatibility
+  `2c3ec388…5c23` gates, build `18dbf33b…49f5` reports. Goldens,
+  AGENTS.md, and CLAUDE.md updated in the same change (per the OC-PRD
+  managed-change discipline Wave 0 was built for).
+

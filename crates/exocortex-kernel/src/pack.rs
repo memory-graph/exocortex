@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
+use crate::verbs::{GuidanceEntry, PackActionDef, PackFunctionDef};
 use crate::{RelKindId, RelMeta};
 
 /// Compiled result of a `pack!` invocation. Registered with `inventory::submit!`.
@@ -26,6 +27,21 @@ pub struct PackDef {
     // in PackDef. PackDef only carries the rule-id list for fingerprinting.
     /// Rule ids for fingerprinting.
     pub rule_ids: Vec<SmolStr>,
+    /// Pack-registered Actions (PX2 §4.1): signature level only — name,
+    /// ceiling, typed input/output names. Bodies live in the `inventory`
+    /// registrations, never here, so patching a body moves neither
+    /// fingerprint level.
+    #[serde(default)]
+    pub actions: Vec<PackActionDef>,
+    /// Pack-registered Functions (PX2 §4.1): signature level plus budgets.
+    /// Body sources live in the registrations only.
+    #[serde(default)]
+    pub functions: Vec<PackFunctionDef>,
+    /// Structured agent guidance (PX2 §4.2). Excluded from the
+    /// compatibility summary (instructions, not stored meaning); covered
+    /// by the build fingerprint.
+    #[serde(default)]
+    pub guidance: Vec<GuidanceEntry>,
 }
 
 /// Semantic version triple for packs and kernel compatibility.
