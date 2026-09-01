@@ -402,8 +402,18 @@ fn main() -> anyhow::Result<()> {
 /// response to `server/discover` is the specified signal for those clients to
 /// fall back to the legacy initialize handshake.
 async fn serve_mcp_stdio(server: mcp::ExocortexMcp) -> anyhow::Result<()> {
+    // D27 (bug-prd-standalone-submit-hang): rmcp treats stdin EOF as an
+    // immediate shutdown and drops in-flight tool-call tasks — a submit
+    // still on the wire loses its response and the harness sees a hang.
+    // The draining reader withholds EOF until every in-flight call has
+    // answered (bounded by the end_session deadlines plus slack).
+    let in_flight = server.in_flight_calls();
     let input = FrameLimitedReader::new(
-        tokio::io::stdin(),
+        exocortex_client::eof_drain::EofDrainReader::new(
+            tokio::io::stdin(),
+            in_flight,
+            exocortex_client::eof_drain::EOF_DRAIN_BUDGET,
+        ),
         exocortex_wire::limits::MAX_MCP_REQUEST_BYTES,
     );
     let mut input = tokio::io::BufReader::new(input);

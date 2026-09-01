@@ -1,5 +1,19 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-01, D27 closed — v0.3.0 binaries unblocked):** The
+standalone submit hang is root-caused and fixed: rmcp treats stdin EOF
+as immediate shutdown, dropping in-flight (and read-but-unpolled) tool
+calls — the live harness pipes its requests and closes stdin, so any
+submit still on the wire lost its response. The wire path itself is
+healthy (h2 frame trace: ~40ms round-trip with stdin held open); both
+earlier hypotheses are disproven. Fix: an EOF-draining stdio reader
+(quiet = no in-flight call AND no dispatch in the 300ms grace window,
+bounded at 55s > the 20s+30s gRPC deadlines), a deterministic
+no-runtime regression (`backend_eof_drain.rs`: in-process node behind a
+400ms delaying proxy; fails-by-stash without the drain), and the live
+script now sequences write→commit→read (8/8 clean runs). Next:
+re-validate the release (`scripts/verify-release.sh`), re-tag v0.3.0.
+
 **Status (2026-08-31, later — D28 closed):** Dogfood failure on the
 write path: `end_session` calls from Crush failed deserialization
 (`missing field memory_type`, then `missing field content`). Root cause:
@@ -402,7 +416,7 @@ each step (88 tests at completion).
 
 | ID | Item | Source | Status |
 |----|------|--------|--------|
-| D27 | **Standalone submit hang** — the intermittent `end_session` gRPC hang against a standalone node found by the v0.3.0 release validation (`docs/bug-prd-standalone-submit-hang.md`). The deterministic half (dropped mortgage registration → fingerprint split → fail-closed hydration) is FIXED with a binary-level canary; the intermittent half (request never reaches the service; client parks forever with no deadline) is open with samples and repro in the PRD. Shipped with it: client-side gRPC deadlines (a wedged submit now surfaces as DeadlineExceeded) and a loud failure mode in `test-standalone-live.sh` | `docs/bug-prd-standalone-submit-hang.md` | **In progress — deterministic half fixed; the race is the open half. Blocks the v0.3.0 GitHub release (crates are published; binaries are held until this closes)** |
+| D27 | **Standalone submit hang** — the intermittent `end_session` gRPC hang against a standalone node found by the v0.3.0 release validation (`docs/bug-prd-standalone-submit-hang.md`) | `docs/bug-prd-standalone-submit-hang.md` | **Done** — both halves closed. Deterministic half: dropped mortgage registration → fingerprint split → fail-closed hydration, fixed with the binary-level canary `the_binary_registers_every_shipped_pack`. Intermittent half: rmcp drops in-flight (and read-but-unpolled) tool calls at stdin EOF — fixed with the EOF-draining stdio reader `client/src/eof_drain.rs` (quiet = no in-flight call AND no dispatch in the 300ms grace window; 55s budget > the 20s+30s gRPC deadlines; `eof_drain.rs` unit suite pins withhold/grace/budget/passthrough), the deterministic no-runtime regression `client/tests/backend_eof_drain.rs` (in-process node behind a 400ms delaying proxy; proved failing-by-stash), and the live script sequencing write→commit→read with both ack and marker asserted (`scripts/test-standalone-live.sh`, 8/8 clean runs). The wire path was healthy throughout (h2 trace ~40ms); the HTTP/2-race and lost-wakeup hypotheses are disproven and recorded in the PRD |
 | D28 | **MCP tool schemas were not self-contained** — schemars emits `{"$ref":"#/definitions/X"}` beside a root `definitions` map; MCP harnesses legitimately drop the map while passing the `$ref` through unresolved (observed live in the Crush dogfood: the model guessed `type`/`body` and the server rejected the calls with `missing field memory_type` / `missing field content`) | Crush dogfood session, 2026-08-31 | **Done** — `list_tools` inlines every `#/definitions/X` ref (`client/src/mcp.rs::{self_contained,inline_schema_refs}`, cyclic/foreign refs left verbatim rather than recursing); the instruction block names the exact draft fields (`draft_key`,`memory_type`,`title`,`content`,`visibility`,`tags`; 297 words); `stdio_smoke.rs::tools_list_serves_self_contained_schemas` + `mcp.rs::schema_inline_tests` pin it (the stdio test fails on the pre-fix tree, proved by stash) |
 | R1 | M3 — backend cache-feed bridge loss windows (reseed/subscribe gap, no retry on fetch error, tight resubscribe flap); needs periodic reseed or LSN reconcile | round-3 review | Accepted v1 residue |
 | R2 | M6-M15 minors: cursor tmp-collision/no-fsync; checksum preimage separators; per-server-restart duplicate replays (in-memory dedup); golden-regen doc flag; `/health/cluster` leader semantics; B8 hex-rederivation guard note; WAL replay must rebuild+sign | round-3 review | Accepted v1 residue — **superseded in part**: WAL-replay clause folds into W1, duplicate-replay clause into W7 |
@@ -512,16 +526,17 @@ idea:
 
 ## In progress
 
-**D27 is in progress** (the standalone submit hang; Backlog row below
-with its evidence) and it gates the v0.3.0 GitHub release. Behind it,
-the next accepted work is **D19/D1/PX4/D17** — D19 needs SaaS
-credentials, D1 needs the arrow/parquet dependency decision (record the
-reason in PUBLISHING, then build), PX4 needs the
-`loanlight-engineering/docs` checkout, and D17 is sequenced behind D13
-proving the deterministic join carries the value. The table below is the
-closed Round 6 detail ledger (every row Done or Verified safe, evidence
-inline; the summary rows live in the Done section). A new item enters
-here only when work actually starts.
+**Nothing in progress.** D27 closed 2026-09-01 (see its Backlog row);
+the v0.3.0 binary release is unblocked — re-validate with
+`scripts/verify-release.sh`, then re-tag. The next accepted work is
+**D19/D1/PX4/D17** — D19 needs SaaS credentials, D1 needs the
+arrow/parquet dependency decision (record the reason in PUBLISHING,
+then build), PX4 needs the `loanlight-engineering/docs` checkout, and
+D17 is sequenced behind D13 proving the deterministic join carries the
+value (proved; D17 is startable). The table below is the closed Round 6
+detail ledger (every row Done or Verified safe, evidence inline; the
+summary rows live in the Done section). A new item enters here only
+when work actually starts.
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|

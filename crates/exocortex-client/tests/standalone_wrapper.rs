@@ -176,7 +176,7 @@ fn archive_live_harness_leaves_sibling_runtime_resolution_to_wrapper() {
     let wrapper = dir.join("exocortex");
     std::fs::write(
         &wrapper,
-        "#!/bin/sh\n[ -z \"${EXOCORTEX_REDIS_SERVER:-}\" ]\n[ -z \"${EXOCORTEX_FALKORDB_MODULE:-}\" ]\nprintf '%s\\n' 'standalone live durable marker'\n",
+        "#!/bin/sh\n[ -z \"${EXOCORTEX_REDIS_SERVER:-}\" ]\n[ -z \"${EXOCORTEX_FALKORDB_MODULE:-}\" ]\nprintf '%s\\n' '{\\\"accepted\\\":1,\\\"rejected\\\":0}'\nprintf '%s\\n' 'standalone live durable marker'\n",
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();

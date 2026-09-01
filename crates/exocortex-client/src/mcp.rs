@@ -16,6 +16,7 @@ use std::sync::Arc;
 use exocortex_cache::LocalCache;
 use exocortex_ops::VisibilityContext;
 
+use crate::eof_drain::InFlightCalls;
 use crate::tools::end_session::{EdgeHintInput, EndSessionArgs, EndSessionTool, MemoryDraftInput};
 use crate::wal;
 
@@ -40,6 +41,9 @@ pub struct ExocortexMcp {
     /// so this id IS the session grouping key unless the caller passes an
     /// explicit one (deliberate multi-agent sharing).
     process_session_id: String,
+    /// D27: in-flight tool calls; stdin EOF drains these before the
+    /// process exits (see `eof_drain`).
+    in_flight: Arc<InFlightCalls>,
 }
 
 impl ExocortexMcp {
@@ -58,6 +62,7 @@ impl ExocortexMcp {
             wal: None,
             ontology,
             process_session_id: uuid::Uuid::now_v7().simple().to_string(),
+            in_flight: InFlightCalls::new(),
         }
     }
 
@@ -77,6 +82,12 @@ impl ExocortexMcp {
     /// §4.8: the process-minted conversation id (test surface).
     pub fn process_session_id(&self) -> &str {
         &self.process_session_id
+    }
+
+    /// D27: the in-flight call tracker feeding the EOF-draining stdio
+    /// reader (see `eof_drain`).
+    pub fn in_flight_calls(&self) -> Arc<InFlightCalls> {
+        Arc::clone(&self.in_flight)
     }
 }
 
@@ -632,12 +643,14 @@ impl ServerHandler for ExocortexMcp {
         })
     }
 
-    /// Dispatch to the registered Functions.
+    /// Dispatch to the registered Functions. D27: the guard marks the
+    /// call in flight so stdin EOF drains it before the process exits.
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParam,
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::Error> {
+        let _in_flight = self.in_flight.guard();
         let tcc = ToolCallContext::new(self, request, context);
         match tcc.name() {
             "exocortex.search_memories" => Self::search_memories_tool_call(tcc).await,

@@ -367,13 +367,17 @@ fn uuid_v4_hex() -> String {
 }
 
 fn uuid_rand_bytes() -> [u8; 16] {
-    // Cheap uniqueness: pid + nanos; only used for dir names.
+    // Cheap uniqueness: pid + nanos + a monotonic counter — parallel
+    // tests can observe identical nanos, and a colliding dir name makes
+    // two children fight over one WAL lock.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let pid = std::process::id() as u128;
-    let mix = nanos ^ (pid << 64);
+    let bump = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128;
+    let mix = (nanos ^ (pid << 64)) + (bump << 96);
     mix.to_be_bytes()
 }
 
