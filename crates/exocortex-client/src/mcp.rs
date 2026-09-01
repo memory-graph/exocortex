@@ -504,6 +504,69 @@ impl ExocortexMcp {
     }
 }
 
+/// Self-contained tool schemas. schemars emits referenced types as
+/// `{"$ref": "#/definitions/X"}` beside a root `definitions` map; MCP
+/// harnesses legitimately drop that map while passing the `$ref`
+/// through unresolved, which leaves the calling model guessing draft
+/// fields (observed live in the Crush dogfood: `missing field
+/// memory_type`, then `missing field content`). Inline every
+/// `#/definitions/X` ref so the served schema needs nothing but itself.
+fn self_contained(tool: rmcp::model::Tool) -> rmcp::model::Tool {
+    let mut schema = tool.input_schema.as_ref().clone();
+    let defs = match schema.remove("definitions") {
+        Some(serde_json::Value::Object(defs)) => defs,
+        _ => return tool,
+    };
+    let mut root = serde_json::Value::Object(schema);
+    inline_schema_refs(&mut root, &defs, &mut Vec::new());
+    match root {
+        serde_json::Value::Object(map) => rmcp::model::Tool {
+            name: tool.name,
+            description: tool.description,
+            input_schema: Arc::new(map),
+        },
+        _ => tool,
+    }
+}
+
+/// Replace each `#/definitions/X` ref object with the definition itself,
+/// depth-first. A name already being expanded (a cyclic schema) or a ref
+/// pointing elsewhere is left verbatim rather than recursing forever.
+fn inline_schema_refs(
+    value: &mut serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    expanding: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(reference)) = map.get("$ref") {
+                if let Some(name) = reference.strip_prefix("#/definitions/") {
+                    if !expanding.iter().any(|n| n == name) {
+                        if let Some(definition) = defs.get(name) {
+                            let mut definition = definition.clone();
+                            expanding.push(name.to_string());
+                            inline_schema_refs(&mut definition, defs, expanding);
+                            expanding.pop();
+                            *value = definition;
+                            return;
+                        }
+                    }
+                    return;
+                }
+            }
+            for child in map.values_mut() {
+                inline_schema_refs(child, defs, expanding);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                inline_schema_refs(item, defs, expanding);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Structured error payload (never a bare string): `{ error, message }`.
 fn json_error(error: &str, message: impl std::fmt::Display) -> String {
     serde_json::json!({ "error": error, "message": message.to_string() }).to_string()
@@ -565,7 +628,7 @@ impl ServerHandler for ExocortexMcp {
         }
         Ok(rmcp::model::ListToolsResult {
             next_cursor: None,
-            tools,
+            tools: tools.into_iter().map(self_contained).collect(),
         })
     }
 
@@ -588,5 +651,71 @@ impl ServerHandler for ExocortexMcp {
                 None,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod schema_inline_tests {
+    use super::inline_schema_refs;
+    use serde_json::json;
+
+    fn object_map(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().expect("object").clone()
+    }
+
+    #[test]
+    fn refs_resolve_to_their_definitions_depth_first() {
+        let defs = object_map(json!({
+            "Draft": {
+                "type": "object",
+                "properties": {
+                    "memory_type": { "type": "string" },
+                    "inner": { "$ref": "#/definitions/Inner" }
+                }
+            },
+            "Inner": { "type": "string" }
+        }));
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "memories": {
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/Draft" }
+                }
+            }
+        });
+        inline_schema_refs(&mut schema, &defs, &mut Vec::new());
+        assert_eq!(
+            schema["properties"]["memories"]["items"]["properties"]["memory_type"],
+            json!({ "type": "string" }),
+            "one hop resolves: {schema}"
+        );
+        assert_eq!(
+            schema["properties"]["memories"]["items"]["properties"]["inner"],
+            json!({ "type": "string" }),
+            "nested refs resolve depth-first: {schema}"
+        );
+        assert!(
+            !schema.to_string().contains("$ref"),
+            "no refs remain: {schema}"
+        );
+    }
+
+    #[test]
+    fn cyclic_and_foreign_refs_are_left_verbatim() {
+        let defs = object_map(json!({
+            "A": { "type": "object", "properties": { "b": { "$ref": "#/definitions/A" } } }
+        }));
+        let mut cyclic = json!({ "$ref": "#/definitions/A" });
+        inline_schema_refs(&mut cyclic, &defs, &mut Vec::new());
+        // The definition's self-reference stays a ref instead of recursing.
+        assert_eq!(
+            cyclic["properties"]["b"],
+            json!({ "$ref": "#/definitions/A" }),
+            "cycle stops expanding: {cyclic}"
+        );
+        let mut foreign = json!({ "$ref": "https://example.com/other" });
+        inline_schema_refs(&mut foreign, &defs, &mut Vec::new());
+        assert_eq!(foreign, json!({ "$ref": "https://example.com/other" }));
     }
 }

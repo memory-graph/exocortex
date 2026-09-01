@@ -18,6 +18,9 @@ fire, write nothing.
 **Types you'll usually write:** `Fix`, `Solution`, `Problem`, `Error`,
 `CodePattern`, `Command`, `Technology` (full list: playbook).
 
+**Draft fields:** `draft_key`, `memory_type`, `title`, `content`,
+`visibility`, `tags`.
+
 **Edges:** typed; `exocortex-mcp-client --verify` locates the 48-kind
 catalogue. Link within the batch by `draft_key`, or
 to an existing memory by `to_memory_id` (32-hex id from search
@@ -41,9 +44,8 @@ cross-project knowledge. `private` for user preferences.
 limit=10)`. When stuck, `search_memories("<exact error>")`. Do not
 search on every turn.
 
-**Rejections:** read the `code` and `detail`, fix, resubmit in the
-same turn. Never drop one silently — surface any unfixable rejection
-in your final message.
+**Rejections:** read the `code` and `detail`, fix, resubmit same
+turn. Never drop one silently — surface any unfixable rejection.
 
-Session ids are client-stamped; you don't manage them. Full reference:
+Session ids are client-stamped. Full reference:
 the playbook path printed by `exocortex-mcp-client --verify`.

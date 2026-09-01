@@ -1,5 +1,15 @@
 # Exocortex — Master Plan
 
+**Status (2026-08-31, later — D28 closed):** Dogfood failure on the
+write path: `end_session` calls from Crush failed deserialization
+(`missing field memory_type`, then `missing field content`). Root cause:
+schemars serves referenced draft types as `$ref`s beside a root
+`definitions` map; Crush drops the map and passes the `$ref` through
+unresolved, so the calling model guesses field names. Fix (D28):
+`tools/list` now inlines every `#/definitions/X` ref — schemas are
+self-contained for any harness — and the instruction block names the
+exact draft fields (297 words). Fail-without-fix proven by stash.
+
 **Status (2026-08-31, night — 0.3.0 released to crates.io; binaries held
 on D27):** The workspace shipped 0.3.0 (additive adapter-contract wave;
 fingerprint unchanged) and AGENTS.md now carries the standing
@@ -393,6 +403,7 @@ each step (88 tests at completion).
 | ID | Item | Source | Status |
 |----|------|--------|--------|
 | D27 | **Standalone submit hang** — the intermittent `end_session` gRPC hang against a standalone node found by the v0.3.0 release validation (`docs/bug-prd-standalone-submit-hang.md`). The deterministic half (dropped mortgage registration → fingerprint split → fail-closed hydration) is FIXED with a binary-level canary; the intermittent half (request never reaches the service; client parks forever with no deadline) is open with samples and repro in the PRD. Shipped with it: client-side gRPC deadlines (a wedged submit now surfaces as DeadlineExceeded) and a loud failure mode in `test-standalone-live.sh` | `docs/bug-prd-standalone-submit-hang.md` | **In progress — deterministic half fixed; the race is the open half. Blocks the v0.3.0 GitHub release (crates are published; binaries are held until this closes)** |
+| D28 | **MCP tool schemas were not self-contained** — schemars emits `{"$ref":"#/definitions/X"}` beside a root `definitions` map; MCP harnesses legitimately drop the map while passing the `$ref` through unresolved (observed live in the Crush dogfood: the model guessed `type`/`body` and the server rejected the calls with `missing field memory_type` / `missing field content`) | Crush dogfood session, 2026-08-31 | **Done** — `list_tools` inlines every `#/definitions/X` ref (`client/src/mcp.rs::{self_contained,inline_schema_refs}`, cyclic/foreign refs left verbatim rather than recursing); the instruction block names the exact draft fields (`draft_key`,`memory_type`,`title`,`content`,`visibility`,`tags`; 297 words); `stdio_smoke.rs::tools_list_serves_self_contained_schemas` + `mcp.rs::schema_inline_tests` pin it (the stdio test fails on the pre-fix tree, proved by stash) |
 | R1 | M3 — backend cache-feed bridge loss windows (reseed/subscribe gap, no retry on fetch error, tight resubscribe flap); needs periodic reseed or LSN reconcile | round-3 review | Accepted v1 residue |
 | R2 | M6-M15 minors: cursor tmp-collision/no-fsync; checksum preimage separators; per-server-restart duplicate replays (in-memory dedup); golden-regen doc flag; `/health/cluster` leader semantics; B8 hex-rederivation guard note; WAL replay must rebuild+sign | round-3 review | Accepted v1 residue — **superseded in part**: WAL-replay clause folds into W1, duplicate-replay clause into W7 |
 | W1 | Offline WAL is never drained — `mark_synced`/`mark_failed` have no non-test callers; buffered writes never reach the backend and are acked `sync_pending: true` | `docs/bug-prd-codebase-audit.md` | **Done** — `exocortex-client/src/drain.rs` (fresh signing, R13 classify, stable batch ids); wired in `main.rs`; `wal_roundtrip.rs::wal_drain_settles_pending_entries` |

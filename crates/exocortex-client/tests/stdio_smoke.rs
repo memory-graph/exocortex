@@ -447,6 +447,70 @@ fn mcp_tool_list_matches_registry() {
     assert!(!listed.iter().any(|t| t.contains("explain_edge")));
 }
 
+/// D28: harnesses may drop a tool schema's JSON-Schema `definitions` map
+/// while passing `$ref`s through unresolved — the Crush dogfood then
+/// guessed draft fields and the server rejected the calls (`missing
+/// field memory_type`, `missing field content`). Every listed schema
+/// must be self-contained: no `$ref`, no `definitions`, and the
+/// end_session draft fields visible inline.
+#[test]
+fn tools_list_serves_self_contained_schemas() {
+    let dir = tempdir();
+    let mut client = Client::spawn_with(|cmd| {
+        cmd.args([
+            "--org",
+            "smoke",
+            "--user",
+            "tester",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ]);
+    });
+    client.send_all(&[
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "t", "version": "0" }
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
+        }),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+    ]);
+    let _init = client.read_line();
+    let tools = client.read_line();
+    let tools = tools["result"]["tools"].as_array().expect("tools array");
+    assert!(!tools.is_empty(), "tool catalogue is populated");
+    for tool in tools {
+        let schema = &tool["inputSchema"];
+        let rendered = schema.to_string();
+        assert!(
+            !rendered.contains("$ref"),
+            "{} schema must inline every ref: {rendered}",
+            tool["name"]
+        );
+        assert!(
+            !rendered.contains("definitions"),
+            "{} schema must not rely on a definitions map: {rendered}",
+            tool["name"]
+        );
+    }
+    let end_session = tools
+        .iter()
+        .find(|t| t["name"] == "exocortex.end_session")
+        .expect("end_session listed");
+    let draft = &end_session["inputSchema"]["properties"]["memories"]["items"]["properties"];
+    for field in ["draft_key", "memory_type", "title", "content", "visibility"] {
+        assert!(
+            draft[field].is_object(),
+            "draft field {field} visible inline: {draft}"
+        );
+    }
+}
+
 /// R6-B06/CL5: backend mode does not expose MCP at all until an authenticated
 /// graph reseed arrives. An unreachable backend must therefore leave stdout
 /// silent rather than serve either fabricated rows or an unhydrated empty
