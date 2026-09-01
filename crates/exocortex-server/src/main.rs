@@ -158,6 +158,13 @@ fn main() -> anyhow::Result<()> {
     // force-link the pack's inventory registration.
     require_linked_ontology_pack();
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
+    // PX1 regression (found by the 0.3.0 release validation): a pack
+    // crate nothing in the binary references has its inventory
+    // registration dropped by the linker, so the node silently loaded
+    // ONLY dev-v1 while every client loaded the composed set — the SSE
+    // fingerprint check then fail-closed every standalone/backend client
+    // at hydration. Every shipped pack needs a live reference here.
+    let _ = std::hint::black_box(exocortex_pack_mortgage_v1::pack_def().name.clone());
     let ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
     if args.verify_embedder {
         return verify_production_embedder();
@@ -861,6 +868,37 @@ fn data_home() -> anyhow::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    // §23 #25's anchor pins dev-v1; THIS pins the whole shipped set. The
+    // linker drops an unreferenced pack crate's inventory registration
+    // (the PX1 standalone regression), and only a test compiled into the
+    // binary's own target links exactly like the binary — so this is the
+    // one place a dropped pack is caught before release.
+    #[test]
+    fn the_binary_registers_every_shipped_pack() {
+        let loaded = exocortex_kernel::pack::load_registered_packs().unwrap();
+        let composed = exocortex_kernel::Ontology::from_packs(vec![
+            exocortex_pack_dev_v1::pack_def(),
+            exocortex_pack_mortgage_v1::pack_def(),
+        ])
+        .unwrap();
+        let names = |o: &exocortex_kernel::Ontology| {
+            o.packs
+                .iter()
+                .map(|p| p.name.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            names(&loaded),
+            names(&composed),
+            "the binary must register every shipped pack"
+        );
+        assert_eq!(
+            loaded.fingerprint, composed.fingerprint,
+            "the binary's fingerprint must equal the composed set's"
+        );
+    }
+
     use super::{
         backend_redis_url, ensure_source_policy_org, load_source_policy, resolve_cluster_secret,
         resolve_falkor_urls, resolve_transport, validate_redis_url, Args,

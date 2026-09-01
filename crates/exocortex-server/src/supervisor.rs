@@ -119,9 +119,19 @@ fn spawn_child(cfg: &SupervisorConfig) -> anyhow::Result<Child> {
     if let Some(token) = &cfg.auth_token {
         command.arg("--requirepass").arg(token);
     }
+    // The supervised store's own log lands beside its data dir: startup
+    // failures on remote runners were previously invisible (null stdio)
+    // and could only be guessed at from the supervisor's exit side.
+    let stderr_sink = cfg.data_dir.join("supervised-redis.stderr.log").clone();
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_sink)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
     command
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .map_err(Into::into)
 }

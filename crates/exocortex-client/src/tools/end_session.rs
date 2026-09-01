@@ -343,6 +343,10 @@ impl EndSessionTool {
         };
         exocortex_wire::signing::sign_registration(&self.hmac_key, &mut registration);
         let mut reg_req = tonic::Request::new(registration);
+        // R-R3 discipline (bug-prd-standalone-submit-hang): a lost or
+        // wedged gRPC exchange must surface as DeadlineExceeded, never a
+        // silently dropped tool response.
+        reg_req.set_timeout(std::time::Duration::from_secs(20));
         if let Some(token) = &self.auth_token {
             if let Ok(v) = format!("Bearer {token}").parse() {
                 reg_req.metadata_mut().insert("authorization", v);
@@ -353,6 +357,7 @@ impl EndSessionTool {
         }
 
         let mut submit_req = tonic::Request::new(batch);
+        submit_req.set_timeout(std::time::Duration::from_secs(30));
         if let Some(token) = &self.auth_token {
             if let Ok(v) = format!("Bearer {token}").parse() {
                 submit_req.metadata_mut().insert("authorization", v);

@@ -53,7 +53,11 @@ first=$(
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"exocortex.search_memories","arguments":{"query":"standalone live durable marker","limit":10}}}
 EOF
 )
-printf '%s\n' "$first" | grep -F 'standalone live durable marker' >/dev/null
+if ! printf '%s\n' "$first" | grep -F 'standalone live durable marker' >/dev/null; then
+  echo "FAILED: first session did not round-trip the durable marker (write, SSE-fed read, or the submit hang — see docs/bug-prd-standalone-submit-hang.md)" >&2
+  printf '%s\n' "$first" | tail -3 >&2
+  exit 1
+fi
 
 second=$(
   invoke <<'EOF'
@@ -62,5 +66,9 @@ second=$(
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exocortex.search_memories","arguments":{"query":"standalone live durable marker","limit":10}}}
 EOF
 )
-printf '%s\n' "$second" | grep -F 'standalone live durable marker' >/dev/null
+if ! printf '%s\n' "$second" | grep -F 'standalone live durable marker' >/dev/null; then
+  echo "FAILED: restart did not durably serve the marker" >&2
+  printf '%s\n' "$second" | tail -3 >&2
+  exit 1
+fi
 echo "standalone live persistence validation passed"
