@@ -134,7 +134,10 @@ is pinned 1.85.0. Live-backend suites (`--features integration` with
 
 - Commit messages: `area: what and why` (one line under 72 chars);
   explain the *why* in the body when non-obvious.
-- One PR-sized change per commit; never amend merged history.
+- Commit incrementally — land each finished unit (change + its test +
+  its plan closure) as its own commit while work proceeds, instead of
+  banking one large diff to commit at the end. One PR-sized change per
+  commit; never amend merged history.
 - **Agents may push and release autonomously** (standing authorization;
   the owner opts into fully autonomous development). Preconditions, in
   order: the full gate matrix green on the exact tree being pushed
