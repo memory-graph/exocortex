@@ -1,5 +1,22 @@
 # Exocortex — Master Plan
 
+**Status (2026-08-31, night — 0.3.0 released to crates.io; binaries held
+on D27):** The workspace shipped 0.3.0 (additive adapter-contract wave;
+fingerprint unchanged) and AGENTS.md now carries the standing
+agent-push-and-release authorization with its preconditions. All 15
+crates are on crates.io — after fixing a latent ORDER bug in
+`scripts/publish.sh` (`exocortex-dreams` must precede `exocortex-ingest`;
+0.2.x never hit it because only `exocortex-client` was ever published)
+and hardening the publish fixture (teardown race + stale embedded
+order/name lists). The GitHub binary release is HELD: the Release
+workflow's packaged-standalone validation — the first real run of that
+leg since 0.2.2, dark locally all along via the exit-77 no-runtime skip —
+caught the dropped-pack registration (FIXED: the node loaded only
+dev-v1; mortgage's inventory registration was linker-dropped; SSE
+fingerprint equality then fail-closed every hydration) and then exposed
+**D27**, the intermittent standalone submit hang. D27 is the open item;
+when it closes, re-tag and the release ships.
+
 **Status (2026-08-31, later — Wave 3 locally-unblocked set shipped):** On top
 of D21's closure, three Wave 3 items landed as their own green changes
 (all of this session's work is commit `b10e2a7`, gate-verified):
@@ -483,15 +500,16 @@ idea:
 
 ## In progress
 
-Nothing is in progress. Wave 1 is complete and Wave 2 has shipped the
-whole of D21 (a+d, then b/c/e), D18, and D13; the next accepted work is
-**D19/D1/PX4/D17** — D19 needs SaaS credentials, D1 needs the
-arrow/parquet dependency decision (record the reason in PUBLISHING, then
-build), PX4 needs the `loanlight-engineering/docs` checkout, and D17 is
-sequenced behind D13 proving the deterministic join carries the value. The table below is the closed Round 6 detail ledger (every
-row Done or Verified safe, evidence inline; the summary rows live in
-the Done section). A new item enters here only when work actually
-starts.
+**D27 is in progress** (the standalone submit hang; Backlog row below
+with its evidence) and it gates the v0.3.0 GitHub release. Behind it,
+the next accepted work is **D19/D1/PX4/D17** — D19 needs SaaS
+credentials, D1 needs the arrow/parquet dependency decision (record the
+reason in PUBLISHING, then build), PX4 needs the
+`loanlight-engineering/docs` checkout, and D17 is sequenced behind D13
+proving the deterministic join carries the value. The table below is the
+closed Round 6 detail ledger (every row Done or Verified safe, evidence
+inline; the summary rows live in the Done section). A new item enters
+here only when work actually starts.
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
