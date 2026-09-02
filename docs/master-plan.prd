@@ -1,5 +1,41 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-02, latest — D1 iceberg flavor shipped):** The
+iceberg milestone of D1 landed as `crates/exocortex-adapter-iceberg`:
+a local Iceberg table's CURRENT snapshot as a bounded declared-
+projection import under the `iceberg` TABLE flavor, reading the format
+directly — `metadata.json`, Avro manifest lists/manifests, Parquet
+data files — with no catalog client and no engine. The direct reader
+is a recorded decision (PUBLISHING.md): the official `iceberg` crate
+stays deny-banned BY CHOICE (catalog/REST surface + a second arrow
+line in a leaf binary), and apache-avro alone cannot read real v2
+manifests anyway — Iceberg v2 keys partition struct fields by
+field-id strings ("1000"), which Avro's name grammar forbids
+(apache-avro: "Invalid field name 1000", reproduced in the suite), so
+the adapter frames the object container itself (order-preserving
+schema sanitization, positional decode, null+deflate codecs with the
+zlib/raw container ambiguity handled both ways). Partition discipline:
+identity-partitioned columns resolve from the MANIFEST partition
+values when the writer omitted them from data files; non-identity
+transforms (bucket/truncate/month) are derived values and are refused
+for mapped columns, fail-closed naming the transform. Snapshot
+identity is Iceberg's own `current-snapshot-id` (rewind refusal proven
+in-suite). The declared-projection mapping core moved to
+`exocortex-adapter-table` (one implementation for parquet-dir/iceberg/
+delta — the R6-R286/287 no-divergence discipline), and the
+adapter-contract gate claims the iceberg crate (15 obligations).
+Dependency record per rule 9: apache-avro exact `=0.21.0` (rust-version
+1.85.0, the workspace floor), flate2 (already in-tree) declared
+directly, bon held to 3.9.3 in Cargo.lock (3.10 needs rustc 1.88).
+Hermetic suite `crates/exocortex-adapter-iceberg/tests/iceberg_table.rs`
+(10 tests): hand-framed v2 manifests (the digit-leading-key byte shape
+real tables carry), genuine apache-avro-written v1 manifests (one
+deflate-coded), overlay/absent-column, deleted entries, delete-file
+refusal, empty table, remote-scheme fail-closed, mock end-to-end under
+the TABLE flavor, new-snapshot + rewind. D1 remainder: the Delta
+flavor, its own milestone with its own dependency record. Wave 2
+remainder: D1(Delta)/D17; D19 parked on credentials.
+
 **Status (2026-09-02, even later — D1 opened; the first table-flavored
 producer is real):** The arrow/parquet table-reader decision is
 recorded in PUBLISHING.md per rule 9 (apache-arrow-rs exact-pinned to
@@ -658,7 +694,7 @@ here only when work actually starts.
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
-| D1 | Table adapters, parquet-dir flavor first: `crates/exocortex-adapter-parquet` (leaf crate, arrow-rs exact pins, flavor `parquet-dir` so the server enforces projection + drift + rewind), plus the shared canonical schema-hash helper in `exocortex-wire` and mock B8/B9 width enforcement in the adapter SDK (which caught and fixed a real git-adapter defect: a 16-byte snapshot schema_hash every live backend would reject) | Crush | parquet-dir shipped (13 tests: lib 6 + hermetic parquet fixture suite 7 — scan determinism, missing-column fail-fast, null-pk skip, table-flavor registration with the declared projection, canonical 32-byte hash, idempotent batch-id replay, changed-dir new snapshot, reverted-dir rewind refused); deny.toml gains CC0-1.0 (tiny-keccak via ahash via arrow, same permissive-precedent style); Iceberg/Delta flavors remain — each its own milestone with its own dependency record |
+| D1 | Table adapters, parquet-dir flavor first: `crates/exocortex-adapter-parquet` (leaf crate, arrow-rs exact pins, flavor `parquet-dir` so the server enforces projection + drift + rewind), plus the shared canonical schema-hash helper in `exocortex-wire` and mock B8/B9 width enforcement in the adapter SDK (which caught and fixed a real git-adapter defect: a 16-byte snapshot schema_hash every live backend would reject) | Crush | parquet-dir shipped (13 tests: lib 6 + hermetic parquet fixture suite 7 — scan determinism, missing-column fail-fast, null-pk skip, table-flavor registration with the declared projection, canonical 32-byte hash, idempotent batch-id replay, changed-dir new snapshot, reverted-dir rewind refused); **iceberg flavor shipped** (`crates/exocortex-adapter-iceberg`, 10-test suite — see the status header; the direct-format reader decision + apache-avro `=0.21.0`/flate2 records in PUBLISHING.md; the shared mapping core extracted to `exocortex-adapter-table`, claimed by the adapter-contract gate alongside the flavor crates); Delta flavor remains — its own milestone with its own dependency record |
 | R6-B30-14 | PRD §23 #14: stamp every stored embedding with its model/version, not only the MCR² aggregate | Codex | Done — vectors are inseparable from model name/version; ingest stamps each row and MCR² rejects mixed revisions while stamping the common input revision |
 | R6-B30-25 | PRD §23 #25: executable kernel-name absence and omit-dev-pack link failure | Codex | Done — production entrypoint requires the pack-owned link anchor; kernel purity builds packless and linked fixtures and verifies the former fails on the unresolved anchor |
 | R6-A1 | Advisory test quality and cleanup (A01-A08) | Codex | Done — every advisory has executable or focused-cleanup evidence below |

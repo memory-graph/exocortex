@@ -27,93 +27,19 @@
 //! declared projection, every batch's snapshot schema hash must equal
 //! the canonical wire digest over the declared column set, and a
 //! directory state the source already superseded is a rewind.
+//!
+//! The mapping core itself (mapping shape, row-to-draft transcription,
+//! the D21-a projection shape) lives in `exocortex-adapter-table` and
+//! is shared with the `iceberg` and `delta` flavor adapters — one
+//! implementation, three readers.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use arrow_cast::display::array_value_to_string;
-use exocortex_adapter_sdk::{
-    BatchUnit, Projection, ProjectionBounds, ProjectionField, SourceColumn,
-};
-use exocortex_wire::ingest::v1::{
-    ExternalKey, ExternalSnapshotInfo, MemoryDraft, RelationshipDraft,
-};
+use exocortex_adapter_sdk::Projection;
+pub use exocortex_adapter_table::{map_rows as map_rows_shared, table_uuid_for, with_snapshot_id};
+pub use exocortex_adapter_table::{Mapping, Row, PK_SEPARATOR};
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
-
-/// The unit separator joining multi-column logical pks (a value
-/// containing it would blur the pk boundary; the git adapter's log
-/// format uses the same discipline).
-pub const PK_SEPARATOR: &str = "\u{1f}";
-
-/// The operator's declared column mapping — what the adapter is
-/// entitled to bring in and how it becomes ontology. Authored as JSON
-/// next to the invocation; versioned by `mapping_version`.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct Mapping {
-    /// Ontology memory-type name for every row (server-validated).
-    pub memory_type: String,
-    /// Column carrying the row title.
-    pub title_column: String,
-    /// Columns rendered into content, in declared order, as
-    /// `column: value` lines.
-    pub content_columns: Vec<String>,
-    /// The primary-key columns (joined, order as declared).
-    pub pk_columns: Vec<String>,
-    /// Optional column of comma-separated tags.
-    pub tags_column: Option<String>,
-    /// Optional self-referencing foreign-key column; its value names
-    /// the parent row's logical pk (same pk columns).
-    pub parent_column: Option<String>,
-    /// Relationship kind for `parent_column` edges (required with it).
-    pub parent_kind: Option<String>,
-    /// Bumped on every deliberate mapping change.
-    pub mapping_version: u32,
-}
-
-impl Mapping {
-    /// Load from a JSON file.
-    pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading mapping {}", path.display()))?;
-        serde_json::from_str(&text).with_context(|| format!("parsing mapping {}", path.display()))
-    }
-
-    fn validate_shape(&self) -> Result<()> {
-        if self.memory_type.trim().is_empty() {
-            bail!("mapping.memory_type is empty");
-        }
-        if self.title_column.trim().is_empty() {
-            bail!("mapping.title_column is empty");
-        }
-        if self.pk_columns.is_empty() {
-            bail!("mapping.pk_columns is empty — rows need identity");
-        }
-        match (&self.parent_column, &self.parent_kind) {
-            (Some(_), None) => bail!("mapping.parent_column requires mapping.parent_kind"),
-            (None, Some(_)) => bail!("mapping.parent_kind requires mapping.parent_column"),
-            _ => {}
-        }
-        if self.mapping_version == 0 {
-            bail!("mapping.mapping_version starts at 1");
-        }
-        Ok(())
-    }
-
-    /// Every column the mapping references, in declared order.
-    pub fn referenced_columns(&self) -> Vec<&str> {
-        let mut cols: Vec<&str> = vec![self.title_column.as_str()];
-        cols.extend(self.content_columns.iter().map(String::as_str));
-        cols.extend(self.pk_columns.iter().map(String::as_str));
-        if let Some(tags) = &self.tags_column {
-            cols.push(tags.as_str());
-        }
-        if let Some(parent) = &self.parent_column {
-            cols.push(parent.as_str());
-        }
-        cols
-    }
-}
 
 /// One directory scan: the sorted file set, its content digest (the
 /// synthetic snapshot id), and the observed schema every file must
@@ -133,7 +59,7 @@ pub struct DirectoryScan {
 /// whose schemas disagree fail the scan naming both files — never a
 /// merged guess.
 pub fn scan_directory(dir: &Path) -> Result<DirectoryScan> {
-    let mut names: Vec<PathBuf> = Vec::new();
+    let mut names: Vec<std::path::PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("scanning {}", dir.display()))? {
         let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
@@ -205,28 +131,12 @@ fn file_columns(path: &Path) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
-/// One row, fully resolved to strings: exactly what the mapping
-/// selects, nothing deduced.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Row {
-    /// Joined logical pk (`PK_SEPARATOR`).
-    pub pk: String,
-    /// Title (the mapped title column).
-    pub title: String,
-    /// Content lines, one per mapped content column, in order.
-    pub content: Vec<(String, String)>,
-    /// Tags (the mapped tags column, comma-split), if any.
-    pub tags: Vec<String>,
-    /// Parent logical pk (the mapped parent column), if declared.
-    pub parent: Option<String>,
-}
-
 /// Read every row the mapping selects from the scanned files, in
 /// sorted file order then row order. Null pk cells skip the row
 /// (counted, never guessed — a row without identity cannot join).
 pub fn read_rows(dir: &Path, mapping: &Mapping) -> Result<(Vec<Row>, usize)> {
     mapping.validate_shape()?;
-    let mut names: Vec<PathBuf> = Vec::new();
+    let mut names: Vec<std::path::PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("scanning {}", dir.display()))? {
         let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
@@ -237,6 +147,7 @@ pub fn read_rows(dir: &Path, mapping: &Mapping) -> Result<(Vec<Row>, usize)> {
 
     let mut rows = Vec::new();
     let mut skipped = 0usize;
+    let overlay = std::collections::BTreeMap::new();
     for path in &names {
         let file =
             std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -247,99 +158,16 @@ pub fn read_rows(dir: &Path, mapping: &Mapping) -> Result<(Vec<Row>, usize)> {
             .context("building parquet reader")?;
         for batch in reader {
             let batch = batch.context("reading record batch")?;
-            let schema = batch.schema();
-            let index_of = |name: &str| -> Option<usize> { schema.index_of(name).ok() };
-            for mapped in mapping.referenced_columns() {
-                if index_of(mapped).is_none() {
-                    bail!(
-                        "mapped column `{mapped}` is absent from {} (observed: {})",
-                        path.display(),
-                        schema
-                            .fields()
-                            .iter()
-                            .map(|f| f.name().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                }
-            }
-            let title_ix = index_of(&mapping.title_column).expect("checked above");
-            let content_ix: Vec<usize> = mapping
-                .content_columns
-                .iter()
-                .map(|c| index_of(c).expect("checked above"))
-                .collect();
-            let pk_ix: Vec<usize> = mapping
-                .pk_columns
-                .iter()
-                .map(|c| index_of(c).expect("checked above"))
-                .collect();
-            let tags_ix = mapping.tags_column.as_deref().and_then(index_of);
-            let parent_ix = mapping.parent_column.as_deref().and_then(index_of);
-
-            for row_index in 0..batch.num_rows() {
-                let cell = |ix: usize| -> Option<String> {
-                    let column = batch.column(ix);
-                    if column.is_null(row_index) {
-                        return None;
-                    }
-                    array_value_to_string(column.as_ref(), row_index).ok()
-                };
-                let pk_parts: Vec<Option<String>> = pk_ix.iter().map(|ix| cell(*ix)).collect();
-                if pk_parts
-                    .iter()
-                    .any(|p| p.as_deref().unwrap_or("").is_empty())
-                {
-                    skipped += 1;
-                    continue;
-                }
-                let pk = pk_parts
-                    .iter()
-                    .map(|p| p.as_deref().unwrap_or(""))
-                    .collect::<Vec<_>>()
-                    .join(PK_SEPARATOR);
-                let title = cell(title_ix).unwrap_or_default();
-                let content: Vec<(String, String)> = mapping
-                    .content_columns
-                    .iter()
-                    .zip(content_ix.iter())
-                    .map(|(name, ix)| (name.clone(), cell(*ix).unwrap_or_default()))
-                    .collect();
-                let tags = tags_ix
-                    .and_then(cell)
-                    .map(|raw| {
-                        raw.split(',')
-                            .map(str::trim)
-                            .filter(|t| !t.is_empty())
-                            .map(str::to_ascii_lowercase)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let parent = parent_ix.and_then(cell).filter(|p| !p.is_empty());
-                rows.push(Row {
-                    pk,
-                    title,
-                    content,
-                    tags,
-                    parent,
-                });
-            }
+            rows.extend(exocortex_adapter_table::read_batch_rows(
+                &batch,
+                &path.display().to_string(),
+                mapping,
+                &mut skipped,
+                &overlay,
+            )?);
         }
     }
     Ok((rows, skipped))
-}
-
-/// Derive the 16-byte table uuid for a pinned table id (the operator
-/// scopes row identity by pinning the same id across runs).
-pub fn table_uuid_for(table_id: &str) -> [u8; 16] {
-    let digest = blake3::hash(table_id.as_bytes());
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest.as_bytes()[..16]);
-    out
-}
-
-fn truncate_200(s: &str) -> String {
-    s.chars().take(200).collect()
 }
 
 /// The declared column set: the mapped columns in declared order,
@@ -349,7 +177,7 @@ fn truncate_200(s: &str) -> String {
 /// participate (D21-d: an unmapped addition is accepted; a mapped
 /// removal/retype/rename moves the hash and fails closed).
 pub fn declared_columns(mapping: &Mapping, scan: &DirectoryScan) -> Vec<(String, String)> {
-    let observed: BTreeMap<&str, &str> = scan
+    let observed: std::collections::BTreeMap<&str, &str> = scan
         .columns
         .iter()
         .map(|(n, t)| (n.as_str(), t.as_str()))
@@ -370,7 +198,7 @@ pub fn declared_columns(mapping: &Mapping, scan: &DirectoryScan) -> Vec<(String,
 /// observe — locally, before any wire traffic (PX4's discipline).
 pub fn validate_mapping(mapping: &Mapping, scan: &DirectoryScan) -> Result<()> {
     mapping.validate_shape()?;
-    let observed: BTreeMap<&str, &str> = scan
+    let observed: std::collections::BTreeMap<&str, &str> = scan
         .columns
         .iter()
         .map(|(n, t)| (n.as_str(), t.as_str()))
@@ -390,94 +218,24 @@ pub fn validate_mapping(mapping: &Mapping, scan: &DirectoryScan) -> Result<()> {
     Ok(())
 }
 
-/// Map one window of rows to a submission unit: one memory per row,
-/// plus parent edges whose endpoints both fall inside THIS window
-/// (cross-window parent links are counted and skipped — the SDK
-/// rejects dangling references, and silently splitting them would be a
-/// lie about the source).
+/// Map one window of rows to a submission unit (see
+/// `exocortex_adapter_table::map_rows`; the `parquet` flavor tag rides
+/// every memory and the snapshot).
 pub fn map_rows(
     mapping: &Mapping,
     table_uuid: &[u8; 16],
     declared: &[(String, String)],
     rows: &[Row],
     batch_id_seed: &str,
-) -> (BatchUnit, usize) {
-    let mut pk_key: BTreeMap<&str, String> = BTreeMap::new();
-    for (index, row) in rows.iter().enumerate() {
-        pk_key.insert(row.pk.as_str(), format!("row-{index}"));
-    }
-    let mut memories = Vec::with_capacity(rows.len());
-    let mut relationships = Vec::new();
-    let mut skipped_parents = 0usize;
-
-    for (index, row) in rows.iter().enumerate() {
-        let draft_key = format!("row-{index}");
-        let mut content = String::new();
-        for (column, value) in &row.content {
-            content.push_str(&format!("{column}: {value}\n"));
-        }
-        let mut tags = vec!["parquet".to_string()];
-        tags.extend(row.tags.iter().cloned());
-        memories.push(MemoryDraft {
-            draft_key: draft_key.clone(),
-            id: String::new(),
-            memory_type: mapping.memory_type.clone(),
-            title: truncate_200(if row.title.trim().is_empty() {
-                &row.pk
-            } else {
-                &row.title
-            }),
-            content,
-            tags,
-            visibility: 3,
-            valid_from: None,
-            valid_until: None,
-            external_key: Some(ExternalKey {
-                table_uuid: table_uuid.to_vec(),
-                logical_pk: row.pk.clone(),
-                mapping_version: mapping.mapping_version,
-            }),
-        });
-        if let Some(parent_pk) = &row.parent {
-            match pk_key.get(parent_pk.as_str()) {
-                Some(parent_key) => relationships.push(RelationshipDraft {
-                    from_draft_key: draft_key.clone(),
-                    to_draft_key: parent_key.clone(),
-                    kind: mapping.parent_kind.clone().unwrap_or_default(),
-                    strength: 0.0,
-                    confidence: 0.9,
-                    context: format!(
-                        "parent via {}={parent_pk}",
-                        mapping.parent_column.as_deref().unwrap_or_default()
-                    ),
-                    visibility: 3,
-                    to_memory_id: String::new(),
-                }),
-                None => skipped_parents += 1,
-            }
-        }
-    }
-
-    let unit = BatchUnit {
-        batch_id_seed: batch_id_seed.into(),
-        memories,
-        relationships,
-        snapshot: Some(ExternalSnapshotInfo {
-            snapshot_id: String::new(),
-            schema_hash: exocortex_wire::projection::schema_hash(declared).to_vec(),
-            source_flavor: "parquet-dir".into(),
-        }),
-        observed_at: std::time::UNIX_EPOCH,
-    };
-    (unit, skipped_parents)
-}
-
-/// Fill a unit's snapshot id (the directory scan's file-set hash).
-pub fn with_snapshot_id(mut unit: BatchUnit, snapshot_id: &str) -> BatchUnit {
-    if let Some(snapshot) = &mut unit.snapshot {
-        snapshot.snapshot_id = snapshot_id.to_string();
-    }
-    unit
+) -> (exocortex_adapter_sdk::BatchUnit, usize) {
+    map_rows_shared(
+        mapping,
+        table_uuid,
+        declared,
+        rows,
+        batch_id_seed,
+        "parquet",
+    )
 }
 
 /// The D21-a projection this adapter declares: the selector names the
@@ -492,36 +250,16 @@ pub fn projection(
     scan: &DirectoryScan,
     max_window: u64,
 ) -> Projection {
-    let mut fields = Vec::new();
-    for column in mapping.referenced_columns() {
-        fields.push(ProjectionField {
-            source_field: column.to_string(),
-            memory_type: mapping.memory_type.clone(),
-            kind: if Some(column) == mapping.parent_column.as_deref() {
-                mapping.parent_kind.clone().unwrap_or_default()
-            } else {
-                String::new()
-            },
-        });
-    }
-    Projection {
-        selector: format!(
+    exocortex_adapter_table::table_projection(
+        format!(
             "parquet-dir {dir}/*.parquet under the declared column mapping v{}",
             mapping.mapping_version
         ),
-        fields,
-        source_schema: declared_columns(mapping, scan)
-            .into_iter()
-            .map(|(name, data_type)| SourceColumn { name, data_type })
-            .collect(),
-        mapping_version: mapping.mapping_version,
-        bounds: ProjectionBounds {
-            max_rows_per_window: max_window,
-            max_rows_per_run: max_window.saturating_mul(100),
-            max_graph_share_percent: 50,
-        },
-        last_snapshot_id: scan.file_set_hash.clone(),
-    }
+        mapping,
+        declared_columns(mapping, scan),
+        max_window,
+        &scan.file_set_hash,
+    )
 }
 
 #[cfg(test)]
@@ -542,16 +280,6 @@ mod tests {
             }"#,
         )
         .unwrap()
-    }
-
-    #[test]
-    fn mapping_shape_is_validated() {
-        assert!(mapping().validate_shape().is_ok());
-        let bad = serde_json::from_str::<Mapping>(
-            r#"{"memory_type":"Problem","title_column":"t","content_columns":["c"],"pk_columns":["id"],"parent_column":"p","mapping_version":1}"#,
-        )
-        .unwrap();
-        assert!(bad.validate_shape().is_err(), "parent without kind");
     }
 
     fn scan_of(names: &[(&str, &str)]) -> DirectoryScan {
@@ -620,60 +348,6 @@ mod tests {
             exocortex_wire::projection::schema_hash(&declared).to_vec(),
             "the batch hash and the registration-derived hash are one value"
         );
-    }
-
-    #[test]
-    fn rows_map_deterministically_with_stable_identities() {
-        let declared = vec![("title".to_string(), "Utf8".to_string())];
-        let rows = vec![
-            Row {
-                pk: "r-1".into(),
-                title: "first".into(),
-                content: vec![("detail".into(), "d1".into())],
-                tags: vec!["alpha".into()],
-                parent: None,
-            },
-            Row {
-                pk: "r-2".into(),
-                title: "second".into(),
-                content: vec![("detail".into(), "d2".into())],
-                tags: vec![],
-                parent: Some("r-1".into()),
-            },
-        ];
-        let table = table_uuid_for("table-id");
-        let (unit, skipped) = map_rows(&mapping(), &table, &declared, &rows, "w-0");
-        assert_eq!(skipped, 0);
-        assert_eq!(unit.memories.len(), 2);
-        assert_eq!(unit.relationships.len(), 1);
-        assert_eq!(unit.relationships[0].kind, "Causes");
-        assert_eq!(
-            unit.memories[0].external_key.as_ref().unwrap().logical_pk,
-            "r-1"
-        );
-        assert!(unit.memories[0].tags.contains(&"parquet".to_string()));
-        let (again, _) = map_rows(&mapping(), &table, &declared, &rows, "w-0");
-        assert_eq!(unit.memories.len(), again.memories.len());
-        assert_eq!(unit.relationships.len(), again.relationships.len());
-        // A parent outside the window is skipped and counted, never
-        // dangled.
-        let lone = vec![rows[1].clone()];
-        let (unit, skipped) = map_rows(&mapping(), &table, &declared, &lone, "w-0");
-        assert_eq!(unit.relationships.len(), 0);
-        assert_eq!(skipped, 1);
-    }
-
-    #[test]
-    fn empty_title_falls_back_to_the_pk() {
-        let declared = vec![];
-        let rows = vec![Row {
-            pk: "r-9".into(),
-            title: "  ".into(),
-            content: vec![],
-            tags: vec![],
-            parent: None,
-        }];
-        let (unit, _) = map_rows(&mapping(), &table_uuid_for("t"), &declared, &rows, "w-0");
-        assert_eq!(unit.memories[0].title, "r-9");
+        assert_eq!(unit.snapshot.as_ref().unwrap().source_flavor, "parquet");
     }
 }

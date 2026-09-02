@@ -9,6 +9,8 @@ members = [
     "crates/exocortex-adapter-sdk",
     "crates/exocortex-adapter-git",
     "crates/exocortex-adapter-parquet",
+    "crates/exocortex-adapter-table",
+    "crates/exocortex-adapter-iceberg",
     "crates/exocortex-storage",
     "crates/exocortex-cache",
     "crates/exocortex-reasoning",
@@ -106,6 +108,15 @@ arrow-array  = "=59.3.0"
 arrow-cast   = "=59.3.0"
 arrow-schema = "=59.3.0"
 parquet      = "=59.3.0"
+# Iceberg manifests are Avro object container files (D1 iceberg flavor).
+# apache-avro 0.21 declares rust-version 1.85.0 — exactly the workspace
+# floor (the same discipline as the arrow 59 exact pin); leaf-crate use
+# only (the iceberg adapter), never kernel or SDK.
+apache-avro  = "=0.21.0"
+# Avro deflate codec blocks in the Iceberg manifest reader (already in
+# the tree via apache-avro; declared directly because the adapter crate
+# inflates manifest blocks itself — see crates/exocortex-adapter-iceberg).
+flate2       = "1"
 
 # --- time / rand ---
 chrono      = { version = "0.4", features = ["serde"] }
@@ -140,6 +151,8 @@ exocortex-wire = { path = "crates/exocortex-wire", version = "0.3.0" }
 exocortex-adapter-sdk = { path = "crates/exocortex-adapter-sdk", version = "0.3.0" }
 exocortex-adapter-git = { path = "crates/exocortex-adapter-git", version = "0.3.0" }
 exocortex-adapter-parquet = { path = "crates/exocortex-adapter-parquet", version = "0.3.0" }
+exocortex-adapter-table = { path = "crates/exocortex-adapter-table", version = "0.3.0" }
+exocortex-adapter-iceberg = { path = "crates/exocortex-adapter-iceberg", version = "0.3.0" }
 exocortex-storage = { path = "crates/exocortex-storage", version = "0.3.0" }
 exocortex-cache = { path = "crates/exocortex-cache", version = "0.3.0" }
 exocortex-reasoning = { path = "crates/exocortex-reasoning", version = "0.3.0" }

@@ -2228,6 +2228,13 @@ pub(crate) const ADAPTER_CONTRACT: &[(&str, &str, &str, &str)] = &[
         "src/lib.rs",
         "fn projection(",
     ),
+    // (a) D1 iceberg flavor: same contract, its own reader.
+    (
+        "projection-declared",
+        "exocortex-adapter-iceberg",
+        "src/lib.rs",
+        "fn projection(",
+    ),
     // (a) Bounds stop the window before the wire (SDK-side, A2).
     (
         "bounds-enforced",
@@ -2332,8 +2339,12 @@ pub(crate) fn adapter_contract_violations(root: &Path) -> Result<Vec<String>> {
         }
     }
     // The bijection direction: an adapter crate nobody claimed is a
-    // contract gap. (exocortex-adapter-sdk is the contract itself, not an
-    // adapter; every ADAPTER crate must declare a projection.)
+    // contract gap. (`exocortex-adapter-sdk` is the contract itself,
+    // not an adapter; `exocortex-adapter-table` is the shared
+    // mapping library the flavor adapters link — it reads no source
+    // and owns no flavor, so it carries no projection row. Every
+    // ADAPTER crate — one that registers a source — must declare a
+    // projection.)
     if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
         for entry in entries {
             let name = entry?.file_name();
@@ -2341,7 +2352,7 @@ pub(crate) fn adapter_contract_violations(root: &Path) -> Result<Vec<String>> {
                 continue;
             };
             if let Some(adapter) = name.strip_prefix("exocortex-adapter-") {
-                if adapter == "sdk" {
+                if adapter == "sdk" || adapter == "table" {
                     continue;
                 }
                 if !claimed.contains(name) {

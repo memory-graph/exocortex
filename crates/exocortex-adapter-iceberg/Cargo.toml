@@ -1,13 +1,13 @@
 [package]
-name    = "exocortex-adapter-parquet"
+name    = "exocortex-adapter-iceberg"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Parquet-directory adapter (D1): a directory of Parquet files as a bounded, declared-projection import through the signed Ingestion Protocol. No network beyond the backend, no LLM — schema-faithful transcription only."
+description = "Iceberg-table adapter (D1, iceberg flavor): a local Iceberg table's current snapshot as a bounded, declared-projection import through the signed Ingestion Protocol. Reads the Iceberg format directly (metadata.json + Avro manifests + Parquet data) — no catalog, no engine, no LLM, no network beyond the backend."
 
 [[bin]]
-name = "exocortex-adapter-parquet"
+name = "exocortex-adapter-iceberg"
 path = "src/main.rs"
 
 [dependencies]
@@ -16,7 +16,6 @@ exocortex-adapter-table = { workspace = true }
 exocortex-wire = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -25,6 +24,8 @@ arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-schema = { workspace = true }
 parquet = { workspace = true }
+apache-avro = { workspace = true }
+flate2 = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]

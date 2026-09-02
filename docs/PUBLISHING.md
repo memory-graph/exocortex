@@ -93,6 +93,28 @@ workspace license/repository metadata applies).
   adapter, never in the kernel (R-I4/CR-26) or the SDK; it is a
   workspace member but not an entry of `scripts/publish.sh` ORDER
   (adapter crates are not crates.io release items).
+- **D1 iceberg-flavor dependency record (2026-09-02, before the
+  dependency landed):** the iceberg adapter reads the format DIRECTLY
+  — `metadata.json` via serde_json, manifests via `apache-avro`
+  exact-pinned to 0.21.0 (rust-version 1.85.0, exactly the workspace
+  floor; the same exact-pin discipline as the arrow 59 line), data
+  files via the existing pinned parquet stack, and Avro deflate blocks
+  via `flate2` (already in the tree; declared directly because the
+  adapter inflates manifest blocks itself). The official `iceberg`
+  crate stays deny.toml-banned BY CHOICE, not by omission: it drags a
+  catalog/REST client surface and a second arrow line into a leaf
+  binary that needs neither, and its manifest reader is unnecessary
+  beside a spec-faithful direct reader — apache-avro alone cannot read
+  real v2 manifests anyway (Iceberg v2 keys partition struct fields by
+  field-id strings like "1000", which Avro's name grammar forbids and
+  apache-avro's parser rejects; the adapter frames the object
+  container itself, sanitizing the embedded writer schema's names
+  order-preservingly, and decodes positionally). One recorded
+  transitive correction: `bon` 3.10.0 (via apache-avro-derive)
+  requires rustc 1.88 and is held to 3.9.3 (rust-version 1.59) in
+  Cargo.lock; darling 0.24.x falls away entirely at that pin. All of
+  it lives ONLY in `exocortex-adapter-iceberg` — leaf crate, never
+  kernel or SDK, not a `scripts/publish.sh` ORDER entry.
 - `exocortex-pack-mortgage-v1` is a workspace dependency of the server,
   client, xtask, and ops (dev) so its verbs ride the one operation
   registry in every linked binary (PX2 §4.3); it is the second pack and
