@@ -135,3 +135,37 @@ fn a_missing_corpus_id_is_a_hard_error() {
         "bad labelled sets must exit non-zero"
     );
 }
+
+#[test]
+fn classify_thresholds_are_pinnable_at_classification_time() {
+    let dir = fixture();
+    let out_path = dir.path().join("proposals-low-review.jsonl");
+    let output = binary()
+        .args([
+            "classify",
+            "--corpus",
+            dir.path().join("corpus.jsonl").to_str().unwrap(),
+            "--labelled",
+            dir.path().join("labelled.jsonl").to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            // Pinning both thresholds proves the override: no score
+            // can reach the accept floor and every score clears the
+            // review floor, so every proposal lands in the review
+            // band the calibrated model would have split.
+            "--accept=1000",
+            "--review=-1000",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::fs::read_to_string(&out_path).unwrap();
+    assert!(
+        text.lines().filter(|l| l.contains("review")).count() > 0,
+        "the override surfaces review-band pairs: {text}"
+    );
+}

@@ -435,19 +435,26 @@ fn render_schema_columns(schema: &serde_json::Value) -> Result<Vec<(String, Stri
 /// the table root. Any OTHER scheme is a remote object store — outside
 /// this adapter's local-table boundary, stated fail-closed.
 fn resolve_path(table_dir: &Path, path: &str) -> Result<PathBuf> {
-    if let Some(rest) = path.strip_prefix("file://") {
-        return Ok(PathBuf::from(rest));
-    }
-    if path.contains("://") {
+    let (scheme_stripped, had_file_scheme) = match path.strip_prefix("file://") {
+        Some(rest) => (rest, true),
+        None => (path, false),
+    };
+    if scheme_stripped.contains("://") {
         bail!(
             "path {path} is a remote object-store URI — this reader's boundary is the local \
              filesystem (file:// or local paths); object stores are a deliberate non-goal of \
              the D1 iceberg milestone"
         );
     }
-    let candidate = PathBuf::from(path);
+    // R7-1: Iceberg manifests commonly URI-encode paths (percent-20 for a
+    // space); decode through the shared implementation so the catalog
+    // flavors cannot disagree.
+    let decoded = exocortex_adapter_table::percent_decode(scheme_stripped)?;
+    let candidate = PathBuf::from(&decoded);
     if candidate.is_absolute() {
         Ok(candidate)
+    } else if had_file_scheme {
+        bail!("file:// path {path} is not absolute — iceberg file URIs carry the full local path")
     } else {
         Ok(table_dir.join(candidate))
     }
@@ -710,6 +717,11 @@ mod avro_framing {
             Avro::Float(f) => serde_json::Value::from(*f),
             Avro::Double(d) => serde_json::Value::from(*d),
             Avro::String(s) => serde_json::Value::String(s.clone()),
+            // R7-2: from_avro_datum without a reader schema returns
+            // Union(index, inner) for union-typed fields — unwrap to
+            // the inner value; a Debug-string placeholder here would
+            // silently corrupt every future reader of a union field.
+            Avro::Union(_, inner) => avro_value_to_json(inner),
             Avro::Record(fields) => serde_json::Value::Array(
                 fields
                     .iter()
@@ -1036,4 +1048,92 @@ pub fn projection(mapping: &Mapping, scan: &IcebergScan, max_window: u64) -> Pro
         max_window,
         &scan.snapshot_id_string().unwrap_or_default(),
     )
+}
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+
+    /// R7-2: a union-typed field holding its NON-null branch decodes
+    /// to the inner value, never a Debug-string placeholder. Built by
+    /// hand (the same framing the v2 fixtures use) so the decoder is
+    /// exercised on real container bytes.
+    #[test]
+    fn union_fields_decode_to_their_inner_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = r#"{
+            "type": "record", "name": "entry", "fields": [
+                {"name": "snapshot_id", "type": ["null", "long"], "default": null},
+                {"name": "note", "type": "string"}
+            ]
+        }"#;
+        let mut out = vec![0x4f, 0x62, 0x6a, 0x01];
+        out.extend(avro_test_long(1));
+        out.extend(avro_test_str("avro.schema"));
+        out.extend(avro_test_bytes(schema.as_bytes()));
+        out.extend(avro_test_long(0));
+        let sync = [0x33u8; 16];
+        out.extend_from_slice(&sync);
+        let mut data = Vec::new();
+        // union branch 1 (long) with value 9001, then a string.
+        data.extend(avro_test_long(1));
+        data.extend(avro_test_long(9001));
+        data.extend(avro_test_str("present"));
+        out.extend(avro_test_long(1));
+        out.extend(avro_test_long(data.len() as i64));
+        out.extend_from_slice(&data);
+        out.extend_from_slice(&sync);
+        let path = dir.path().join("u.avro");
+        std::fs::write(&path, out).unwrap();
+        let container = avro_framing::read_container(&path).unwrap();
+        assert_eq!(container.records.len(), 1);
+        let snapshot = record_field(&container.records[0], "snapshot_id").unwrap();
+        assert!(
+            snapshot.as_i64().is_some_and(|v| v == 9001),
+            "the union unwraps to its long, not a placeholder: {snapshot:?}"
+        );
+        assert_eq!(
+            record_field(&container.records[0], "note")
+                .unwrap()
+                .as_str(),
+            Some("present")
+        );
+    }
+
+    fn avro_test_long(mut n: i64) -> Vec<u8> {
+        n = (n << 1) ^ (n >> 63);
+        let mut out = Vec::new();
+        loop {
+            let byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+        out
+    }
+
+    fn avro_test_str(s: &str) -> Vec<u8> {
+        let mut out = avro_test_long(s.len() as i64);
+        out.extend_from_slice(s.as_bytes());
+        out
+    }
+
+    fn avro_test_bytes(raw: &[u8]) -> Vec<u8> {
+        let mut out = avro_test_long(raw.len() as i64);
+        out.extend_from_slice(raw);
+        out
+    }
+
+    /// R7-1: manifest paths percent-decode (shared implementation).
+    #[test]
+    fn percent_escaped_manifest_paths_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_path(dir.path(), "data/part%20a.parquet").unwrap();
+        assert!(resolved.ends_with("part a.parquet"), "{resolved:?}");
+        let bad = resolve_path(dir.path(), "data/part%2.parquet").unwrap_err();
+        assert!(bad.to_string().contains("part%2"), "{bad}");
+    }
 }

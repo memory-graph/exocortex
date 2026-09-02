@@ -40,6 +40,15 @@ enum Command {
         /// Output JSONL path (default stdout).
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+        /// Override the calibrated accept threshold (R7-3): iterating
+        /// operators pin thresholds at classification time instead of
+        /// editing code; calibration stays the default and stays
+        /// printed by `evaluate`.
+        #[arg(long)]
+        accept: Option<f64>,
+        /// Override the calibrated review threshold.
+        #[arg(long)]
+        review: Option<f64>,
     },
 }
 
@@ -61,7 +70,19 @@ fn main() -> anyhow::Result<()> {
             println!("model: {}", serde_json::to_string_pretty(&model)?);
             Ok(())
         }
-        Command::Classify { out, .. } => {
+        Command::Classify {
+            out,
+            accept,
+            review,
+            ..
+        } => {
+            let mut model = model;
+            if let Some(accept) = accept {
+                model.accept_threshold = *accept;
+            }
+            if let Some(review) = review {
+                model.review_threshold = *review;
+            }
             let scored = exocortex_entity_resolution::score_candidates(&corpus, &model);
             let mut lines = String::new();
             for pair in &scored {

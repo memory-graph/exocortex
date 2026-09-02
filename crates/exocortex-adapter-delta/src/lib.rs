@@ -313,24 +313,7 @@ fn resolve_path(table_dir: &Path, raw: &str) -> Result<PathBuf> {
 }
 
 fn percent_decode(input: &str) -> Result<String> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut at = 0usize;
-    while at < bytes.len() {
-        if bytes[at] == b'%' {
-            let hex = input
-                .get(at + 1..at + 3)
-                .ok_or_else(|| anyhow!("truncated percent escape in {input}"))?;
-            let byte = u8::from_str_radix(hex, 16)
-                .map_err(|_| anyhow!("invalid percent escape %{hex} in {input}"))?;
-            out.push(byte);
-            at += 3;
-        } else {
-            out.push(bytes[at]);
-            at += 1;
-        }
-    }
-    String::from_utf8(out).with_context(|| format!("path {input} decodes to non-UTF-8"))
+    exocortex_adapter_table::percent_decode(input)
 }
 
 fn partition_overlay(

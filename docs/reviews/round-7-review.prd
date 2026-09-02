@@ -1,0 +1,95 @@
+# Exocortex — Round 7 Review (Wave 2 boundary)
+
+**Status:** CLOSED (2026-09-02). Scope: the Wave 2 boundary review of
+the 2026-09-02 run's three commits — D1 iceberg (`78518a8`), D1 delta
+(`3e9453e`), D17 (`04e8adc`) — plus the shared-core extraction
+(`exocortex-adapter-table`) they introduced. Method: adversarial read
+of the new surface against the formats' specifications (Iceberg v1/v2,
+Delta classic protocol, Fellegi-Sunter) and this repo's invariants,
+with every accepted finding verified against the source before
+inclusion. Findings landed through the master-plan lifecycle in the
+same commits as their fixes.
+
+## Baseline
+
+`04e8adc` (2026-09-02). New hand-authored surface reviewed:
+`crates/exocortex-adapter-iceberg` (lib, bin, tests),
+`crates/exocortex-adapter-delta` (lib, bin, tests),
+`crates/exocortex-entity-resolution` (lib, bin, tests),
+`crates/exocortex-adapter-table` (lib), the `exocortex-adapter-parquet`
+slim-down, the ADAPTER_CONTRACT gate rows + bijection skip, and the
+PUBLISHING.md dependency records.
+
+## Findings
+
+### R7-1 — Iceberg manifest paths are not URI-decoded (blocker)
+
+Iceberg writers commonly URI-encode paths in manifests and metadata
+(spaces as `%20`, per the spec's file:// path conventions). The
+iceberg adapter's `resolve_path` treated them literally, so a real
+table whose data paths contain a space would fail to open — and fail
+during the row read, after the scan had already claimed the file set.
+The Delta adapter decoded correctly; the two flavors disagreed, which
+is exactly the divergence class the shared crate exists to prevent.
+
+**Fix:** `percent_decode` moved to `exocortex-adapter-table` as the
+one implementation; both flavors' path resolution decodes through it.
+Regression: `percent_escaped_paths_decode` (delta, pre-existing) and a
+new iceberg fixture whose manifest `file_path` carries `%20`, proving
+the overlay path resolves and rows read.
+
+### R7-2 — The Avro value decoder had no Union arm (blocker, latent)
+
+`apache_avro::from_avro_datum` with no reader schema returns
+`Value::Union(index, inner)` for union-typed fields. The iceberg
+adapter's `avro_value_to_json` matched every concrete variant and
+fell back to `format!("{other:?}")` — a non-null union would silently
+decode to a Debug-string placeholder instead of its value. No shipped
+path reads a union field today (`snapshot_id` is never consulted), so
+nothing was yet wrong in behavior — but a decoder with a
+silent-corruption shape is a defect waiting for its first caller.
+
+**Fix:** a `Union(_, inner)` arm that unwraps to the inner value.
+Regression: a v1 manifest entry whose `snapshot_id` union is the LONG
+branch (non-null), asserted to decode as a number via the public
+record-field path.
+
+### R7-3 — The ER harness could not pin thresholds at classification time (advisory)
+
+`exocortex-er classify` used the calibrated thresholds with no
+override. An operator iterating on the labelled set (the harness's
+whole workflow: measure, adjust, re-classify) had to accept the
+calibration as-is or edit code. Advisory, not behavioral: calibration
+remains the default and remains printed by `evaluate`.
+
+**Fix:** `--accept` / `--review` optional overrides on `classify`.
+Regression: harness test classifying with an explicit `--review` low
+enough to surface review-band pairs.
+
+## Verified-safe notes (recorded so they are not re-derived)
+
+- The iceberg OCF framing reader's negative map-block-count handling
+  consumes the block-size long AND the pairs (verified against the
+  Avro spec's container format); block payloads are sliced by the
+  declared size, never length-prefixed again; sync markers are
+  validated per block.
+- The delta checkpoint multi-part completeness check derives the
+  expected total from each part's own filename, so a deleted part
+  fails closed without trusting `_last_checkpoint`.
+- Delta's `_last_checkpoint` is a hint only; a v2-checkpoint pointer
+  (sidecar files) fails closed rather than replaying a stale state.
+- Fellegi-Sunter thresholds are calibrated from the labelled scores
+  (midpoint boundary, 3/4 toward each mean); a feature with
+  match-only evidence refuses estimation; both classes are required.
+- The adapter-contract gate's bijection skip now names `table` with
+  the same rationale `sdk` has carried (a library the adapters link,
+  not a source); the negative fixture still rejects unclaimed adapter
+  crates.
+
+## Verdict
+
+Changes requested at baseline; both blockers and the advisory landed
+with fail-without-it regressions in the same commits, and the master
+plan's R7 rows carry the closing evidence. Wave 2's
+locally-satisfiable rows (D21, D18, D13, PX4, D1, D17) are closed;
+D19 parks on owner credentials. The run proceeded to Wave 3.

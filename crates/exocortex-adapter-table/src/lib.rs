@@ -347,6 +347,34 @@ pub fn table_uuid_for(table_id: &str) -> [u8; 16] {
     out
 }
 
+/// Percent-decode a table-format path (R7-1): Iceberg manifests and
+/// Delta `add.path` values commonly URI-encode spaces (`%20`), and a
+/// reader that treats them literally fails on real tables. ONE
+/// implementation — both catalog flavors decode through it, so the
+/// flavors cannot disagree (the reason this crate exists). Escapes
+/// are the standard `%XX` hex set; anything else fails closed naming
+/// the path.
+pub fn percent_decode(input: &str) -> Result<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0usize;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            let hex = input
+                .get(at + 1..at + 3)
+                .ok_or_else(|| anyhow::anyhow!("truncated percent escape in {input}"))?;
+            let byte = u8::from_str_radix(hex, 16)
+                .map_err(|_| anyhow::anyhow!("invalid percent escape %{hex} in {input}"))?;
+            out.push(byte);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|e| anyhow::anyhow!("path {input} decodes to non-UTF-8: {e}"))
+}
+
 /// The D21-a projection shape every table flavor declares: the
 /// caller's selector names the source in its own terms, the field
 /// list is the declared column mapping, the source schema is the
