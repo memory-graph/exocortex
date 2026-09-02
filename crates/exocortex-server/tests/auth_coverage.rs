@@ -99,6 +99,23 @@ async fn every_endpoint_rejects_unauthenticated_calls() {
         );
     }
 
+    // The explorer (PX5): every view behind the same bearer layer.
+    for path in [
+        "/explorer",
+        "/explorer/memories?type=Fix",
+        "/explorer/ontology",
+        "/explorer/audit",
+        "/explorer/memories/01010101010101010101010101010101",
+        "/explorer/memories/01010101010101010101010101010101/neighborhood",
+        "/explorer/memories/01010101010101010101010101010101/provenance",
+    ] {
+        let status = unauth(addr, "GET", path, None).await;
+        assert_eq!(
+            status, 401,
+            "GET {path} must reject an unauthenticated call"
+        );
+    }
+
     // The SSE feed — with AND without a token query value.
     for path in ["/v1/changes?token=x", "/v1/changes", "/v1/changes?token="] {
         let status = unauth(addr, "GET", path, None).await;

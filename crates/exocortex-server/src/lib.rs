@@ -7,6 +7,7 @@
 
 pub mod backend;
 pub mod corpus_export;
+pub mod explorer;
 pub mod http_bind;
 pub mod org_backup;
 pub mod principal;

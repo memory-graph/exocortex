@@ -125,9 +125,10 @@ impl HttpBind {
                 ops.route(entry.http_path, post(handler))
             };
         }
-        // The bearer layer covers operations, SSE, metrics, and detailed
-        // health. Only a minimal ready/not-ready probe is public.
-        let mut protected = ops;
+        // The bearer layer covers operations, SSE, the explorer
+        // (PX5), metrics, and detailed health. Only a minimal
+        // ready/not-ready probe is public.
+        let mut protected = ops.merge(crate::explorer::router(self.ctx.clone()));
         if let Some(extra) = extra {
             protected = protected.merge(extra);
         }
