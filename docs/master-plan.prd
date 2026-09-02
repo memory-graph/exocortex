@@ -1,40 +1,32 @@
 # Exocortex — Master Plan
 
-**Status (2026-09-02, later — D29: five stacked defects, all closed;
-release unblocked):** What read as one flaky CI failure was five
-defects, each invisible until the previous one was fixed (the supervisor
-nulled the store's stdout — where redis logs — until the third fix).
-(1) Relative `--loadmodule` paths resolve against the DATA DIRECTORY
-(redis chdirs into `--dir` before loading modules) — failed on every
-runner; `resolve_paths` now canonicalizes (the CI-exact relative-layout
-script invocation failed pre-fix, passes post-fix). (2/3) The runtime's
-platform floors: darwin-arm64 `falkordb.so` declares `minos 15.0`
-(macos-14 can never load it → arm64 leg on `macos-15`) and linux-x64
-`redis-server` needs `GLIBC_2.38` (ubuntu-22.04 native can't load it →
-the linux leg keeps its 22.04 builder for the shipped binaries' 2.35
+**Status (2026-09-02, SHIPPED — v0.3.0 GitHub release published; D29
+closed):** Release run 33601757000 (tag `d61f667`) is green end to end —
+correctness, all three build legs including the macos-15 native and
+linux-container standalone validations, and the release job — and
+`Exocortex v0.3.0` is published with all six binary assets plus
+checksums and install.sh. The release note states plainly that the live
+FALKOR_URL/REDIS_URL suites and the Docker chaos harness were NOT
+executed for this release. D29 closed as FIVE stacked defects (full
+story in the row below): (1) relative `--loadmodule` paths resolve
+against the DATA DIRECTORY (redis chdirs into `--dir` before loading
+modules) — failed on every runner; `resolve_paths` now canonicalizes.
+(2/3) the runtime's platform floors: darwin-arm64 `falkordb.so` declares
+`minos 15.0` (macos-14 can never load it → arm64 leg on `macos-15`) and
+linux-x64 `redis-server` needs `GLIBC_2.38` (ubuntu-22.04 native can't
+→ the linux leg keeps its 22.04 builder for the shipped binaries' 2.35
 floor and validates inside the digest-pinned falkordb/falkordb trixie
-container). (4) The module dlopens Homebrew `libomp`/`openssl@3` at
-absolute paths — absent on stock machines (runners, clean Macs); the
-fetcher now bundles both as pinned ghcr.io bottle blobs (the last
-arm64_sequoia builds, matching the module's macOS 15 floor) beside the
-module and the supervisor sets the store child's `DYLD_LIBRARY_PATH`
-there (mechanism proven live with DYLD_PRINT_LIBRARIES against the real
-store binary; standalone is now genuinely self-contained on macOS). (5)
-The wrapper handed the background MCP client `<&0 &` and a
-non-interactive shell may give a background job /dev/null stdin (POSIX
-async-list semantics, stub-reproduced inside the pinned container): the
-client read instant EOF; the wrapper now dups stdin to fd 3 in the
-foreground and passes `<&3`. Diagnosability shipped alongside: a dying
-store names its exit status (code or signal) plus the tail of its own
-log with stdout joined to the sink (`startup_failure_names_the_cause`,
-fails-by-stash), and missing runtime files fail fast by path. Floors and
-the bundled dylibs are recorded at every user surface (RUNTIME-MANIFEST,
-installer refusal, README-install.txt, README, PUBLISHING.md; milestone
-deviation 21; the missing numbered deviation-20 entry the plan already
-cited was also written). Local end-to-end green on the CI-exact relative
-layout with the bundled runtime; full gate matrix green
-(`verify-release.sh` exit 0, 23 gates; live backend legs loud-skipped as
-always). Next: re-tag v0.3.0.
+container). (4) the module dlopens Homebrew `libomp`/`openssl@3` at
+absolute paths — now bundled beside the module as pinned ghcr.io bottle
+blobs (last arm64_sequoia builds) and loaded via the store child's
+`DYLD_LIBRARY_PATH` (standalone is genuinely self-contained on macOS
+now). (5) the wrapper's background client lost its stdin under POSIX
+async-list semantics (`<&0 &`) — now dup'd to fd 3 in the foreground.
+Diagnosability shipped with each fix: a dying store names its exit
+status plus its own log tail (stdout joined to the sink — redis logs
+there), and missing runtime files fail fast by path. The queue behind
+D29 is unchanged: D19/D1/PX4/D17 (Wave 2 remainder), then Wave 3's
+PX5/D24/D6/D20.
 
 **Status (2026-09-01, later — D28+D27 closed; release re-held on D29):**
 Two dogfood/release defects closed this session and the full gate
