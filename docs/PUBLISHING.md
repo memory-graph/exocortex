@@ -74,6 +74,25 @@ workspace license/repository metadata applies).
   rides `exocortex-adapter-sdk` + `blake3` (both already workspace deps);
   `tempfile` is a dev-only test fixture dependency. It publishes
   independently of the server (adapter crates are leaf binaries).
+- **D1 table-reader decision (recorded 2026-09-02 per rule 9, before
+  the dependency landed):** the parquet-dir flavor reads through
+  apache-arrow-rs — `parquet` plus the `arrow-array`/`arrow-cast`/`arrow-schema`
+  crates it interoperates with, exact-pinned to the 59 line
+  (rust-version 1.85, exactly the workspace toolchain floor; later
+  arrow lines can raise their MSRV the way `image` 0.25.6 did, so the
+  pins are exact, the fastembed/image precedent). Default features keep
+  the stock codecs (snap/brotli/deflate/lz4/zstd) so real-world files
+  read without surprises. Alternatives, recorded so they are not
+  relitigated: `duckdb` (C++ binary surface in a leaf adapter; also
+  deny.toml-banned as the kernel-boundary defense), `iceberg`/`deltalake`
+  (the catalog flavors are later D1 milestones, deny.toml-banned until
+  the adapter that owns them ships — revisit then with a scoped,
+  reasoned exception), `polars` (a lazy compute engine where a
+  schema-faithful reader is needed). The crates live ONLY in
+  `exocortex-adapter-parquet` — a leaf binary crate like the git
+  adapter, never in the kernel (R-I4/CR-26) or the SDK; it is a
+  workspace member but not an entry of `scripts/publish.sh` ORDER
+  (adapter crates are not crates.io release items).
 - `exocortex-pack-mortgage-v1` is a workspace dependency of the server,
   client, xtask, and ops (dev) so its verbs ride the one operation
   registry in every linked binary (PX2 §4.3); it is the second pack and

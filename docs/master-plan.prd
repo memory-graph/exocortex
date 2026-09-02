@@ -620,21 +620,21 @@ idea:
 
 ## In progress
 
-**Nothing is in progress.** D29 closed (v0.3.0 shipped; Backlog row
-carries the evidence) and PX4 closed (the Mintlify adapter's first
-real-corpus run — 92 memories / 94 relationships from 36 authored
-pages on the canonical loanlight docs checkout, idempotent full
-replay, UnknownType exercised on real input; two reference-adapter
-defects fixed in its repo — see the PX4 row). The next accepted work:
-**D19/D1/D17** (D19 needs SaaS credentials, D1 needs the arrow/parquet
-decision recorded in PUBLISHING, D17 is startable), then Wave 3's
-PX5/D24/D6/D20. The table below is the closed Round 6 detail ledger
-(every row Done or Verified safe, evidence inline; the summary rows
-live in the Done section). A new item enters here only when work
-actually starts.
+**D1 is in progress** (started 2026-09-02, after the arrow/parquet
+table-reader decision was recorded in PUBLISHING.md — the item's
+standing gate). The parquet-dir flavor ships first as
+`crates/exocortex-adapter-parquet` under the FULL D21 contract (flavor
+`parquet-dir`, declared projection, canonical wire-side schema hash);
+Iceberg and Delta follow as their own milestones (§7.16), each with its
+own dependency decision recorded the same way. D19 waits on SaaS
+credentials; D17 remains startable. The table below also carries the
+closed Round 6 detail ledger (every row Done or Verified safe, evidence
+inline; the summary rows live in the Done section). A new item enters
+here only when work actually starts.
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
+| D1 | Table adapters, parquet-dir flavor first: `crates/exocortex-adapter-parquet` (leaf crate, arrow-rs exact pins, flavor `parquet-dir` so the server enforces projection + drift + rewind), plus the shared canonical schema-hash helper in `exocortex-wire` and mock B8/B9 width enforcement in the adapter SDK (which caught and fixed a real git-adapter defect: a 16-byte snapshot schema_hash every live backend would reject) | Crush | In progress — see PUBLISHING.md for the dependency record; Iceberg/Delta flavors remain after parquet-dir closes |
 | R6-B30-14 | PRD §23 #14: stamp every stored embedding with its model/version, not only the MCR² aggregate | Codex | Done — vectors are inseparable from model name/version; ingest stamps each row and MCR² rejects mixed revisions while stamping the common input revision |
 | R6-B30-25 | PRD §23 #25: executable kernel-name absence and omit-dev-pack link failure | Codex | Done — production entrypoint requires the pack-owned link anchor; kernel purity builds packless and linked fixtures and verifies the former fails on the unresolved anchor |
 | R6-A1 | Advisory test quality and cleanup (A01-A08) | Codex | Done — every advisory has executable or focused-cleanup evidence below |
