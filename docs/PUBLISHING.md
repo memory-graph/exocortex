@@ -211,6 +211,24 @@ OC-PRD rolling-upgrade acceptance test that drives a real IngestServer;
 both already workspace dependencies, no new external crate).
 
 `exocortex-server` directly depends on `axum-server` with its Rustls feature.
+- **D20 CDC dependency record (2026-09-02, per rule 9):** the
+  Postgres CDC adapter uses `postgres-protocol` 0.6 (rust-version
+  1.85, the exact floor) plus `fallible-iterator` 0.2 (the version
+  postgres-protocol itself links) and the existing `bytes` — NOTHING
+  else. Rejected, recorded so it is not relitigated:
+  `pgwire-replication` (the purpose-built client) requires rustc 1.88
+  against the pinned 1.85 floor in every published version;
+  `tokio-postgres` 0.7 exposes no replication mode (no
+  `replication=database` startup parameter, no CopyBoth), so a
+  first-party MINIMAL replication session on postgres-protocol's own
+  codecs and SCRAM machinery is the remaining correct option (the
+  'W' CopyBothResponse frame is parsed locally because
+  postgres-protocol's enum has no variant for it). Scope boundaries:
+  SCRAM-SHA-256 only (cleartext/MD5 refused), no TLS in v1 (loopback
+  / private-network Postgres — the Falkor live-leg pattern), wal2json
+  format-version 2 as the decode plugin. All of it lives ONLY in
+  `exocortex-adapter-postgres` — leaf crate, never kernel or SDK, not
+  a publish.sh ORDER entry.
 
 D21 (adapter-contract PRD) additions, all already workspace pins: the
 `exocortex-wire` manifest module serializes its JSON through `serde_json`
