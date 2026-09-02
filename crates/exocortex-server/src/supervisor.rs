@@ -140,8 +140,11 @@ fn spawn_child(cfg: &SupervisorConfig) -> anyhow::Result<Child> {
 fn wait_ping(cfg: &SupervisorConfig, child: &mut Child) -> anyhow::Result<bool> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if child.try_wait()?.is_some() {
-            anyhow::bail!("supervised redis-server exited during startup");
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "supervised redis-server exited during startup: {}",
+                diagnose_exit(cfg, &status)
+            );
         }
         if ping(cfg.port, cfg.auth_token.as_deref()) {
             return Ok(true);
@@ -151,6 +154,48 @@ fn wait_ping(cfg: &SupervisorConfig, child: &mut Child) -> anyhow::Result<bool> 
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Name WHY the supervised store died: its exit status plus the tail of
+/// its own stderr log (D29: the release-runner failures — a redis-server
+/// needing glibc 2.38 on a 2.35 runner, a module whose `minos 15.0` cannot
+/// load on macOS 14 — were invisible because the log lived in a data dir
+/// the harness deleted, leaving only "exited during startup" to guess
+/// from). Bounded to the last 2 KiB: a diagnosis, not a log ship.
+fn diagnose_exit(cfg: &SupervisorConfig, status: &std::process::ExitStatus) -> String {
+    let how = match status.code() {
+        Some(code) => format!("exit status {code}"),
+        None => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt as _;
+                match status.signal() {
+                    Some(signal) => format!("killed by signal {signal}"),
+                    None => "terminated without an exit status".to_owned(),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                "terminated without an exit status".to_owned()
+            }
+        }
+    };
+    match stderr_tail(&cfg.data_dir.join("supervised-redis.stderr.log")) {
+        Some(tail) if !tail.is_empty() => format!("{how}; stderr: {tail}"),
+        _ => how,
+    }
+}
+
+/// The bounded tail of the supervised store's stderr log, if it exists.
+fn stderr_tail(path: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 2048;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut bytes = Vec::new();
+    file.take(TAIL).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).trim().to_owned())
 }
 
 /// Resolve binary/module paths from flags or environment.
@@ -366,6 +411,52 @@ mod tests {
     fn free_port_returns_open_port() {
         let port = free_port().unwrap();
         assert!(port > 0);
+    }
+
+    /// D29: a store binary that cannot start — here a stub that prints its
+    /// reason to stderr and exits 1, the same shape as the release-runner
+    /// walls (glibc 2.38 symbols missing on a 2.35 runner; a `minos 15.0`
+    /// module that cannot dlopen on macOS 14) — must be NAMED in the
+    /// supervisor's error: the exit status and the child's own stderr
+    /// tail, not a bare "exited during startup".
+    #[test]
+    fn startup_failure_names_the_cause() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = std::env::temp_dir().join(format!(
+                "exocortex-supervisor-diagnose-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let stub = dir.join("redis-stub");
+            std::fs::write(
+                &stub,
+                "#!/bin/sh\necho 'stub: module needs a newer glibc' >&2\nexit 1\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cfg = SupervisorConfig {
+                redis_server_bin: stub,
+                falkordb_module: "unused".into(),
+                data_dir: dir.clone(),
+                port: free_port().unwrap(),
+                max_restarts: 0,
+                port_file: None,
+                auth_token: None,
+            };
+            let error = spawn_supervised(&cfg).err().expect("the stub cannot start");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("exit status 1"),
+                "the error names the exit status: {message}"
+            );
+            assert!(
+                message.contains("stub: module needs a newer glibc"),
+                "the error carries the child's own stderr: {message}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

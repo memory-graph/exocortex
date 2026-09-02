@@ -111,7 +111,11 @@ if [ "$runtime_supported" -eq 1 ]; then
   cp -R "$src/standalone-runtime" "$staged_runtime"
   chmod 0755 "$staged_runtime/redis-server"
   chmod 0555 "$staged_runtime/falkordb.so"
-  "$staged_runtime/redis-server" --version >/dev/null
+  "$staged_runtime/redis-server" --version >/dev/null || {
+    echo "install refused: the bundled standalone runtime did not start on this system" >&2
+    echo "(its floors are macOS 15+ on arm64 and glibc >= 2.38 on linux x64; the loader message above says which symbol or image is missing)" >&2
+    exit 1
+  }
 fi
 for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
   staged_bin="$dest/.$bin.new.$$"

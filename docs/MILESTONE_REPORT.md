@@ -169,6 +169,27 @@ cross-cutting gates (§3). Commits: one per milestone, `M<n>: <what and why>`.
     bundled. Operators needing local standalone on Intel must provide explicit
     `EXOCORTEX_REDIS_SERVER` and `EXOCORTEX_FALKORDB_MODULE` paths; no network
     download occurs at runtime.
+20. **`storage-conformance` is an umbrella, not a shared corpus** (§2.1,
+    R6-R247/PX3): the gate runs distinct in-memory and live-Falkor target
+    suites, not one corpus against every `Storage` implementation. The
+    command name remains for CI/operator compatibility; the all-implementation
+    shared corpus is accepted post-v1 work under PX3.
+21. **The standalone runtime carries its own platform floors** (D29, §4.3):
+    the pinned `@falkordblite` 8.2.3-falkordb.4.16.3 pair is upstream's build,
+    and its load-time requirements bound where mcp-standalone can run: the
+    darwin-arm64 `falkordb.so` declares `minos 15.0` (`otool LC_BUILD_VERSION`)
+    and the linux-x64 `redis-server` references `GLIBC_2.38` symbols. Release
+    validation therefore moved to `macos-15` (arm64) and, on Linux, into the
+    digest-pinned `falkordb/falkordb` trixie userland — the ubuntu-22.04
+    builder stays so the shipped exocortex binaries keep their own glibc 2.35
+    floor. The floors are recorded in the packaged `RUNTIME-MANIFEST.txt`, the
+    installer's pre-install `redis-server --version` probe names them on
+    refusal, and the supervisor's startup-failure error now carries the
+    child's exit status and stderr tail instead of a bare "exited during
+    startup". This is recorded against the PRD's self-contained-standalone
+    claim exactly like deviation 19: the bundle is complete, but upstream's
+    binaries still refuse to load below their floors; client and backend-node
+    modes are unaffected.
 
 ## Post-review round 1 (2026-08-24)
 

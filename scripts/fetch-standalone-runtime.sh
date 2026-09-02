@@ -53,5 +53,11 @@ Contains: Redis 8.2.3 and FalkorDB 4.16.3
 Package license: MIT (official falkordblite platform package)
 Redis source/license: https://github.com/redis/redis/tree/8.2.3
 FalkorDB source/license: https://github.com/FalkorDB/FalkorDB/tree/v4.16.3
+Platform floors (verified 2026-09-01, release run 33543324895): the
+darwin-arm64 module declares minos 15.0 (otool LC_BUILD_VERSION), so it
+cannot load on macOS 14; the linux-x64 redis-server references GLIBC_2.38
+symbols, so it cannot load on glibc < 2.38 (ubuntu 22.04 = 2.35). Client
+and backend-node modes do not use this runtime and keep the exocortex
+binaries' own floor.
 EOF
 echo "standalone runtime verified: $package@$version"

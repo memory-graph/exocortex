@@ -69,10 +69,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          # The bundled Falkor runtime's own floors decide the runners: its
+          # darwin-arm64 falkordb.so declares minos 15.0 (LC_BUILD_VERSION),
+          # so it cannot dlopen on macOS 14; its linux-x64 redis-server
+          # references GLIBC_2.38 symbols. Validate the packaged artifact
+          # where the runtime can actually load (D29).
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
             standalone: true
+            runtime_validate_in: native
           # FalkorDB publishes no macOS-x64 embedded runtime. Keep the
           # client/team binaries on GitHub's native Intel runner, but do not
           # misrepresent this artifact as self-contained standalone.
@@ -80,10 +86,17 @@ jobs:
             target: x86_64-apple-darwin
             archive: tar.gz
             standalone: false
+            runtime_validate_in: none
+          # Stay on the 22.04 builder so the shipped binaries keep the
+          # ubuntu-22.04 glibc (2.35) floor; the standalone live validation
+          # runs the packaged runtime inside the digest-pinned trixie
+          # userland (glibc 2.41 + the runtime's shared libs) the compose
+          # harness already trusts — 22.04 itself cannot load it.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
             standalone: true
+            runtime_validate_in: falkordb-container
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -130,10 +143,20 @@ jobs:
           cp README.md LICENSE "dist/$DIST/"
           if [ "${{ matrix.standalone }}" = true ]; then
             model_dir=$(find "dist/$DIST/models" -mindepth 1 -maxdepth 1 -type d | head -1)
-            EXOCORTEX_BIN_DIR="dist/$DIST" \
-              EXOCORTEX_WRAPPER="dist/$DIST/exocortex" \
-              EXOCORTEX_BGE_SMALL_MODEL_DIR="$model_dir" \
-              sh scripts/test-standalone-live.sh
+            if [ "${{ matrix.runtime_validate_in }}" = "falkordb-container" ]; then
+              docker run --rm --entrypoint sh \
+                -v "$PWD:/work" -w /work \
+                -e EXOCORTEX_BIN_DIR="dist/$DIST" \
+                -e EXOCORTEX_WRAPPER="dist/$DIST/exocortex" \
+                -e EXOCORTEX_BGE_SMALL_MODEL_DIR="$model_dir" \
+                falkordb/falkordb@sha256:adbddd418916c25618564ff8597a919b08bc76452ebeb74eb985c38d7281df62 \
+                -c 'sh scripts/test-standalone-live.sh'
+            else
+              EXOCORTEX_BIN_DIR="dist/$DIST" \
+                EXOCORTEX_WRAPPER="dist/$DIST/exocortex" \
+                EXOCORTEX_BGE_SMALL_MODEL_DIR="$model_dir" \
+                sh scripts/test-standalone-live.sh
+            fi
           fi
           cat > "dist/$DIST/README-install.txt" <<EOF
           Exocortex $TAG (${{ matrix.target }})
@@ -152,6 +175,8 @@ jobs:
           Supported modes: mcp-client, mcp-standalone, backend-node.
           This artifact includes the verified Redis/Falkor runtime. Start with:
             exocortex --mode mcp-standalone --org my-org --user me
+          The bundled runtime's own floors: macOS 15+ (arm64) or glibc >= 2.38
+          (linux x64). Client and backend-node modes run on older systems.
           EOF
           else
             cat >> "dist/$DIST/README-install.txt" <<EOF

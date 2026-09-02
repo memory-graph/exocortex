@@ -96,8 +96,10 @@ curl -LsSf https://github.com/memory-graph/exocortex/releases/latest/download/in
 Installs the `exocortex` entrypoint and its client/node/worker binaries into
 `~/.cargo`. Linux x64 and Apple Silicon archives also include the verified
 standalone Falkor runtime; macOS Intel supports client and team/backend modes
-because upstream publishes no Intel embedded runtime. No Rust toolchain or
-protoc is needed.
+because upstream publishes no Intel embedded runtime. The bundled runtime
+sets the standalone-mode floors: macOS 15+ (Apple Silicon) or glibc >= 2.38
+(Linux x64); client and backend modes run on older systems. No Rust toolchain
+or protoc is needed.
 
 **Client only from Cargo** (any platform; needs Rust 1.85+ and `protoc`):
 

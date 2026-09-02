@@ -94,8 +94,9 @@ source/license coordinates ride the packaged `RUNTIME-MANIFEST.txt`.
 
 - **Installer (primary)**: tag push (`git tag v0.3.0 && git push
   memory-graph v0.3.0`) triggers `.github/workflows/release.yml` —
-  cross-platform release builds (macOS arm64 on `macos-14`, Intel on the
-  native `macos-15-intel` runner, and Linux x64) for all three binaries,
+  cross-platform release builds (macOS arm64 on `macos-15`, Intel on the
+  native `macos-15-intel` runner, and Linux x64 on the `ubuntu-22.04`
+  builder) for all three binaries,
   sha256 checksums, and an
   auto-generated `install.sh` attached to the GitHub Release:
 
@@ -109,7 +110,14 @@ source/license coordinates ride the packaged `RUNTIME-MANIFEST.txt`.
   carry the SHA-512-pinned official `@falkordblite` Redis 8.2.3/FalkorDB
   4.16.3 runtime under `$CARGO_HOME/share/exocortex/standalone`; release CI
   first executes the extracted archive's wrapper and sibling runtime through
-  the write/read/restart target. Installer tests separately verify resolution
+  the write/read/restart target — natively on `macos-15` (the runtime's
+  darwin-arm64 module declares `minos 15.0`), and on Linux inside the
+  digest-pinned `falkordb/falkordb` trixie userland because the runtime's
+  redis-server needs glibc >= 2.38 while the ubuntu-22.04 builder (kept so
+  the shipped binaries keep their own glibc 2.35 floor) has 2.35 (D29).
+  The runtime's floors are macOS 15+ / glibc >= 2.38 for mcp-standalone
+  mode; the installer names them when its pre-install `redis-server
+  --version` probe fails. Installer tests separately verify resolution
   from `$CARGO_HOME/share/exocortex/standalone`. macOS Intel ships client/backend
   binaries only because upstream has no self-contained x64 runtime (deviation
   19). No Rust toolchain or protoc required.

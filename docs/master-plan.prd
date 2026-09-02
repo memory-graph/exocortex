@@ -1,5 +1,34 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-01, night — D29 root-caused and closed; release
+unblocked):** The "second-invocation teardown race" suspicion is
+DISPROVEN — both failing legs of run 33543324895 died on the FIRST
+wrapper invocation (the ubuntu log's printf error is the invocation-1
+pipeline), and each is a hard load-time floor of the pinned
+`@falkordblite` runtime against its runner: the darwin-arm64
+`falkordb.so` declares `minos 15.0` (otool LC_BUILD_VERSION), so it
+cannot dlopen on the macos-14 runner; the linux-x64 `redis-server`
+references `GLIBC_2.38` symbols and ubuntu-22.04 ships glibc 2.35.
+Local runs passed 8/8 because the author's machine is macOS 26.
+Fixes: the arm64 release leg moved to the `macos-15` runner; the linux
+leg keeps its ubuntu-22.04 builder (so the shipped binaries keep their
+own glibc 2.35 floor) and runs the packaged standalone live validation
+inside the digest-pinned `falkordb/falkordb` trixie userland (glibc 2.41
+plus the runtime's shared libs — userland verified against the pinned
+image). The supervisor's startup-failure error now carries the child's
+exit status and stderr tail (`startup_failure_names_the_cause`, proved
+fails-by-stash; D29's original fix requirement), the packaged
+`RUNTIME-MANIFEST.txt` records the floors, the installer's pre-install
+probe names them on refusal, and milestone deviation 21 records the
+boundary (the numbered deviation-20 entry the plan already cited for
+the storage-conformance umbrella was also missing from the report and
+is now written). Full packaged validation re-run locally end to end
+(`standalone live persistence validation passed` on macOS 26 with the
+fresh release binaries + pinned runtime + model sidecar), and the full
+gate matrix is green on this tree (`scripts/verify-release.sh` exit 0,
+23 gate commands; live FALKOR_URL/REDIS_URL legs loud-skipped as
+always). Next: re-tag v0.3.0.
+
 **Status (2026-09-01, later — D28+D27 closed; release re-held on D29):**
 Two dogfood/release defects closed this session and the full gate
 matrix re-verified green (`scripts/verify-release.sh` exit 0, 23 gate
@@ -441,7 +470,7 @@ each step (88 tests at completion).
 
 | ID | Item | Source | Status |
 |----|------|--------|--------|
-| D29 | **Packaged-standalone validation: supervised redis exits during startup (second invocation, release runner)** — found by the re-tagged v0.3.0 release run AFTER D27's fix cleared the first invocation. Sequence (run 33543324895, macos-14 arm64 Package job): `embedder-ok … max_tokens=512` ✓ → `Error: supervised redis-server exited during startup` → `standalone node exited before publishing its backend endpoint` → `test-standalone-live.sh: line 68: printf: write error: Broken pipe`. The SAME script + SAME pinned runtime (darwin-arm64@8.2.3-falkordb.4.16.3, SHA-512-verified in-run) passes 8/8 locally, so the failure is specific to the release runner or to back-to-back invocation state (leading suspicion: invocation 1's supervised redis/node not fully torn down — port or process cleanup race — when invocation 2 starts; the packaged validation runs the wrapper twice against one extracted layout). Fix requirement: the supervised-store supervisor must surface WHY redis exited (capture its stderr into the error) and the packaged validation must be robust to (or provably serialize) cross-invocation teardown. **Blocks the v0.3.0 GitHub release** (crates are on crates.io; tag v0.3.0 re-pointed at `07d4694`; no release/draft exists yet) | v0.3.0 re-tag release validation, run 33543324895 | **Open — release-held; next step is reproducing the supervised-redis startup exit (capture redis stderr) and the two-invocation teardown sequence** |
+| D29 | **Packaged-standalone validation: supervised redis exits during startup (second invocation, release runner)** — found by the re-tagged v0.3.0 release run AFTER D27's fix cleared the first invocation. Sequence (run 33543324895, macos-14 arm64 Package job): `embedder-ok … max_tokens=512` ✓ → `Error: supervised redis-server exited during startup` → `standalone node exited before publishing its backend endpoint` → `test-standalone-live.sh: line 68: printf: write error: Broken pipe`. The SAME script + SAME pinned runtime (darwin-arm64@8.2.3-falkordb.4.16.3, SHA-512-verified in-run) passes 8/8 locally, so the failure is specific to the release runner or to back-to-back invocation state (leading suspicion: invocation 1's supervised redis/node not fully torn down — port or process cleanup race — when invocation 2 starts; the packaged validation runs the wrapper twice against one extracted layout). Fix requirement: the supervised-store supervisor must surface WHY redis exited (capture its stderr into the error) and the packaged validation must be robust to (or provably serialize) cross-invocation teardown. **Blocks the v0.3.0 GitHub release** (crates are on crates.io; tag v0.3.0 re-pointed at `07d4694`; no release/draft exists yet) | v0.3.0 re-tag release validation, run 33543324895 | **Done — root cause is a hard platform floor of the pinned runtime, not a teardown race.** Evidence pulled from the failed run: BOTH failing legs (macos-14 arm64 AND ubuntu-22.04 x64 — the plan initially recorded only the macos one) died on the FIRST wrapper invocation ~240ms after node start, with no prior wrapper run in the job. The darwin-arm64 `falkordb.so` declares `minos 15.0` (`otool -l … LC_BUILD_VERSION`) — it can never dlopen on macOS 14, while the author's local 8/8 ran on macOS 26. The linux-x64 `redis-server` references `GLIBC_2.38` symbols (`strings … GLIBC_ | sort -Vu`) while ubuntu-22.04 ships 2.35 — the dynamic loader kills it before main. Fixes: (1) release matrix arm64 leg `macos-14` → `macos-15` (satisfies minos 15.0); (2) the linux leg keeps its ubuntu-22.04 builder so the SHIPPED binaries keep their glibc 2.35 floor, and the packaged standalone live validation runs inside the digest-pinned `falkordb/falkordb@sha256:adbddd41…` trixie userland (glibc 2.41; libgomp/libssl3/libcrypto3/libstdc++6 all present — verified by executing the pinned image), since 22.04 itself cannot load the runtime; (3) the supervisor's `wait_ping` exit path now names the cause — exit status (code or signal) plus the bounded 2 KiB tail of the supervised store's own stderr log (`supervisor.rs::diagnose_exit`/`stderr_tail`; regression `startup_failure_names_the_cause` with a stub store that prints its reason and exits 1, proved failing-by-stash) — D29's fix requirement 1; (4) fix requirement 2 (serialize/robustify cross-invocation teardown) is closed as moot under the root cause — invocation 2 never started on CI, and the restart-durability leg including teardown passes locally end to end; (5) the floors are now recorded where users meet them: packaged `RUNTIME-MANIFEST.txt`, the installer's pre-install `redis-server --version` refusal text, README-install.txt, PUBLISHING.md, and milestone deviation 21. Local proof on the fix tree: `scripts/test-standalone-live.sh` passes end to end against fresh release binaries + the SHA-512-verified pinned runtime + model sidecar; `cargo xtask deployment-acceptance` (which executes the standalone live target) green |
 | D27 | **Standalone submit hang** — the intermittent `end_session` gRPC hang against a standalone node found by the v0.3.0 release validation (`docs/bug-prd-standalone-submit-hang.md`) | `docs/bug-prd-standalone-submit-hang.md` | **Done** — both halves closed. Deterministic half: dropped mortgage registration → fingerprint split → fail-closed hydration, fixed with the binary-level canary `the_binary_registers_every_shipped_pack`. Intermittent half: rmcp drops in-flight (and read-but-unpolled) tool calls at stdin EOF — fixed with the EOF-draining stdio reader `client/src/eof_drain.rs` (quiet = no in-flight call AND no dispatch in the 300ms grace window; 55s budget > the 20s+30s gRPC deadlines; `eof_drain.rs` unit suite pins withhold/grace/budget/passthrough), the deterministic no-runtime regression `client/tests/backend_eof_drain.rs` (in-process node behind a 400ms delaying proxy; proved failing-by-stash), and the live script sequencing write→commit→read with both ack and marker asserted (`scripts/test-standalone-live.sh`, 8/8 clean runs). The wire path was healthy throughout (h2 trace ~40ms); the HTTP/2-race and lost-wakeup hypotheses are disproven and recorded in the PRD. Re-tagged release run 33543324895 passed the first invocation (this defect's site); the hold moved to D29 |
 | D28 | **MCP tool schemas were not self-contained** — schemars emits `{"$ref":"#/definitions/X"}` beside a root `definitions` map; MCP harnesses legitimately drop the map while passing the `$ref` through unresolved (observed live in the Crush dogfood: the model guessed `type`/`body` and the server rejected the calls with `missing field memory_type` / `missing field content`) | Crush dogfood session, 2026-08-31 | **Done** — `list_tools` inlines every `#/definitions/X` ref (`client/src/mcp.rs::{self_contained,inline_schema_refs}`, cyclic/foreign refs left verbatim rather than recursing); the instruction block names the exact draft fields (`draft_key`,`memory_type`,`title`,`content`,`visibility`,`tags`; 297 words); `stdio_smoke.rs::tools_list_serves_self_contained_schemas` + `mcp.rs::schema_inline_tests` pin it (the stdio test fails on the pre-fix tree, proved by stash) |
 | R1 | M3 — backend cache-feed bridge loss windows (reseed/subscribe gap, no retry on fetch error, tight resubscribe flap); needs periodic reseed or LSN reconcile | round-3 review | Accepted v1 residue |
@@ -552,16 +581,12 @@ idea:
 
 ## In progress
 
-**D29 is in progress** (release-held; Backlog row with evidence and the
-repro direction). Everything else this session closed: D28 (self-
-contained MCP schemas) and D27 (EOF drain) are in Done with their
-verify-clauses; `verify-release.sh` exit 0 at `07d4694`; v0.3.0
-re-tagged there and pushed (release run 33543324895 failed at D29; no
-release/draft exists; crates.io is unaffected). Behind D29 the next
-accepted work is unchanged — **D19/D1/PX4/D17** (D19 needs SaaS
-credentials, D1 needs the arrow/parquet decision recorded in
-PUBLISHING, PX4 needs the `loanlight-engineering/docs` checkout, D17
-is startable). The table below is the closed Round 6 detail ledger
+**Nothing is in progress.** D29 closed (root cause + fixes above;
+Backlog row carries the evidence). The next accepted work is unchanged —
+**D19/D1/PX4/D17** (D19 needs SaaS credentials, D1 needs the
+arrow/parquet decision recorded in PUBLISHING, PX4 needs the
+`loanlight-engineering/docs` checkout, D17 is startable), then Wave 3's
+PX5/D24/D6/D20. The table below is the closed Round 6 detail ledger
 (every row Done or Verified safe, evidence inline; the summary rows
 live in the Done section). A new item enters here only when work
 actually starts.
