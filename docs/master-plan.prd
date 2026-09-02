@@ -1,5 +1,17 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-02, round 7 closed; matrix green; main pushed):** The
+Wave 2 boundary review landed as `docs/reviews/round-7-review.prd` and
+its three findings closed in one commit through the lifecycle (R7-1
+shared percent-decoding — iceberg failed on real URI-encoded manifest
+paths and the flavors disagreed; R7-2 the Avro Union arm — a non-null
+union decoded to a Debug-string placeholder; R7-3 `exocortex-er
+classify --accept/--review` pinning). The full gate matrix
+(`scripts/verify-release.sh`) passed on the final tree — exit 0, 158
+suite-oks including the new adapter/ER suites; live FALKOR/REDIS legs
+NOT executed locally, as usual. Main pushed under the standing
+authorization. Wave 3 opens with PX5.
+
 **Status (2026-09-02, Wave 2 LOCALLY COMPLETE — D17 shipped):** The
 probabilistic half of entity resolution landed as
 `crates/exocortex-entity-resolution` — the half D13's deterministic
