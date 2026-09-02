@@ -399,18 +399,12 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Install the process-wide Prometheus recorder once; subsequent binds
-/// reuse the handle (double-install panics).
+/// Install the process-wide metric recorders once (D6): Prometheus
+/// always, plus the OTLP fanout leg when compiled in and configured —
+/// see `telemetry::install`. Subsequent binds reuse the handle
+/// (double-install panics).
 fn install_prometheus() -> metrics_exporter_prometheus::PrometheusHandle {
-    static HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
-        std::sync::OnceLock::new();
-    HANDLE
-        .get_or_init(|| {
-            metrics_exporter_prometheus::PrometheusBuilder::new()
-                .install_recorder()
-                .expect("install prometheus recorder")
-        })
-        .clone()
+    crate::telemetry::install()
 }
 
 #[cfg(test)]

@@ -44,9 +44,13 @@ thiserror      = "1"
 anyhow         = "1"
 tracing        = "0.1"
 tracing-subscriber        = { version = "0.3", features = ["env-filter", "json"] }
-tracing-opentelemetry     = "0.24"
-opentelemetry             = "0.23"
-opentelemetry-otlp        = { version = "0.16", features = ["tonic"] }
+# D6 OTel export (opt-in `otlp` feature of exocortex-server; the rule-9
+# record lives in PUBLISHING.md). The 0.31 line is the only version family
+# compatible with the metrics 0.24 recorder bridge.
+opentelemetry             = "0.31"
+opentelemetry_sdk         = "0.31"
+opentelemetry-otlp        = { version = "0.31", default-features = false, features = ["grpc-tonic", "metrics", "internal-logs"] }
+metrics-exporter-opentelemetry = "0.2"
 
 # --- data structures ---
 arc-swap  = "1.7"
@@ -138,8 +142,9 @@ http        = "1"
 subtle      = "2"
 
 # --- observability ---
-metrics                     = "0.23"
-metrics-exporter-prometheus = "0.15"
+metrics                     = "0.24"
+metrics-exporter-prometheus = "0.18"
+metrics-util                = "0.20"
 
 # --- testing ---
 proptest    = "1"

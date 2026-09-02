@@ -9,6 +9,13 @@ description = "The Exocortex node binary: mcp-standalone and backend-node modes 
 
 [features]
 fastembed = ["exocortex-ingest/fastembed"]
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:metrics-exporter-opentelemetry",
+    "dep:metrics-util",
+]
 
 [lib]
 name = "exocortex_server"
@@ -51,6 +58,15 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+# D6 (R-O3): opt-in OTLP metric export. Default builds keep the exact
+# dependency surface they had; operators pointing a collector at the
+# node build with `--features otlp` and set OTEL_EXPORTER_OTLP_ENDPOINT.
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+metrics-exporter-opentelemetry = { workspace = true, optional = true }
+metrics-util = { workspace = true, optional = true }
+
 arc-swap = { workspace = true }
 serde = { workspace = true }
 chitchat = { workspace = true }

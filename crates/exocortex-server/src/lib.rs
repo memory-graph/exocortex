@@ -12,3 +12,4 @@ pub mod http_bind;
 pub mod org_backup;
 pub mod principal;
 pub mod sse;
+pub mod telemetry;
