@@ -1,5 +1,25 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-02, later — PX4 closed; the docs producer is real):**
+The Mintlify adapter ran its first real-corpus ingest against the
+canonical `loanlight-engineering/docs` checkout (clone @ `a9dd1684f9`):
+36 pages opted in with authored `exocortex:` frontmatter, validated
+locally, then registered and submitted through a live backend node
+(bundled Falkor store, admin source policy pinning
+`ProducerKind::DocsAdapter`, signed registration and batches). Result:
+**92 memories / 94 relationships** (`--export-org`), a cursor-wiped
+full replay that deduplicated server-side to the byte-identical graph,
+and the deliberate `RejectCode::UnknownType` exercise on a real page
+(the PRD's own example type `Integration`, rejected
+`detail=UnknownMemoryType`). The run doubled as a hardening pass on the
+reference adapter: it had shipped WITHOUT principal bearer auth (401
+against every current backend — its mock-server tests never surfaced
+it) and its `validate` now names empty-content pages locally instead of
+letting the kernel's opaque `Unknown` code hide the cause
+(memory-graph/exocortex-adapter-mintlify `8a7b2ab`, `fdd91a2`). The
+annotated corpus is kept at `~/loanlight/px4-annotated-docs` as the seed
+of the real opt-in set. Wave 2 remainder: D19/D1/D17.
+
 **Status (2026-09-02, SHIPPED — v0.3.0 GitHub release published; D29
 closed):** Release run 33601757000 (tag `d61f667`) is green end to end —
 correctness, all three build legs including the macos-15 native and
@@ -455,7 +475,7 @@ A PRD that is not listed here is not accepted work.
 |---|---|---|
 | `docs/prd/exocortex-core-prd.md` | The authoritative spec. Every `§`-reference in code points here | Shipped through M0-M8; still authority |
 | `docs/prd/agent-instructions-prd.md` | The agent playbook, `preflight_wrapup`, write grouping, producer kinds, the generated-vs-prose split in the CLAUDE.md/AGENTS.md block | Shipped (A-PRD rows in Done) |
-| `docs/prd/mintlify-docs-integration-prd.md` | The docs producer's ingest contract | Shipped as its own repo (ML1); first real-corpus run is PX4, Wave 2 |
+| `docs/prd/mintlify-docs-integration-prd.md` | The docs producer's ingest contract | Shipped as its own repo (ML1); its first real-corpus run closed as PX4 (Wave 2, 2026-09-02) |
 | `docs/prd/backup-restore-prd.md` | `--export` / `--import`, fingerprint-gated, all-or-nothing | Shipped (BR-PRD rows in Done); its restore gate is relaxed by OC-PRD |
 | `docs/prd/ontology-compatibility-prd.md` | How two components decide they may exchange data: the fingerprint, its six enforcement sites, and their migration | **Shipped** (Wave 0; OC-PRD rows in Done) |
 | `docs/prd/exocortex-palantir-expansion-prd.md` | Second pack, pack-registered Actions/Functions, seam inventory, first real docs run, read-only explorer | **Wave 1 complete** (PX1-PX3, PX6, PX2 all closed); PX4 is Wave 2, PX5 is Wave 3 |
@@ -600,11 +620,14 @@ idea:
 
 ## In progress
 
-**Nothing is in progress.** D29 closed (root cause + fixes above;
-Backlog row carries the evidence). The next accepted work is unchanged —
-**D19/D1/PX4/D17** (D19 needs SaaS credentials, D1 needs the
-arrow/parquet decision recorded in PUBLISHING, PX4 needs the
-`loanlight-engineering/docs` checkout, D17 is startable), then Wave 3's
+**Nothing is in progress.** D29 closed (v0.3.0 shipped; Backlog row
+carries the evidence) and PX4 closed (the Mintlify adapter's first
+real-corpus run — 92 memories / 94 relationships from 36 authored
+pages on the canonical loanlight docs checkout, idempotent full
+replay, UnknownType exercised on real input; two reference-adapter
+defects fixed in its repo — see the PX4 row). The next accepted work:
+**D19/D1/D17** (D19 needs SaaS credentials, D1 needs the arrow/parquet
+decision recorded in PUBLISHING, D17 is startable), then Wave 3's
 PX5/D24/D6/D20. The table below is the closed Round 6 detail ledger
 (every row Done or Verified safe, evidence inline; the summary rows
 live in the Done section). A new item enters here only when work
