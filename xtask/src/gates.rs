@@ -2235,6 +2235,13 @@ pub(crate) const ADAPTER_CONTRACT: &[(&str, &str, &str, &str)] = &[
         "src/lib.rs",
         "fn projection(",
     ),
+    // (a) D1 delta flavor: same contract, its own reader.
+    (
+        "projection-declared",
+        "exocortex-adapter-delta",
+        "src/lib.rs",
+        "fn projection(",
+    ),
     // (a) Bounds stop the window before the wire (SDK-side, A2).
     (
         "bounds-enforced",

@@ -1284,6 +1284,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "exocortex-adapter-delta"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-cast",
+ "arrow-schema",
+ "clap",
+ "exocortex-adapter-sdk",
+ "exocortex-adapter-table",
+ "exocortex-wire",
+ "parquet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "exocortex-adapter-git"
 version = "0.3.0"
 dependencies = [

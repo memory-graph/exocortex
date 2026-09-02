@@ -1,0 +1,31 @@
+[package]
+name    = "exocortex-adapter-delta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Delta-table adapter (D1, delta flavor): a local Delta table's current state as a bounded, declared-projection import through the signed Ingestion Protocol. Replays the _delta_log transaction log directly (JSON commits + parquet checkpoints) — no engine, no catalog, no LLM, no network beyond the backend."
+
+[[bin]]
+name = "exocortex-adapter-delta"
+path = "src/main.rs"
+
+[dependencies]
+exocortex-adapter-sdk = { workspace = true }
+exocortex-adapter-table = { workspace = true }
+exocortex-wire = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-schema = { workspace = true }
+parquet = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+exocortex-adapter-sdk = { workspace = true, features = ["testing"] }
+tempfile = "3"

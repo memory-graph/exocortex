@@ -1,5 +1,28 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-02, closing — D1 COMPLETE; Wave 2 remainder D17):** The
+Delta flavor landed as `crates/exocortex-adapter-delta` and closes D1:
+the `_delta_log` transaction log replayed DIRECTLY (JSON commits +
+single AND multi-part parquet checkpoints with the classic nested
+action columns) — no new external dependency (the log is serde_json +
+the pinned arrow stack; the `deltalake` crate stays deny-banned by
+choice, the record in PUBLISHING.md), protocol fail-closed on what
+changes the bytes' meaning (minReaderVersion > 2, deletionVectors,
+v2Checkpoint sidecars, `delta.columnMapping.*`), snapshot identity =
+the monotonic log version (`v<N>`; a regressed log is refused locally
+before any wire traffic — Delta versions are ordered, so a cold
+session CAN see what parquet/iceberg sessions cannot), partition
+values from `add.partitionValues` overlaying data files, `_last_checkpoint`
+treated as a hint with the file scan authoritative. Hermetic suite
+(10 tests): JSON-log replay, checkpoint+commits equivalence, multi-part
+completeness from the part names (a missing part fails closed),
+percent-escaped paths, protocol refusals, mock-server end-to-end under
+the TABLE flavor, version advance + regression refused. D1 is now
+CLOSED across all three flavors (parquet-dir, iceberg, delta) with the
+shared declared-projection core in `exocortex-adapter-table` and the
+adapter-contract gate claiming all three (16 obligations). Wave 2
+remainder: D17 (locally satisfiable); D19 parked on credentials.
+
 **Status (2026-09-02, latest — D1 iceberg flavor shipped):** The
 iceberg milestone of D1 landed as `crates/exocortex-adapter-iceberg`:
 a local Iceberg table's CURRENT snapshot as a bounded declared-
@@ -694,7 +717,7 @@ here only when work actually starts.
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
-| D1 | Table adapters, parquet-dir flavor first: `crates/exocortex-adapter-parquet` (leaf crate, arrow-rs exact pins, flavor `parquet-dir` so the server enforces projection + drift + rewind), plus the shared canonical schema-hash helper in `exocortex-wire` and mock B8/B9 width enforcement in the adapter SDK (which caught and fixed a real git-adapter defect: a 16-byte snapshot schema_hash every live backend would reject) | Crush | parquet-dir shipped (13 tests: lib 6 + hermetic parquet fixture suite 7 — scan determinism, missing-column fail-fast, null-pk skip, table-flavor registration with the declared projection, canonical 32-byte hash, idempotent batch-id replay, changed-dir new snapshot, reverted-dir rewind refused); **iceberg flavor shipped** (`crates/exocortex-adapter-iceberg`, 10-test suite — see the status header; the direct-format reader decision + apache-avro `=0.21.0`/flate2 records in PUBLISHING.md; the shared mapping core extracted to `exocortex-adapter-table`, claimed by the adapter-contract gate alongside the flavor crates); Delta flavor remains — its own milestone with its own dependency record |
+| D1 | Table adapters, parquet-dir flavor first: `crates/exocortex-adapter-parquet` (leaf crate, arrow-rs exact pins, flavor `parquet-dir` so the server enforces projection + drift + rewind), plus the shared canonical schema-hash helper in `exocortex-wire` and mock B8/B9 width enforcement in the adapter SDK (which caught and fixed a real git-adapter defect: a 16-byte snapshot schema_hash every live backend would reject) | Crush | **All three flavors shipped, D1 closed.** parquet-dir (13 tests); iceberg (`crates/exocortex-adapter-iceberg`, 10 tests, direct-format reader — see the status headers; apache-avro `=0.21.0`/flate2 records in PUBLISHING.md); delta (`crates/exocortex-adapter-delta`, 10 tests — log replay incl. multi-part checkpoints, protocol fail-closed, local version-regression refusal; no new deps, the deltalake-ban-by-choice record in PUBLISHING.md); the declared-projection mapping core shared in `exocortex-adapter-table`; adapter-contract gate 16 obligations green. Closing evidence: commits `78518a8` (iceberg) and this commit (delta) |
 | R6-B30-14 | PRD §23 #14: stamp every stored embedding with its model/version, not only the MCR² aggregate | Codex | Done — vectors are inseparable from model name/version; ingest stamps each row and MCR² rejects mixed revisions while stamping the common input revision |
 | R6-B30-25 | PRD §23 #25: executable kernel-name absence and omit-dev-pack link failure | Codex | Done — production entrypoint requires the pack-owned link anchor; kernel purity builds packless and linked fixtures and verifies the former fails on the unresolved anchor |
 | R6-A1 | Advisory test quality and cleanup (A01-A08) | Codex | Done — every advisory has executable or focused-cleanup evidence below |
@@ -1272,14 +1295,13 @@ so they are never renumbered, only re-waved.
 - **Wave 1 — ontology verbs and modularity** (complete). The pack seam
   became a product: typed domain verbs, a second pack, and the seam set
   that keeps both honest. Everything else reads better once this lands.
-- **Wave 2 — data breadth** (D21 complete, D18, D13, and PX4 in; D19/D1/D17
-  remain, each gated on an external input). The claim that matters most
-  and the one the repo is weakest on: point Exocortex at data that is not
-  a coding session. Structured-source adapters plus the deterministic
-  half of entity resolution, which is what makes a graph of documents
-  into a model of a world — the deterministic half shipped and the
-  adapter contract that governs the rest is complete; the SaaS/table
-  adapters and the docs run remain.
+- **Wave 2 — data breadth** (D21, D18, D13, PX4, and D1 complete;
+  D17 remains locally satisfiable; D19 parked on credentials). The
+  claim that matters most and the one the repo was weakest on: point
+  Exocortex at data that is not a coding session — now real for docs
+  (PX4) and for tables (parquet/Iceberg/Delta under one adapter
+  contract); the deterministic half of entity resolution shipped and
+  the SaaS adapters remain gated on external credentials.
 - **Wave 3 — surface and operability** (D23, D7, D22 in; PX5, D24, D6,
   D20 remain). Make the graph visible and the node observable.
 - **Wave 4 — scale.** Prove the numbers past 100k before anyone bets an
@@ -1289,7 +1311,7 @@ so they are never renumbered, only re-waved.
 
 | ID | Wave | Item | PRD |
 |----|------|------|-----|
-| D1 | **2** | *(D21 steps a+d)* Iceberg / Delta / parquet-dir adapter workers — **undeferred**. Already unblocked (B8+B9+A1 closed) and the single largest gap between what the README claims and what the repo ingests: today every producer is a coding session, a docs page, or the analytics worker. Structured-source ingest is what makes "point it at your data" true | §18.4, §24 |
+| D1 | **2** | *(D21 steps a+d)* Iceberg / Delta / parquet-dir adapter workers — **undeferred**. Already unblocked (B8+B9+A1 closed) and the single largest gap between what the README claims and what the repo ingests: today every producer is a coding session, a docs page, or the analytics worker. Structured-source ingest is what makes "point it at your data" true | §18.4, §24 | **Done** — all three flavors: parquet-dir (commit `f5c67fb`), iceberg (`78518a8`), delta (this commit); the D21 contract enforced end-to-end for each (declared projection, canonical schema hash, rewind refusal — proven in-suite against the SDK mock); one shared mapping core (`exocortex-adapter-table`); dependency decisions recorded in PUBLISHING.md per rule 9 (apache-avro `=0.21.0` + flate2 for iceberg; NO new dependency for delta) |
 | D2 | **1** | Second-pack demo — **closed by PX1**: `exocortex-pack-mortgage-v1` shipped (§23 criterion 26 verified) | §23.26, §24 |
 | D3 | **5** | Federation | §24 |
 | D4 | **4** | Embedding fine-tuning | §24 |
@@ -1320,10 +1342,7 @@ so they are never renumbered, only re-waved.
 or close):**
 
 - **Locally satisfiable — an unattended run may take them in wave
-  order:** D1's remaining flavors (Iceberg, Delta — each its own
-  milestone; the scoped deny.toml exception is pre-authorized by the
-  PUBLISHING record, land the reasons with the dependency), D17
-  (D13 shipped), PX5 (PX6 shipped), D6 (the rule-9 record IS the
+  order:** D17 (D13 shipped), PX5 (PX6 shipped), D6 (the rule-9 record IS the
   first deliverable), D20 (live-Postgres legs gate like `FALKOR_URL`),
   D24 (the ONLY open row authorized to move the compatibility
   fingerprint — one commit with golden + AGENTS.md + this plan).

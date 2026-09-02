@@ -115,6 +115,19 @@ workspace license/repository metadata applies).
   Cargo.lock; darling 0.24.x falls away entirely at that pin. All of
   it lives ONLY in `exocortex-adapter-iceberg` — leaf crate, never
   kernel or SDK, not a `scripts/publish.sh` ORDER entry.
+- **D1 delta-flavor dependency record (2026-09-02):** the delta
+  adapter adds NO new external dependency — the Delta transaction log
+  is JSON (`serde_json`) and parquet checkpoints/data files (the
+  pinned arrow stack), both already workspace pins, and it lives ONLY
+  in `exocortex-adapter-delta` (leaf crate, never kernel or SDK, not a
+  publish.sh ORDER entry). The `deltalake` crate stays deny.toml-banned
+  BY CHOICE, recorded here so it is not relitigated: it drags a
+  datafusion-grade engine and its own arrow line into a leaf binary
+  whose job is a schema-faithful bounded transcription, and the
+  classic log (JSON commits + parquet checkpoints, reader protocol <= 2,
+  no deletion vectors, no column mapping) is fully specified. Those
+  protocol boundaries are enforced fail-closed in the reader — see the
+  crate's suite — rather than absorbed by an engine dependency.
 - `exocortex-pack-mortgage-v1` is a workspace dependency of the server,
   client, xtask, and ops (dev) so its verbs ride the one operation
   registry in every linked binary (PX2 §4.3); it is the second pack and

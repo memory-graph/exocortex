@@ -1,0 +1,180 @@
+//! D1: the Delta-table adapter binary. Replays a local Delta table's
+//! `_delta_log` under a declared column mapping, and submits through
+//! the signed Ingestion Protocol under the `delta` source flavor (the
+//! server enforces the declared projection, the canonical schema
+//! hash, and rewind). Secrets come from the environment (never
+//! argv): `EXOCORTEX_AUTH_TOKEN` (bearer) and `EXOCORTEX_HMAC_KEY`
+//! (64 hex).
+//!
+//! `--validate` performs the local check only (mapping shape, column
+//! presence, row counts, run bound) — no backend, no secrets — for CI
+//! against a table fixture.
+
+use clap::Parser;
+
+/// Import a local Delta table's current state into the exocortex graph.
+#[derive(Debug, Parser)]
+#[command(name = "exocortex-adapter-delta", version)]
+struct Args {
+    /// Root directory of the Delta table (the one containing _delta_log/).
+    #[arg(long)]
+    table: std::path::PathBuf,
+    /// Column-mapping JSON (see exocortex_adapter_table::Mapping).
+    #[arg(long)]
+    mapping: std::path::PathBuf,
+    /// Local check only.
+    #[arg(long, default_value_t = false)]
+    validate: bool,
+    /// Backend IngestService base URL.
+    #[arg(long)]
+    backend: Option<String>,
+    /// Owning org.
+    #[arg(long)]
+    org: Option<String>,
+    /// Producer identity for registration.
+    #[arg(long, default_value = "delta-adapter")]
+    producer: String,
+    /// Durable cursor file (stores the last ingested log version).
+    #[arg(long, default_value = "delta-adapter.cursor")]
+    cursor: std::path::PathBuf,
+    /// Maximum rows per submit window (D21-a bound).
+    #[arg(long, default_value = "256")]
+    max_window: u64,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+    let args = Args::parse();
+
+    let mapping = exocortex_adapter_table::Mapping::load(&args.mapping)?;
+    let scan = exocortex_adapter_delta::scan_table(&args.table)?;
+    exocortex_adapter_delta::validate_mapping(&mapping, &scan)?;
+    let snapshot = scan.snapshot_id_string();
+    let declared = exocortex_adapter_delta::declared_columns(&mapping, &scan);
+    let (rows, skipped) = exocortex_adapter_delta::read_rows(&mapping, &scan)?;
+    if skipped > 0 {
+        tracing::warn!(skipped, "rows without a usable pk skipped");
+    }
+    let max_run = args.max_window.saturating_mul(100);
+    if rows.len() as u64 > max_run {
+        anyhow::bail!(
+            "{} rows exceed the declared max_rows_per_run {} — narrow the projection (a table import is a bounded import, not a firehose)",
+            rows.len(),
+            max_run
+        );
+    }
+    tracing::info!(
+        files = scan.files.len(),
+        rows = rows.len(),
+        version = %snapshot,
+        table_id = %scan.table_id,
+        "delta table scanned"
+    );
+
+    if args.validate {
+        println!(
+            "ok: {} files, {} rows, {} columns mapped (version {snapshot})",
+            scan.files.len(),
+            rows.len(),
+            declared.len()
+        );
+        return Ok(());
+    }
+
+    // Delta log versions are monotonic by construction, so a table
+    // below the settled cursor is a REGRESSED log (someone restored an
+    // old _delta_log) — refused locally, before any wire traffic,
+    // which a cold session's in-memory history could never see.
+    let last = std::fs::read_to_string(&args.cursor)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let settled_version = last
+        .as_deref()
+        .and_then(|last| last.strip_prefix('v'))
+        .and_then(|digits| digits.parse::<u64>().ok());
+    if settled_version.is_some_and(|v| v > scan.version) {
+        anyhow::bail!(
+            "the Delta log regressed: cursor settled at {} but the table is at \
+             {snapshot} — a rewound source needs an operator, not a submission",
+            settled_version.unwrap_or_default()
+        );
+    }
+    if last.as_deref() == Some(snapshot.as_str()) {
+        println!("nothing to ingest (version {snapshot} already settled)");
+        return Ok(());
+    }
+
+    let backend = args.backend.clone().unwrap_or_default();
+    let org = args.org.clone().unwrap_or_default();
+    if backend.is_empty() || org.is_empty() {
+        anyhow::bail!("--backend and --org are required unless --validate is set");
+    }
+    let auth_token = std::env::var("EXOCORTEX_AUTH_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("EXOCORTEX_AUTH_TOKEN is required"))?;
+    let hmac_key = exocortex_wire::signing::decode_hex32(
+        &std::env::var("EXOCORTEX_HMAC_KEY")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("EXOCORTEX_HMAC_KEY is required (64 hex chars)"))?,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    let mut config = exocortex_adapter_sdk::AdapterConfig::new(
+        &org,
+        &format!("delta://{}", scan.table_id),
+        &args.producer,
+        &backend,
+    );
+    // The honest flavor: table-shaped, so the server enforces the
+    // declared projection, the schema hash, and rewind on THIS source.
+    config.source_flavor = "delta".into();
+    config.producer_kind = exocortex_wire::ingest::v1::ProducerKind::Custom;
+    config.auth_token = auth_token;
+    config.hmac_key = hmac_key;
+    config.cursor_path = args.cursor.with_extension("sdk-cursor");
+    config.projection = Some(exocortex_adapter_delta::projection(
+        &mapping,
+        &scan,
+        args.max_window,
+    ));
+
+    let mut session = exocortex_adapter_sdk::AdapterSession::connect(config).await?;
+    let table = exocortex_adapter_delta::table_uuid_for(&scan.table_id);
+    for (index, chunk) in rows.chunks(args.max_window as usize).enumerate() {
+        let (unit, skipped_parents) = exocortex_adapter_delta::map_rows(
+            &mapping,
+            &table,
+            &declared,
+            chunk,
+            &format!("window-{index}"),
+        );
+        if skipped_parents > 0 {
+            tracing::warn!(skipped_parents, "parent links outside this window skipped");
+        }
+        let unit = exocortex_adapter_delta::with_snapshot_id(unit, &snapshot);
+        let outcome = session.submit_window(vec![unit], &snapshot).await?;
+        tracing::info!(
+            accepted = outcome.accepted,
+            duplicates = outcome.duplicates,
+            rejected = outcome.permanent_rejections.len(),
+            cursor = %snapshot,
+            "window settled"
+        );
+        for rejection in &outcome.permanent_rejections {
+            tracing::error!(key = %rejection.draft_key, code = %rejection.code, "{}", rejection.detail);
+        }
+    }
+    println!(
+        "ingested {} rows from {} files (version {snapshot})",
+        rows.len(),
+        scan.files.len()
+    );
+    Ok(())
+}
