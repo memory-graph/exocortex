@@ -121,16 +121,25 @@ fn spawn_child(cfg: &SupervisorConfig) -> anyhow::Result<Child> {
     }
     // The supervised store's own log lands beside its data dir: startup
     // failures on remote runners were previously invisible (null stdio)
-    // and could only be guessed at from the supervisor's exit side.
-    let stderr_sink = cfg.data_dir.join("supervised-redis.stderr.log").clone();
-    let stderr = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&stderr_sink)
-        .map(Stdio::from)
-        .unwrap_or_else(|_| Stdio::null());
+    // and could only be guessed at from the supervisor's exit side. Redis
+    // writes its whole startup log to STDOUT when no logfile is set, so
+    // BOTH streams join the sink — the stderr-only capture of the first
+    // D29 fix proved empty exactly because redis had logged its fatal
+    // reason to stdout. Two append handles to one file: `Stdio` cannot be
+    // shared across fds on the pinned toolchain.
+    let sink_path = cfg.data_dir.join("supervised-redis.stderr.log").clone();
+    let open_sink = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sink_path)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null())
+    };
+    let stdout = open_sink();
+    let stderr = open_sink();
     command
-        .stdout(Stdio::null())
+        .stdout(stdout)
         .stderr(stderr)
         .spawn()
         .map_err(Into::into)
@@ -198,7 +207,14 @@ fn stderr_tail(path: &std::path::Path) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).trim().to_owned())
 }
 
-/// Resolve binary/module paths from flags or environment.
+/// Resolve binary/module paths from flags or environment, then make both
+/// ABSOLUTE. Redis chdirs into `--dir` during startup BEFORE loading
+/// modules, so a relative `--loadmodule` path is resolved against the data
+/// directory and dlopen fails with "no such file" / "server aborting"
+/// (D29's primary defect: every release-runner leg failed this way because
+/// the wrapper exports `dist/$DIST`-relative runtime paths; local runs with
+/// absolute paths never saw it). Canonicalizing here also fails fast when
+/// the configured binary or module does not exist.
 pub fn resolve_paths(
     flag_bin: Option<PathBuf>,
     flag_module: Option<PathBuf>,
@@ -227,6 +243,10 @@ pub fn resolve_paths(
                  or set EXOCORTEX_FALKORDB_MODULE"
             )
         })?;
+    let bin = std::fs::canonicalize(&bin)
+        .map_err(|e| anyhow::anyhow!("redis-server binary not found at {}: {e}", bin.display()))?;
+    let module = std::fs::canonicalize(&module)
+        .map_err(|e| anyhow::anyhow!("FalkorDB module not found at {}: {e}", module.display()))?;
     Ok((bin, module))
 }
 
@@ -411,6 +431,67 @@ mod tests {
     fn free_port_returns_open_port() {
         let port = free_port().unwrap();
         assert!(port > 0);
+    }
+
+    /// D29 (primary defect): relative runtime paths must be canonicalized
+    /// to absolute before they reach the child — redis chdirs into `--dir`
+    /// before `--loadmodule`, so a relative module path would be resolved
+    /// against the data directory and abort every supervised startup.
+    #[test]
+    fn resolve_paths_canonicalizes_relative_runtime_paths() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = std::env::temp_dir().join(format!(
+                "exocortex-supervisor-resolve-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let stub = dir.join("redis-stub");
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let module = dir.join("falkordb-stub.so");
+            std::fs::write(&module, b"stub").unwrap();
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&dir).unwrap();
+            let (bin, module) = resolve_paths(
+                Some(PathBuf::from("redis-stub")),
+                Some(PathBuf::from("falkordb-stub.so")),
+            )
+            .expect("relative paths resolve against the current directory");
+            std::env::set_current_dir(previous).unwrap();
+            assert!(
+                bin.is_absolute(),
+                "binary path is canonicalized: {}",
+                bin.display()
+            );
+            assert!(
+                module.is_absolute(),
+                "module path is canonicalized: {}",
+                module.display()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// D29 companion: a missing binary or module fails fast with the path
+    /// named, instead of surfacing later as an opaque child exit.
+    #[test]
+    fn resolve_paths_names_missing_runtime_files() {
+        let error = resolve_paths(
+            Some(PathBuf::from("/nonexistent/redis-server")),
+            Some(PathBuf::from("/nonexistent/falkordb.so")),
+        )
+        .expect_err("a missing binary cannot resolve");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("redis-server binary not found"),
+            "the error names the missing binary: {message}"
+        );
+        assert!(
+            message.contains("/nonexistent/redis-server"),
+            "the error names the path: {message}"
+        );
     }
 
     /// D29: a store binary that cannot start — here a stub that prints its
