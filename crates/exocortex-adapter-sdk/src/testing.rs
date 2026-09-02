@@ -194,8 +194,23 @@ impl IngestService for MockService {
         &self,
         req: Request<RegisterSourceRequest>,
     ) -> Result<Response<RegisterSourceResponse>, Status> {
+        let request = req.into_inner();
+        // D21-a: table-shaped flavors cannot register without a
+        // declared projection — the real server refuses, so the mock
+        // does too (an adapter that skips the contract fails its own
+        // tests instead of a live backend).
+        if matches!(
+            request.source_flavor.as_str(),
+            "iceberg" | "delta" | "parquet-dir"
+        ) && request.projection.is_none()
+        {
+            return Err(Status::invalid_argument(format!(
+                "source_flavor {} requires a declared projection (D21-a)",
+                request.source_flavor
+            )));
+        }
         self.0.calls.lock().unwrap().push("register");
-        self.0.registrations.lock().unwrap().push(req.into_inner());
+        self.0.registrations.lock().unwrap().push(request);
         Ok(Response::new(RegisterSourceResponse {
             ceiling: *self.0.ceiling.lock().unwrap(),
         }))
@@ -205,6 +220,16 @@ impl IngestService for MockService {
         self.0.calls.lock().unwrap().push("submit");
         let batch = req.into_inner();
         self.0.submitted.lock().unwrap().push(batch.clone());
+        // §18.6 widths, enforced by the real ingest boundary (B8/B9)
+        // before any batch settles. The mock enforces them under every
+        // scripted action so a malformed-coordinates adapter fails its
+        // own tests instead of its first live backend (PX4's class).
+        if let Some(detail) = width_violation(&batch) {
+            return Ok(Response::new(reject_all(
+                batch, 13, // INVALID_EXTERNAL_KEY
+                detail,
+            )));
+        }
         let action = self
             .0
             .script
@@ -256,6 +281,12 @@ impl IngestService for MockService {
         self.0.calls.lock().unwrap().push("preflight");
         let batch = req.into_inner();
         self.0.preflighted.lock().unwrap().push(batch.clone());
+        if let Some(detail) = width_violation(&batch) {
+            return Ok(Response::new(reject_all(
+                batch, 13, // INVALID_EXTERNAL_KEY
+                detail,
+            )));
+        }
         Ok(Response::new(IngestAck {
             batch_id: batch.batch_id,
             accepted: (batch.memories.len() + batch.relationships.len()) as u32,
@@ -327,5 +358,44 @@ impl IngestService for MockService {
                 compatibility_fingerprint: fingerprint.to_vec(),
             },
         ))
+    }
+}
+
+/// §18.6 width check, mirroring the real ingest boundary: a batch
+/// snapshot's `schema_hash` is 32 bytes and every external key's
+/// `table_uuid` is 16. Returns the violation detail, or `None` when
+/// the coordinates are well-formed.
+fn width_violation(batch: &IngestBatch) -> Option<&'static str> {
+    if let Some(snapshot) = &batch.snapshot {
+        if snapshot.schema_hash.len() != 32 {
+            return Some("snapshot schema_hash must be 32 bytes (B9)");
+        }
+    }
+    for memory in &batch.memories {
+        if let Some(key) = &memory.external_key {
+            if key.table_uuid.len() != 16 {
+                return Some("external_key table_uuid must be 16 bytes (B8)");
+            }
+        }
+    }
+    None
+}
+
+fn reject_all(batch: IngestBatch, code: i32, detail: &'static str) -> IngestAck {
+    IngestAck {
+        batch_id: batch.batch_id,
+        accepted: 0,
+        rejected: batch.memories.len() as u32,
+        similar_to: vec![],
+        rejections: batch
+            .memories
+            .iter()
+            .map(|m| RejectRow {
+                draft_key: m.draft_key.clone(),
+                code,
+                detail: detail.into(),
+            })
+            .collect(),
+        assigned_lsn: 0,
     }
 }

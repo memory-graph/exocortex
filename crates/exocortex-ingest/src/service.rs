@@ -57,19 +57,12 @@ pub struct StoredProjection {
     pub max_graph_share_percent: u32,
 }
 
-/// Canonical digest over a declared column set (D21-d): sorted
-/// (name, type) pairs, NUL-separated, through the ONE wire digest.
+/// Canonical digest over a declared column set (D21-d). The formula
+/// lives in `exocortex_wire::projection::schema_hash_hex` so every
+/// table-flavored adapter derives the identical value kernel-free;
+/// this is the server-side call of the one implementation.
 pub fn projection_schema_hash(columns: &[(String, String)]) -> String {
-    let mut sorted = columns.to_vec();
-    sorted.sort();
-    let mut preimage = String::new();
-    for (name, data_type) in &sorted {
-        preimage.push_str(name);
-        preimage.push('\u{0}');
-        preimage.push_str(data_type);
-        preimage.push('\u{0}');
-    }
-    exocortex_wire::signing::content_digest_hex(preimage.as_bytes())
+    exocortex_wire::projection::schema_hash_hex(columns)
 }
 
 /// Table-shaped flavors whose registrations REQUIRE a declared projection

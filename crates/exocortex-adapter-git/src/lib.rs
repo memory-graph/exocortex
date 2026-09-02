@@ -25,6 +25,26 @@ use exocortex_wire::ingest::v1::{
     ExternalKey, ExternalSnapshotInfo, MemoryDraft, RelationshipDraft,
 };
 
+/// The source columns this adapter's mapping was authored against —
+/// the ONE list shared by the declared projection and the snapshot
+/// schema hash, so the observed hash can never drift from the
+/// declared one (D21-d; §18.6 pins the width at 32 bytes).
+pub const GIT_SOURCE_COLUMNS: &[(&str, &str)] = &[
+    ("commit_sha", "sha-hex"),
+    ("subject", "string"),
+    ("author", "string"),
+    ("changed_path", "path"),
+];
+
+/// The declared column set as owned `(String, String)` pairs — the
+/// shape `exocortex_wire::projection::schema_hash` takes.
+pub fn git_source_columns() -> Vec<(String, String)> {
+    GIT_SOURCE_COLUMNS
+        .iter()
+        .map(|(n, t)| (n.to_string(), t.to_string()))
+        .collect()
+}
+
 /// The `git log --format` this adapter runs: a RECORD separator BEFORE
 /// each record (so each record owns its `--name-only` lines), unit
 /// separators between fields.
@@ -216,7 +236,11 @@ pub fn map_history(repo_id: &str, commits: &[GitCommit], batch_id_seed: &str) ->
                 .last()
                 .map(|commit| commit.sha.clone())
                 .unwrap_or_else(|| "empty".into()),
-            schema_hash: table.to_vec(),
+            // The canonical 32-byte digest over the declared column set
+            // — the same value the server derives from the registration
+            // (a 16-byte table uuid here was rejected by every real
+            // backend; the mock now enforces the width).
+            schema_hash: exocortex_wire::projection::schema_hash(&git_source_columns()).to_vec(),
             source_flavor: "custom".into(),
         }),
         observed_at: std::time::UNIX_EPOCH,
@@ -243,24 +267,13 @@ pub fn projection(max_window: u64) -> Projection {
                 kind: "Modifies".into(),
             },
         ],
-        source_schema: vec![
-            SourceColumn {
-                name: "commit_sha".into(),
-                data_type: "sha-hex".into(),
-            },
-            SourceColumn {
-                name: "subject".into(),
-                data_type: "string".into(),
-            },
-            SourceColumn {
-                name: "author".into(),
-                data_type: "string".into(),
-            },
-            SourceColumn {
-                name: "changed_path".into(),
-                data_type: "path".into(),
-            },
-        ],
+        source_schema: GIT_SOURCE_COLUMNS
+            .iter()
+            .map(|(name, data_type)| SourceColumn {
+                name: (*name).into(),
+                data_type: (*data_type).into(),
+            })
+            .collect(),
         mapping_version: 1,
         bounds: ProjectionBounds {
             max_rows_per_window: max_window,

@@ -171,6 +171,17 @@ async fn history_flows_through_the_ingestion_protocol() {
         .memories
         .iter()
         .all(|m| m.external_key.is_some()));
+    // §18.6: the snapshot schema_hash is the canonical 32-byte digest
+    // over the declared column set — the exact value the server
+    // derives from the registration (the 16-byte table uuid this
+    // adapter once shipped was rejected by every real backend).
+    let snapshot = submitted[0].snapshot.as_ref().unwrap();
+    assert_eq!(snapshot.schema_hash.len(), 32);
+    assert_eq!(
+        snapshot.schema_hash,
+        exocortex_wire::projection::schema_hash(&exocortex_adapter_git::git_source_columns())
+            .to_vec()
+    );
     mock.stop();
 }
 

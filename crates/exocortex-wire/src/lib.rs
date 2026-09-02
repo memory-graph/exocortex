@@ -44,6 +44,10 @@ pub mod corrections;
 /// D21-c (adapter-contract PRD D3): the validation manifest — the
 /// rulebook as data, fingerprinted and interpreted SDK-side.
 pub mod manifest;
+/// D21-d (adapter-contract PRD §3.4): the canonical projection schema
+/// hash, computed identically by the server and every table-flavored
+/// adapter (one formula, one digest).
+pub mod projection;
 
 /// `exocortex.sse.v1` — SSE change-feed events (§2.6.3).
 pub mod sse {
