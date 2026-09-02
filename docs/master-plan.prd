@@ -1,5 +1,28 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-02, even later — D1 opened; the first table-flavored
+producer is real):** The arrow/parquet table-reader decision is
+recorded in PUBLISHING.md per rule 9 (apache-arrow-rs exact-pinned to
+the 59 line — rust-version 1.85, exactly the pinned toolchain floor;
+duckdb/iceberg/deltalake stay deny-banned with written reasons), and
+the parquet-dir flavor shipped as `crates/exocortex-adapter-parquet`
+(commits `0d6be97`, `9f5b2e5`, `f5c67fb`): a directory of Parquet
+files as a bounded, declared-projection import under the `parquet-dir`
+TABLE flavor — the first workspace adapter where the server's full
+D21 contract (projection-required registration, canonical schema hash
+per batch, rewind refusal) is not optional. Opening it hardened the
+boundary for every adapter: the canonical column-set digest moved to
+`exocortex_wire::projection` (one implementation; the ingest boundary
+delegates), and the SDK mock now enforces the §18.6 widths — which
+caught a real git-adapter defect on contact: its snapshot schema_hash
+was the 16-byte table uuid, which every live backend rejects (PX4's
+mock-tests-never-surface-it class); fixed with a byte-equal regression.
+Gate matrix green on the pushed tree (`scripts/verify-release.sh` exit
+0, 158 suite-oks; live FALKOR/REDIS legs not executed locally, as
+usual). D1 remains open — Iceberg and Delta follow as their own
+milestones, each with its own dependency record. Wave 2 remainder:
+D19/D1(Iceberg+Delta)/D17.
+
 **Status (2026-09-02, later — PX4 closed; the docs producer is real):**
 The Mintlify adapter ran its first real-corpus ingest against the
 canonical `loanlight-engineering/docs` checkout (clone @ `a9dd1684f9`):
