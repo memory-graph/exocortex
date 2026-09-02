@@ -75,6 +75,7 @@ pub fn install() -> metrics_exporter_prometheus::PrometheusHandle {
 /// The OTLP endpoint: `OTEL_EXPORTER_OTLP_ENDPOINT`, with the
 /// signal-specific `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` override (the
 /// standard OpenTelemetry environment precedence).
+#[cfg(feature = "otlp")]
 fn ot_endpoint() -> anyhow::Result<Option<String>> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
         .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))

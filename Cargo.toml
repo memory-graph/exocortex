@@ -13,6 +13,7 @@ members = [
     "crates/exocortex-adapter-iceberg",
     "crates/exocortex-adapter-delta",
     "crates/exocortex-entity-resolution",
+    "crates/exocortex-adapter-postgres",
     "crates/exocortex-storage",
     "crates/exocortex-cache",
     "crates/exocortex-reasoning",
@@ -162,6 +163,7 @@ exocortex-adapter-table = { path = "crates/exocortex-adapter-table", version = "
 exocortex-adapter-iceberg = { path = "crates/exocortex-adapter-iceberg", version = "0.3.0" }
 exocortex-adapter-delta = { path = "crates/exocortex-adapter-delta", version = "0.3.0" }
 exocortex-entity-resolution = { path = "crates/exocortex-entity-resolution", version = "0.3.0" }
+exocortex-adapter-postgres = { path = "crates/exocortex-adapter-postgres", version = "0.3.0" }
 exocortex-storage = { path = "crates/exocortex-storage", version = "0.3.0" }
 exocortex-cache = { path = "crates/exocortex-cache", version = "0.3.0" }
 exocortex-reasoning = { path = "crates/exocortex-reasoning", version = "0.3.0" }

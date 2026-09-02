@@ -69,7 +69,7 @@ pub fn projection_schema_hash(columns: &[(String, String)]) -> String {
 /// (D21-a). `session`, `custom`, and the shipped docs flavor are exempt
 /// in v1 — the Mintlify adapter's compliance migration is tracked work.
 pub fn projection_required(flavor: &str) -> bool {
-    matches!(flavor, "iceberg" | "delta" | "parquet-dir")
+    matches!(flavor, "iceberg" | "delta" | "parquet-dir" | "cdc-postgres")
 }
 
 /// The registered source: its ceiling (R-I3) and its declared producer

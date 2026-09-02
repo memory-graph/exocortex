@@ -201,7 +201,7 @@ impl IngestService for MockService {
         // tests instead of a live backend).
         if matches!(
             request.source_flavor.as_str(),
-            "iceberg" | "delta" | "parquet-dir"
+            "iceberg" | "delta" | "parquet-dir" | "cdc-postgres"
         ) && request.projection.is_none()
         {
             return Err(Status::invalid_argument(format!(

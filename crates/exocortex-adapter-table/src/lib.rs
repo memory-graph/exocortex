@@ -242,6 +242,73 @@ pub fn read_batch_rows(
     Ok(rows)
 }
 
+/// Resolve ONE row from a cell map (D20 CDC): the same semantics as
+/// [`read_batch_rows`] — exactly the mapped columns resolve, a null or
+/// empty pk skips the row (None, counted by the caller), and the
+/// partition overlay (partition columns a stream source carries
+/// beside the row) fills columns absent from the cells.
+pub fn row_from_cells(
+    mapping: &Mapping,
+    cells: &std::collections::BTreeMap<String, Option<String>>,
+    overlay: &std::collections::BTreeMap<String, Option<String>>,
+) -> Result<Option<Row>> {
+    mapping.validate_shape()?;
+    let referenced: std::collections::BTreeSet<&str> =
+        mapping.referenced_columns().into_iter().collect();
+    let resolve = |name: &str| -> Result<Option<String>> {
+        if let Some(value) = cells.get(name) {
+            return Ok(value.clone());
+        }
+        if let Some(value) = overlay.get(name) {
+            return Ok(value.clone());
+        }
+        if referenced.contains(name) {
+            Ok(None)
+        } else {
+            bail!("mapped column `{name}` is absent from the change and the overlay")
+        }
+    };
+    let mut pk_parts = Vec::with_capacity(mapping.pk_columns.len());
+    for column in &mapping.pk_columns {
+        pk_parts.push(resolve(column)?);
+    }
+    if pk_parts
+        .iter()
+        .any(|part| part.as_deref().unwrap_or("").is_empty())
+    {
+        return Ok(None);
+    }
+    let pk = pk_parts
+        .iter()
+        .map(|p| p.as_deref().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join(PK_SEPARATOR);
+    let title = resolve(&mapping.title_column)?.unwrap_or_default();
+    let content = mapping
+        .content_columns
+        .iter()
+        .map(|column| Ok((column.clone(), resolve(column)?.unwrap_or_default())))
+        .collect::<Result<Vec<_>>>()?;
+    let tags = resolve(mapping.tags_column.as_deref().unwrap_or_default())?
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let parent =
+        resolve(mapping.parent_column.as_deref().unwrap_or_default())?.filter(|p| !p.is_empty());
+    Ok(Some(Row {
+        pk,
+        title,
+        content,
+        tags,
+        parent,
+    }))
+}
+
 /// Map one window of rows to a submission unit: one memory per row,
 /// plus parent edges whose endpoints both fall inside THIS window
 /// (cross-window parent links are counted and skipped — the SDK

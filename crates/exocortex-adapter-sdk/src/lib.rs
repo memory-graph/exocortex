@@ -66,7 +66,8 @@ pub struct AdapterConfig {
     pub adapter_id: String,
     /// Node identity for lease/envelope attribution.
     pub node_id: String,
-    /// §18.6 source flavor: `"iceberg" | "delta" | "parquet-dir" | "custom"`.
+    /// §18.6 source flavor: `"iceberg" | "delta" | "parquet-dir" |
+    /// "cdc-postgres" | "custom"`.
     pub source_flavor: String,
     /// D8 (agent-instructions PRD §3.8): producer kind declared at
     /// registration. Adapters default to `Custom`; a docs or analytics

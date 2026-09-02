@@ -1,0 +1,33 @@
+[package]
+name    = "exocortex-adapter-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Postgres-CDC adapter (D20): logical-replication changes (wal2json) as bounded, declared-projection windows through the signed Ingestion Protocol. A first-party minimal replication client on postgres-protocol (the codecs tokio-postgres itself uses) — no engine, no LLM, no network beyond the backend."
+
+[[bin]]
+name = "exocortex-adapter-postgres"
+path = "src/main.rs"
+
+[features]
+integration = []
+
+[dependencies]
+exocortex-adapter-sdk = { workspace = true }
+exocortex-adapter-table = { workspace = true }
+exocortex-wire = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+postgres-protocol = "0.6"
+fallible-iterator = "0.2"
+bytes = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+exocortex-adapter-sdk = { workspace = true, features = ["testing"] }
+tempfile = "3"
