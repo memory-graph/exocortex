@@ -193,9 +193,18 @@ cross-cutting gates (§3). Commits: one per milestone, `M<n>: <what and why>`.
     floors are recorded in the packaged `RUNTIME-MANIFEST.txt`, the
     installer's pre-install `redis-server --version` probe names them on
     refusal. This is recorded against the PRD's self-contained-standalone
-    claim exactly like deviation 19: the bundle is complete, but upstream's
-    binaries still refuse to load below their floors; client and backend-node
-    modes are unaffected.
+    claim exactly like deviation 19: client and backend-node modes are
+    unaffected. Two further D29 findings are folded in: (a) the module's
+    Homebrew dependencies — libomp and openssl@3 at absolute
+    `/opt/homebrew` paths — are now bundled beside the module as pinned
+    ghcr.io bottle blobs (the last arm64_sequoia builds, matching the
+    module's own macOS 15 floor) and loaded via the store child's
+    DYLD_LIBRARY_PATH, making standalone genuinely self-contained on stock
+    machines; (b) the wrapper no longer hands the background MCP client
+    `<&0` directly — a non-interactive shell may give a background job
+    `/dev/null` stdin (POSIX async-list behavior, observed live in the
+    release validation's Linux container), so the wrapper duplicates its
+    own stdin to fd 3 in the foreground first.
 
 ## Post-review round 1 (2026-08-24)
 

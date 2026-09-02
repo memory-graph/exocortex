@@ -96,6 +96,28 @@ impl SupervisedServer {
     }
 }
 
+/// The darwin-arm64 module's homebrew dependencies (libomp, openssl@3)
+/// are bundled BESIDE it by the runtime fetcher, and dyld resolves an
+/// absolute install name through DYLD_LIBRARY_PATH's leaf name first —
+/// so the bundled copies win over any system/homebrew ones (or stand in
+/// when none exist, e.g. on stock CI runners; verified live with
+/// DYLD_PRINT_LIBRARIES against the real store binary). The store is not
+/// a hardened binary, so the loader honors the variable. Tested via the
+/// constructed Command because Apple-protected interpreters such as
+/// /bin/sh scrub DYLD_* at load and cannot observe it from a stub.
+#[cfg(target_os = "macos")]
+fn apply_bundled_dyld_path(command: &mut Command, module: &std::path::Path) {
+    let Some(dir) = module.parent() else {
+        return;
+    };
+    let dir = dir.to_string_lossy().into_owned();
+    let value = match std::env::var("DYLD_LIBRARY_PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{dir}:{existing}"),
+        _ => dir,
+    };
+    command.env("DYLD_LIBRARY_PATH", value);
+}
+
 /// Spawn the raw child (CS5: shared by spawn + restart).
 fn spawn_child(cfg: &SupervisorConfig) -> anyhow::Result<Child> {
     let mut command = Command::new(&cfg.redis_server_bin);
@@ -116,6 +138,8 @@ fn spawn_child(cfg: &SupervisorConfig) -> anyhow::Result<Child> {
         .arg(&cfg.data_dir)
         .arg("--loadmodule")
         .arg(&cfg.falkordb_module);
+    #[cfg(target_os = "macos")]
+    apply_bundled_dyld_path(&mut command, &cfg.falkordb_module);
     if let Some(token) = &cfg.auth_token {
         command.arg("--requirepass").arg(token);
     }
@@ -492,6 +516,23 @@ mod tests {
             message.contains("/nonexistent/redis-server"),
             "the error names the path: {message}"
         );
+    }
+
+    /// D29 (macOS leg): the store child must be able to resolve the dylibs
+    /// bundled beside the module — the supervisor points the child's
+    /// DYLD_LIBRARY_PATH at the module's directory, so a stock machine
+    /// without Homebrew libomp/openssl@3 still loads the module.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn store_child_receives_the_bundled_dyld_library_path() {
+        let mut command = Command::new("/bin/true");
+        apply_bundled_dyld_path(&mut command, std::path::Path::new("/rt/falkordb.so"));
+        let value = command
+            .get_envs()
+            .find(|(key, _)| *key == "DYLD_LIBRARY_PATH")
+            .and_then(|(_, value)| value)
+            .expect("DYLD_LIBRARY_PATH is set on the store child");
+        assert_eq!(value.to_string_lossy(), "/rt");
     }
 
     /// D29: a store binary that cannot start — here a stub that prints its

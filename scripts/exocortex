@@ -136,7 +136,12 @@ case "$mode" in
     export EXOCORTEX_SSE_KEY
     # The foreground MCP runtime uses the supervised Falkor-backed node for
     # both writes and authenticated cache hydration.
-    "$client_bin" --backend "$EXOCORTEX_BACKEND" "$@" <&0 &
+    # A non-interactive shell may hand a BACKGROUND job /dev/null stdin
+    # (POSIX async-list behavior, observed live in the release
+    # validation's linux container where the client read instant EOF).
+    # Duplicate the wrapper's stdin in the FOREGROUND, then pass the copy.
+    exec 3<&0
+    "$client_bin" --backend "$EXOCORTEX_BACKEND" "$@" <&3 &
     client_pid=$!
     set +e
     wait "$client_pid"

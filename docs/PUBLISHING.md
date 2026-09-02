@@ -115,6 +115,11 @@ source/license coordinates ride the packaged `RUNTIME-MANIFEST.txt`.
   digest-pinned `falkordb/falkordb` trixie userland because the runtime's
   redis-server needs glibc >= 2.38 while the ubuntu-22.04 builder (kept so
   the shipped binaries keep their own glibc 2.35 floor) has 2.35 (D29).
+  The runtime is self-contained on macOS: the fetcher bundles the module's
+  Homebrew dependencies (libomp, openssl@3 — pinned ghcr.io bottle blobs,
+  the last arm64_sequoia builds at the macOS 15 floor) beside the module,
+  and the supervisor points the store child's DYLD_LIBRARY_PATH at them,
+  so no Homebrew install is required (D29).
   The runtime's floors are macOS 15+ / glibc >= 2.38 for mcp-standalone
   mode; the installer names them when its pre-install `redis-server
   --version` probe fails. Installer tests separately verify resolution
