@@ -157,6 +157,58 @@ is pinned 1.85.0. Live-backend suites (`--features integration` with
   are feature-gated and skip (loudly) without `FALKOR_URL`.
 - Secrets live in `.env.local` (gitignored). Never commit tokens.
 
+## Autonomous runs — directives for unattended work
+
+Long unattended runs proceed without asking, under these directives.
+They are deliberately timeless: **current state never lives here** —
+which rows are open, what gates what, and what closed with which
+evidence live in the master plan alone.
+
+1. **Select work deterministically.** Read the plan's In-progress
+   section first: an item there is owned — resume it before selecting
+   anything else. Otherwise the next item is the lowest-wave row in
+   the plan's Sequenced table whose gates are all locally
+   satisfiable. One item in flight at a time.
+2. **External gates park; they never block.** When a row's gate is an
+   owner input (credentials or secrets, a business decision,
+   real-world demand), record the gate in the row and move to the
+   next eligible row. A wave whose remaining rows are all
+   externally-gated is complete for a run's purposes; the next wave
+   opens.
+3. **One item, one lifecycle.** Open with an In-progress row. Land
+   each finished unit as its own commit: the change, a test that
+   fails without it, and the plan update, together. Close with
+   evidence in the same commit that closes the work. A dependency
+   decision is recorded where rule 9 requires before the dependency
+   lands.
+4. **Defects found mid-run** enter the plan with a reproduction, are
+   fixed in their own commit with a fail-without-it test, and the
+   interrupted item resumes. Never detour silently, never fix outside
+   the lifecycle.
+5. **Fingerprint discipline under autonomy.** The compatibility
+   fingerprint moves ONLY when the item's plan row explicitly
+   authorizes the move — the row is the authorization, and the move
+   lands as one commit with the golden, AGENTS.md, and the plan
+   together. Any other movement is a defect you introduced: find it.
+   Never regenerate a golden to make a gate green.
+6. **Gate cadence.** Fast loop while iterating (`cargo fmt`, `cargo
+   clippy`, the touched crates' tests); the full gate matrix
+   (`scripts/verify-release.sh`, exit 0) before every push. Push
+   after each closed unit under the standing authorization
+   preconditions. Report skipped live-backend legs plainly — never
+   claim coverage that was not executed.
+7. **Review at wave boundaries.** When a wave's locally-satisfiable
+   rows are closed, run a review round
+   (`docs/reviews/round-<n>-review.prd`) and land its findings
+   through the lifecycle before opening the next wave.
+8. **Halt and surface ONLY for:** owner credentials or secrets; a
+   fingerprint move no row authorizes; a release or dependency
+   decision the plan does not pre-authorize; a demand-gated row; or a
+   business decision. Everything else continues.
+9. **End honestly.** A run ends by reporting what closed (with
+   evidence) and what parks (with its gate recorded). Never force a
+   closure and never invent scope to finish a row.
+
 ## Where things are documented
 
 | Question | Answer |
