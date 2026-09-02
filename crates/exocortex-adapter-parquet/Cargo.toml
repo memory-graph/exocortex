@@ -1,0 +1,31 @@
+[package]
+name    = "exocortex-adapter-parquet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Parquet-directory adapter (D1): a directory of Parquet files as a bounded, declared-projection import through the signed Ingestion Protocol. No network beyond the backend, no LLM — schema-faithful transcription only."
+
+[[bin]]
+name = "exocortex-adapter-parquet"
+path = "src/main.rs"
+
+[dependencies]
+exocortex-adapter-sdk = { workspace = true }
+exocortex-wire = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-schema = { workspace = true }
+parquet = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+exocortex-adapter-sdk = { workspace = true, features = ["testing"] }
+tempfile = "3"

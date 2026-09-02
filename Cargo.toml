@@ -8,6 +8,7 @@ members = [
     "crates/exocortex-wire",
     "crates/exocortex-adapter-sdk",
     "crates/exocortex-adapter-git",
+    "crates/exocortex-adapter-parquet",
     "crates/exocortex-storage",
     "crates/exocortex-cache",
     "crates/exocortex-reasoning",
@@ -97,6 +98,15 @@ fastembed = { version = "=5.2.0", default-features = false, features = ["ort-dow
 # releases exceed Rust 1.85, so keep the compatible resolver boundary explicit.
 image = "=0.25.5"
 
+# --- table reader (D1 parquet-dir adapter; see docs/PUBLISHING.md) ---
+# apache-arrow-rs 59 line: rust-version 1.85, exactly the workspace floor.
+# Exact pins because later arrow lines can raise their MSRV (the fastembed/
+# image 0.25.6 precedent); leaf-crate use only, never kernel or SDK.
+arrow-array  = "=59.3.0"
+arrow-cast   = "=59.3.0"
+arrow-schema = "=59.3.0"
+parquet      = "=59.3.0"
+
 # --- time / rand ---
 chrono      = { version = "0.4", features = ["serde"] }
 chrono-tz   = "0.9"
@@ -129,6 +139,7 @@ exocortex-pack-mortgage-v1 = { path = "crates/exocortex-pack-mortgage-v1", versi
 exocortex-wire = { path = "crates/exocortex-wire", version = "0.3.0" }
 exocortex-adapter-sdk = { path = "crates/exocortex-adapter-sdk", version = "0.3.0" }
 exocortex-adapter-git = { path = "crates/exocortex-adapter-git", version = "0.3.0" }
+exocortex-adapter-parquet = { path = "crates/exocortex-adapter-parquet", version = "0.3.0" }
 exocortex-storage = { path = "crates/exocortex-storage", version = "0.3.0" }
 exocortex-cache = { path = "crates/exocortex-cache", version = "0.3.0" }
 exocortex-reasoning = { path = "crates/exocortex-reasoning", version = "0.3.0" }
