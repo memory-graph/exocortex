@@ -1,5 +1,23 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-02, later — D6 shipped):** OpenTelemetry metric
+export (R-O3) landed as `exocortex-server`'s opt-in `otlp` feature:
+ONE global `metrics` recorder slot fans out to BOTH the authenticated
+Prometheus surface (unchanged, still the default when OTLP is off or
+unconfigured) and an OTLP/gRPC PeriodicReader pushing to
+`OTEL_EXPORTER_OTLP_ENDPOINT` (with the standard
+`..._METRICS_ENDPOINT` override; malformed endpoints fail startup; an
+endpoint set on a feature-less binary is a startup ERROR, not a
+silent skip). The fanout delivery is proven without a collector by a
+capturing-exporter regression (run under the feature). Dependency
+decision recorded per rule 9 (PUBLISHING.md): metrics 0.23->0.24 +
+prometheus-exporter 0.18 + metrics-util 0.20 alignment, the
+opentelemetry 0.31 line behind the feature with tonic 0.14.5 held
+(0.14.6 needs rustc 1.88), and the dead workspace otel entries
+removed. `verify-release.sh` runs the matrix WITH the feature so the
+suite can never go dark. Boundary recorded: metrics only; traces/logs
+out of scope for this row. Wave 3 remainder: D20/D24.
+
 **Status (2026-09-02, Wave 3 open — PX5 shipped):** The read-only
 object explorer landed as `crates/exocortex-server/src/explorer.rs`,
 mounted on the node's HTTP surface at `/explorer` INSIDE the existing
@@ -1385,7 +1403,7 @@ so they are never renumbered, only re-waved.
 | D3 | **5** | Federation | §24 |
 | D4 | **4** | Embedding fine-tuning | §24 |
 | D5 | **4** | Ingest-time SimilarTo seeding (`SimilarityCosine`) | §24 q12 (lean: no) |
-| D6 | **3** | OTel export (R-O3) — opentelemetry dep decision | §19, round-2 W14 |
+| D6 | **3** | OTel export (R-O3) — opentelemetry dep decision | §19, round-2 W14 | **Done (Wave 3, 2026-09-02)** — `exocortex-server/src/telemetry.rs`: opt-in `otlp` feature, FanoutBuilder recorder (Prometheus + OTLP/gRPC PeriodicReader over `OTEL_EXPORTER_OTLP_ENDPOINT`), fail-closed on malformed endpoints and on feature-less builds with the env set; capturing-exporter regression `telemetry::tests::the_fanout_delivers_instruments_to_the_otel_leg` under the feature; rule-9 record in PUBLISHING.md (metrics 0.24 family alignment, otel 0.31 line, tonic 0.14.5 hold, dead entries removed); verify-release runs the matrix with the feature (commit `dadb0c4`) |
 | D7 | **3** | Contradiction-resolution op (§23 #13) | §23 #13, round-2 H14 | **Done** — `resolve_contradiction` in the ONE registry (MCP/HTTP parity-covered): a human decision over an open `Contradicts` edge (from|to|neither + mandatory note) closes the edge (new version, `valid_until`, so it stops firing the detector), supersedes the loser to the exact stale-belief floor the commit path applies to `Replaces`/`Contradicts` targets (never deletes — reversible history), and writes the decision to the audit ledger in the SAME atomic commit (`upsert_batch_audited`). Refuses everything else by name: non-Contradicts edges, already-resolved edges, invisible endpoints (IN2 pattern), empty notes. `parity.rs::resolve_contradiction_supersedes_closes_and_audits`; §23 criterion 13 verified |
 | D8 | **4** | ABSTRACT row-writing variant (ontology shape TBD) | §12.1 step 4, round-2 H9 |
 | D9 | **4** | 100-user visibility fuzz + concurrent-region/CrossRegion suites | §23 #21/#22, round-2 H10 |
