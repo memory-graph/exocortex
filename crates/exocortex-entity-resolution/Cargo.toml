@@ -1,0 +1,23 @@
+[package]
+name    = "exocortex-entity-resolution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "D17: the probabilistic half of entity resolution — blocking, hand-written string comparators, Fellegi-Sunter scoring estimated from an operator-labelled set, and an evaluation harness (precision/recall/F1). Deterministic statistics, no LLM, no ML training, no new dependency; matches are PROPOSALS, never automatic merges."
+publish = false
+
+[[bin]]
+name = "exocortex-er"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

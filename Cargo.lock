@@ -1517,6 +1517,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "exocortex-entity-resolution"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "exocortex-ingest"
 version = "0.3.0"
 dependencies = [

@@ -1,5 +1,34 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-02, Wave 2 LOCALLY COMPLETE — D17 shipped):** The
+probabilistic half of entity resolution landed as
+`crates/exocortex-entity-resolution` — the half D13's deterministic
+join deliberately excludes ("Acme Financial Corp" vs "acme financial
+corporation"). Classical Fellegi-Sunter, no learning system, no new
+dependency (serde/anyhow only; the comparators — Jaro-Winkler, token
+set, legal-suffix stripping — are hand-written in-crate): m/u
+probabilities per comparison feature estimated from an
+operator-labelled pair set with Laplace smoothing, summed
+log-likelihood-ratio scoring, and decision thresholds CALIBRATED
+from the labelled scores themselves (midpoint boundary, accept at
+3/4 toward the match mean, review at 3/4 toward the non-match mean —
+magic constants cannot mean the same thing across feature counts).
+Missing attributes are a third comparison state, not evidence
+either way; a feature with match-only evidence refuses estimation
+("label pairs that exercise it"); calibration requires both classes.
+Matches are PROPOSALS (match/review/non_match JSONL via the
+`exocortex-er` binary) — the harness never writes a graph; D13's
+join remains the only automatic identity. The evaluation harness
+(precision/recall/F1 + confusion over the labelled set) IS the
+deliverable; corpus input is JSONL shaped exactly like the
+`--export-corpus` lineage output. 13 tests (10 lib + 3 harness:
+round-trip F1=1.0 on a clean set, the singular/plural boundary lands
+in review not match, binary evaluate/classify against real files,
+label/id validation, blocking never pairs key-disjoint records).
+Wave 2's locally-satisfiable rows are now ALL closed (D21, D18, D13,
+PX4, D1, D17); D19 alone remains, parked on owner credentials. Next
+per directive 7: the Wave 2 boundary review round.
+
 **Status (2026-09-02, closing — D1 COMPLETE; Wave 2 remainder D17):** The
 Delta flavor landed as `crates/exocortex-adapter-delta` and closes D1:
 the `_delta_log` transaction log replayed DIRECTLY (JSON commits +
@@ -1295,13 +1324,13 @@ so they are never renumbered, only re-waved.
 - **Wave 1 — ontology verbs and modularity** (complete). The pack seam
   became a product: typed domain verbs, a second pack, and the seam set
   that keeps both honest. Everything else reads better once this lands.
-- **Wave 2 — data breadth** (D21, D18, D13, PX4, and D1 complete;
-  D17 remains locally satisfiable; D19 parked on credentials). The
-  claim that matters most and the one the repo was weakest on: point
-  Exocortex at data that is not a coding session — now real for docs
-  (PX4) and for tables (parquet/Iceberg/Delta under one adapter
-  contract); the deterministic half of entity resolution shipped and
-  the SaaS adapters remain gated on external credentials.
+- **Wave 2 — data breadth** (COMPLETE for this run: D21, D18, D13,
+  PX4, D1, D17 closed; D19 parked on credentials). Point Exocortex
+  at data that is not a coding session — now real for docs (PX4),
+  tables (parquet/Iceberg/Delta under one adapter contract), and
+  both halves of entity resolution (D13 deterministic join + D17
+  probabilistic proposals); the SaaS adapters remain gated on
+  external credentials.
 - **Wave 3 — surface and operability** (D23, D7, D22 in; PX5, D24, D6,
   D20 remain). Make the graph visible and the node observable.
 - **Wave 4 — scale.** Prove the numbers past 100k before anyone bets an
@@ -1327,7 +1356,7 @@ so they are never renumbered, only re-waved.
 | D14 | **4** | Org-scale benchmarks past the existing 100k suite (10M memories) — forces the embedding-store decision, so it waits for a deployment that demands it rather than leading one | palantir-expansion PRD §5, §24 |
 | D15 | **5** | Row-level ACLs beyond the five visibility labels (inheritance chains, an authorization DSL) | palantir-expansion PRD §5, §24 |
 | D16 | **5** | Ontology branching / PRs against the ontology — only meaningful once a third pack is proposed by someone outside the org | palantir-expansion PRD §5, §24 |
-| D17 | **2** | Probabilistic / fuzzy entity resolution (the half D13 excludes): corpus, labelled set, evaluation harness. Sequenced after D13 proves the deterministic join carries most of the value | palantir-expansion PRD §5, §24 |
+| D17 | **2** | Probabilistic / fuzzy entity resolution (the half D13 excludes): corpus, labelled set, evaluation harness. Sequenced after D13 proves the deterministic join carries most of the value | palantir-expansion PRD §5; core PRD §24 | **Done** — `crates/exocortex-entity-resolution`: Fellegi-Sunter over hand-written comparators (Jaro-Winkler, token set, legal-suffix strip; NO new dependency, no LLM, no ML), m/u estimated from the operator-labelled set with Laplace smoothing + fail-closed evidence checks, thresholds calibrated from the labelled scores, deterministic blocking (prefix/token/attribute keys), and the evaluation harness (P/R/F1 + confusion) as the deliverable; output is scored PROPOSALS (`exocortex-er evaluate|classify`), never graph writes — D13's join stays the only automatic identity; corpus input shaped to the `--export-corpus` lineage output; 13 tests (`entity_resolution` lib 10 + `harness` 3) |
 | D18 | **2** | *(D21 steps a+d)* **Git-history adapter** — commits, authors, files, PRs into `Fix` / `Problem` / `CodePattern` / `Technology`, which `exocortex-pack-dev-v1` already declares. No auth, no network, fully deterministic, offline-testable, and self-evidencing: it runs against this repository. Cheapest real adapter available and the strongest zero-friction demo, so it lands ahead of D1 | adapter roadmap; §18.4 | **Done** — `crates/exocortex-adapter-git`: `git log --format` transcription (unit-separator record format, malformed records skipped-and-counted, never guessed); `fix:`→`Fix` / else `Command` (a prefix test); `FileContext` per changed path + `Modifies` edges (the one factual relationship; PR/issue joins are D19's, not text guessing — recorded); ExternalKey identity (blake3 repo-scoped table uuid, sha/path pks) ⇒ idempotent re-runs with content-bound batch ids; D21 projection declared (window bound stops before wire traffic); binary with env-only secrets; hermetic fixture-repo suite `tests/git_history.rs` (real git binary, fixed identities/timestamps) |
 | D19 | **2** | *(D21 steps a+d)* **SaaS-API adapter family** — Linear/Jira first, then GitHub, then Salesforce/ServiceNow. Highest semantic density of any source: these systems already carry relationships (issue→assignee→team, PR→commit→file), so edges are transcribed rather than inferred. Linear and GitHub join directly to D18's git graph on the same entities | adapter roadmap; §18.4 |
 | D20 | **3** | *(D21 steps a+d)* **CDC adapters** — Postgres logical replication first, then MySQL binlog / Debezium. Structurally different from table sources: continuous rather than batch-with-cursor, deletes arrive as first-class events (a clean match for soft-delete and `valid_until`), primary keys map onto `ExternalKey`, and source ordering must reconcile with LSN assignment. This is the category that makes integration of *operational* systems real | adapter roadmap; §18.4 |
@@ -1342,7 +1371,7 @@ so they are never renumbered, only re-waved.
 or close):**
 
 - **Locally satisfiable — an unattended run may take them in wave
-  order:** D17 (D13 shipped), PX5 (PX6 shipped), D6 (the rule-9 record IS the
+  order:** PX5 (PX6 shipped), D6 (the rule-9 record IS the
   first deliverable), D20 (live-Postgres legs gate like `FALKOR_URL`),
   D24 (the ONLY open row authorized to move the compatibility
   fingerprint — one commit with golden + AGENTS.md + this plan).
