@@ -283,6 +283,7 @@ mod tests {
 
     pub(super) fn draft(k: &str, big: bool) -> MemoryDraft {
         MemoryDraft {
+            rights: None,
             draft_key: k.into(),
             id: String::new(),
             memory_type: "General".into(),

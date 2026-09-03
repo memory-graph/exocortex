@@ -30,6 +30,7 @@ fn memory(
     valid_until: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Memory {
     Memory {
+        rights: None,
         id: MemoryId::new_v7(),
         memory_type: 0,
         title: key.into(),
@@ -262,4 +263,53 @@ async fn corpus_cut_defaults_to_now() {
         .unwrap();
     assert_eq!(manifest.memories, 1);
     assert_eq!(manifest.as_of, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn d24_egress_verdict_is_computed_from_row_rights() {
+    let onto = ontology();
+    let fix_id = onto.memory_type_id("Fix").unwrap();
+
+    // Fully-covered corpus: every row claims licence + consent.
+    let covered = InMemoryStorage::new(onto.clone());
+    let mut row = memory("covered", "Fix", ts(2024), ts(2024), None);
+    row.memory_type = fix_id;
+    row.rights = Some(exocortex_kernel::memory::Rights {
+        licence: Some("Apache-2.0".into()),
+        consent_basis: Some("contractual".into()),
+        retention_until: None,
+        redacted: false,
+    });
+    covered.upsert_memory(&row).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = export_corpus(&covered, &onto, None, dir.path())
+        .await
+        .unwrap();
+    assert!(
+        manifest.egress.starts_with("permitted:"),
+        "the verdict flips when every row is covered: {}",
+        manifest.egress
+    );
+
+    // One uncovered row poisons the whole corpus (fail closed).
+    let mixed = InMemoryStorage::new(onto.clone());
+    mixed.upsert_memory(&row).await.unwrap();
+    let mut bare = memory("bare", "Fix", ts(2024), ts(2024), None);
+    bare.memory_type = fix_id;
+    mixed.upsert_memory(&bare).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = export_corpus(&mixed, &onto, None, dir.path())
+        .await
+        .unwrap();
+    assert!(
+        manifest.egress.starts_with("NOT permitted:"),
+        "an uncovered row blocks egress: {}",
+        manifest.egress
+    );
+    assert!(manifest.egress.contains("1/2"), "{}", manifest.egress);
+    assert!(
+        manifest.egress.contains("claim none"),
+        "{}",
+        manifest.egress
+    );
 }

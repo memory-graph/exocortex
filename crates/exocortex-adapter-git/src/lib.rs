@@ -178,6 +178,7 @@ pub fn map_history(repo_id: &str, commits: &[GitCommit], batch_id_seed: &str) ->
             content.push_str(path);
         }
         memories.push(MemoryDraft {
+            rights: None,
             draft_key: commit_key.clone(),
             id: String::new(),
             memory_type: memory_type_for(&commit.subject).into(),
@@ -210,6 +211,7 @@ pub fn map_history(repo_id: &str, commits: &[GitCommit], batch_id_seed: &str) ->
     for path in sorted_paths {
         let key = &file_key[path];
         memories.push(MemoryDraft {
+            rights: None,
             draft_key: key.clone(),
             id: String::new(),
             memory_type: "FileContext".into(),

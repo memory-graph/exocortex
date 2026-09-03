@@ -93,6 +93,14 @@ pub struct SourceEntry {
     /// D21-a: the declared projection (table-shaped flavors only).
     #[serde(default)]
     pub projection: Option<StoredProjection>,
+    /// D24: the source's per-record default rights, stamped onto
+    /// submitted memories that carry none of their own.
+    /// Producer-declared and visible in provenance; the administrator
+    /// source policy remains the enforcement point (the WS2 ceiling
+    /// pattern). Old registry rows load as `None` — no rights
+    /// claimed, egress fail-closed.
+    #[serde(default)]
+    pub default_rights: Option<exocortex_kernel::memory::Rights>,
 }
 
 /// Immutable administrator policy for one exact producer identity.
@@ -719,6 +727,14 @@ impl<S: Storage> IngestServer<S> {
             invalidated_by: None,
             embedding: None,
             lsn: LSN::new_local(0),
+            // D24: the record's own rights, else the source's
+            // registered default — absent on both stays `None` so the
+            // corpus exporter answers "not covered" (fail closed).
+            rights: m
+                .rights
+                .as_ref()
+                .map(kernel_rights)
+                .or_else(|| source.default_rights.clone()),
         };
         if let Some(k) = &m.external_key {
             // B8: identity rides the RAW uuid bytes — hex here would
@@ -991,6 +1007,31 @@ struct CommitRows {
 struct BatchTimes {
     observed_at: chrono::DateTime<chrono::Utc>,
     recorded_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// D24: the wire rights block as the kernel type. Retention is
+/// checked against the row's validity — a retention stop before the
+/// row is even valid is a malformed claim, rejected rather than
+/// silently clamped.
+fn kernel_rights(rights: &exocortex_wire::ingest::v1::Rights) -> exocortex_kernel::memory::Rights {
+    exocortex_kernel::memory::Rights {
+        licence: rights
+            .licence
+            .trim()
+            .is_empty()
+            .then_some(None)
+            .unwrap_or_else(|| Some(rights.licence.trim().to_string().into())),
+        consent_basis: rights
+            .consent_basis
+            .trim()
+            .is_empty()
+            .then_some(None)
+            .unwrap_or_else(|| Some(rights.consent_basis.trim().to_string().into())),
+        retention_until: rights.retention_until.as_ref().map(|stamp| {
+            chrono::DateTime::from_timestamp(stamp.seconds, stamp.nanos as u32).unwrap_or_default()
+        }),
+        redacted: rights.redacted,
+    }
 }
 
 fn checked_timestamp(
@@ -2413,11 +2454,20 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
                 // not stored, not audited, and not enforced).
                 None
             };
+            // D24: the source's default rights ride the FIRST
+            // registration (re-registration does not overwrite — the
+            // ceiling pattern: a later producer identity cannot widen
+            // rights the org already recorded).
+            let default_rights = match &existing {
+                Some(previous) => previous.default_rights.clone(),
+                None => r.default_rights.as_ref().map(kernel_rights),
+            };
             let entry = SourceEntry {
                 ceiling,
                 kind,
                 flavor,
                 projection: stored_projection,
+                default_rights,
             };
             candidate.put(key.clone(), entry.clone());
             let rows = Self::source_rows(&candidate);

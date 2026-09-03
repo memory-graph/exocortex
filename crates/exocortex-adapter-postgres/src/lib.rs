@@ -140,10 +140,7 @@ fn cells_of(columns: &serde_json::Value) -> Result<BTreeMap<String, Option<Strin
             .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("wal2json column carries no name"))?;
-        cells.insert(
-            name.to_string(),
-            column.get("value").map(render_cell).flatten(),
-        );
+        cells.insert(name.to_string(), column.get("value").and_then(render_cell));
     }
     Ok(cells)
 }

@@ -22,6 +22,7 @@ fn server() -> IngestServer<InMemoryStorage> {
 
 fn row(key: &str, mt: &str, vis: i32) -> MemoryDraft {
     MemoryDraft {
+        rights: None,
         draft_key: key.into(),
         id: String::new(),
         memory_type: mt.into(),
@@ -189,6 +190,7 @@ fn checksum_is_order_independent() {
     // same rows in any order -> identical checksum; any change differs.
     use exocortex_wire::ingest::v1::ProducerIdentity;
     let mk = |k: &str, t: &str| exocortex_wire::ingest::v1::MemoryDraft {
+        rights: None,
         draft_key: k.into(),
         id: String::new(),
         memory_type: "Fix".into(),

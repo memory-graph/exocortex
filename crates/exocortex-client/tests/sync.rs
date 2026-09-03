@@ -915,6 +915,7 @@ async fn per_client_sse_hmac_verifies_with_derived_key() {
 fn test_memory(title: &str, n: u8) -> exocortex_kernel::Memory {
     use exocortex_kernel::{Memory, MemoryContext, Provenance, Visibility, LSN};
     Memory {
+        rights: None,
         id: MemoryId([n; 16]),
         memory_type: 3,
         title: title.into(),

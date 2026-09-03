@@ -64,6 +64,13 @@ message RegisterSourceRequest {
   // "parquet-dir"); "session" and "custom" are exempt in v1 (the shipped
   // docs adapter migrates separately).
   ProjectionDescriptor projection = 8;
+  // D24 (rights and consent provenance): the source's per-record
+  // DEFAULT rights, stamped onto submitted memories that carry none
+  // of their own. Producer-declared and visible in provenance; the
+  // administrator source policy remains the enforcement point (the
+  // WS2 ceiling pattern — a producer's self-declaration never widens
+  // what policy allows).
+  Rights default_rights = 9;
 }
 message ProjectionField {
   string source_field = 1; // column / key, in the source's own terms
@@ -118,6 +125,20 @@ message MemoryDraft {
   google.protobuf.Timestamp valid_from  = 8;   // empty = recorded_at (R-T7)
   google.protobuf.Timestamp valid_until = 9;   // optional
   ExternalKey external_key = 10;  // required iff batch.snapshot present
+  // D24: this record's rights and consent provenance. Absent = the
+  // source's registered default applies; absent on both = the corpus
+  // exporter answers "not covered" for this row (fail closed).
+  Rights rights = 11;
+}
+
+// D24 (rights and consent provenance): whether a record may leave the
+// org (train on, resell, republish) and under what basis. Every field
+// is a claim an operator can verify against the audit ledger.
+message Rights {
+  string licence = 1;             // SPDX id or name; "" = unlicensed
+  string consent_basis = 2;       // e.g. "contractual", "legitimate-interest"; "" = none claimed
+  google.protobuf.Timestamp retention_until = 3;  // optional hard stop
+  bool   redacted = 4;            // content already redacted by the producer
 }
 
 message RelationshipDraft {

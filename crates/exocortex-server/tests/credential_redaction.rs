@@ -95,6 +95,7 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
 
     let registration_error = ingest
         .register_source(tonic::Request::new(RegisterSourceRequest {
+            default_rights: None,
             org_id: "org".into(),
             source_uri: "session://safe-source".into(),
             producer_id: "safe-producer".into(),

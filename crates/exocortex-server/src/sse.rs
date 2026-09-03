@@ -1048,6 +1048,7 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new(ontology.clone()));
         let now = chrono::Utc::now();
         let memory = Memory {
+            rights: None,
             id: MemoryId::new_v7(),
             memory_type: 3,
             title: "concurrent".into(),
@@ -1109,6 +1110,7 @@ mod tests {
         let now = chrono::Utc::now();
         let rows = (0..520)
             .map(|index| Memory {
+                rights: None,
                 id: MemoryId::new_v7(),
                 memory_type: 3,
                 title: format!("oversized-{index}").into(),
@@ -1171,6 +1173,7 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new(ontology.clone()));
         let now = chrono::Utc::now();
         let make_memory = |title: &str| Memory {
+            rights: None,
             id: MemoryId::new_v7(),
             memory_type: 3,
             title: title.into(),

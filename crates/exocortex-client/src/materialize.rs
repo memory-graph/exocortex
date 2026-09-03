@@ -83,6 +83,7 @@ pub fn materialize_entry(
     for (idx, draft) in entry.memories.iter().enumerate() {
         let ts = draft.context.timestamp;
         out.memories.push(Memory {
+            rights: None,
             id: entry.memory_ids[idx],
             memory_type: draft.memory_type,
             title: draft.title.clone(),
@@ -268,6 +269,7 @@ pub fn grouping_node_local(
     id_bytes.copy_from_slice(&hash.as_bytes()[..16]);
     let short: String = key.chars().take(8).collect();
     Some(Memory {
+        rights: None,
         id: MemoryId(id_bytes),
         memory_type,
         title: format!("Session {short}").into(),

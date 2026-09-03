@@ -50,6 +50,11 @@ pub struct LineageRow {
     pub entities: Vec<String>,
     /// The LSN the row was written under.
     pub lsn: u64,
+    /// D24: the row's rights verdict — `licensed` (licence + consent
+    /// both claimed), `partial` (rights present but incomplete), or
+    /// `none` (no rights claimed). Egress decisions read the
+    /// manifest's aggregate, computed from exactly these.
+    pub rights: String,
 }
 
 /// The corpus manifest (one JSON document beside the JSONL files).
@@ -207,6 +212,11 @@ pub async fn export_corpus<S: Storage>(
                 .map(|entity| hex(&entity.0))
                 .collect(),
             lsn: memory.lsn.value,
+            rights: match &memory.rights {
+                Some(rights) if rights.egress_permitted() => "licensed".into(),
+                Some(_) => "partial".into(),
+                None => "none".into(),
+            },
         };
         lineage_out.push_str(&serde_json::to_string(&row).context("serialize lineage row")?);
         lineage_out.push('\n');
@@ -218,6 +228,39 @@ pub async fn export_corpus<S: Storage>(
         edges_out.push('\n');
     }
 
+    // D24: the egress verdict is COMPUTED from the exported rows'
+    // own rights claims — every row licensed + consented, or the
+    // corpus does not leave under this manifest. Fail closed.
+    let licensed = memories
+        .iter()
+        .filter(|memory| {
+            memory
+                .rights
+                .as_ref()
+                .is_some_and(exocortex_kernel::memory::Rights::egress_permitted)
+        })
+        .count();
+    let partial = memories
+        .iter()
+        .filter(|memory| {
+            memory
+                .rights
+                .as_ref()
+                .is_some_and(|rights| !rights.egress_permitted())
+        })
+        .count();
+    let egress = if memories.is_empty() {
+        "empty corpus: no rows, no egress claim".to_string()
+    } else if licensed == memories.len() {
+        format!("permitted: all {licensed} exported rows claim licence + consent basis (D24)")
+    } else {
+        format!(
+            "NOT permitted: {licensed}/{} rows claim licence + consent; {partial} carry              incomplete rights; {} claim none — a corpus leaves the org only when every              row is covered (D24, fail closed)",
+            memories.len(),
+            memories.len() - licensed - partial
+        )
+    };
+
     let manifest = CorpusManifest {
         format: FORMAT.into(),
         version: VERSION,
@@ -226,9 +269,7 @@ pub async fn export_corpus<S: Storage>(
         memories: memories.len(),
         edges: edges.len(),
         computed_only_kinds: computed_only_kinds.into_iter().collect(),
-        egress: "rights and consent provenance (D24) is not modelled yet; \
-                 this corpus leaving the org is NOT covered by any licence field"
-            .into(),
+        egress,
     };
 
     let noun = "corpus export";

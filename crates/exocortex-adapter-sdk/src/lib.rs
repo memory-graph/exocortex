@@ -419,6 +419,7 @@ impl AdapterSession {
             detail: format!("server fingerprint is {} bytes, expected 32", v.len()),
         })?;
         let mut registration = exocortex_wire::ingest::v1::RegisterSourceRequest {
+            default_rights: None,
             org_id: config.org_id.clone(),
             source_uri: config.source_uri.clone(),
             producer_id: config.producer_id.clone(),

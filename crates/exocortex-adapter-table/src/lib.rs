@@ -340,6 +340,7 @@ pub fn map_rows(
         let mut tags = vec![flavor_tag.to_string()];
         tags.extend(row.tags.iter().cloned());
         memories.push(MemoryDraft {
+            rights: None,
             draft_key: draft_key.clone(),
             id: String::new(),
             memory_type: mapping.memory_type.clone(),

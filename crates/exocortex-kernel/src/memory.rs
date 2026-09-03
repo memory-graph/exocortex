@@ -128,6 +128,49 @@ pub struct Memory {
     pub embedding: Option<Embedding>,
     /// Storage-assigned log sequence number (§6.2).
     pub lsn: LSN,
+    /// D24 (rights and consent provenance): whether this record may
+    /// leave the org, under what licence and basis, until when, and
+    /// whether its content was already redacted. `None` = no rights
+    /// claimed — the corpus exporter answers "not covered" for this
+    /// row (fail closed). Optional and additive: rows predating D24
+    /// deserialize as `None`, and the compatibility fingerprint is
+    /// UNMOVED (row shape, not pack structure — the plan authorized a
+    /// move this design turns out not to need).
+    #[serde(default)]
+    pub rights: Option<Rights>,
+}
+
+/// D24: the rights and consent block a record (or a source's default)
+/// carries. Every field is a claim an operator can verify against the
+/// audit ledger.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Rights {
+    /// SPDX id or name; `None`/empty = unlicensed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licence: Option<SmolStr>,
+    /// Consent basis (e.g. "contractual", "legitimate-interest");
+    /// `None` = none claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_basis: Option<SmolStr>,
+    /// Hard retention stop; rows must not outlive it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_until: Option<DateTime<Utc>>,
+    /// The producer already redacted the content.
+    #[serde(default)]
+    pub redacted: bool,
+}
+
+impl Rights {
+    /// The egress verdict (D24): a row may leave the org only when it
+    /// claims BOTH a licence and a consent basis. Anything less is
+    /// "not covered" — fail closed, never guess.
+    pub fn egress_permitted(&self) -> bool {
+        self.licence.as_deref().is_some_and(|l| !l.is_empty())
+            && self
+                .consent_basis
+                .as_deref()
+                .is_some_and(|basis| !basis.is_empty())
+    }
 }
 
 /// The entity linkage layer (§7.6) — session, git, project, and extracted
@@ -246,5 +289,49 @@ mod confidence_tests {
         assert!((derived_confidence(false, 0, 99).get() - 0.1).abs() < 1e-6);
         // Superseded: the floor regardless of history.
         assert!((derived_confidence(true, 99, 0).get() - 0.1).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod rights_tests {
+    use super::*;
+
+    #[test]
+    fn egress_requires_both_licence_and_consent() {
+        let full = Rights {
+            licence: Some("Apache-2.0".into()),
+            consent_basis: Some("contractual".into()),
+            retention_until: None,
+            redacted: false,
+        };
+        assert!(full.egress_permitted());
+        assert!(!Rights {
+            licence: Some("Apache-2.0".into()),
+            consent_basis: None,
+            retention_until: None,
+            redacted: false,
+        }
+        .egress_permitted());
+        assert!(!Rights {
+            licence: None,
+            consent_basis: Some("contractual".into()),
+            retention_until: None,
+            redacted: false,
+        }
+        .egress_permitted());
+        assert!(!Rights::default().egress_permitted());
+    }
+
+    #[test]
+    fn pre_d24_rows_deserialize_as_no_rights() {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            title: String,
+            #[serde(default)]
+            rights: Option<Rights>,
+        }
+        let row: Row = serde_json::from_str(r#"{"title":"old row"}"#).unwrap();
+        assert_eq!(row.title, "old row");
+        assert_eq!(row.rights, None, "additive field: old shapes load clean");
     }
 }

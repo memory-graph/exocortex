@@ -109,6 +109,7 @@ async fn signed_budget_is_enforced_not_estimated() {
         .await
         .unwrap();
     let mk = |k: &str| MemoryDraft {
+        rights: None,
         draft_key: k.into(),
         id: String::new(),
         memory_type: "General".into(),

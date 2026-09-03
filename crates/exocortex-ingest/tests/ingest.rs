@@ -23,6 +23,7 @@ fn server() -> IngestServer<InMemoryStorage> {
 
 fn draft(key: &str, mt: &str, vis: i32) -> MemoryDraft {
     MemoryDraft {
+        rights: None,
         draft_key: key.into(),
         id: String::new(),
         memory_type: mt.into(),
@@ -120,6 +121,7 @@ fn register_table_source(srv: &IngestServer<InMemoryStorage>, source_uri: &str, 
     };
     let columns = table_columns();
     let mut r = RegisterSourceRequest {
+        default_rights: None,
         org_id: "org".into(),
         source_uri: source_uri.into(),
         producer_id: producer_id.into(),
@@ -1527,6 +1529,7 @@ async fn unsigned_registration_is_unauthenticated() {
     let srv = server();
     let err = srv
         .register_source(tonic::Request::new(RegisterSourceRequest {
+            default_rights: None,
             org_id: "org".into(),
             source_uri: "session://evil".into(),
             producer_id: "attacker".into(),
@@ -1570,6 +1573,7 @@ async fn legitimate_producer_survives_registration_flood() {
     for i in 0..1100 {
         let r = srv
             .register_source(tonic::Request::new(RegisterSourceRequest {
+                default_rights: None,
                 org_id: "org".into(),
                 source_uri: format!("session://flood-{i}"),
                 producer_id: format!("attacker-{i}"),

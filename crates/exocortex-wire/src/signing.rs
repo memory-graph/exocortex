@@ -259,6 +259,7 @@ pub fn registration(
     producer_kind: crate::ingest::v1::ProducerKind,
 ) -> RegisterSourceRequest {
     let mut r = RegisterSourceRequest {
+        default_rights: None,
         org_id: org_id.into(),
         source_uri: source_uri.into(),
         producer_id: producer_id.into(),
@@ -321,6 +322,7 @@ mod tests {
 
     fn draft(key: &str, title: &str) -> MemoryDraft {
         MemoryDraft {
+            rights: None,
             draft_key: key.into(),
             id: String::new(),
             memory_type: "General".into(),

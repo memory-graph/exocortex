@@ -95,6 +95,7 @@ fn kind(name: &str) -> u32 {
 
 fn mem(mt: u8, tags: &[&str], entities: &[u8]) -> Memory {
     Memory {
+        rights: None,
         id: MemoryId::new_v7(),
         memory_type: mt,
         title: "t".into(),
@@ -739,6 +740,7 @@ async fn derived_confidence_uses_per_pair_shared_count() {
 fn base_memory_for_tags() -> exocortex_kernel::Memory {
     use exocortex_kernel::*;
     Memory {
+        rights: None,
         id: MemoryId::new_v7(),
         memory_type: 3,
         title: "t".into(),

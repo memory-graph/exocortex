@@ -34,6 +34,7 @@ fn mem_with_embedding(i: usize, dup_of: Option<usize>, embedding: Vec<f32>) -> M
         MemoryId::new_v7()
     };
     Memory {
+        rights: None,
         id,
         memory_type: 3,
         title: format!("m{i}").into(),

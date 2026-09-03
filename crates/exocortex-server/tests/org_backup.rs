@@ -27,6 +27,7 @@ fn fingerprint_hex(o: &exocortex_kernel::Ontology) -> String {
 
 fn test_mem(title: &str, n: u8) -> Memory {
     Memory {
+        rights: None,
         id: MemoryId([n; 16]),
         memory_type: 3,
         title: title.into(),

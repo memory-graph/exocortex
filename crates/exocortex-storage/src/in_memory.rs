@@ -2351,6 +2351,7 @@ mod atomic_fence_tests {
 
     fn memory() -> Memory {
         Memory {
+            rights: None,
             id: MemoryId::new_v7(),
             memory_type: 0,
             title: "atomic fence".into(),

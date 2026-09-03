@@ -39,6 +39,7 @@ async fn register(srv: &IngestServer<InMemoryStorage>, uri: &str) {
 
 fn draft(key: &str, title: &str, content: &str) -> MemoryDraft {
     MemoryDraft {
+        rights: None,
         draft_key: key.into(),
         id: String::new(),
         memory_type: "Solution".into(),

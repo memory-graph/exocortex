@@ -252,6 +252,7 @@ pub fn prepare_pack_action(
         )
         .map_err(|e| OpError::BadInput(e.to_string()))?;
         let memory = Memory {
+            rights: None,
             id: MemoryId::new_v7(),
             memory_type: effective,
             title: m.title.clone(),

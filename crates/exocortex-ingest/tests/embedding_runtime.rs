@@ -58,6 +58,7 @@ impl Embedder for BlockingBatchEmbedder {
 
 fn draft(index: usize) -> MemoryDraft {
     MemoryDraft {
+        rights: None,
         draft_key: format!("row-{index}"),
         id: String::new(),
         memory_type: "Solution".into(),

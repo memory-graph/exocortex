@@ -89,6 +89,7 @@ fn spawn_node() -> Node {
 
 fn draft(k: &str) -> MemoryDraft {
     MemoryDraft {
+        rights: None,
         draft_key: k.into(),
         id: String::new(),
         memory_type: "General".into(),

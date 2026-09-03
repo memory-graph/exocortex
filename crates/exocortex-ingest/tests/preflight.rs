@@ -33,6 +33,7 @@ type InMemoryStorageShim = exocortex_storage::InMemoryStorage;
 
 async fn register(srv: &IngestServer<InMemoryStorageShim>, producer: &str) {
     let mut r = RegisterSourceRequest {
+        default_rights: None,
         org_id: "org".into(),
         source_uri: "custom://probe".into(),
         producer_id: producer.into(),
@@ -70,6 +71,7 @@ fn session_batch(batch_id: &str) -> IngestBatch {
         snapshot: None,
         memories: vec![
             MemoryDraft {
+                rights: None,
                 draft_key: "good".into(),
                 id: String::new(),
                 memory_type: "Fix".into(),
@@ -91,6 +93,7 @@ fn session_batch(batch_id: &str) -> IngestBatch {
                 visibility: 1,
                 valid_from: None,
                 valid_until: None,
+                rights: None,
                 external_key: None,
             },
             MemoryDraft {
@@ -104,6 +107,7 @@ fn session_batch(batch_id: &str) -> IngestBatch {
                 valid_from: None,
                 valid_until: None,
                 external_key: None,
+                rights: None,
             },
         ],
         relationships: vec![
@@ -160,6 +164,7 @@ fn snapshot_batch(batch_id: &str) -> IngestBatch {
             source_flavor: "custom".into(),
         }),
         memories: vec![MemoryDraft {
+            rights: None,
             draft_key: "no-key".into(),
             id: String::new(),
             memory_type: "Fix".into(),

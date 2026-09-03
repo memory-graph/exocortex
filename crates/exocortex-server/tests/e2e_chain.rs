@@ -218,6 +218,7 @@ fn ext_batch(fp: [u8; 32], snapshot: &str, key: &str, title: &str) -> IngestBatc
             source_flavor: "custom".into(),
         }),
         memories: vec![MemoryDraft {
+            rights: None,
             draft_key: key.into(),
             id: String::new(),
             memory_type: "General".into(),
@@ -314,6 +315,7 @@ async fn wrapup_chain_grpc_to_sse_to_sibling_client() {
         recorded_at: None,
         snapshot: None,
         memories: vec![MemoryDraft {
+            rights: None,
             draft_key: "k1".into(),
             id: String::new(),
             memory_type: "General".into(),
@@ -615,6 +617,7 @@ async fn two_sync_snapshot_bump_upserts_same_row_new_pk_appends() {
 fn test_mem(title: &str, n: u8) -> exocortex_kernel::Memory {
     use exocortex_kernel::{Memory, MemoryContext, Provenance, Visibility, LSN};
     Memory {
+        rights: None,
         id: exocortex_kernel::MemoryId([n; 16]),
         memory_type: 3,
         title: title.into(),

@@ -31,6 +31,7 @@ fn visibility(vis: u8) -> Visibility {
 
 fn base_memory(title: String, content: String, mt: u8, vis: u8) -> Memory {
     Memory {
+        rights: None,
         id: MemoryId::new_v7(),
         memory_type: mt % 13,
         title: title.into(),

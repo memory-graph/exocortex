@@ -66,6 +66,7 @@ pub async fn drain_once(
         // Register (signed, idempotent) before the first submit (R-I3);
         // the server rejects unsigned registrations (WS1).
         let mut registration = RegisterSourceRequest {
+            default_rights: None,
             org_id: org_id.to_string(),
             source_uri: batch.source_uri.clone(),
             producer_id: batch.producer_id.clone(),
@@ -201,6 +202,7 @@ fn rebuild_batch(
             .clone();
         let tags = entry.tags.get(i).cloned().unwrap_or_default();
         drafts.push(WireDraft {
+            rights: None,
             draft_key: keys[i].clone(),
             id: hex16(&entry.memory_ids[i].0),
             memory_type: mt_label.to_string(),
@@ -494,6 +496,7 @@ mod tests {
             strength: 0.5,
         };
         let wire = WireDraft {
+            rights: None,
             draft_key: "k1".into(),
             id: String::new(),
             memory_type: "Fix".into(),

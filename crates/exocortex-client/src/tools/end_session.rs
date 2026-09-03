@@ -240,6 +240,7 @@ impl EndSessionTool {
             let vis = parse_visibility(&m.visibility)
                 .map_err(|_| rmcp::Error::invalid_params("unknown visibility", None))?;
             memories.push(WireMemoryDraft {
+                rights: None,
                 draft_key: m.draft_key,
                 id: uuid::Uuid::now_v7().simple().to_string(),
                 memory_type: m.memory_type,
@@ -323,6 +324,7 @@ impl EndSessionTool {
         // registry mutations. D8: declares the closed producer kind.
         let mut client = self.client.clone();
         let mut registration = RegisterSourceRequest {
+            default_rights: None,
             org_id: self.org_id.clone(),
             source_uri: batch.source_uri.clone(),
             producer_id: "session-wrapup".into(),

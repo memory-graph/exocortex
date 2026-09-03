@@ -24,6 +24,7 @@ fn server() -> IngestServer<InMemoryStorage> {
 
 fn draft(key: &str, title: &str) -> MemoryDraft {
     MemoryDraft {
+        rights: None,
         draft_key: key.into(),
         id: String::new(),
         memory_type: "General".into(),

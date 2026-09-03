@@ -1242,6 +1242,7 @@ impl Operation for PreflightBatchOp {
                     })
                     .transpose()?;
                 Ok(exocortex_wire::ingest::v1::MemoryDraft {
+                    rights: None,
                     draft_key: m.draft_key.clone(),
                     id: String::new(),
                     memory_type: m.memory_type.clone(),

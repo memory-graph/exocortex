@@ -211,7 +211,8 @@ impl ReplicationSession {
 
     async fn simple_command(&mut self, statement: &str) -> Result<()> {
         self.buffer.clear();
-        frontend::query(statement, &mut self.buffer);
+        frontend::query(statement, &mut self.buffer)
+            .map_err(|e| anyhow::anyhow!("encoding : {e}"))?;
         self.stream.write_all(&self.buffer).await?;
         self.buffer.clear();
         loop {
@@ -268,7 +269,8 @@ impl ReplicationSession {
             ),
         };
         self.buffer.clear();
-        frontend::query(&statement, &mut self.buffer);
+        frontend::query(&statement, &mut self.buffer)
+            .map_err(|e| anyhow::anyhow!("encoding START_REPLICATION: {e}"))?;
         self.stream.write_all(&self.buffer).await?;
         self.buffer.clear();
 

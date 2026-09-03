@@ -687,6 +687,7 @@ async fn backend_node_threads_a_non_default_org_through_its_runtime() {
 fn acceptance_memory(seed: u8, embedding: bool) -> exocortex_kernel::Memory {
     use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
     Memory {
+        rights: None,
         id: MemoryId([seed; 16]),
         memory_type: 3,
         title: format!("cluster-{seed}").into(),

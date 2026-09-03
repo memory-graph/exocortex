@@ -659,6 +659,7 @@ async fn mcp_get_memory_shape_matches_registry() {
     let mut snap = GraphSnapshot::empty();
     use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
     let m = Memory {
+        rights: None,
         id: MemoryId([9; 16]),
         memory_type: onto.memory_type_id("Problem").unwrap(),
         title: "shape witness".into(),

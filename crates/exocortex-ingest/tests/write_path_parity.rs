@@ -31,6 +31,7 @@ struct Row {
 
 fn wire(key: &str, mt: &str, title: &str, vis: i32) -> WireDraft {
     WireDraft {
+        rights: None,
         draft_key: key.into(),
         id: String::new(),
         memory_type: mt.into(),

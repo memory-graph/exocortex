@@ -28,6 +28,7 @@ fn grown_ontology() -> Arc<Ontology> {
 
 fn draft(key: &str) -> MemoryDraft {
     MemoryDraft {
+        rights: None,
         draft_key: key.into(),
         id: String::new(),
         memory_type: "Fix".into(),

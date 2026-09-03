@@ -86,6 +86,7 @@ async fn register_as(
     descriptor: Option<ProjectionDescriptor>,
 ) -> Result<(), tonic::Status> {
     let mut r = RegisterSourceRequest {
+        default_rights: None,
         org_id: "org".into(),
         source_uri: source_uri.into(),
         producer_id: producer.into(),
@@ -115,6 +116,7 @@ fn table_batch(
 ) -> IngestBatch {
     let memories: Vec<MemoryDraft> = (0..rows)
         .map(|i| MemoryDraft {
+            rights: None,
             draft_key: format!("r{i}"),
             id: String::new(),
             memory_type: "Fix".into(),
@@ -417,6 +419,7 @@ async fn external_identity_joins_across_producers() {
         let mut memories = Vec::new();
         for (i, name) in [title, title].iter().enumerate() {
             memories.push(exocortex_wire::ingest::v1::MemoryDraft {
+                rights: None,
                 draft_key: format!("k{i}"),
                 id: String::new(),
                 memory_type: "Fix".into(),

@@ -115,6 +115,7 @@ async fn run_fixture(args: Args) -> anyhow::Result<()> {
     let mut memories = Vec::new();
     for m in raw["memories"].as_array().cloned().unwrap_or_default() {
         memories.push(MemoryDraft {
+            rights: None,
             draft_key: m["draft_key"].as_str().unwrap_or_default().into(),
             id: String::new(),
             memory_type: m["memory_type"].as_str().unwrap_or("General").into(),

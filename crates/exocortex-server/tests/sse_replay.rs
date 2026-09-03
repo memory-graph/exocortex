@@ -141,6 +141,7 @@ fn decoded_events(body: &str) -> Vec<exocortex_wire::sse::v1::Invalidation> {
 fn scoped_memory(id: u8, project: &str) -> Memory {
     let now = chrono::Utc::now();
     Memory {
+        rights: None,
         id: MemoryId([id; 16]),
         memory_type: 3,
         title: format!("memory-{id}").into(),

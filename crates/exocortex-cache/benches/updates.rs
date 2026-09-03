@@ -12,6 +12,7 @@ use exocortex_storage::{InMemoryStorage, Invalidation, Storage};
 
 fn memory(i: usize) -> Memory {
     Memory {
+        rights: None,
         id: MemoryId::from_content_hash("bench-org", &i.to_string()),
         memory_type: 3,
         title: format!("update-{i}").into(),

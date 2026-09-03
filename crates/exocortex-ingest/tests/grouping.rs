@@ -30,6 +30,7 @@ fn server() -> IngestServer<InMemoryStorage> {
 
 fn draft(key: &str, mt: &str, title: &str) -> MemoryDraft {
     MemoryDraft {
+        rights: None,
         draft_key: key.into(),
         id: String::new(),
         memory_type: mt.into(),
@@ -340,6 +341,7 @@ async fn unspecified_producer_kind_is_rejected() {
     let srv = server();
     let err = srv
         .register_source(Request::new(RegisterSourceRequest {
+            default_rights: None,
             org_id: "org".into(),
             source_uri: "session://d8".into(),
             producer_id: "session-wrapup".into(),

@@ -15,6 +15,7 @@ fn synth_memory(i: usize) -> Memory {
     ];
     let title = format!("{} fix number {}", words[i % words.len()], i);
     Memory {
+        rights: None,
         id: MemoryId::new_v7(),
         memory_type: (i % 13) as u8,
         title: title.into(),

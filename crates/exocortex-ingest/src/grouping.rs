@@ -135,6 +135,7 @@ pub fn grouping_node(
         invalidated_by: None,
         embedding: None, // structural rows are not embedded (Dreams skips)
         lsn: LSN::new_local(0),
+        rights: None,
     })
 }
 

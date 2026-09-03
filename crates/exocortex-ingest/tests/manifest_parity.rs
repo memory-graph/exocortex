@@ -29,6 +29,7 @@ fn server() -> IngestServer<InMemoryStorage> {
 async fn registered_server() -> IngestServer<InMemoryStorage> {
     let srv = server();
     let mut r = RegisterSourceRequest {
+        default_rights: None,
         org_id: "org".into(),
         source_uri: "custom://parity".into(),
         producer_id: "parity".into(),
@@ -67,6 +68,7 @@ fn unit(memories: Vec<MemoryDraft>, relationships: Vec<RelationshipDraft>) -> Ba
 
 fn draft(key: &str, mt: &str, title: &str, vis: i32) -> MemoryDraft {
     MemoryDraft {
+        rights: None,
         draft_key: key.into(),
         id: String::new(),
         memory_type: mt.into(),

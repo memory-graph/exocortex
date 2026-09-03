@@ -20,6 +20,7 @@ fn ontology() -> Arc<exocortex_kernel::Ontology> {
 
 fn mem(title: &str, n: u8) -> Memory {
     Memory {
+        rights: None,
         id: MemoryId([n; 16]),
         memory_type: 3,
         title: title.into(),
@@ -626,6 +627,7 @@ async fn preflight_batch_answers_identically_over_http_and_the_registry() {
         [7u8; 32],
     ));
     let mut registration = exocortex_wire::ingest::v1::RegisterSourceRequest {
+        default_rights: None,
         org_id: "org".into(),
         source_uri: "custom://parity-probe".into(),
         producer_id: "parity-probe".into(),
