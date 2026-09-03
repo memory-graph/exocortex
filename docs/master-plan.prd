@@ -1,5 +1,24 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-03, v0.4.0 SHIPPED — release run 33811497061 all
+green; crates.io complete):** The release landed end to end under the
+standing authorization: bump `28266f9`, matrix exit 0 / 179 suite-oks
+on the bumped tree, main pushed (`efe8257`, 30 commits incl. the
+prior run's stale-push correction), tag `v0.4.0` → release run
+33811497061 green in every job — correctness (verify-release in CI),
+all three build legs (macos-15-intel, ubuntu-22.04 falkordb-container,
+macos-15 native; BOTH packaged-standalone write/read/restart
+validations passed, no D27/D29-class hold), release job — with all
+six binary assets + checksums + install.sh attached, the release note
+stating plainly that the live FALKOR/REDIS/POSTGRES suites and the
+Docker chaos harness were NOT executed. `PUBLISH_VERSION=0.4.0
+scripts/publish.sh` exit 0: all 15 ORDER crates on crates.io at 0.4.0
+(the six new leaf crates stay un-published by policy, recorded in
+PUBLISHING.md). **Wave 4 now opens**: D4/D5/D8-D11 per the open-row
+gates (D5 and D8 lead with fail-without-it tests and the §12.1 shape
+decision respectively); D19 parks on owner credentials; D14/D16/D26 +
+the training-corpus direction park on owner decisions.
+
 **Status (2026-09-03, v0.4.0 RELEASE CUT):** The workspace bumped to
 0.4.0 (commit `28266f9`: all 21 crates + xtask, the golden openapi
 version stamp regenerated via `gen-schemas --write`, PUBLISHING.md
