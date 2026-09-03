@@ -217,7 +217,7 @@ evidence live in the master plan alone.
 | How do I write an ontology pack? | `docs/ONTOLOGY_GUIDE.md` |
 | What's accepted work, and in what order? | `docs/master-plan.prd` — including its PRD index |
 | What was delivered/deviated? | `docs/MILESTONE_REPORT.md` |
-| What did reviews find? | `docs/reviews/round-<n>-review.prd` (1, 2, 3, 6) |
+| What did reviews find? | `docs/reviews/round-<n>-review.prd` (1, 2, 3, 6, 7, 8) |
 | How do we publish? | `docs/PUBLISHING.md` (`scripts/publish.sh`) |
 | Known bugs? | `docs/bug-prd-*.md` — these keep their `docs/` paths because code comments cite them |
 | What is planned but not built? | `docs/prd/` — every feature PRD lives here; the master plan's index says which wave each is in |
