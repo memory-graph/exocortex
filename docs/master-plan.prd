@@ -1,5 +1,30 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-02, END OF RUN — Wave 3 shipped; matrix green; main
+pushed):** The run closed every locally-satisfiable row it touched:
+D1 (iceberg `78518a8` + delta `3e9453e`, the shared declared-projection
+core in `exocortex-adapter-table`), D17 (`04e8adc`, Fellegi-Sunter
+harness), PX5 (`9b7b7d0`, the six-view zero-JS explorer), D6
+(`dadb0c4`, opt-in OTLP metric export), D20 (`31efce1`, Postgres CDC
+on a first-party minimal replication client), D24 (`4c55f25`, rights
+and consent provenance with the computed egress verdict — the
+authorized fingerprint move proved unnecessary, golden unchanged),
+plus two boundary reviews landed through the lifecycle (round 7
+`06c055c`, round 8 `d6d8388` with four self-review blockers fixed) and
+the seam/fixture catches (`c3b9568`). The full gate matrix passed on
+the final pushed tree — `scripts/verify-release.sh` exit 0, 179
+suite-oks; live FALKOR/REDIS/POSTGRES legs NOT executed locally (URLs
+unset), stated plainly. NEW this run: four adapters (iceberg, delta,
+postgres-cdc, plus the shared table core), the ER harness, the
+explorer, OTLP export, rights provenance end to end; seam inventory
+37; adapter-contract 17 obligations; `verify-release.sh` now runs the
+matrix with `exocortex-server/otlp` and carries the Postgres live leg.
+**What remains:** the v0.4.0 release itself (version bump → re-verify
+→ tag → publish; every gate is green to do it), D19 (owner
+credentials), Wave 4 (D4/D5/D8-D11; D14 demand-gated) and Wave 5
+(D3/D15) per the open-row gates, and the training-corpus direction
+(owner decision).
+
 **Status (2026-09-02, round 8 closed; Wave 3 COMPLETE for this run):**
 The Wave 3 boundary review landed as `docs/reviews/round-8-review.prd`
 — four blockers found in this run's own wave-3 code, all fixed in one

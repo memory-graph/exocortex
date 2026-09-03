@@ -21,7 +21,7 @@ cargo xtask metrics-hygiene
 cargo xtask wire-standalone
 cargo xtask bench
 cargo xtask storage-conformance
-if [ -n "$POSTGRES_URL" ]; then
+if [ -n "${POSTGRES_URL:-}" ]; then
   cargo test -p exocortex-adapter-postgres --features integration --test cdc_live -- --nocapture
 else
   echo "live Postgres CDC suite UNEXECUTED (POSTGRES_URL unset)"
