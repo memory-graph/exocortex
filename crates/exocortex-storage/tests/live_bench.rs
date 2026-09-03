@@ -28,6 +28,7 @@ fn ontology() -> Arc<exocortex_kernel::Ontology> {
 
 fn memory(id: MemoryId, title: &str) -> Memory {
     Memory {
+        rights: None,
         id,
         memory_type: 3,
         title: title.into(),

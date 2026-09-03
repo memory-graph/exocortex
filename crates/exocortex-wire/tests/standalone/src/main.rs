@@ -34,6 +34,7 @@ fn main() {
             valid_from: None,
             valid_until: None,
             external_key: None,
+            rights: None,
         }],
         relationships: vec![],
         producer: Some(ProducerIdentity {

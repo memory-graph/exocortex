@@ -71,6 +71,7 @@ async fn connect_graph(node: &str, graph_name: String) -> FalkorStorage {
 
 fn mem(title: &str, mt: u8, vis: Visibility) -> Memory {
     Memory {
+        rights: None,
         id: MemoryId::new_v7(),
         memory_type: mt,
         title: title.into(),

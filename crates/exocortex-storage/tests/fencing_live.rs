@@ -160,6 +160,7 @@ async fn inflight_stale_dreams_write_is_fenced_after_takeover_live() {
 
 fn mem(seed: u8) -> Memory {
     Memory {
+        rights: None,
         id: MemoryId::new_v7(),
         memory_type: 3,
         title: format!("fencing probe {seed}").into(),

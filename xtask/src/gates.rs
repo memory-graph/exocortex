@@ -1810,6 +1810,12 @@ pub(crate) const SEAM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "fifty_row_batch_accepted_lsn_monotonic",
     ),
     (
+        "ingest-rights",
+        "exocortex-ingest",
+        "tests/rights.rs",
+        "record_rights_override_source_defaults_and_absence_stays_none",
+    ),
+    (
         "ingest-embedding-runtime",
         "exocortex-ingest",
         "tests/embedding_runtime.rs",
