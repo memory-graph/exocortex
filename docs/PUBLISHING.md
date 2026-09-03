@@ -9,6 +9,26 @@ planned for `ghcr.io`).
 All 14 crate names were verified available (2026-08-25;
 exocortex-adapter-sdk joined with A1).
 
+**0.4.0 (2026-09-02)** — the data-breadth and surface wave, additive
+throughout: wire gains the `projection` module (the canonical
+declared-projection schema digest every table-flavored adapter and the
+ingest boundary share, D1) and the `Rights` block on `MemoryDraft`
+(proto field 11, D24, serde-defaulted so pre-D24 rows deserialize as
+absent); the kernel gains `memory::Rights` with the computed egress
+verdict (licence AND consent, fail closed) and rejects
+retention-before-valid at materialization; the adapter SDK mock
+enforces the §18.6 widths and the full TABLE-flavor contract
+(declared projection, canonical schema hash, rewind refusal); the
+client gains the EOF-draining stdio reader (D27) and self-contained
+MCP tool schemas (D28); the server gains the read-only explorer at
+`/explorer` (PX5), the opt-in `otlp` metric-export feature (D6), and
+the corpus exporter's row-rights-computed egress verdict (D24); the
+packaged standalone runtime carries the D29 supervisor/path fixes.
+The ontology compatibility fingerprint is unchanged. New workspace
+members since 0.3.0 — `exocortex-adapter-table`, the
+parquet/iceberg/delta/postgres adapter crates, and
+`exocortex-entity-resolution` (`publish = false`) — are leaf tool
+crates, not ORDER entries (the standing adapter-crate policy below).
 **0.3.0 (2026-08-31)** — the adapter-contract wave, additive throughout:
 wire gains the `Preflight` and `GetValidationManifest` RPCs and the
 validation-manifest module (+`serde_json`, recorded below); the SDK
@@ -23,7 +43,7 @@ must publish in dependency order. The supported entry point is the fail-closed
 repository script:
 
 ```sh
-PUBLISH_VERSION=0.3.0 scripts/publish.sh
+PUBLISH_VERSION=0.4.0 scripts/publish.sh
 ```
 
 It refuses dirty manifests/lockfiles and mixed package versions, runs the full
@@ -146,8 +166,8 @@ source/license coordinates ride the packaged `RUNTIME-MANIFEST.txt`.
 
 ## Binaries
 
-- **Installer (primary)**: tag push (`git tag v0.3.0 && git push
-  memory-graph v0.3.0`) triggers `.github/workflows/release.yml` —
+- **Installer (primary)**: tag push (`git tag v0.4.0 && git push
+  memory-graph v0.4.0`) triggers `.github/workflows/release.yml` —
   cross-platform release builds (macOS arm64 on `macos-15`, Intel on the
   native `macos-15-intel` runner, and Linux x64 on the `ubuntu-22.04`
   builder) for all three binaries,
