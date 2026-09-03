@@ -1,5 +1,22 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-03, v0.4.0 RELEASE CUT):** The workspace bumped to
+0.4.0 (commit `28266f9`: all 21 crates + xtask, the golden openapi
+version stamp regenerated via `gen-schemas --write`, PUBLISHING.md
+carrying the 0.4.0 entry and the leaf-crate policy note for the six
+new workspace members that are deliberately not publish.sh ORDER
+entries — table/parquet/iceberg/delta/postgres adapters and
+entity-resolution `publish = false`). The FULL gate matrix passed on
+the bumped tree: `scripts/verify-release.sh` exit 0, 179 suite-oks,
+all 23 gate commands, bench green (R-Lat1); live FALKOR/REDIS/POSTGRES
+legs NOT executed locally (URLs unset), stated plainly here and in the
+release note. Next: push main, tag `v0.4.0`, `PUBLISH_VERSION=0.4.0
+scripts/publish.sh`, evidence recorded in the next status entry; then
+Wave 4 opens (D4/D5/D8-D11). One prior-run correction this session:
+the END OF RUN header below claimed "main pushed" but local main sat
+28 commits ahead of origin (origin at `f1a07b1`, the D29 hold) — the
+push happens with this release cut.
+
 **Status (2026-09-02, END OF RUN — Wave 3 shipped; matrix green; main
 pushed):** The run closed every locally-satisfiable row it touched:
 D1 (iceberg `78518a8` + delta `3e9453e`, the shared declared-projection
