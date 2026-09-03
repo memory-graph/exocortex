@@ -1,0 +1,83 @@
+# Exocortex — Round 8 Review (Wave 3 boundary)
+
+**Status:** CLOSED (2026-09-02). Scope: the Wave 3 boundary review of
+this run's four commits — PX5 (`9b7b7d0`), D6 (`dadb0c4`/`b6a6241`),
+D20 (`31efce1`/`e542a33`), D24 (`4c55f25`) — with findings landed
+through the lifecycle in the same commits as their fixes. Method:
+adversarial self-review of the new surface against the PRDs'
+acceptance text and this repo's invariants (fail-closed seams, budget
+surfacing, claim-vs-code honesty).
+
+## Findings
+
+### R8-1 — D24's retention validation was documented but not enforced (blocker)
+
+`kernel_rights`' doc comment claimed "a retention stop before the row
+is even valid is a malformed claim, rejected" — nothing enforced it.
+A claim in a comment with no teeth is exactly the class round-7's
+union arm was.
+
+**Fix:** the materializer rejects any rights block whose
+`retention_until` precedes the row's own `valid_from`, fail closed.
+
+### R8-2 — The explorer's list view silently truncated at the region budget (blocker)
+
+`memories_in_region(&region, 501)` capped the listing at 501 rows and
+rendered "N visible rows" from the truncated set — a table with more
+rows than the budget silently lied about the count. The region seam's
+sibling surfaces (`relationships_in_region` & co.) fail closed at
+their budget; the explorer must too.
+
+**Fix:** the budget is SURFACED — a rendered note ("region budget
+reached at N rows — narrow the type/project filter") when the seam
+saturates, matching the other seams' discipline.
+
+### R8-3 — The CDC adapter stamped every window with the PREVIOUS cursor LSN (blocker)
+
+`submit_window` derived the snapshot id from `session.cursor()` — the
+LAST SETTLED position — so window N+1 (containing NEW rows) carried
+window N's identity. Idempotency still held (content-bound batch ids),
+but the snapshot id lied about which WAL position the rows represent,
+and the local cold-start regression gate compared against the wrong
+number.
+
+**Fix:** an `AtomicU64` shared between the replication task (updated
+`fetch_max` on every XLogData) and the submitter (stamps each window
+with the LSN the stream actually reached, seeded with the settled
+cursor).
+
+### R8-4 — The OTel meter provider was dropped at install, killing OTLP export (blocker)
+
+`install_with_otlp` bound the `SdkMeterProvider` to `_provider` and
+let it drop. The provider OWNS the PeriodicReader's export loop;
+dropping it stops OTLP export silently — the fanout recorder would
+keep recording into a dead pipeline. The capturing-exporter test
+passed because IT kept its provider alive in test scope.
+
+**Fix:** the provider is deliberately leaked with a comment stating
+why: it must live exactly as long as the process-lifetime recorder.
+
+## Verified-safe notes
+
+- D24's compatibility fingerprint authorization proved UNNECESSARY:
+  rights ride row shape, not pack structure; `cargo xtask fingerprint`
+  prints the unchanged golden (2c3ec388…5c23) on the closed tree.
+- D24's `default_rights` registration semantics follow WS2 (first
+  registration wins; admin policy stays the enforcement point), and
+  pre-D24 rows deserialize as `None` (additive serde defaults) —
+  pinned by kernel and ingest regressions.
+- D20's DELETE boundary is recorded, not silently dropped: counts and
+  surfacing in the binary's output; the protocol has no producer
+  delete surface to map onto (proto enumerates the whole surface in
+  the crate docs).
+- The D6 telemetry fail-closed behavior (endpoint set on a feature-less
+  build = startup error) is enforced in both feature states, and
+  verify-release.sh runs the matrix WITH the feature so the suite
+  cannot go dark.
+
+## Verdict
+
+All four findings landed with their fixes in one commit. Wave 3's
+locally-satisfiable rows (PX5, D6, D20, D24) are closed; the parked
+D19 (credentials) and Wave 4/5 items remain per the open-row gates.
+The run proceeded to the full gate matrix and push.

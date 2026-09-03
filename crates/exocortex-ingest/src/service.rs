@@ -730,11 +730,24 @@ impl<S: Storage> IngestServer<S> {
             // D24: the record's own rights, else the source's
             // registered default — absent on both stays `None` so the
             // corpus exporter answers "not covered" (fail closed).
-            rights: m
-                .rights
-                .as_ref()
-                .map(kernel_rights)
-                .or_else(|| source.default_rights.clone()),
+            rights: {
+                // R8-1: a retention stop before the row is even valid
+                // is a malformed claim — rejected, never silently
+                // clamped (the doc claim now has teeth).
+                let rights = m
+                    .rights
+                    .as_ref()
+                    .map(kernel_rights)
+                    .or_else(|| source.default_rights.clone());
+                if let Some(rights) = &rights {
+                    if let Some(until) = rights.retention_until {
+                        if until < valid_from {
+                            return Err(RejectCode::Unknown);
+                        }
+                    }
+                }
+                rights
+            },
         };
         if let Some(k) = &m.external_key {
             // B8: identity rides the RAW uuid bytes — hex here would

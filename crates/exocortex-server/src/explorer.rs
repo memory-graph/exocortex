@@ -233,13 +233,24 @@ async fn list_memories(
         .skip(query.offset)
         .take(query.limit.clamp(1, 200))
         .collect::<Vec<_>>();
+    // R8-2: the region seam's budget is surfaced, never silently
+    // truncated — exactly what its sibling seams do.
+    let budget_note = if rows.len() > 500 {
+        format!(
+            " (region budget reached at {} rows — narrow the type/project filter)",
+            rows.len()
+        )
+    } else {
+        String::new()
+    };
     let mut body = format!(
-        "<p>{} visible rows of type {} (showing {} at offset {})</p>\
+        "<p>{} visible rows of type {} (showing {} at offset {}){}</p>\
 <table><tr><th>title</th><th>visibility</th><th>provenance</th><th>lsn</th><th>created</th></tr>",
         visible.len(),
         esc(type_name),
         window.len(),
         query.offset,
+        budget_note,
     );
     for memory in window {
         body.push_str(&format!(

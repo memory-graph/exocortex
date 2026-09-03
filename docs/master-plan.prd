@@ -1,5 +1,19 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-02, round 8 closed; Wave 3 COMPLETE for this run):**
+The Wave 3 boundary review landed as `docs/reviews/round-8-review.prd`
+— four blockers found in this run's own wave-3 code, all fixed in one
+commit: R8-1 D24's retention-before-valid rejection was documented but
+not enforced (now rejected at the materializer); R8-2 the explorer's
+list view silently truncated at the region budget (now surfaced, the
+sibling seams' discipline); R8-3 the CDC adapter stamped every window
+with the PREVIOUS cursor LSN (a shared AtomicU64 now carries the
+stream position into each window's snapshot id); R8-4 the OTel meter
+provider was dropped at install, silently killing OTLP export (now
+deliberately leaked for the process lifetime). Full gate matrix next,
+then push. Parked: D19 (owner credentials), Wave 4/5 per the
+open-row gates.
+
 **Status (2026-09-02, night — D24 SHIPPED; Wave 3 locally complete):**
 Rights and consent provenance landed end to end: a `Rights` block
 (licence, consent basis, retention_until, redacted) on every kernel

@@ -129,9 +129,14 @@ async fn main() -> anyhow::Result<()> {
     let flush_seconds = args.flush_seconds;
     let max_window = args.max_window;
     let (rows_tx, mut rows_rx) = tokio::sync::mpsc::channel::<exocortex_adapter_table::Row>(1024);
+    // R8-3: the stream position, shared between the replication task
+    // and the submitter so each window's snapshot id is the LSN it
+    // actually reached — not the PREVIOUS settled cursor.
+    let stream_lsn = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(settled.unwrap_or(0)));
     let stream_mapping = mapping.clone();
 
     // The replication task: parse every change, forward mapped rows.
+    let task_lsn = stream_lsn.clone();
     let stream_task = tokio::spawn(async move {
         let mut deletes = 0usize;
         let mut skipped = 0usize;
@@ -141,8 +146,9 @@ async fn main() -> anyhow::Result<()> {
                 match event {
                     exocortex_adapter_postgres::replication::StreamEvent::Change {
                         payload,
-                        ..
+                        lsn,
                     } => {
+                        task_lsn.fetch_max(lsn, std::sync::atomic::Ordering::Relaxed);
                         let change = exocortex_adapter_postgres::parse_change(&payload)?;
                         match exocortex_adapter_postgres::map_change(&stream_mapping, &change)? {
                             exocortex_adapter_postgres::MappedChange::Row(row) => {
@@ -179,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
                     if window.len() >= max_window as usize {
                         if let Err(error) = submit_window(
                             &mut session, &mapping, &table_uuid, &declared, &mut window_index,
-                            std::mem::take(&mut window), &args.cursor,
+                            std::mem::take(&mut window), &args.cursor, &stream_lsn,
                         ).await {
                             stream_task.abort();
                             return Err(error);
@@ -191,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
                     if !window.is_empty() {
                         submit_window(
                             &mut session, &mapping, &table_uuid, &declared, &mut window_index,
-                            std::mem::take(&mut window), &args.cursor,
+                            std::mem::take(&mut window), &args.cursor, &stream_lsn,
                         ).await?;
                     }
                     break;
@@ -201,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
                 if !window.is_empty() {
                     if let Err(error) = submit_window(
                         &mut session, &mapping, &table_uuid, &declared, &mut window_index,
-                        std::mem::take(&mut window), &args.cursor,
+                        std::mem::take(&mut window), &args.cursor, &stream_lsn,
                     ).await {
                         stream_task.abort();
                         return Err(error);
@@ -224,6 +230,7 @@ async fn submit_window(
     window_index: &mut usize,
     rows: Vec<exocortex_adapter_table::Row>,
     cursor: &std::path::Path,
+    stream_lsn: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<()> {
     // The snapshot id is the settled cursor's next LSN — the SDK
     // advances its durable cursor when the window settles, and the
@@ -240,11 +247,10 @@ async fn submit_window(
         tracing::warn!(skipped_parents, "parent links outside this window skipped");
     }
     *window_index += 1;
-    // LSN identity rides the SDK's own settled cursor value.
-    let snapshot = session
-        .cursor()
-        .map(|cursor| cursor.to_string())
-        .unwrap_or_else(|| "lsn-0".to_string());
+    // R8-3: the window's snapshot id is the LSN the stream has
+    // actually reached (monotonic, seeded with the settled cursor).
+    let lsn = stream_lsn.load(std::sync::atomic::Ordering::Relaxed);
+    let snapshot = format!("lsn-{lsn:016x}");
     let unit = exocortex_adapter_postgres::with_snapshot_id(unit, &snapshot);
     let outcome = session.submit_window(vec![unit], &snapshot).await?;
     tracing::info!(
