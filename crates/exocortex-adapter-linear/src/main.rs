@@ -131,7 +131,10 @@ async fn main() -> anyhow::Result<()> {
     config.projection = Some(exocortex_adapter_linear::projection(args.max_window));
 
     let mut session = exocortex_adapter_sdk::AdapterSession::connect(config).await?;
-    let client = ApiClient::new(&args.endpoint)?;
+    let client = ApiClient::new(&args.endpoint)?.with_user_agent(concat!(
+        "exocortex-adapter-linear/",
+        env!("CARGO_PKG_VERSION")
+    ));
 
     // Drain the workspace in windows. The fetch bound is HALF the
     // declared per-run row bound: every issue may also introduce a

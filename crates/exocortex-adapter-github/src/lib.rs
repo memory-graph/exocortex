@@ -71,7 +71,7 @@ pub fn github_source_columns() -> Vec<(String, String)> {
 pub const ISSUES_QUERY: &str = r#"
 query IssuesWindow($owner: String!, $repo: String!, $after: String, $since: DateTime, $first: Int!) {
   repository(owner: $owner, name: $repo) {
-    issues(first: $first, after: $after, since: $since,
+    issues(first: $first, after: $after, filterBy: {since: $since},
             orderBy: {field: UPDATED_AT, direction: ASC}) {
       nodes { number title body url updatedAt closedAt state
               author { login }

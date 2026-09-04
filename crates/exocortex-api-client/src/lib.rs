@@ -117,6 +117,7 @@ pub enum ApiError {
 pub struct ApiClient {
     endpoint: hyper::Uri,
     use_tls: bool,
+    user_agent: String,
 }
 
 impl ApiClient {
@@ -139,7 +140,15 @@ impl ApiClient {
         Ok(Self {
             endpoint: uri,
             use_tls,
+            user_agent: format!("exocortex-api-client/{}", env!("CARGO_PKG_VERSION")),
         })
+    }
+
+    /// Override the User-Agent (adapters name themselves; GitHub refuses
+    /// requests without one, with an empty 403).
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = user_agent.into();
+        self
     }
 
     /// POST `body` as JSON with `Authorization: Bearer <token>`.
@@ -157,6 +166,7 @@ impl ApiClient {
             .uri(self.endpoint.clone())
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(hyper::header::USER_AGENT, &self.user_agent)
             .body(hyper::Body::from(payload))
             .map_err(|e| ApiError::Transport(format!("build request: {e}")))?;
         let response = do_request(self.use_tls, request).await?;
@@ -225,15 +235,47 @@ async fn do_request(
     let response_future: std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<hyper::Response<hyper::Body>, hyper::Error>>>,
     > = if use_tls {
-        let connector = std::panic::catch_unwind(|| {
-            hyper_rustls::HttpsConnectorBuilder::new()
-                .with_native_roots()
-                .https_only()
-                .enable_http1()
-                .enable_http2()
-                .build()
-        })
-        .map_err(|_| ApiError::Transport("failed to load the platform TLS trust store".into()))?;
+        // `with_native_roots` loads the platform trust store eagerly and
+        // PANICS on failure. On macOS the Keychain read flakes
+        // intermittently (security-framework -36, observed live in the
+        // D19 GitHub leg: one run loads, the next does not), so the
+        // load is retried a bounded three times before surfacing — the
+        // D29 supervisor lesson: name WHY, and do not die on a
+        // transient the second attempt survives.
+        let mut attempt = 0u32;
+        let connector = loop {
+            attempt += 1;
+            match std::panic::catch_unwind(|| {
+                hyper_rustls::HttpsConnectorBuilder::new()
+                    .with_native_roots()
+                    .https_only()
+                    .enable_http1()
+                    .enable_http2()
+                    .build()
+            }) {
+                Ok(connector) => break connector,
+                Err(payload) if attempt < 3 => {
+                    let reason = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "(panic payload not a string)".into());
+                    tracing::warn!(attempt, %reason, "platform trust store load failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(attempt)))
+                        .await;
+                }
+                Err(payload) => {
+                    let reason = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "(panic payload not a string)".into());
+                    return Err(ApiError::Transport(format!(
+                        "failed to load the platform TLS trust store after {attempt} attempts: {reason}"
+                    )));
+                }
+            }
+        };
         let client = hyper::Client::builder().build::<_, hyper::Body>(connector);
         Box::pin(async move { client.request(request).await })
     } else {

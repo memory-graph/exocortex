@@ -20,12 +20,20 @@ async fn one_live_page_parses_and_maps() -> anyhow::Result<()> {
     };
     // A small public repo exercises the schema without depending on
     // the owner's private data; any repo works.
-    let client = exocortex_api_client::ApiClient::new("https://api.github.com/graphql")?;
+    // The default repo is this project's own (schema validity with no
+    // private-data dependency); GITHUB_LIVE_OWNER/GITHUB_LIVE_REPO
+    // override it to exercise real rows (any repo the token can read).
+    let owner = std::env::var("GITHUB_LIVE_OWNER").unwrap_or_else(|_| "memory-graph".into());
+    let repo = std::env::var("GITHUB_LIVE_REPO").unwrap_or_else(|_| "exocortex".into());
+    let client =
+        exocortex_api_client::ApiClient::new("https://api.github.com/graphql")?.with_user_agent(
+            concat!("exocortex-adapter-github/", env!("CARGO_PKG_VERSION")),
+        );
     let issues_data = client
         .graphql(
             &token,
             exocortex_adapter_github::ISSUES_QUERY,
-            &serde_json::json!({ "owner": "memory-graph", "repo": "exocortex", "first": 5 }),
+            &serde_json::json!({ "owner": owner, "repo": repo, "first": 5 }),
         )
         .await?;
     let (issues, skipped, _, _) = exocortex_adapter_github::parse_issues_page(&issues_data);
@@ -39,7 +47,7 @@ async fn one_live_page_parses_and_maps() -> anyhow::Result<()> {
         .graphql(
             &token,
             exocortex_adapter_github::PULLS_QUERY,
-            &serde_json::json!({ "owner": "memory-graph", "repo": "exocortex", "first": 5 }),
+            &serde_json::json!({ "owner": owner, "repo": repo, "first": 5 }),
         )
         .await?;
     let (pulls, skipped, _, _) = exocortex_adapter_github::parse_pulls_page(&pulls_data);
@@ -49,13 +57,8 @@ async fn one_live_page_parses_and_maps() -> anyhow::Result<()> {
     );
     eprintln!("live pulls page: {} pulls", pulls.len());
     if !issues.is_empty() || !pulls.is_empty() {
-        let unit = exocortex_adapter_github::map_window(
-            "memory-graph",
-            "exocortex",
-            &issues,
-            &pulls,
-            "live-page",
-        );
+        let unit =
+            exocortex_adapter_github::map_window(&owner, &repo, &issues, &pulls, "live-page");
         assert!(unit.snapshot.is_some());
     }
     Ok(())

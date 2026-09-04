@@ -120,7 +120,10 @@ async fn main() -> anyhow::Result<()> {
     config.projection = Some(exocortex_adapter_github::projection(args.max_window));
 
     let mut session = exocortex_adapter_sdk::AdapterSession::connect(config).await?;
-    let client = ApiClient::new(&args.endpoint)?;
+    let client = ApiClient::new(&args.endpoint)?.with_user_agent(concat!(
+        "exocortex-adapter-github/",
+        env!("CARGO_PKG_VERSION")
+    ));
 
     // The fetch bound is HALF the declared per-run row bound (every
     // item may introduce closing-reference rows). Overrun is safe:
