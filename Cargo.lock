@@ -1615,6 +1615,7 @@ dependencies = [
  "exocortex-wire",
  "futures",
  "metrics",
+ "prost 0.13.5",
  "redis 0.27.6",
  "serde_json",
  "smol_str",

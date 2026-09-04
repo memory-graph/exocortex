@@ -1792,6 +1792,12 @@ pub(crate) const SEAM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "superset_accepts_subset_producer_subset_rejects_legibly",
     ),
     (
+        "cluster-wire-fanout",
+        "exocortex-cluster",
+        "tests/wire_fanout.rs",
+        "invalidations_fan_out_across_three_nodes_at_floor_throughput",
+    ),
+    (
         "cluster-sse-e2e",
         "exocortex-cluster",
         "tests/sse_e2e.rs",

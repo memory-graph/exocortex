@@ -35,3 +35,4 @@ exocortex-pack-dev-v1 = { workspace = true }
 exocortex-ingest = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
+prost = { workspace = true }
