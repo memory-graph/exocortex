@@ -1848,6 +1848,7 @@ dependencies = [
  "chrono",
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
+ "exocortex-pack-mortgage-v1",
  "exocortex-wire",
  "falkordb",
  "futures",

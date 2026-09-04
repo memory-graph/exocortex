@@ -32,6 +32,7 @@ testing = []
 [dev-dependencies]
 exocortex-kernel = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
+exocortex-pack-mortgage-v1 = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }

@@ -28,6 +28,20 @@ fn ontology() -> Arc<exocortex_kernel::Ontology> {
     Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap())
 }
 
+/// The chaos fixtures join the PRODUCTION graph, whose nodes pin the
+/// composed pack set (dev-v1 + mortgage-v1) — a dev-only runtime is a
+/// subset of that pin and is refused (NotASuperset). The harness links
+/// exactly what production links.
+fn composed_ontology() -> Arc<exocortex_kernel::Ontology> {
+    Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![
+            pack_def(),
+            exocortex_pack_mortgage_v1::pack_def(),
+        ])
+        .unwrap(),
+    )
+}
+
 fn falkor_url() -> Option<String> {
     std::env::var("FALKOR_URL").ok().filter(|u| !u.is_empty())
 }
@@ -243,7 +257,7 @@ async fn seed_actual_production_dreams_barrier_fixture() {
             org_id: "org".into(),
             node_id: "chaos-seeder".into(),
         },
-        ontology(),
+        composed_ontology(),
     )
     .await
     .expect("connect to the production-node graph");
@@ -352,7 +366,7 @@ async fn assert_actual_production_dreams_barrier_fixture() {
             org_id: "org".into(),
             node_id: "chaos-assertion".into(),
         },
-        ontology(),
+        composed_ontology(),
     )
     .await
     .expect("connect to the production-node graph");
