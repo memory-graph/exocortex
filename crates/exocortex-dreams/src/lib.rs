@@ -803,6 +803,13 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 outcome = &mut consolidation => outcome,
             }
         };
+        // The cycle returns its (result, working set); the discovery
+        // pass below REUSES the loaded set — one bounded region query
+        // per cycle, the discipline the query-count test pins.
+        let (outcome, cycled_set) = match outcome {
+            Ok((result, set)) => (Ok(result), Some(set)),
+            Err(error) => (Err(error), None),
+        };
         #[cfg(feature = "testing")]
         let crashed = self.cycle_crash_after.is_some() && outcome.is_err();
         #[cfg(not(feature = "testing"))]
@@ -830,8 +837,12 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         };
         let outcome = match outcome {
             Ok(result) if !renewal_stopped && !crashed => {
-                let discovery =
-                    self.run_discovery_fenced(region, &lease, Some(journal.cycle_id.as_str()));
+                let discovery = self.run_discovery_fenced(
+                    region,
+                    &lease,
+                    Some(journal.cycle_id.as_str()),
+                    cycled_set.as_ref(),
+                );
                 tokio::pin!(discovery);
                 tokio::select! {
                     biased;
@@ -987,7 +998,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         region: &RegionKey,
         journal: &mut CycleJournal,
         mut working_set: RegionWorkingSet,
-    ) -> anyhow::Result<ConsolidationResult> {
+    ) -> anyhow::Result<(ConsolidationResult, RegionWorkingSet)> {
         let mut mutations = 0usize;
         let anchors = self.select_anchors(&working_set);
         // IN5 (audit): a region with fewer than two anchors cannot be
@@ -1001,9 +1012,10 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                     Some(crate::mcr2::MCR2Error::TooFew(_))
                 ) =>
             {
-                return self
+                let result = self
                     .empty_result(region, lease, anchors.len() as u32, &working_set)
-                    .await;
+                    .await?;
+                return Ok((result, working_set));
             }
             Err(e) => return Err(e),
         };
@@ -1120,7 +1132,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             res.hairball_regression = true; // R-Mcr6
         }
         self.write_audit(&res).await?;
-        Ok(res)
+        Ok((res, working_set))
     }
 
     async fn mutation_checkpoint(&self, mutations: &mut usize) -> anyhow::Result<()> {
@@ -1809,7 +1821,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let outcome = {
             let discovery = async {
                 self.validate_region(region).await?;
-                self.run_discovery_fenced(region, &lease, None).await
+                self.run_discovery_fenced(region, &lease, None, None).await
             };
             tokio::pin!(discovery);
             tokio::select! {
@@ -1831,11 +1843,75 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         }
     }
 
+    /// §23 #21 (D9): same-class anchors from different projects
+    /// sharing two or more typed entities — the cross-user pattern no
+    /// single scope can see alone. Deterministic, bounded, proposals
+    /// only.
+    async fn cross_domain_candidates(
+        &self,
+        region: &RegionKey,
+        cycle: &SmolStr,
+        working_set: Option<&RegionWorkingSet>,
+    ) -> anyhow::Result<Vec<Discovery>> {
+        const CROSS_DOMAIN_ANCHOR_CAP: usize = 64;
+        const SHARED_ENTITY_FLOOR: usize = 2;
+        // Reuse the cycle's already-loaded working set when present
+        // (the bounded-cycle query-count discipline); a standalone
+        // discovery run loads at the cycle's own region budget, then the
+        // pairing pass is bounded to the cap (memories_in_region ERRORS
+        // past its limit, it does not truncate).
+        let loaded;
+        let memories: &[Memory] = match working_set {
+            Some(set) => &set.memories.values().cloned().collect::<Vec<_>>(),
+            None => {
+                loaded = self
+                    .storage
+                    .memories_in_region(region, MAX_REGION_MEMORIES as u32)
+                    .await?;
+                &loaded
+            }
+        };
+        let memories = &memories[..memories.len().min(CROSS_DOMAIN_ANCHOR_CAP)];
+        let mut proposals = Vec::new();
+        for i in 0..memories.len() {
+            for j in (i + 1)..memories.len() {
+                let (a, b) = (&memories[i], &memories[j]);
+                if a.memory_type != b.memory_type
+                    || a.id == b.id
+                    || a.context.project_id == b.context.project_id
+                {
+                    continue;
+                }
+                let shared = a
+                    .context
+                    .entities
+                    .iter()
+                    .filter(|entity| b.context.entities.contains(entity))
+                    .count();
+                if shared < SHARED_ENTITY_FLOOR {
+                    continue;
+                }
+                proposals.push(Discovery {
+                    id: uuid::Uuid::new_v4(),
+                    kind: DiscoveryKind::CrossDomain,
+                    endpoints: (a.id, b.id),
+                    quality: DiscoveryKind::CrossDomain.default_quality(),
+                    // Entity-shared, not edge-mediated: no via kinds.
+                    via_types: (0, 0),
+                    discovery_cycle_id: cycle.clone(),
+                    discovered_at: chrono::Utc::now(),
+                });
+            }
+        }
+        Ok(proposals)
+    }
+
     async fn run_discovery_fenced(
         &self,
         region: &RegionKey,
         lease: &exocortex_storage::OwnerLease,
         cycle_id: Option<&str>,
+        working_set: Option<&RegionWorkingSet>,
     ) -> anyhow::Result<Vec<Discovery>> {
         let relationships = self
             .storage
@@ -1857,7 +1933,7 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         let cycle: SmolStr = cycle_id
             .map(SmolStr::new)
             .unwrap_or_else(|| format!("dream:{}", uuid::Uuid::new_v4()).into());
-        let out: Vec<_> = candidates
+        let mut out: Vec<Discovery> = candidates
             .into_iter()
             .map(|(a, c, k1, k2)| Discovery {
                 id: uuid::Uuid::new_v4(),
@@ -1869,6 +1945,15 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 discovered_at: chrono::Utc::now(),
             })
             .collect();
+        // §23 #21 (D9): the cross-domain finder — two same-class anchors
+        // from DIFFERENT projects sharing >= 2 typed entities propose a
+        // CrossDomain pattern. Proposals only (R-Dr1/R-Dr2); the pattern
+        // is interesting precisely because no single user's scope can see
+        // both endpoints. Bounded to the first 64 anchors.
+        out.extend(
+            self.cross_domain_candidates(region, &cycle, working_set)
+                .await?,
+        );
         let records = out
             .iter()
             .map(|discovery| exocortex_storage::DiscoveryRecord {
@@ -1876,7 +1961,11 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 region: region.clone(),
                 from: discovery.endpoints.0,
                 to: discovery.endpoints.1,
-                discovery_type: "transitive".into(),
+                discovery_type: match discovery.kind {
+                    DiscoveryKind::CrossDomain => "cross_domain",
+                    _ => "transitive",
+                }
+                .into(),
                 quality: discovery.quality,
                 via_types: [discovery.via_types.0, discovery.via_types.1],
                 discovery_cycle_id: discovery.discovery_cycle_id.clone(),
