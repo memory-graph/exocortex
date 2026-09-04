@@ -14,6 +14,9 @@ members = [
     "crates/exocortex-adapter-delta",
     "crates/exocortex-entity-resolution",
     "crates/exocortex-adapter-postgres",
+    "crates/exocortex-api-client",
+    "crates/exocortex-adapter-linear",
+    "crates/exocortex-adapter-github",
     "crates/exocortex-storage",
     "crates/exocortex-cache",
     "crates/exocortex-reasoning",
@@ -157,6 +160,7 @@ exocortex-pack-dev-v1 = { path = "crates/exocortex-pack-dev-v1", version = "0.4.
 exocortex-pack-mortgage-v1 = { path = "crates/exocortex-pack-mortgage-v1", version = "0.4.0" }
 exocortex-wire = { path = "crates/exocortex-wire", version = "0.4.0" }
 exocortex-adapter-sdk = { path = "crates/exocortex-adapter-sdk", version = "0.4.0" }
+exocortex-api-client = { path = "crates/exocortex-api-client" }
 exocortex-adapter-git = { path = "crates/exocortex-adapter-git", version = "0.4.0" }
 exocortex-adapter-parquet = { path = "crates/exocortex-adapter-parquet", version = "0.4.0" }
 exocortex-adapter-table = { path = "crates/exocortex-adapter-table", version = "0.4.0" }

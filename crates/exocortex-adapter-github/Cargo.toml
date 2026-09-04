@@ -1,0 +1,33 @@
+[package]
+name    = "exocortex-adapter-github"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GitHub adapter (D19): issues, pull requests, and their structured closing references transcribed deterministically into the dev-v1 ontology through the signed Ingestion Protocol. Direct GraphQL with a PAT — no MCP, no inference, no LLM."
+
+[[bin]]
+name = "exocortex-adapter-github"
+path = "src/main.rs"
+
+[features]
+integration = []
+
+[dependencies]
+exocortex-adapter-sdk  = { workspace = true }
+exocortex-api-client   = { workspace = true }
+exocortex-wire         = { workspace = true }
+tokio       = { workspace = true }
+anyhow      = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+chrono      = { workspace = true }
+prost-types = { workspace = true }
+blake3      = { workspace = true }
+clap        = { version = "4", features = ["derive"] }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+exocortex-adapter-sdk  = { workspace = true, features = ["testing"] }
+tempfile = "3"

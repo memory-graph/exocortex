@@ -1431,6 +1431,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "exocortex-adapter-github"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "clap",
+ "exocortex-adapter-sdk",
+ "exocortex-api-client",
+ "exocortex-wire",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "exocortex-adapter-iceberg"
 version = "0.4.0"
 dependencies = [
@@ -1445,6 +1465,26 @@ dependencies = [
  "exocortex-wire",
  "flate2",
  "parquet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "exocortex-adapter-linear"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "clap",
+ "exocortex-adapter-sdk",
+ "exocortex-api-client",
+ "exocortex-wire",
+ "prost-types",
  "serde",
  "serde_json",
  "tempfile",
@@ -1525,6 +1565,17 @@ dependencies = [
  "exocortex-wire",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "exocortex-api-client"
+version = "0.4.0"
+dependencies = [
+ "hyper 0.14.32",
+ "hyper-rustls 0.24.2",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

@@ -9,6 +9,18 @@ planned for `ghcr.io`).
 All 14 crate names were verified available (2026-08-25;
 exocortex-adapter-sdk joined with A1).
 
+**Unreleased (D19, SaaS adapters)** — additive: the wire producer-kind
+enum gains `SAAS_ADAPTER` (value 7 — older servers reject it
+fail-closed, the correct rolling-upgrade behavior; no ontology
+fingerprint move). New workspace members — `exocortex-api-client`
+(`publish = false`, the shared first-party hyper/rustls JSON+GraphQL
+client; no new dependency: hyper 0.14 + hyper-rustls 0.24 + serde_json
+were already workspace deps), `exocortex-adapter-linear`, and
+`exocortex-adapter-github` (leaf binary crates, not ORDER entries; the
+standing adapter-crate policy below) — carry the SaaS transcription
+path. Direct API credentials (LINEAR_API_KEY / GITHUB_TOKEN) live in
+`.env.local`, never in manifests.
+
 **0.4.0 (2026-09-02)** — the data-breadth and surface wave, additive
 throughout: wire gains the `projection` module (the canonical
 declared-projection schema digest every table-flavored adapter and the

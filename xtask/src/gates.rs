@@ -2273,6 +2273,21 @@ pub(crate) const ADAPTER_CONTRACT: &[(&str, &str, &str, &str)] = &[
         "src/lib.rs",
         "fn projection(",
     ),
+    // (a) D19 Linear flavor: SaaS transcription under the same
+    // contract (direct GraphQL, bounded updatedAt windows).
+    (
+        "projection-declared",
+        "exocortex-adapter-linear",
+        "src/lib.rs",
+        "fn projection(",
+    ),
+    // (a) D19 GitHub flavor: same contract, its own reader.
+    (
+        "projection-declared",
+        "exocortex-adapter-github",
+        "src/lib.rs",
+        "fn projection(",
+    ),
     // (a) Bounds stop the window before the wire (SDK-side, A2).
     (
         "bounds-enforced",
