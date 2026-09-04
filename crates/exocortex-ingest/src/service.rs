@@ -2836,6 +2836,7 @@ fn wire_kind_to_kernel(v: i32) -> Option<exocortex_kernel::ProducerKind> {
         4 => Some(ProducerKind::AnalyticsAdapter),
         5 => Some(ProducerKind::Custom),
         6 => Some(ProducerKind::Extracted),
+        7 => Some(ProducerKind::SaaSAdapter),
         _ => None,
     }
 }

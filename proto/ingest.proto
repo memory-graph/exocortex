@@ -212,6 +212,15 @@ enum ProducerKind {
   // servers reject registrations carrying it (fail closed), which is the
   // correct rolling-upgrade behavior for a new producer class.
   PRODUCER_KIND_EXTRACTED      = 6;
+  // D19 (master plan, SaaS-API adapter family): a SaaS-API adapter —
+  // Linear/Jira/GitHub/ServiceNow transcribed deterministically through
+  // this same signed path (relationships these systems already state
+  // are transcribed, never inferred). One kind for the whole family so
+  // its rows are distinguishable as a class in provenance and filterable
+  // or revocable at query time. Additive like EXTRACTED: older servers
+  // reject registrations carrying it (fail closed), which is the correct
+  // rolling-upgrade behavior for a new producer class.
+  PRODUCER_KIND_SAAS_ADAPTER = 7;
 }
 
 message IngestAck {

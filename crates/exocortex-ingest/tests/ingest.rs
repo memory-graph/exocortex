@@ -2099,3 +2099,77 @@ async fn extraction_producers_are_stamped_distinguishably() {
         other => panic!("expected asserted provenance with a kind, got {other:?}"),
     }
 }
+
+/// D19 (SaaS-API adapter family): a SaaS adapter registers under
+/// `PRODUCER_KIND_SAAS_ADAPTER` and its committed rows carry that kind in
+/// provenance — one stamp for the whole family (Linear, Jira, GitHub,
+/// ServiceNow), so the class is distinguishable and revocable without
+/// touching any other producer's rows. Additive wire value 7: a server
+/// built before D19 fails `wire_kind_to_kernel` to None, so the
+/// registration rejects fail-closed (the rolling-upgrade behavior).
+#[tokio::test]
+async fn saas_producers_are_stamped_distinguishably() {
+    use exocortex_storage::Storage as _;
+    let srv = server();
+    srv.register_source(tonic::Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "linear://acme",
+        "linear-adapter",
+        3,
+        "linear",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::SaasAdapter,
+    )))
+    .await
+    .unwrap();
+
+    let memory = draft("x", "Task", 1);
+    let b = IngestBatch {
+        org_id: "org".into(),
+        source_uri: "linear://acme".into(),
+        producer_id: "linear-adapter".into(),
+        batch_id: "linear-1".into(),
+        mapping_version: "linear:1".into(),
+        ontology_fingerprint: srv.ontology.fingerprint.0.to_vec(),
+        ceiling: 3,
+        checksum: String::new(),
+        observed_at: None,
+        recorded_at: None,
+        snapshot: None,
+        memories: vec![memory],
+        relationships: vec![],
+        producer: Some(ProducerIdentity {
+            node_id: "node".into(),
+            agent_id: String::new(),
+            adapter_id: "linear-adapter".into(),
+            hmac_signature: vec![],
+            client_metadata: None,
+        }),
+    };
+    let ack = srv
+        .submit(tonic::Request::new(sign(b, [5u8; 32])))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ack.accepted, 1, "rejections: {:#?}", ack.rejections);
+
+    use futures::StreamExt as _;
+    let mut stream = srv.storage.stream_all_memories().await;
+    let mut stored = Vec::new();
+    while let Some(row) = stream.next().await {
+        stored.push(row.unwrap());
+    }
+    assert_eq!(stored.len(), 1);
+    match &stored[0].provenance {
+        exocortex_kernel::Provenance::Asserted {
+            producer_kind: Some(kind),
+            ..
+        } => assert_eq!(
+            *kind,
+            exocortex_kernel::ProducerKind::SaaSAdapter,
+            "SaaS adapter output is distinguishable in provenance"
+        ),
+        other => panic!("expected asserted provenance with a kind, got {other:?}"),
+    }
+}

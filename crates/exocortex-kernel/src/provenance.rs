@@ -91,6 +91,11 @@ pub enum ProducerKind {
     /// this workspace; this kind makes its output distinguishable in
     /// stored provenance so reads can filter or revoke it as a class.
     Extracted,
+    /// D19: a SaaS-API adapter (Linear, Jira, GitHub, ServiceNow). One
+    /// kind for the whole family — structure these systems already state,
+    /// transcribed and never inferred — so the class is distinguishable
+    /// and revocable in stored provenance.
+    SaaSAdapter,
 }
 
 /// External-system coordinates carried on every ingested assertion (R-T16a).
