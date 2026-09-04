@@ -991,20 +991,22 @@ idea:
 
 ## In progress
 
-**No row is in progress.** D1 CLOSED this run (all three flavors:
-parquet-dir, iceberg `78518a8`, delta `3e9453e`) alongside D17
-(`04e8adc`), PX5 (`9b7b7d0`), D6 (`dadb0c4`), D20 (`31efce1`), and D24
-(`4c55f25`) — each closed with evidence in its row below or in the
-Sequenced table, and both boundary reviews (rounds 7 and 8) landed
-through the lifecycle. The table below carries the CLOSED detail
-ledgers (Round 6, Round 7, Round 8; every row Done, evidence inline;
-the summary rows live in the Done section). The next locally
-satisfiable work is the v0.4.0 release (version bump → re-verify on
-the bumped tree → tag → publish; the full matrix is green on the
-pushed tree), then Wave 4 opens (D4/D5/D8-D11). D19 parks on owner
-credentials; D14/D16/D26 + the training-corpus direction park on
-owner decisions. A new item enters here only when work actually
-starts.
+**No row is in progress.** The v0.4.0 release SHIPPED this run (bump
+`28266f9`; matrix exit 0 / 179 oks on the bumped tree; tag `v0.4.0` →
+release run 33811497061 green in every job; all 15 ORDER crates on
+-crates.io; live FALKOR/REDIS/POSTGRES matrix legs unexecuted, stated
+in the release note — though the compose chaos leg itself RAN for
+D11, its first local execution). **Wave 4 is COMPLETE**: D4 (`700f932`),
+D5 (`cdeeda4`), D8 (`c18079e`, the authorized fingerprint move
+`2c3ec388…→4615018b…96c4`), D9 (`cc871ab`), D10 (`ee028ac`), D11
+(`1b60eb5`) — each closed with evidence in its Sequenced row, and the
+boundary review round 9 (`725523a`) landed with all three findings
+fixed. The table below carries the CLOSED detail ledgers (Rounds 6-9;
+every row Done, evidence inline; the summary rows live in the Done
+section). The next locally satisfiable work is Wave 5 (D3/D15) per
+the open-row gates. D19 parks on owner credentials; D14/D16/D26 +
+the training-corpus direction park on owner decisions. A new item
+enters here only when work actually starts.
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
@@ -1607,8 +1609,11 @@ so they are never renumbered, only re-waved.
   D6, D20, D24 all closed; boundary review round 8 landed). The graph
   is visible (the explorer), the node is observable (OTLP), operational
   systems integrate (CDC), and corpora carry rights (D24).
-- **Wave 4 — scale.** Prove the numbers past 100k before anyone bets an
-  org on them.
+- **Wave 4 — scale** (COMPLETE: D4, D5, D8, D9, D10, D11 all closed;
+  round 9 landed; D8 shipped the authorized fingerprint move
+  `2c3ec388…→4615018b…96c4`; D11 executed the live compose chaos leg
+  for the first time). Prove the numbers past 100k before anyone bets
+  an org on them.
 - **Wave 5 — multi-tenant and federated.** The capabilities that only
   matter once more than one org depends on a deployment.
 
@@ -1641,16 +1646,17 @@ so they are never renumbered, only re-waved.
 | D25 | **1** | **Name the change-feed seam (`ChangeLog`)** — the one major subsystem with no written contract. Append-at-LSN lives in `cluster/src/node.rs`, feed mount and auth in `server/src/sse.rs`, consumption and gap detection in `client/src/sync.rs`: three crates holding three partial ideas of one contract, which is exactly how CS1 happened (an empty replay ring answering "you are current" instead of 409 Resync, silently dropping every invalidation in the gap). Ships as a trait with four operations over today's in-memory ring — no behaviour change, no new dependency, no fingerprint move — plus a conformance suite landing as the seventh seam in PX3's inventory. **The case is CS1, not scale** | palantir-expansion PRD §3.3 S7 | **Done** — `cluster/src/change_log.rs`: the `ChangeLog` trait (append / replay_since / replay_floor / frontier) over the moved `RingChangeLog`; `ClusterNode` appends through the seam and exposes `&dyn ChangeLog`, the SSE handler replays through it, and `Replay` lives with the contract; conformance suite `cluster/tests/change_log.rs` pins LSN order, floor-vs-frontier truth, the CS1 empty-log rule, CS8 saturation, and dyn-safety — the seventh seam for PX3's inventory. No behaviour change, no new dependency, no fingerprint move |
 | D26 | **4** | **Broker-backed change log** — swap a durable, replayable broker in behind D25's port. **Redpanda** as the reference (single binary, Kafka-wire-compatible, no JVM and no ZooKeeper, so it sits with the single-binary ethos rather than against it); NATS JetStream the alternative. Apache Kafka itself is rejected: the operational surface contradicts the product's own deployment claim. Two things must be decided before any implementation, not during: **(a) LSN partitioning** — `next_lsn_block` hands out a contiguous, globally ordered range and the client's `since_lsn` resync depends on that order being real, while a partitioned log orders only within a partition; a single partition is almost certainly right at this tier and must be written down, because the pressure to "just add partitions" arrives under load and not while reading a PRD. **(b) The in-process implementation stays the default forever** — a broker is opt-in, or standalone mode and the single-binary claim both die. Gated on genuine scale pressure or on the D22 training direction being accepted, whichever comes first | D25; D22; D14 |
 
-**Open-row gates (stated 2026-09-02; keep current as rows open, park,
-or close):**
+**Open-row gates (stated 2026-09-02, revised 2026-09-03 after Wave 4
+closed; keep current as rows open, park, or close):**
 
 - **Locally satisfiable — an unattended run may take them in wave
-  order:** the v0.4.0 release FIRST (version bump → full re-verify on
-  the bumped tree → tag → `scripts/publish.sh`; the matrix is green on
-  the pushed tree and every wave-2/3 row is closed), then Wave 4's
-  D4/D5/D8/D9/D10/D11 (Wave 3's review landed, so the wave is open;
-  D5 and D8 touch ingest — fail-without-it tests and §12.1's shape
-  decision are each row's first deliverable).
+  order:** Wave 5's D3 (federation — §24 q15 is the sharp form; the
+  v1-locked constraints it cites are all still in place) and D15
+  (row-level ACLs beyond the five labels). Wave 4's review landed, so
+  the wave is open; neither row is small, and each one's first
+  deliverable is the design decision its PRD § names — the
+  common-subset fingerprint for D3, the authorization-DSL shape for
+  D15 — before any code.
 - **Credentials-gated — park and surface:** D19 (Linear/Jira, then
   GitHub, then Salesforce/ServiceNow tokens; only the owner can
   supply them).
