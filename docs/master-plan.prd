@@ -1,5 +1,25 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-04, D19 — Linear + GitHub adapters LANDED; matrix
+green 197 oks; GitHub live leg EXECUTED; Linear live leg awaits a
+LINEAR_API_KEY):** The SaaS family's first two legs shipped in five
+commits: the `SaaSAdapter` kind end to end (additive wire 7, no
+fingerprint move), `exocortex-api-client` (shared first-party
+hyper/rustls transport, typed rate-limit signals, bounded trust-store
+retry after the live leg exposed the macOS Keychain -36 flake, no new
+dependency), and both adapter crates with hermetic mapping suites and
+D21-declared projections (adapter-contract at 19 obligations). The
+GitHub live leg RAN against real rows through the owner's gh CLI
+token (5 issues + 3 PRs parsed clean, zero malformed nodes) and paid
+for itself three times: the missing User-Agent (empty 403), the
+`filterBy.since` argument shape, and the Keychain flake were all
+caught by it, not by review. The Linear live leg and a full
+backend-submit run (the PX4 precedent) wait on the owner minting a
+LINEAR_API_KEY — the MCP authorization cannot ride the adapter (no
+cursors, no rate-limit headers, a model-facing contract). Matrix:
+verify-release.sh exit 0, 197 suite-oks on the final tree; live
+FALKOR/REDIS/POSTGRES legs unexecuted (URLs unset), stated plainly.
+
 **Status (2026-09-03, D19 UNPARKED — SaaS adapters in progress; design
 recorded, Linear first):** The owner supplied Linear + GitHub credentials,
 which was D19's only external gate. The row is open in the In-progress
@@ -1024,7 +1044,7 @@ enters here only when work actually starts.
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
-| D19 | SaaS-API adapters: `exocortex-adapter-linear` first, `exocortex-adapter-github` second; design decisions recorded in the Sequenced row (direct APIs not MCP, one additive `SaaSAdapter` producer kind, D21 bounded projections, D13 ExternalKey joins from structured references only) | Crush | Owner supplied credentials 2026-09-03. Landed this run: the `SaaSAdapter` kind end to end (wire 7 + kernel + ingest mapping + `saas_producers_are_stamped_distinguishably`), `exocortex-api-client` (shared first-party hyper/rustls client, rate-limit signals typed, no new dependency), both adapter crates (lib + bin + hermetic suites, 16 tests; adapter-contract 19 obligations green), live legs feature-gated behind `LINEAR_API_KEY`/`GITHUB_TOKEN` (loud skip, the POSTGRES_URL pattern). Remaining: a live end-to-end run against the owner's Linear (the PX4 precedent) to close the row |
+| D19 | SaaS-API adapters: `exocortex-adapter-linear` first, `exocortex-adapter-github` second; design decisions recorded in the Sequenced row (direct APIs not MCP, one additive `SaaSAdapter` producer kind, D21 bounded projections, D13 ExternalKey joins from structured references only) | Crush | Owner supplied credentials 2026-09-03 (GitHub via gh CLI; Linear needs an API key minted — the MCP auth cannot ride the adapter). LANDED: the kind, `exocortex-api-client`, both adapter crates (hermetic suites; adapter-contract 19 obligations; no-llm reviews the transport dep), and the EXECUTED GitHub live leg (real rows parsed clean; it caught the UA/filterBy/Keychain defects). REMAINING to close: the owner mints a Linear API key → the Linear live leg → one full backend-submit run per adapter against a live node (the PX4 precedent) with idempotent rerun proven |
 | R7-1 | Round 7 finding: Iceberg manifest paths are commonly URI-encoded (`%20`); the iceberg `resolve_path` treated them literally (real tables with a space in a path would fail at read time), and the two catalog flavors disagreed on decoding — the exact divergence the shared crate exists to prevent | Crush | **Done** — `percent_decode` moved to `exocortex-adapter-table` as the ONE implementation; delta delegates; iceberg `resolve_path` decodes through it (and refuses a relative path behind `file://` instead of silently resolving against the table root). Regressions: iceberg lib `percent_escaped_manifest_paths_decode` (decode + malformed-escape fail-closed) and delta's pre-existing `percent_escaped_paths_decode` (now riding the shared fn) |
 | R7-2 | Round 7 finding: the iceberg Avro value decoder had no `Union` arm — `from_avro_datum` without a reader schema returns `Union(index, inner)`, and the fallback arm would silently decode a non-null union to a Debug-string placeholder. Latent (no shipped path reads a union field) but a silent-corruption shape | Crush | **Done** — `avro_value_to_json` unwraps `Union(_, inner)` to the inner value. Regression: `union_fields_decode_to_their_inner_value` (hand-framed container, union branch 1 = long 9001, asserted to decode as a number via the record-field path) |
 | R7-3 | Round 7 finding (advisory): `exocortex-er classify` could not pin thresholds — an operator iterating on the labelled set had to accept calibration as-is or edit code | Crush | **Done** — `--accept` / `--review` overrides on `classify` (calibration stays the default and stays printed by `evaluate`). Regression: `classify_thresholds_are_pinnable_at_classification_time` pins both thresholds and proves every proposal lands in the review band |
