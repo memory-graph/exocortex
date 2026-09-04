@@ -43,6 +43,10 @@ pub struct OpContext {
     /// surfaces with no ingest path (standalone MCP); the operation fails
     /// loudly rather than approximating with a second validator.
     pub ingest_preflight: Option<std::sync::Arc<dyn IngestPreflight>>,
+    /// D4 (§24 q5): the backend's embedding runtime, for
+    /// `reindex_embeddings`' whole-graph re-embed. `None` on surfaces
+    /// with no embedder; the operation fails loudly.
+    pub embedding_reindex: Option<std::sync::Arc<dyn EmbeddingReindex>>,
 }
 
 /// D21-b (adapter-contract PRD D2): the handle `preflight_batch` uses to
@@ -65,6 +69,39 @@ pub trait IngestPreflight: Send + Sync {
     ) -> Result<exocortex_wire::ingest::v1::IngestAck, OpError>;
 }
 
+/// D4 (§24 q5): whole-graph re-embed under the configured model — the
+/// explicit reindex operation a model swap needs (blue/green corpora:
+/// swap the model, reindex, the graph is single-revision again).
+/// Implemented by the backend node over its ingest server; `None` on
+/// surfaces with no embedding runtime (standalone MCP), where the
+/// operation fails loudly rather than approximating.
+#[async_trait]
+pub trait EmbeddingReindex: Send + Sync {
+    /// Re-embed every stored memory under the current model, committing
+    /// changed rows with their audit events. `actor` names the
+    /// administrator for the audit ledger.
+    async fn reindex_embeddings(&self, actor: &str) -> Result<ReindexStats, OpError>;
+}
+
+/// D4: the reindex outcome shared by the handle and the operation
+/// surface. Ops cannot link the ingest crate (the dependency arrow runs
+/// the other way through the server), so the counts cross as data.
+#[derive(
+    Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct ReindexStats {
+    /// Rows examined.
+    pub scanned: u64,
+    /// Rows re-embedded and committed (stamp or vector changed).
+    pub reembedded: u64,
+    /// Rows already at the target model and vector.
+    pub unchanged: u64,
+    /// The model every row now carries.
+    pub model_name: String,
+    /// Its revision.
+    pub model_version: String,
+}
+
 impl OpContext {
     /// IN11 (audit): a per-request context with a fresh R-R3 budget.
     /// The backend used to build ONE shared context at startup, so every
@@ -84,6 +121,7 @@ impl OpContext {
             deadline: chrono::Utc::now() + budget,
             ontology: None,
             ingest_preflight: None,
+            embedding_reindex: None,
         }
     }
 
@@ -102,6 +140,12 @@ impl OpContext {
     /// Attach the backend ingest service (D21-b `preflight_batch`).
     pub fn with_ingest_preflight(mut self, handle: std::sync::Arc<dyn IngestPreflight>) -> Self {
         self.ingest_preflight = Some(handle);
+        self
+    }
+
+    /// Attach the backend embedding runtime (D4 `reindex_embeddings`).
+    pub fn with_embedding_reindex(mut self, handle: std::sync::Arc<dyn EmbeddingReindex>) -> Self {
+        self.embedding_reindex = Some(handle);
         self
     }
 

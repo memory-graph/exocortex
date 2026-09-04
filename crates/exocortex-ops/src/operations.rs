@@ -424,6 +424,84 @@ register_operation!(
     PromoteVisibilityOutput
 );
 
+/// `reindex_embeddings` — D4 (§24 q5): the explicit model-swap step.
+/// Re-embeds every stored memory under the configured model, restamping
+/// model name/version; admin-only, audited per chunk.
+#[derive(Default)]
+pub struct ReindexEmbeddingsOp;
+
+/// Input for `reindex_embeddings` (no parameters — the whole graph is
+/// the unit; MCR² forbids mixed revisions, so a partial reindex is not
+/// a thing this operation offers).
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct ReindexEmbeddingsInput {}
+
+/// Output for `reindex_embeddings`.
+#[derive(Serialize, JsonSchema)]
+pub struct ReindexEmbeddingsOutput {
+    /// Rows examined.
+    pub scanned: u64,
+    /// Rows re-embedded and committed.
+    pub reembedded: u64,
+    /// Rows already at the target model.
+    pub unchanged: u64,
+    /// The model every row now carries.
+    pub model_name: String,
+    /// Its revision.
+    pub model_version: String,
+}
+
+#[async_trait]
+impl Operation for ReindexEmbeddingsOp {
+    type Input = ReindexEmbeddingsInput;
+    type Output = ReindexEmbeddingsOutput;
+    fn name(&self) -> &'static str {
+        "reindex_embeddings"
+    }
+    fn mcp_tool_name(&self) -> &'static str {
+        "exocortex.reindex_embeddings"
+    }
+    fn http_method(&self) -> http::Method {
+        http::Method::POST
+    }
+    fn http_path(&self) -> &'static str {
+        "/v1/reindex_embeddings"
+    }
+    async fn handle(&self, ctx: &OpContext, _input: Self::Input) -> Result<Self::Output, OpError> {
+        ctx.check_deadline()?;
+        // Org-wide maintenance over every stored row: the audit
+        // administrator capability, the same gate the audit ledger uses.
+        if !ctx.audit_admin {
+            return Err(OpError::Unauthorized(
+                "reindex_embeddings requires the audit administrator capability".into(),
+            ));
+        }
+        let handle = ctx.embedding_reindex.as_ref().ok_or_else(|| {
+            OpError::Other("no embedding runtime on this surface (backend node only)".into())
+        })?;
+        let stats = handle
+            .reindex_embeddings(&ctx.visibility_ctx.user_id)
+            .await?;
+        Ok(ReindexEmbeddingsOutput {
+            scanned: stats.scanned,
+            reembedded: stats.reembedded,
+            unchanged: stats.unchanged,
+            model_name: stats.model_name,
+            model_version: stats.model_version,
+        })
+    }
+}
+
+register_operation!(
+    ReindexEmbeddingsOp,
+    "reindex_embeddings",
+    "exocortex.reindex_embeddings",
+    POST,
+    "/v1/reindex_embeddings",
+    ReindexEmbeddingsInput,
+    ReindexEmbeddingsOutput
+);
+
 /// `list_discoveries` — present durable, unasserted Dreams candidates.
 #[derive(Default)]
 pub struct ListDiscoveriesOp;

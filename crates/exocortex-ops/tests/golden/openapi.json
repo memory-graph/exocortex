@@ -814,6 +814,28 @@
         }
       }
     },
+    "/v1/reindex_embeddings": {
+      "post": {
+        "operationId": "reindex_embeddings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "description": "Input for `reindex_embeddings` (no parameters — the whole graph is the unit; MCR² forbids mixed revisions, so a partial reindex is not a thing this operation offers).",
+                "title": "ReindexEmbeddingsInput",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
     "/v1/resolve_contradiction": {
       "post": {
         "operationId": "resolve_contradiction",

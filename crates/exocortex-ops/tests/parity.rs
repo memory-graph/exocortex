@@ -183,6 +183,7 @@ fn ctx_with_storage() -> (OpContext, Memory, Arc<InMemoryStorage>) {
 
             ontology: None,
             ingest_preflight: None,
+            embedding_reindex: None,
         },
         m,
         storage,
@@ -528,6 +529,7 @@ async fn audit_ledger_is_org_scoped() {
         OpContext {
             ontology: None,
             ingest_preflight: None,
+            embedding_reindex: None,
             visibility_ctx: ops_vc(org, "alice", Visibility::Org),
             audit_admin: true,
             storage: Arc::new(InMemoryStorage::new(ontology())),
@@ -602,6 +604,7 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
 
         ontology: None,
         ingest_preflight: None,
+        embedding_reindex: None,
     };
     let err = exocortex_ops::operations::GetMemory
         .handle(
@@ -633,6 +636,7 @@ async fn get_memory_surfaces_permission_denied_not_silent_none() {
 
         ontology: None,
         ingest_preflight: None,
+        embedding_reindex: None,
     };
     let out = exocortex_ops::operations::GetMemory
         .handle(
@@ -689,6 +693,7 @@ async fn promote_visibility_denies_invisible_target() {
 
         ontology: None,
         ingest_preflight: None,
+        embedding_reindex: None,
     };
     let err = exocortex_ops::operations::PromoteVisibilityOp
         .handle(
@@ -734,6 +739,7 @@ async fn promote_visibility_denies_target_above_caller_ceiling() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ontology: None,
         ingest_preflight: None,
+        embedding_reindex: None,
     };
     let error = exocortex_ops::operations::PromoteVisibilityOp
         .handle(
@@ -791,6 +797,7 @@ async fn expired_deadline_returns_deadline_exceeded() {
 
         ontology: None,
         ingest_preflight: None,
+        embedding_reindex: None,
     };
     let err = exocortex_ops::operations::GetMemory
         .handle(
@@ -877,6 +884,7 @@ async fn superseded_state_is_visible_on_reads() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ontology: Some(onto),
         ingest_preflight: None,
+        embedding_reindex: None,
     };
 
     // get_memory: the stale row names its successor.
@@ -1045,6 +1053,7 @@ async fn retract_edge_closes_audits_and_refuses_invisible_endpoints() {
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ingest_preflight: None,
+        embedding_reindex: None,
     };
     let out = RetractEdgeOp
         .handle(
@@ -1098,6 +1107,7 @@ async fn retract_edge_closes_audits_and_refuses_invisible_endpoints() {
         cache: Arc::new(cache2),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ingest_preflight: None,
+        embedding_reindex: None,
     };
     let err = RetractEdgeOp
         .handle(
@@ -1170,6 +1180,7 @@ async fn get_chain_walks_derived_evidence_and_explain_edge_renders() {
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ingest_preflight: None,
+        embedding_reindex: None,
     };
 
     let chain = GetChainOp
@@ -1264,6 +1275,7 @@ async fn verb_ctx(onto: &Arc<exocortex_kernel::Ontology>) -> OpContext {
         cache: Arc::new(cache),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ingest_preflight: None,
+        embedding_reindex: None,
     }
 }
 
@@ -1533,6 +1545,34 @@ async fn preflight_batch_requires_the_backend_ingest_surface() {
     assert!(err.to_string().contains("backend ingest surface"), "{err}");
 }
 
+/// D4 (§24 q5): `reindex_embeddings` is admin-only and fails LOUDLY on
+/// surfaces with no embedding runtime (standalone MCP) rather than
+/// approximating a re-embed.
+#[tokio::test]
+async fn reindex_embeddings_requires_admin_and_a_backend_surface() {
+    let entry = entries()
+        .into_iter()
+        .find(|e| e.name == "reindex_embeddings")
+        .expect("reindex_embeddings registered");
+    // Not an administrator: refused before the surface is consulted.
+    let (mut ctx, _m) = ctx_sync();
+    ctx.audit_admin = false;
+    let err = (entry.handler)(entry, &ctx, serde_json::json!({}))
+        .await
+        .expect_err("non-admin refused");
+    assert!(
+        matches!(err, exocortex_ops::OpError::Unauthorized(_)),
+        "{err}"
+    );
+    // Administrator but no embedding runtime on this surface: loud
+    // failure naming the missing surface.
+    let (ctx2, _m2) = ctx_sync();
+    let err = (entry.handler)(entry, &ctx2, serde_json::json!({}))
+        .await
+        .expect_err("no embedding runtime on this surface");
+    assert!(err.to_string().contains("embedding runtime"), "{err}");
+}
+
 /// D7 (§23 #13): `resolve_contradiction` — a human decision over a
 /// `Contradicts` edge closes the edge, supersedes the loser to the
 /// stale-belief floor (never deletes), writes the decision to the audit
@@ -1566,6 +1606,7 @@ async fn resolve_contradiction_supersedes_closes_and_audits() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ontology: Some(onto.clone()),
         ingest_preflight: None,
+        embedding_reindex: None,
     };
 
     let mut hex = String::with_capacity(32);

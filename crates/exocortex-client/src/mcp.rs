@@ -120,6 +120,9 @@ impl ExocortexMcp {
             // D21-b: no ingest surface in standalone mode — `preflight_batch`
             // fails loudly rather than approximating Submit's verdicts.
             ingest_preflight: None,
+            // D4: no embedding runtime in standalone mode —
+            // `reindex_embeddings` fails loudly (backend node only).
+            embedding_reindex: None,
         })
     }
 

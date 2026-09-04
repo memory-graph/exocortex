@@ -208,6 +208,7 @@ async fn every_operation_answers_over_http_with_auth() {
         // D2: preflight needs the effective rulebook.
         ontology: Some(ontology()),
         ingest_preflight: None,
+        embedding_reindex: None,
     });
 
     let principals = Arc::new(
@@ -285,6 +286,9 @@ async fn every_operation_answers_over_http_with_auth() {
                     "finding_content": "c",
                 },
             }),
+            // D4: no input surface; this shared ctx carries no embedding
+            // handle, so both surfaces answer the same loud error.
+            "reindex_embeddings" => serde_json::json!({}),
             other => panic!("no test input crafted for op {other}"),
         }
     };
@@ -306,6 +310,11 @@ async fn every_operation_answers_over_http_with_auth() {
         // D21-b: `preflight_batch` needs a real ingest registration; it is
         // covered by its own parity test below with the backend handle.
         if entry.name == "preflight_batch" {
+            continue;
+        }
+        // D4: `reindex_embeddings` needs the backend embedding runtime;
+        // covered by its own parity test below with the reindex handle.
+        if entry.name == "reindex_embeddings" {
             continue;
         }
         let input = input_for(entry.name);
@@ -659,6 +668,7 @@ async fn preflight_batch_answers_identically_over_http_and_the_registry() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ontology: Some(onto.clone()),
         ingest_preflight: Some(exocortex_server::backend::preflight_handle(ingest.clone())),
+        embedding_reindex: None,
     });
     let principals = Arc::new(
         exocortex_server::principal::PrincipalRegistry::single_with_audit_admin(
@@ -733,6 +743,203 @@ async fn preflight_batch_answers_identically_over_http_and_the_registry() {
     assert!(err.to_string().contains("another org"), "{err}");
 }
 
+/// D4 (§24 q5): `reindex_embeddings` — the model-swap reindex over a
+/// REAL ingest server answers byte-identically over HTTP and the typed
+/// handler (CR-9), restamps every row, and writes audit rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn reindex_embeddings_answers_identically_over_http_and_the_registry() {
+    use exocortex_storage::Storage as _;
+    use exocortex_wire::ingest::v1::ingest_service_server::IngestService as _;
+
+    let onto = ontology();
+    let storage = Arc::new(InMemoryStorage::new(onto.clone()));
+    let (cache, _writer) = LocalCache::new(16 * 1024 * 1024);
+
+    let mut ingest = exocortex_ingest::IngestServer::new(storage.clone(), onto.clone(), [7u8; 32])
+        .with_embedder(Arc::new(exocortex_ingest::FakeEmbedder::default()));
+    ingest.org_guard = Some("org".into());
+    let ingest = Arc::new(ingest);
+    let mut registration = exocortex_wire::ingest::v1::RegisterSourceRequest {
+        default_rights: None,
+        org_id: "org".into(),
+        source_uri: "custom://reindex-parity".into(),
+        producer_id: "reindex-parity".into(),
+        ceiling: 3,
+        source_flavor: "custom".into(),
+        producer_kind: 5,
+        producer: Some(exocortex_wire::ingest::v1::ProducerIdentity {
+            node_id: "node".into(),
+            agent_id: String::new(),
+            adapter_id: "adapter".into(),
+            hmac_signature: vec![],
+            client_metadata: None,
+        }),
+        projection: None,
+    };
+    exocortex_wire::signing::sign_registration(&[7u8; 32], &mut registration);
+    ingest
+        .register_source(tonic::Request::new(registration))
+        .await
+        .unwrap();
+    let mut batch = exocortex_wire::ingest::v1::IngestBatch {
+        org_id: "org".into(),
+        source_uri: "custom://reindex-parity".into(),
+        producer_id: "reindex-parity".into(),
+        batch_id: "seed".into(),
+        mapping_version: "1".into(),
+        ontology_fingerprint: onto.fingerprint.0.to_vec(),
+        ceiling: 3,
+        checksum: String::new(),
+        observed_at: None,
+        recorded_at: None,
+        snapshot: None,
+        memories: vec![
+            exocortex_wire::ingest::v1::MemoryDraft {
+                rights: None,
+                draft_key: "r1".into(),
+                id: String::new(),
+                memory_type: "Solution".into(),
+                title: "reindex parity one".into(),
+                content: "deterministic embedding text".into(),
+                tags: vec![],
+                visibility: 3,
+                valid_from: None,
+                valid_until: None,
+                external_key: None,
+            },
+            exocortex_wire::ingest::v1::MemoryDraft {
+                rights: None,
+                draft_key: "r2".into(),
+                id: String::new(),
+                memory_type: "Solution".into(),
+                title: "reindex parity two".into(),
+                content: "deterministic embedding text".into(),
+                tags: vec![],
+                visibility: 3,
+                valid_from: None,
+                valid_until: None,
+                external_key: None,
+            },
+        ],
+        relationships: vec![],
+        producer: Some(exocortex_wire::ingest::v1::ProducerIdentity {
+            node_id: "node".into(),
+            agent_id: String::new(),
+            adapter_id: "adapter".into(),
+            hmac_signature: vec![],
+            client_metadata: None,
+        }),
+    };
+    exocortex_wire::signing::prepare_batch(&[7u8; 32], &mut batch);
+    let ack = ingest
+        .submit(tonic::Request::new(batch))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ack.accepted, 2);
+    // One row committed WITHOUT a vector (the embedding-failure path):
+    // the first reindex run has real work to do, and an audit row to
+    // write for it.
+    {
+        use futures::StreamExt;
+        let mut stream = storage.stream_all_memories().await;
+        let first = stream.next().await.unwrap().unwrap();
+        let mut stripped = first.clone();
+        stripped.embedding = None;
+        storage.upsert_memory(&stripped).await.unwrap();
+    }
+
+    let ctx = Arc::new(OpContext {
+        visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        audit_admin: true,
+        storage: storage.clone() as Arc<dyn exocortex_storage::Storage>,
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        ontology: Some(onto.clone()),
+        ingest_preflight: Some(exocortex_server::backend::preflight_handle(ingest.clone())),
+        embedding_reindex: Some(exocortex_server::backend::reindex_handle(ingest.clone())),
+    });
+    let principals = Arc::new(
+        exocortex_server::principal::PrincipalRegistry::single_with_audit_admin(
+            "test-only-reindex-bearer-token-000".into(),
+            ctx.visibility_ctx.clone(),
+            true,
+        )
+        .unwrap(),
+    );
+    let bind = HttpBind::with_principals(ctx.clone(), principals);
+    let app = bind.router(None);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let entry = entries()
+        .into_iter()
+        .find(|e| e.name == "reindex_embeddings")
+        .expect("reindex_embeddings registered");
+    let input = serde_json::json!({});
+    // Run 1 (typed): repairs the stripped vector and audits the change.
+    let repair = (entry.handler)(entry, &ctx, input.clone())
+        .await
+        .expect("typed surface");
+    assert_eq!(repair["reembedded"].as_u64().unwrap(), 1);
+    // Runs 2 and 3 (HTTP then typed): the graph is converged, so the
+    // surfaces are compared on a stable answer — byte-identical.
+    let (status, over_http, raw) = http(
+        addr,
+        "POST",
+        "/v1/reindex_embeddings",
+        Some("test-only-reindex-bearer-token-000"),
+        Some(&input),
+    )
+    .await;
+    assert_eq!(status, 200, "{raw}");
+    let typed = (entry.handler)(entry, &ctx, input.clone())
+        .await
+        .expect("typed surface");
+    assert_eq!(typed, over_http, "byte-identical across surfaces");
+    assert_eq!(typed["model_name"], "fake-deterministic");
+    assert_eq!(typed["scanned"].as_u64().unwrap(), 2);
+    // Every row carries the stamped model and an audit row exists.
+    {
+        use futures::StreamExt;
+        let mut stream = storage.stream_all_memories().await;
+        let mut rows = Vec::new();
+        while let Some(row) = stream.next().await {
+            rows.push(row.unwrap());
+        }
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row
+            .embedding
+            .as_ref()
+            .map(|embedding| embedding.model.name.as_str() == "fake-deterministic")
+            .unwrap_or(false)));
+    }
+    let audit = storage.audit_range("org", 0, 1000).await.unwrap();
+    assert!(audit
+        .iter()
+        .any(|event| event["action"] == "reindex_embeddings"));
+
+    // A non-admin principal is refused by the operation itself.
+    let (plain_cache, _rx) = LocalCache::new(1024 * 1024);
+    let mut ctx2 = OpContext::per_request(
+        ops_vc("org", "mallory", Visibility::Org),
+        storage.clone() as Arc<dyn exocortex_storage::Storage>,
+        Arc::new(plain_cache),
+        chrono::Duration::seconds(5),
+    );
+    ctx2.embedding_reindex = ctx.embedding_reindex.clone();
+    let err = (entry.handler)(entry, &ctx2, input)
+        .await
+        .expect_err("non-admin refused");
+    assert!(
+        matches!(err, exocortex_ops::OpError::Unauthorized(_)),
+        "{err}"
+    );
+}
+
 /// PX2 acceptance: pack Actions and Functions ride the SAME parity walk
 /// in the same shape as kernel ops — HTTP output byte-identical to the
 /// typed handler's. Pack verbs declare their own ceilings
@@ -772,6 +979,7 @@ async fn pack_verbs_answer_identically_over_http_and_the_registry() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ontology: Some(onto.clone()),
         ingest_preflight: None,
+        embedding_reindex: None,
     });
     let principals = Arc::new(
         exocortex_server::principal::PrincipalRegistry::single_with_audit_admin(

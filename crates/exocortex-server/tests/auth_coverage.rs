@@ -32,6 +32,7 @@ fn boot_router() -> (axum::Router, Arc<InMemoryStorage>) {
 
         ontology: None,
         ingest_preflight: None,
+        embedding_reindex: None,
     });
     let bind = exocortex_server::http_bind::HttpBind::new(
         ctx,

@@ -14,4 +14,4 @@ pub mod service;
 
 pub use embedding::{Embedder, EmbedderRef, FakeEmbedder};
 pub use entities::EntityExtractor;
-pub use service::IngestServer;
+pub use service::{IngestServer, ReindexReport};

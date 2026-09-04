@@ -641,6 +641,16 @@
     "name": "exocortex.promote_visibility"
   },
   {
+    "description": "reindex_embeddings",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Input for `reindex_embeddings` (no parameters — the whole graph is the unit; MCR² forbids mixed revisions, so a partial reindex is not a thing this operation offers).",
+      "title": "ReindexEmbeddingsInput",
+      "type": "object"
+    },
+    "name": "exocortex.reindex_embeddings"
+  },
+  {
     "description": "resolve_contradiction",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",

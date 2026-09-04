@@ -207,6 +207,22 @@ pub struct IngestServer<S: Storage> {
     seen_snapshots: Arc<Mutex<HashMap<(String, String, String), Vec<String>>>>,
 }
 
+/// D4 (§24 q5): the whole-graph reindex outcome — what the operation
+/// surface reports and the audit ledger summarizes.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReindexReport {
+    /// Rows examined.
+    pub scanned: u64,
+    /// Rows re-embedded and committed (stamp or vector changed).
+    pub reembedded: u64,
+    /// Rows already at the target model and vector.
+    pub unchanged: u64,
+    /// The model every row now carries.
+    pub model_name: String,
+    /// Its revision.
+    pub model_version: String,
+}
+
 /// One ring entry.
 #[derive(Clone)]
 pub struct RecentEmbedding {
@@ -1276,9 +1292,6 @@ impl<S: Storage + 'static> IngestServer<S> {
     }
 
     async fn embed_memories(&self, memories: &mut [Memory]) {
-        let Some(embedder) = self.embedder.clone() else {
-            return;
-        };
         if memories.is_empty() {
             return;
         }
@@ -1286,35 +1299,61 @@ impl<S: Storage + 'static> IngestServer<S> {
             .iter()
             .map(|memory| format!("{}\n{}", memory.title, memory.content))
             .collect::<Vec<_>>();
-        let model_id = embedder.model_id();
-        let model_version = embedder.model_version();
-        let Ok(permit) = self.embedding_permits.clone().acquire_owned().await else {
-            return;
+        let vectors = match self.embed_texts(&texts).await {
+            Ok(vectors) => vectors,
+            Err(error) => {
+                tracing::warn!(%error, "embedding batch failed; committing without vectors");
+                return;
+            }
         };
+        self.stamp_embeddings(memories, vectors);
+    }
+
+    /// The one synchronous model-invocation path every embedding takes
+    /// (submit and D4 reindex alike): admission permits, the blocking
+    /// pool, and cardinality checking stay identical.
+    async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        let embedder = self
+            .embedder
+            .clone()
+            .ok_or_else(|| "no embedder configured".to_string())?;
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let texts = texts.to_vec();
+        let Ok(permit) = self.embedding_permits.clone().acquire_owned().await else {
+            return Err("embedding admission shut down".into());
+        };
+        let expected = texts.len();
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             embedder.embed_batch(&texts)
         })
         .await;
-        let vectors = match result {
-            Ok(Ok(vectors)) if vectors.len() == memories.len() => vectors,
-            Ok(Ok(vectors)) => {
-                tracing::warn!(
-                    expected = memories.len(),
-                    actual = vectors.len(),
-                    "embedder returned the wrong batch cardinality"
-                );
-                return;
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "embedding batch failed; committing without vectors");
-                return;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "embedding blocking task failed; committing without vectors");
-                return;
-            }
-        };
+        match result {
+            Ok(Ok(vectors)) if vectors.len() == expected => Ok(vectors),
+            Ok(Ok(vectors)) => Err(format!(
+                "embedder returned {} vectors for {} texts",
+                vectors.len(),
+                expected
+            )),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(format!("embedding blocking task failed: {error}")),
+        }
+    }
+
+    /// Stamp the current model identity on every vector (R-Mcr1/R-Dr5).
+    fn stamp_embeddings(&self, memories: &mut [Memory], vectors: Vec<Vec<f32>>) {
+        let model_id = self
+            .embedder
+            .as_ref()
+            .map(|embedder| embedder.model_id())
+            .unwrap_or("");
+        let model_version = self
+            .embedder
+            .as_ref()
+            .map(|embedder| embedder.model_version())
+            .unwrap_or("");
         for (memory, vector) in memories.iter_mut().zip(vectors) {
             memory.embedding = Some(exocortex_kernel::Embedding {
                 model: exocortex_kernel::EmbeddingModel {
@@ -1550,6 +1589,121 @@ impl<S: Storage + 'static> IngestServer<S> {
             ))
             .cloned()
             .ok_or_else(|| "producer not registered".to_string())
+    }
+
+    /// D4 (§24 q5): one-shot whole-graph re-embed under the CONFIGURED
+    /// model — the explicit reindex a model swap needs. Every row whose
+    /// model stamp or vector changed (including rows that committed
+    /// without vectors after an embedding failure) is committed as a new
+    /// assertion carrying the fresh stamp; MCR² rejects mixed revisions
+    /// (R-Mcr1), so a swap must reindex before the next Dreams cycle.
+    /// Chunk-committed with one audit event per chunk; idempotent — a
+    /// deterministic model re-embeds to identical vectors and re-runs
+    /// change nothing.
+    pub async fn reindex_embeddings(&self, actor: &str) -> Result<ReindexReport, String> {
+        if self.embedder.is_none() {
+            return Err("no embedder configured (R-Lat3); nothing to reindex under".into());
+        }
+        let mut report = ReindexReport::default();
+        use futures::StreamExt;
+        let mut stream = self.storage.stream_all_memories().await;
+        let mut chunk: Vec<Memory> =
+            Vec::with_capacity(exocortex_wire::limits::MAX_MEMORIES_PER_BATCH);
+        loop {
+            let row = stream.next().await;
+            let at_end = row.is_none();
+            if let Some(memory) = row {
+                let memory = memory.map_err(|error| format!("reindex scan failed: {error}"))?;
+                chunk.push(memory);
+            }
+            if chunk.len() < exocortex_wire::limits::MAX_MEMORIES_PER_BATCH && !at_end {
+                continue;
+            }
+            if chunk.is_empty() {
+                debug_assert!(at_end);
+                break;
+            }
+            let rows = std::mem::replace(
+                &mut chunk,
+                Vec::with_capacity(exocortex_wire::limits::MAX_MEMORIES_PER_BATCH),
+            );
+            let (reembedded, unchanged) = self.reindex_chunk(rows, actor).await?;
+            report.scanned += reembedded + unchanged;
+            report.reembedded += reembedded;
+            report.unchanged += unchanged;
+            if at_end {
+                break;
+            }
+        }
+        let embedder = self.embedder.as_ref().expect("checked above");
+        report.model_name = embedder.model_id().to_string();
+        report.model_version = embedder.model_version().to_string();
+        Ok(report)
+    }
+
+    /// Re-embed one bounded chunk and commit the changed rows with their
+    /// audit event atomically (the promote_visibility discipline).
+    async fn reindex_chunk(
+        &self,
+        mut rows: Vec<Memory>,
+        actor: &str,
+    ) -> Result<(u64, u64), String> {
+        let before: Vec<_> = rows.iter().map(|row| row.embedding.clone()).collect();
+        let texts = rows
+            .iter()
+            .map(|memory| format!("{}\n{}", memory.title, memory.content))
+            .collect::<Vec<_>>();
+        let vectors = self.embed_texts(&texts).await?;
+        self.stamp_embeddings(&mut rows, vectors);
+        let mut reembedded = 0u64;
+        let mut unchanged = 0u64;
+        let mut changed: Vec<Memory> = Vec::new();
+        for (row, previous) in rows.into_iter().zip(before) {
+            if row.embedding == previous {
+                unchanged += 1;
+            } else {
+                reembedded += 1;
+                changed.push(row);
+            }
+        }
+        if changed.is_empty() {
+            return Ok((reembedded, unchanged));
+        }
+        let org_id = changed[0]
+            .context
+            .tenant_id
+            .clone()
+            .or_else(|| self.org_guard.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let audit = exocortex_storage::AuditEvent {
+            action: "reindex_embeddings".into(),
+            actor: actor.into(),
+            org_id,
+            input_digest: *blake3::hash(
+                format!(
+                    "{}|{}",
+                    self.embedder
+                        .as_ref()
+                        .map(|embedder| embedder.model_id())
+                        .unwrap_or(""),
+                    self.embedder
+                        .as_ref()
+                        .map(|embedder| embedder.model_version())
+                        .unwrap_or("")
+                )
+                .as_bytes(),
+            )
+            .as_bytes(),
+            output_ids: changed.iter().map(|row| row.id.to_hex().into()).collect(),
+            fingerprint: self.storage.ontology_fingerprint(),
+            lease_epoch: None,
+            recorded_at: chrono::Utc::now(),
+        };
+        self.storage
+            .upsert_batch_audited(&changed, &[], &audit)
+            .await
+            .map_err(|error| format!("reindex chunk commit failed: {error}"))?;
+        Ok((reembedded, unchanged))
     }
 
     /// D21-c (adapter-contract PRD D3): compile the rulebook as data —

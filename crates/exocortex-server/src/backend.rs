@@ -12,7 +12,7 @@ use exocortex_cache::LocalCache;
 use exocortex_cluster::ClusterNode;
 use exocortex_ingest::IngestServer;
 use exocortex_kernel::{Ontology, OntologyFingerprint};
-use exocortex_ops::{IngestPreflight, OpContext};
+use exocortex_ops::{EmbeddingReindex, IngestPreflight, OpContext, ReindexStats};
 use exocortex_storage::{LeaseKey, Storage};
 use futures::{FutureExt, Stream, StreamExt};
 
@@ -286,6 +286,47 @@ pub fn preflight_handle<S: Storage + 'static>(
     server: Arc<IngestServer<S>>,
 ) -> Arc<dyn IngestPreflight> {
     Arc::new(RegistryPreflight {
+        server: Arc::new(tokio::sync::OnceCell::from(server)),
+    })
+}
+
+/// D4 (§24 q5): the reindex handle over the node's ingest server. The
+/// node late-binds the same cell the preflight handle uses (the ingest
+/// server is constructed after this context); tests and embedders pass
+/// an already-built server.
+struct RegistryReindex<S: Storage> {
+    server: Arc<tokio::sync::OnceCell<Arc<IngestServer<S>>>>,
+}
+
+#[async_trait::async_trait]
+impl<S: Storage + 'static> EmbeddingReindex for RegistryReindex<S> {
+    async fn reindex_embeddings(
+        &self,
+        actor: &str,
+    ) -> Result<ReindexStats, exocortex_ops::OpError> {
+        let server = self
+            .server
+            .get()
+            .ok_or_else(|| exocortex_ops::OpError::Other("ingest surface not ready".into()))?;
+        let report = server
+            .reindex_embeddings(actor)
+            .await
+            .map_err(exocortex_ops::OpError::Other)?;
+        Ok(ReindexStats {
+            scanned: report.scanned,
+            reembedded: report.reembedded,
+            unchanged: report.unchanged,
+            model_name: report.model_name,
+            model_version: report.model_version,
+        })
+    }
+}
+
+/// D4: a reindex handle over an already-built ingest server.
+pub fn reindex_handle<S: Storage + 'static>(
+    server: Arc<IngestServer<S>>,
+) -> Arc<dyn EmbeddingReindex> {
+    Arc::new(RegistryReindex {
         server: Arc::new(tokio::sync::OnceCell::from(server)),
     })
 }
@@ -565,6 +606,9 @@ async fn run_backend_node_inner<S: Storage + 'static>(
         // is the same ontology the ingest path validates against.
         ontology: Some(ontology.clone()),
         ingest_preflight: Some(Arc::new(RegistryPreflight {
+            server: preflight_server.clone(),
+        })),
+        embedding_reindex: Some(Arc::new(RegistryReindex {
             server: preflight_server.clone(),
         })),
     });

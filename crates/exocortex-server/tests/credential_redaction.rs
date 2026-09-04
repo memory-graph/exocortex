@@ -171,6 +171,7 @@ async fn credentials_are_absent_from_feasible_failure_surfaces() {
         deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
         ontology: Some(ontology.clone()),
         ingest_preflight: None,
+        embedding_reindex: None,
     });
     let router = exocortex_server::http_bind::HttpBind::new(
         context,

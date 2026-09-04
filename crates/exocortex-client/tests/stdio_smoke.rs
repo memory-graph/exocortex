@@ -739,6 +739,7 @@ async fn mcp_get_memory_shape_matches_registry() {
         cache: cache.clone(),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
         ingest_preflight: None,
+        embedding_reindex: None,
     });
     let entry = exocortex_ops::entries()
         .into_iter()

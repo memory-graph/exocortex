@@ -525,6 +525,7 @@ async fn backend_router_rejects_token_query_without_bearer() {
 
         ontology: None,
         ingest_preflight: None,
+        embedding_reindex: None,
     });
     let bind = exocortex_server::http_bind::HttpBind::new(
         ctx,
