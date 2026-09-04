@@ -1,0 +1,77 @@
+# Exocortex — Round 9 Review (Wave 4 boundary)
+
+**Status:** CLOSED (2026-09-03). Scope: the Wave 4 boundary review of
+this run's six commits — D4 (`700f932`), D5 (`cdeeda4`), D8
+(`c18079e`), D9 (`cc871ab`), D10 (`ee028ac`), D11 (`1b60eb5`) — with
+findings landed through the lifecycle in the same commit as their
+fixes. Method: adversarial self-review of the new surface against the
+PRDs' acceptance text and this repo's invariants (fail-closed seams,
+claim-vs-code honesty, no-silent-design), preceded by the full gate
+matrix on the wave's final tree (`scripts/verify-release.sh` exit 0,
+187 suite-oks; live FALKOR/REDIS/POSTGRES legs unexecuted in the
+matrix — though the compose chaos leg itself RAN for D11, the first
+local execution).
+
+## Findings
+
+### R9-1 — Dreams re-anchored its own computed layer (blocker)
+
+`select_anchors` took ANY live embedded memory as an anchor, and D8's
+abstraction rows are live, embedded, General-carried memories. An
+org-wide (`project: "*"`) cycle therefore anchored the machine layer:
+merge candidates over centroids-of-centroids could close an
+abstraction whose member set then re-derives a FRESH id next cycle
+(id churn), and MCR² scored the graph with its own summary rows
+folded in. The D8 row's "stale abstractions are PRUNE's discipline"
+boundary assumed Dreams never touches them mid-flight — the anchor
+selector broke that assumption one region-wildcard away.
+
+**Fix:** `select_anchors` skips `Provenance::Computed` rows — Dreams
+never re-consolidates its own output. Verify:
+`abstractions.rs::org_wide_cycles_do_not_reconsolidate_abstractions`
+(a `"*"` cycle over a graph with an open abstraction: not merged, not
+closed, `memories_input` counts the five members only).
+
+### R9-2 — CrossDomain discoveries stamped `Solves` as evidence (advisory)
+
+The cross-domain finder (D9) records `via_types: (0, 0)` for
+entity-shared discoveries — but `0` is the REAL kind id `Solves`. The
+stored record asserted edge-mediated evidence that does not exist;
+anything consuming `via_types` (the transitive finder's
+already-derived-pair exclusion compares kinds) would mis-read it.
+
+**Fix:** the none-sentinel is `u32::MAX` (not a valid kind id; authored
+ids live below `0x8001_0000` and companions below `0x4001_0000`),
+documented at the finder. Verify:
+`tenancy_regions.rs` asserts `via_types == (u32::MAX, u32::MAX)` on
+the surfaced pattern.
+
+### R9-3 — Reindex failures hid their partial progress (advisory)
+
+`reindex_embeddings` commits chunk by chunk (idempotent, restartable
+by design), but a mid-run chunk failure returned only the embedder's
+error — an operator could not tell what remained. "How far did it
+get" is the first question a partial-failure answer owes.
+
+**Fix:** the error names its progress — "reindex failed after N rows
+scanned / M re-embedded: …" — with N/M the committed-so-far counts.
+Verify: `reindex.rs::reindex_failure_names_partial_progress` (256-row
+first chunk commits; the second chunk's embedder refuses; the error
+names "after 256 rows scanned").
+
+## Verified non-findings
+
+- D5's seeding window `[0.85, 0.92)` deliberately leaves
+  near-duplicates to the merge path while Dreams' own writer has no
+  upper bound over SURVIVORS — the doc's "Dreams' own write window"
+  phrasing is behaviorally right (post-merge survivors never carry
+  ≥0.92 pairs) and the tests pin the window exactly.
+- D8's General-carrier decision held under load: the live compose run
+  (D11) showed the production graph pinning the composed fingerprint
+  with `Summarizes` present — the superset advance works in
+  production conditions, and the chaos-seeder defect that run
+  surfaced (a dev-only subset runtime refused `NotASuperset` against a
+  node-pinned composed graph) was fixed in the same run
+  (`composed_ontology()`).
+- D10's additive-rollout leg is byte-honest: the unknown field is
+  appended to a REAL envelope's encoding and re-decoded, not a mock.

@@ -240,3 +240,127 @@ async fn reindex_refuses_without_an_embedder() {
         .expect_err("refused");
     assert!(err.contains("no embedder configured"), "{err}");
 }
+
+/// A complete kernel row for the hand-committed bulk fixtures (R9-3).
+fn seed_row_shape(index: usize) -> exocortex_kernel::Memory {
+    exocortex_kernel::Memory {
+        rights: None,
+        id: exocortex_kernel::MemoryId::new_v7(),
+        memory_type: 3,
+        title: format!("shape {index}").into(),
+        content: "shape".into(),
+        summary: None,
+        tags: Default::default(),
+        visibility: exocortex_kernel::Visibility::Org,
+        provenance: exocortex_kernel::Provenance::Asserted {
+            author: "reindex-test".into(),
+            producer_kind: None,
+        },
+        context: exocortex_kernel::MemoryContext {
+            timestamp: chrono::Utc::now(),
+            project_id: Some("p".into()),
+            project_path: None,
+            team_id: None,
+            tenant_id: Some("org".into()),
+            session_id: None,
+            user_id: None,
+            created_by: None,
+            files_involved: Default::default(),
+            languages: Default::default(),
+            frameworks: Default::default(),
+            technologies: Default::default(),
+            git_commit: None,
+            git_branch: None,
+            working_directory: None,
+            entities: Default::default(),
+            additional_metadata: serde_json::Value::Null,
+        },
+        importance: exocortex_kernel::memory::F01::new(0.5).unwrap(),
+        confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
+        effectiveness: None,
+        usage_count: 0,
+        valid_from: chrono::Utc::now(),
+        valid_until: None,
+        recorded_at: chrono::Utc::now(),
+        invalidated_by: None,
+        embedding: None,
+        lsn: exocortex_kernel::LSN::new_local(0),
+    }
+}
+
+/// R9-3: a mid-run embedding failure names its progress — the first
+/// chunk's commits stand and the error says exactly how far it got.
+#[tokio::test]
+async fn reindex_failure_names_partial_progress() {
+    struct PoisonAfterFirstChunk {
+        batches_served: std::sync::atomic::AtomicUsize,
+    }
+    impl Embedder for PoisonAfterFirstChunk {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+            Ok(vec![0.5; 64])
+        }
+        fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            use std::sync::atomic::Ordering;
+            if self.batches_served.fetch_add(1, Ordering::SeqCst) > 0 {
+                Err("second chunk refuses embedding".into())
+            } else {
+                Ok(texts.iter().map(|_| vec![0.5; 64]).collect())
+            }
+        }
+        fn model_id(&self) -> &'static str {
+            "fake-sequence"
+        }
+        fn model_version(&self) -> &'static str {
+            "v1"
+        }
+        fn dim(&self) -> usize {
+            64
+        }
+    }
+    let ontology = Arc::new(
+        exocortex_kernel::Ontology::from_packs(vec![pack_def()]).expect("ontology assembles"),
+    );
+    let storage = Arc::new(InMemoryStorage::new(ontology.clone()));
+    let mut server = IngestServer::new(storage.clone(), ontology, HMAC_KEY).with_embedder(
+        Arc::new(PoisonAfterFirstChunk {
+            batches_served: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+    server.org_guard = Some("org".into());
+    server
+        .register_source(Request::new(exocortex_wire::signing::registration(
+            &HMAC_KEY,
+            "org",
+            "custom://reindex",
+            "reindex-test",
+            3,
+            "custom",
+            "test-node",
+            exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+        )))
+        .await
+        .unwrap();
+
+    // 256 clean rows (one full chunk) + one poisoned row in the second
+    // chunk: hand-commit them so the embedder never sees them at ingest.
+    for index in 0..exocortex_wire::limits::MAX_MEMORIES_PER_BATCH {
+        let memory = seed_row_shape(index);
+        storage.upsert_memory(&memory).await.unwrap();
+    }
+    // The 257th row lands alone in the second chunk (stream order aside,
+    // chunking is 256 rows per commit).
+    storage.upsert_memory(&seed_row_shape(257)).await.unwrap();
+
+    let err = server
+        .reindex_embeddings("admin")
+        .await
+        .expect_err("second chunk fails");
+    assert!(err.contains("second chunk refuses"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "after {} rows scanned",
+            exocortex_wire::limits::MAX_MEMORIES_PER_BATCH
+        )),
+        "progress named: {err}"
+    );
+}

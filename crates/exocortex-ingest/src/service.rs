@@ -1654,7 +1654,16 @@ impl<S: Storage + 'static> IngestServer<S> {
                 &mut chunk,
                 Vec::with_capacity(exocortex_wire::limits::MAX_MEMORIES_PER_BATCH),
             );
-            let (reembedded, unchanged) = self.reindex_chunk(rows, actor).await?;
+            // R9-3: a mid-run failure names its progress — earlier chunks
+            // stay committed (idempotent rerun continues), and the
+            // operator can see exactly how far it got.
+            let (reembedded, unchanged) =
+                self.reindex_chunk(rows, actor).await.map_err(|error| {
+                    format!(
+                        "reindex failed after {} rows scanned / {} re-embedded: {error}",
+                        report.scanned, report.reembedded
+                    )
+                })?;
             report.scanned += reembedded + unchanged;
             report.reembedded += reembedded;
             report.unchanged += unchanged;

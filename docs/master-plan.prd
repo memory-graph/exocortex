@@ -1,5 +1,18 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-03, WAVE 4 CLOSED — round 9 landed; matrix green on
+the fixed tree; main pushed):** The Wave 4 boundary review is
+`docs/reviews/round-9-review.prd` — three findings (one blocker:
+Dreams re-anchored its own computed layer, fixed by skipping
+Computed-provenance rows in `select_anchors`; two advisories: the
+CrossDomain via-types sentinel, reindex partial-progress naming), all
+fixed with regressions in one commit. The full gate matrix passed on
+the wave's final tree BEFORE the review (exit 0, 187 suite-oks) and
+the touched suites re-ran green after the fixes. **Wave 4 is
+COMPLETE: D4/D5/D8/D9/D10/D11 all closed.** Wave 5 (D3/D15) is now
+open per the wave rule; D19 parks on owner credentials; D14/D16/D26 +
+the training-corpus direction park on owner decisions.
+
 **Status (2026-09-03, Wave 4 LOCALLY COMPLETE — D4/D5/D8/D9/D10/D11
 all closed; the live compose chaos leg ran):** D11 closed by EXECUTING
 the partition/leader-kill leg locally for the first time: fresh
@@ -840,7 +853,7 @@ A PRD that is not listed here is not accepted work.
 | `docs/bug-prd-standalone-readback.md` | Zero-setup mode's write→read loop | Closed (SR-PRD) |
 | `docs/bug-prd-external-key-identity.md` | `ExternalKey` identity stability | Closed |
 | `docs/prd/adapter-contract-prd.md` | Projection bounds, adapter-side validation, source-schema evolution — the contract every table/CDC/API adapter needs | **Shipped** (Wave 2, D21 a-e complete; D1/D19/D20 unblocked) |
-| `docs/reviews/round-<n>-review.prd` | Findings against completed work; rounds 1, 2, 3, 6, 7, and 8 are closed | Round 8 closed — Wave 3 boundary, four findings landed with fixes; rounds 7/8 follow the same lifecycle as 6 |
+| `docs/reviews/round-<n>-review.prd` | Findings against completed work; rounds 1, 2, 3, 6, 7, 8, and 9 are closed | Round 9 closed — Wave 4 boundary, three findings landed with fixes; every round follows the same lifecycle as 6 |
 
 Bug PRDs keep their `docs/` paths because source comments cite them; feature
 PRDs live in `docs/prd/`.
@@ -1001,6 +1014,9 @@ starts.
 | R8-1 | Round 8 finding: D24's retention-before-valid rejection was documented in `kernel_rights`' doc comment but never enforced — a claim with no teeth | Crush | **Done** — the materializer rejects any rights block whose `retention_until` precedes the row's `valid_from`, fail closed (commit `d6d8388`) |
 | R8-2 | Round 8 finding: the explorer's list view silently truncated at the `memories_in_region` 501-row budget and misreported the count — the sibling seams surface their budgets | Crush | **Done** — the budget is surfaced as a rendered narrow-the-filter note, matching the region seam's discipline (commit `d6d8388`) |
 | R8-3 | Round 8 finding: the CDC adapter derived each window's snapshot id from the PREVIOUS settled cursor — window N+1 carried window N's identity while containing new rows | Crush | **Done** — a shared `AtomicU64` carries the stream position (`fetch_max` on every XLogData) into each window's snapshot id, seeded with the settled cursor (commit `d6d8388`) |
+| R9-1 | Round 9 finding: `select_anchors` took ANY live embedded memory as an anchor, so D8's General-carried, embedded abstraction rows were re-anchored by org-wide cycles — merges over centroids-of-centroids could close an abstraction whose member set re-derives a fresh id next cycle (churn), and MCR² scored the machine layer | Crush | **Done** — `select_anchors` skips `Provenance::Computed` rows (Dreams never re-consolidates its own output); `abstractions.rs::org_wide_cycles_do_not_reconsolidate_abstractions` pins it (not merged, not closed, members-only anchor count) |
+| R9-2 | Round 9 finding (advisory): the cross-domain finder stamped `via_types: (0, 0)` — `0` is the REAL kind id `Solves`, so entity-shared discoveries asserted edge-mediated evidence that does not exist | Crush | **Done** — the none-sentinel is `u32::MAX` (not a valid kind id), documented at the finder; `tenancy_regions.rs` asserts the sentinel on the surfaced pattern |
+| R9-3 | Round 9 finding (advisory): `reindex_embeddings` chunk-commits by design, but a mid-run failure returned only the embedder's error — no indication of what remained | Crush | **Done** — the error names its progress ("reindex failed after N rows scanned / M re-embedded: …"); `reindex.rs::reindex_failure_names_partial_progress` pins it (first chunk committed, second refuses, progress named) |
 | R8-4 | Round 8 finding: the OTel meter provider was bound to `_provider` and dropped at install — it OWNS the PeriodicReader's export loop, so OTLP export silently died; the test passed only because IT kept its provider alive in scope | Crush | **Done** — the provider is deliberately leaked with a comment stating it must live exactly as long as the process-lifetime recorder (commit `d6d8388`) |
 | D1 | Table adapters, parquet-dir flavor first: `crates/exocortex-adapter-parquet` (leaf crate, arrow-rs exact pins, flavor `parquet-dir` so the server enforces projection + drift + rewind), plus the shared canonical schema-hash helper in `exocortex-wire` and mock B8/B9 width enforcement in the adapter SDK (which caught and fixed a real git-adapter defect: a 16-byte snapshot schema_hash every live backend would reject) | Crush | **All three flavors shipped, D1 closed.** parquet-dir (13 tests); iceberg (`crates/exocortex-adapter-iceberg`, 10 tests, direct-format reader — see the status headers; apache-avro `=0.21.0`/flate2 records in PUBLISHING.md); delta (`crates/exocortex-adapter-delta`, 10 tests — log replay incl. multi-part checkpoints, protocol fail-closed, local version-regression refusal; no new deps, the deltalake-ban-by-choice record in PUBLISHING.md); the declared-projection mapping core shared in `exocortex-adapter-table`; adapter-contract gate 16 obligations green. Closing evidence: commits `78518a8` (iceberg) and this commit (delta) |
 | R6-B30-14 | PRD §23 #14: stamp every stored embedding with its model/version, not only the MCR² aggregate | Codex | Done — vectors are inseparable from model name/version; ingest stamps each row and MCR² rejects mixed revisions while stamping the common input revision |

@@ -1181,11 +1181,18 @@ impl<S: Storage + 'static> DreamsEngine<S> {
     }
 
     /// Rank regional memories by recency decay; take top 32 (§12.5 step 3),
-    /// deterministic tie-break by id.
+    /// deterministic tie-break by id. Dreams never re-consolidates its own
+    /// computed layer (R9-1): D8's abstraction rows summarize anchors, they
+    /// are not members — anchoring them would merge centroids-of-centroids
+    /// (closing a row whose member set re-derives a fresh id next cycle)
+    /// and skew MCR² with the machine layer.
     fn select_anchors(&self, working_set: &RegionWorkingSet) -> Vec<MemoryWithEmbedding> {
         let mut rows: Vec<(chrono::DateTime<chrono::Utc>, MemoryWithEmbedding)> = Vec::new();
         for memory in working_set.memories.values() {
             if memory.valid_until.is_some() {
+                continue;
+            }
+            if matches!(memory.provenance, Provenance::Computed { .. }) {
                 continue;
             }
             if let Some(embedding) = &memory.embedding {
@@ -1897,7 +1904,10 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                     endpoints: (a.id, b.id),
                     quality: DiscoveryKind::CrossDomain.default_quality(),
                     // Entity-shared, not edge-mediated: no via kinds.
-                    via_types: (0, 0),
+                    // u32::MAX is the documented none-sentinel — 0 is the
+                    // REAL kind id `Solves` and must not be stamped as
+                    // evidence that does not exist (R9-2).
+                    via_types: (u32::MAX, u32::MAX),
                     discovery_cycle_id: cycle.clone(),
                     discovered_at: chrono::Utc::now(),
                 });

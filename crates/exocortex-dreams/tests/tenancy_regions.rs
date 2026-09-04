@@ -232,6 +232,9 @@ async fn cross_domain_finder_surfaces_cross_user_patterns() {
         "each endpoint is private to its owner"
     );
     assert_eq!(pattern.quality, 0.9);
+    // R9-2: entity-shared discoveries carry the none-sentinel, never a
+    // real kind id posing as evidence.
+    assert_eq!(pattern.via_types, (u32::MAX, u32::MAX));
 }
 
 /// §23 #22: three engines concurrently consolidate three distinct

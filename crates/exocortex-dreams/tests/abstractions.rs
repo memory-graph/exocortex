@@ -239,3 +239,56 @@ fn onto_kind_summarizes() -> exocortex_kernel::RelKindId {
 fn onto_kind_carrier() -> u8 {
     ontology().memory_type_id("General").unwrap()
 }
+
+/// R9-1: Dreams never re-consolidates its own computed layer — an
+/// org-wide ("*") cycle over a graph containing abstraction rows must
+/// not anchor them: no abstraction is merged or closed, and the member
+/// set stays the only anchor population.
+#[tokio::test]
+async fn org_wide_cycles_do_not_reconsolidate_abstractions() {
+    let onto = ontology();
+    let storage = InMemoryStorage::new(onto);
+    for row in dataset() {
+        storage.upsert_memory(&row).await.unwrap();
+    }
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        exocortex_dreams::trigger::DreamsTrigger::default(),
+        0.01,
+        0.05,
+        false,
+        "dreams-abstract".into(),
+    );
+    let region = RegionKey {
+        org: "o".into(),
+        project: "p".into(),
+        memory_type: 3,
+    };
+    let first = engine.try_consolidate(&region).await.expect("region cycle");
+    assert_eq!(first.abstracted.len(), 1);
+    let abstraction = first.abstracted[0];
+
+    // The org-wide cycle sees every project and type — including the
+    // General-carried abstraction rows.
+    let org_wide = engine
+        .try_consolidate(&RegionKey {
+            org: "o".into(),
+            project: "*".into(),
+            memory_type: 3,
+        })
+        .await
+        .expect("org-wide cycle");
+    assert!(
+        !org_wide.merged.contains(&abstraction),
+        "computed rows are never merge targets"
+    );
+    // The abstraction row itself stays open and un-re-anchored.
+    let row = storage
+        .get_memory(&abstraction)
+        .await
+        .unwrap()
+        .expect("abstraction row present");
+    assert!(row.valid_until.is_none(), "not closed by the wide cycle");
+    // Anchors are the five members, not the members + abstraction.
+    assert_eq!(org_wide.memories_input, 5, "computed rows are not anchors");
+}
