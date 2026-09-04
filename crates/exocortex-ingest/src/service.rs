@@ -193,6 +193,12 @@ pub struct IngestServer<S: Storage> {
     /// merge threshold); the ring is rebuilt from nothing on restart, so
     /// hints degrade to none — never wrong.
     pub recent: Arc<Mutex<std::collections::VecDeque<RecentEmbedding>>>,
+    /// D5 (§24 q12, opt-in, default OFF): seed coarse `SimilarTo` edges
+    /// at commit time from the recent ring — the warm skeleton before
+    /// the first Dreams cycle. The embeddings are already computed on
+    /// the write path; the extra cost is bounded cosine compares over
+    /// the 512-row ring (in-memory dot products).
+    pub ingest_similarity_seeding: bool,
     /// Shared concurrency admission for expensive batch validation/commit.
     pub submit_permits: Arc<tokio::sync::Semaphore>,
     /// Wakes the durable-effect drainer after a newly committed outbox row.
@@ -237,6 +243,10 @@ pub struct RecentEmbedding {
     pub title: String,
     /// Exact-content marker (title + content equality ⇒ duplicate).
     pub content_exact: String,
+    /// Row visibility — D5 seeding narrows edge visibility by endpoint
+    /// (the W5 discipline); the ring carries it so the pair is decided
+    /// without a storage read.
+    pub visibility: exocortex_kernel::Visibility,
     /// The embedding (None rows are not ringed).
     pub embedding: exocortex_kernel::Embedding,
 }
@@ -247,6 +257,12 @@ pub const RECENT_RING_LEN: usize = 512;
 /// The hint threshold: Dreams' merge threshold (§12.5 step 5) — the same
 /// cosine bar means "near-duplicate" means the same thing everywhere.
 pub const SIMILAR_HINT_THRESHOLD: f32 = 0.92;
+/// D5 (§24 q12): the ingest-seeding floor — Dreams' SimilarTo threshold
+/// (§12.1 step 5). Seeding writes edges in
+/// [`SIMILAR_TO_SEED_THRESHOLD`, `SIMILAR_HINT_THRESHOLD`): the same
+/// window Dreams writes in, leaving near-duplicates (>= 0.92) to the
+/// merge path rather than wiring them together first.
+pub const SIMILAR_TO_SEED_THRESHOLD: f32 = 0.85;
 const DEFAULT_CONCURRENT_SUBMITS: usize = 64;
 
 impl<S: Storage> Clone for IngestServer<S> {
@@ -276,6 +292,7 @@ impl<S: Storage> Clone for IngestServer<S> {
             require_request_principal: self.require_request_principal,
             allow_personal_scopes: self.allow_personal_scopes,
             recent: self.recent.clone(),
+            ingest_similarity_seeding: self.ingest_similarity_seeding,
             submit_permits: self.submit_permits.clone(),
             post_ingest_notify: self.post_ingest_notify.clone(),
             grouping_rules: self.grouping_rules.clone(),
@@ -315,6 +332,7 @@ impl<S: Storage> IngestServer<S> {
             require_request_principal: false,
             allow_personal_scopes: false,
             recent: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            ingest_similarity_seeding: false,
             submit_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CONCURRENT_SUBMITS)),
             post_ingest_notify: Arc::new(tokio::sync::Notify::new()),
             grouping_rules: Arc::new(crate::grouping::grouping_rules().to_vec()),
@@ -358,6 +376,14 @@ impl<S: Storage> IngestServer<S> {
             embedder.max_concurrency().max(1),
         ));
         self.embedder = Some(embedder);
+        self
+    }
+
+    /// D5 (§24 q12): opt in to ingest-time SimilarTo seeding (default
+    /// off — the recorded lean; the cold-start window is short once
+    /// event-driven Dreams fires).
+    pub fn with_ingest_similarity_seeding(mut self, enabled: bool) -> Self {
+        self.ingest_similarity_seeding = enabled;
         self
     }
 
@@ -977,6 +1003,7 @@ impl<S: Storage> IngestServer<S> {
                     id: m.id,
                     memory_type: m.memory_type,
                     title: m.title.to_string(),
+                    visibility: m.visibility,
                     content_exact: format!(
                         "{}
 {}",
@@ -2244,6 +2271,95 @@ impl<S: Storage + 'static> IngestServer<S> {
             similar_to,
         }
     }
+
+    /// D5 (§24 q12, opt-in): seed coarse `SimilarTo` edges at commit
+    /// time — each newly committed, embedded row against the recent
+    /// ring, in Dreams' own write window [0.85, 0.92) so near-duplicates
+    /// still consolidate through the merge path instead of being wired
+    /// together first. The producer boundary is untouched: producers
+    /// still cannot submit SimilarTo (R-T14 `ComputedKindRejected`);
+    /// these edges are SERVER-computed with
+    /// `Computed { SimilarityCosine, 0.85 }` provenance, deterministic
+    /// ids, and narrower-endpoint visibility (W5). Best-effort by
+    /// design: a crash between commit and seeding loses skeleton edges
+    /// the next Dreams cycle writes anyway; a batch replay never
+    /// re-seeds (idempotency short-circuits before this point).
+    async fn seed_similarity_edges(&self, org: &str, rows: &CommitRows) {
+        let Some(similar_kind) = self.ontology.kind_id("SimilarTo") else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let mut edges: Vec<exocortex_kernel::Relationship> = Vec::new();
+        {
+            let ring = self.recent.lock().unwrap();
+            for memory in &rows.producer_memories {
+                let Some(embedding) = &memory.embedding else {
+                    continue;
+                };
+                for entry in ring.iter() {
+                    if entry.org != org
+                        || entry.id == memory.id
+                        || entry.memory_type != memory.memory_type
+                        || entry.embedding.model != embedding.model
+                        || entry.embedding.vector.len() != embedding.vector.len()
+                    {
+                        continue;
+                    }
+                    let cosine =
+                        exocortex_dreams::mcr2::cosine(&embedding.vector, &entry.embedding.vector);
+                    if !(SIMILAR_TO_SEED_THRESHOLD..SIMILAR_HINT_THRESHOLD).contains(&cosine) {
+                        continue;
+                    }
+                    edges.push(exocortex_kernel::Relationship {
+                        id: exocortex_kernel::RelationshipId::derive(
+                            memory.id,
+                            similar_kind,
+                            entry.id,
+                            None,
+                        ),
+                        kind: similar_kind,
+                        from: memory.id,
+                        to: entry.id,
+                        visibility: exocortex_kernel::relationship_visibility(
+                            memory.visibility,
+                            entry.visibility,
+                        ),
+                        provenance: exocortex_kernel::Provenance::Computed {
+                            producer:
+                                exocortex_kernel::provenance::ComputedProducer::SimilarityCosine,
+                            threshold: SIMILAR_TO_SEED_THRESHOLD,
+                        },
+                        properties: exocortex_kernel::RelationshipProperties {
+                            strength: cosine.clamp(0.0, 1.0),
+                            confidence: cosine.clamp(0.0, 1.0),
+                            context: None,
+                            evidence_count: 1,
+                            success_rate: None,
+                            validation_count: 0,
+                            counter_evidence_count: 0,
+                            last_validated: now,
+                        },
+                        description: None,
+                        bidirectional: true,
+                        valid_from: now,
+                        valid_until: None,
+                        recorded_at: now,
+                        invalidated_by: None,
+                        lsn: exocortex_kernel::LSN::new_local(0),
+                    });
+                }
+            }
+        }
+        if edges.is_empty() {
+            return;
+        }
+        let seeded = edges.len() as u64;
+        if let Err(error) = self.storage.upsert_batch(&[], &edges).await {
+            tracing::warn!(%error, "D5 similarity seeding failed; Dreams fills the skeleton");
+            return;
+        }
+        metrics::counter!("exocortex_ingest_similarity_seeded_total").increment(seeded);
+    }
 }
 
 #[tonic::async_trait]
@@ -2284,6 +2400,11 @@ impl<S: Storage + 'static> IngestService for IngestServer<S> {
             Ok(commit) => commit,
             Err(ack) => return Ok(Response::new(self.remember_ack(&batch, ack))),
         };
+        // D5: seed the warm SimilarTo skeleton BEFORE finish_commit admits
+        // this batch into the ring (pairs are new-vs-prior only).
+        if self.ingest_similarity_seeding {
+            self.seed_similarity_edges(&batch.org_id, &rows).await;
+        }
         let ack = self.finish_commit(&batch, &rows, assigned_lsn, accepted);
         Ok(Response::new(self.remember_ack(&batch, ack)))
     }

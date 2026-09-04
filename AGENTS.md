@@ -80,8 +80,9 @@ commit — a stale plan is a lie about the repo.
 5. **One checksum/HMAC implementation** — `exocortex_wire::signing`. Do
    not hand-roll another; clients and the server must never diverge.
 6. **Every write carries typed provenance; `Proposed` never persists.**
-   Computed-only kinds (SimilarTo) are Dreams-exclusive — the ingest
-   boundary rejects them (R-T14).
+   Computed-only kinds (SimilarTo) are server-computed only — Dreams
+   consolidation or the opt-in D5 ingest seeding — and the ingest
+   boundary rejects producer-submitted ones (R-T14).
 7. **External identity is raw bytes** — never `from_utf8_lossy` on a
    `table_uuid` (B8). §18.6 widths (16B uuid, 32B schema hash) are
    validated, not coerced.
