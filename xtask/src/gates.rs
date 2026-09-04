@@ -97,6 +97,12 @@ fn reviewed_outbound_dependency(manifest: &str, package: &str) -> bool {
         (manifest, package),
         ("Cargo.toml", "eventsource-client")
             | ("Cargo.toml", "hyper")
+            // D19: the SaaS-API adapter family's source transport. The
+            // ONLY outbound HTTP in the workspace outside the reviewed
+            // SSE/backend legs; bearer-authenticated JSON+GraphQL to
+            // the operator-pinned Linear/GitHub endpoints, body-capped,
+            // rate-limit-aware (exocortex-api-client).
+            | ("crates/exocortex-api-client/Cargo.toml", "hyper")
             | ("crates/exocortex-client/Cargo.toml", "eventsource-client")
             | ("crates/exocortex-client/Cargo.toml", "hyper")
             | ("crates/exocortex-cluster/Cargo.toml", "eventsource-client")
