@@ -1840,6 +1840,18 @@ pub(crate) const SEAM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "dreams_cycle_over_ingested_data",
     ),
     (
+        "ingest-reindex",
+        "exocortex-ingest",
+        "tests/reindex.rs",
+        "reindex_restamps_a_swapped_graph_to_one_model",
+    ),
+    (
+        "ingest-similarity-seeding",
+        "exocortex-ingest",
+        "tests/similarity_seeding.rs",
+        "seeding_writes_computed_edges_in_the_dreams_window",
+    ),
+    (
         "ingest-schema-evolution",
         "exocortex-ingest",
         "tests/schema_evolution.rs",

@@ -1,6 +1,12 @@
 //! The v1 developer-domain pack (§7.1, §7.2, §7.3, §7.18).
 //!
-//! 13 memory types × 12 entity types × 48 relationship kinds across 8 buckets.
+//! 13 memory types × 12 entity types × 49 relationship kinds across 8
+//! buckets (D8 added the computed-only `Summarizes` kind — the §12.1
+//! step-4 shape decision: abstraction rows ride the `General` type,
+//! provenance-distinguished, because a new memory type would renumber
+//! every later pack's type ids in composed ontologies; recorded in the
+//! core PRD and the master plan's D8 row; a kind-only append, a superset
+//! event under OC-PRD).
 //! This crate is the sole pack v1 links; adding a second pack in v2 is purely
 //! additive.
 
@@ -27,11 +33,13 @@ pack! {
         Person, Project, Command, Package, Url, Variable,
     }
 
-    // W6 (audit): R-T14's computed-only kinds — Dreams is the only
+    // W6 (audit): R-T14's computed-only kinds — the server is the only
     // legitimate producer; the ingest boundary reads THIS marker, not a
-    // string literal.
+    // string literal. D8 added Summarizes (Dreams' §12.1 step-4
+    // abstraction membership; ingest seeding writes the same class of
+    // row, also server-side).
     computed_only_kinds! {
-        SimilarTo,
+        SimilarTo, Summarizes,
     }
 
     kinds! {
@@ -60,7 +68,14 @@ pack! {
         InSession     => bucket: Context,    inverse: HasMember,    bi: false, default_strength: 0.80, kernel_const: IN_SESSION,
         InProject     => bucket: Context,    inverse: ProjectHas,   bi: false, default_strength: 0.80,
         WrittenIn     => bucket: Context,    inverse: Powers,       bi: false, default_strength: 0.65,
-        Modifies      => bucket: Context,    inverse: ModifiedBy,   bi: false, default_strength: 0.65,
+        Modifies      => bucket: Context,    inverse: ModifiedBy,    bi: false, default_strength: 0.65,
+        // D8 (§12.1 step 4): abstraction→member membership, server-written
+        // only (computed_only above). Symmetric like SimilarTo — one row
+        // serves both traversal directions. The abstraction row itself is
+        // a `General` memory (provenance-distinguished), NOT a new type:
+        // type ids run across packs with a shared offset, so a dev-v1
+        // type append would renumber every later pack.
+        Summarizes    => bucket: Context,    inverse: Self,          bi: true,  default_strength: 0.70,
 
         // Learning bucket (6)
         Teaches       => bucket: Learning,   inverse: LearnedFrom,  bi: false, default_strength: 0.70,
@@ -125,6 +140,7 @@ pack! {
         InProject     => (_, Project),
         WrittenIn     => (CodePattern | FileContext, Technology),
         Modifies      => (Task | Command | Fix, FileContext),
+        Summarizes    => (_, _),
         // Learning
         Teaches       => (_, _), Demonstrates => (_, _), Contradicts => (_, _),
         Confirms      => (_, _), BuildsOn => (_, _), Specializes => (_, _),

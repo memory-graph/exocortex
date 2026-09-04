@@ -51,10 +51,14 @@ pub enum Provenance {
 /// Internal computed producers (§7.9).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ComputedProducer {
-    /// Ingest-time embedding compare (deferred; §24 q12).
+    /// Ingest-time embedding compare (D5, §24 q12; opt-in server flag).
     SimilarityCosine,
     /// Dreams-time ANN.
     SimilarityHnsw,
+    /// Dreams' §12.1 step-4 class abstraction — the `Abstraction` row
+    /// and its computed-only `Summarizes` membership edges (D8). The
+    /// threshold carries the class's mean pairwise cosine (cohesion).
+    Abstraction,
     /// Two memories share >=N typed entities.
     EntityCoOccurrence,
     /// Two memories from the same session_id.

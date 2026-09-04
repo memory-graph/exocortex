@@ -18,7 +18,7 @@ use smol_str::SmolStr;
 use tokio::sync::mpsc;
 use tracing::{info, instrument, warn};
 
-use exocortex_kernel::{Memory, MemoryId, Provenance, Relationship, RelationshipId};
+use exocortex_kernel::{Memory, MemoryId, Provenance, Relationship, RelationshipId, LSN};
 use exocortex_storage::{FencedBatchCommit, FencedRestore, LeaseKey, RegionKey, Storage};
 
 use mcr2::{
@@ -28,6 +28,9 @@ use trigger::{DreamsTrigger, RegionWriteCounters};
 
 /// §12.1 step 5: SimilarTo creation threshold.
 pub const SIMILAR_TO_THRESHOLD: f32 = 0.85;
+/// D8 (§12.1 step 4): the minimum surviving class size that earns an
+/// abstraction row.
+const MIN_ABSTRACT_MEMBERS: usize = 3;
 /// Maximum structured discovery proposals emitted by one production cycle.
 pub const MAX_DISCOVERIES_PER_CYCLE: usize = 16;
 /// Maximum two-hop path candidates inspected by one discovery cycle.
@@ -161,6 +164,17 @@ impl CycleJournal {
             self.created_relationships
                 .entry(relationship.id)
                 .or_insert_with(|| relationship.clone());
+        }
+    }
+
+    /// D8: a memory row created by this cycle (the §12.1 step-4
+    /// abstraction). Rollback physically removes ids that have no
+    /// preimage — created rows are exactly that class.
+    fn create_memory(&mut self, memory: &Memory) {
+        if !self.memories.contains_key(&memory.id) {
+            self.created_memories
+                .entry(memory.id)
+                .or_insert_with(|| memory.clone());
         }
     }
 
@@ -1032,24 +1046,16 @@ impl<S: Storage + 'static> DreamsEngine<S> {
                 }
             }
         }
-        // §12.1 step 4 ABSTRACT (informational in v1): the PRD names the
-        // action without specifying the abstraction's ontology shape, so
-        // the cycle records each multi-member class's surviving
-        // representative in `abstracted` — an auditable stamp of the
-        // consolidation structure. Inventing memory rows or kinds here
-        // would violate the "no silent design" rule; the row-writing
-        // variant lands with the second-pack ontology work (open
-        // question, docs/MILESTONE_REPORT.md).
-        {
-            let mut by_class: std::collections::BTreeMap<u32, Vec<MemoryId>> = Default::default();
-            for a in anchors.iter().filter(|a| !res.merged.contains(&a.id)) {
-                by_class.entry(a.class as u32).or_default().push(a.id);
-            }
-            for (_class, members) in by_class {
-                if members.len() >= 3 {
-                    res.abstracted.push(*members.last().expect("non-empty"));
-                }
-            }
+        // §12.1 step 4 ABSTRACT (D8): multi-member classes get a
+        // row-writing abstraction — an `Abstraction` memory over the
+        // class with computed-only `Summarizes` membership edges (the
+        // shape decision lives in the core PRD §12.1 and the master
+        // plan's D8 row). `res.abstracted` carries the abstraction ROW
+        // ids, its documented meaning.
+        self.write_abstractions(&mut res, &anchors, lease, &mut working_set, journal)
+            .await?;
+        if !res.abstracted.is_empty() {
+            self.mutation_checkpoint(&mut mutations).await?;
         }
         self.strengthen(&mut res, lease, &mut working_set, journal)
             .await?;
@@ -1473,6 +1479,229 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             working_set.apply_relationship_writes(&fresh);
             metrics::counter!("exocortex_dreams_similar_edges_total").increment(fresh.len() as u64);
         }
+        Ok(())
+    }
+
+    /// §12.1 step 4 (D8): each class of >= [`MIN_ABSTRACT_MEMBERS`]
+    /// surviving anchors gets an `Abstraction` row — deterministic id
+    /// over the sorted member ids (same set ⇒ same row, so re-runs and
+    /// cross-cycle repeats converge), narrowest-member visibility, the
+    /// member centroid as its embedding (stamped with the members'
+    /// common model), and a bounded deterministic content list of member
+    /// titles (structure only — R-Dr8's no-narration discipline).
+    /// Membership rides computed-only `Summarizes` edges with
+    /// `Computed { Abstraction, cohesion }` provenance (cohesion = mean
+    /// pairwise cosine). All rows commit in ONE fenced journaled batch,
+    /// rollback-able with the cycle. Recorded boundary: a class whose
+    /// membership drifts derives a NEW abstraction row; retiring the
+    /// stale one is PRUNE's discipline, not this action's.
+    async fn write_abstractions(
+        &self,
+        res: &mut ConsolidationResult,
+        anchors: &[MemoryWithEmbedding],
+        lease: &exocortex_storage::OwnerLease,
+        working_set: &mut RegionWorkingSet,
+        journal: &mut CycleJournal,
+    ) -> anyhow::Result<()> {
+        let Some(abstraction_type) = abstraction_carrier_type() else {
+            return Ok(());
+        };
+        let Some(summarizes) = summarizes_kind() else {
+            return Ok(());
+        };
+        let now = chrono::Utc::now();
+        let mut by_class: std::collections::BTreeMap<u32, Vec<&MemoryWithEmbedding>> =
+            Default::default();
+        for anchor in anchors.iter().filter(|a| !res.merged.contains(&a.id)) {
+            by_class
+                .entry(anchor.class as u32)
+                .or_default()
+                .push(anchor);
+        }
+        let mut new_memories: Vec<Memory> = Vec::new();
+        let mut new_edges: Vec<Relationship> = Vec::new();
+        for (_class, members) in by_class {
+            if members.len() < MIN_ABSTRACT_MEMBERS {
+                continue;
+            }
+            let mut member_ids: Vec<MemoryId> = members.iter().map(|m| m.id).collect();
+            member_ids.sort();
+            let abstraction_id = derive_abstraction_id(&member_ids);
+            if working_set.memories.contains_key(&abstraction_id) {
+                // Same member set already abstracted (re-run or repeat
+                // cycle): idempotent, no second row.
+                res.abstracted.push(abstraction_id);
+                continue;
+            }
+            // Cohesion: mean pairwise cosine over the class.
+            let mut pairs = 0usize;
+            let mut cohesion = 0.0f32;
+            for i in 0..members.len() {
+                for j in (i + 1)..members.len() {
+                    cohesion +=
+                        mcr2::cosine(&members[i].embedding.vector, &members[j].embedding.vector);
+                    pairs += 1;
+                }
+            }
+            let cohesion = if pairs > 0 {
+                cohesion / pairs as f32
+            } else {
+                1.0
+            };
+            // Centroid embedding under the members' common model.
+            let dim = members[0].embedding.vector.len();
+            let mut centroid = vec![0.0f32; dim];
+            for member in &members {
+                for (slot, value) in centroid.iter_mut().zip(member.embedding.vector.iter()) {
+                    *slot += value;
+                }
+            }
+            let norm: f32 = centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for slot in &mut centroid {
+                    *slot /= norm;
+                }
+            }
+            let visibility = members
+                .iter()
+                .map(|m| m.visibility)
+                .min()
+                .expect("non-empty class");
+            // Deterministic content: member titles from the working set,
+            // bounded.
+            let mut titles: Vec<String> = Vec::with_capacity(members.len());
+            for id in &member_ids {
+                if let Some(row) = working_set.memories.get(id) {
+                    titles.push(row.title.to_string());
+                }
+            }
+            let mut content = titles.iter().take(8).cloned().collect::<Vec<_>>().join(
+                "
+",
+            );
+            if titles.len() > 8 {
+                content.push_str(&format!(
+                    "
+…and {} more",
+                    titles.len() - 8
+                ));
+            }
+            // Scope inheritance: the abstraction carries its first
+            // member's context (org/project/team), re-stamped.
+            let Some(context) = working_set.memories.get(&member_ids[0]).map(|row| {
+                let mut context = row.context.clone();
+                context.timestamp = now;
+                context
+            }) else {
+                continue;
+            };
+            let confidence = exocortex_kernel::memory::F01::new(cohesion.clamp(0.0, 1.0))
+                .unwrap_or(exocortex_kernel::memory::F01::new(0.5).expect("0.5 in range"));
+            let abstraction = Memory {
+                id: abstraction_id,
+                memory_type: abstraction_type,
+                title: format!("Abstraction of {} {}", members.len(), {
+                    // The class's memory-type name when the pack declares
+                    // it; the numeric class otherwise.
+                    match type_name(members[0].class) {
+                        Some(name) => name.to_string(),
+                        None => format!("class-{}", members[0].class),
+                    }
+                })
+                .into(),
+                content,
+                summary: None,
+                tags: Default::default(),
+                visibility,
+                provenance: Provenance::Computed {
+                    producer: exocortex_kernel::provenance::ComputedProducer::Abstraction,
+                    threshold: cohesion,
+                },
+                context,
+                importance: exocortex_kernel::memory::F01::new(0.5).expect("0.5 in range"),
+                confidence,
+                effectiveness: None,
+                usage_count: 0,
+                valid_from: now,
+                valid_until: None,
+                recorded_at: now,
+                invalidated_by: None,
+                embedding: Some(exocortex_kernel::Embedding {
+                    model: members[0].embedding.model.clone(),
+                    vector: centroid,
+                }),
+                lsn: LSN::new_local(0),
+                rights: None,
+            };
+            journal.create_memory(&abstraction);
+            new_memories.push(abstraction);
+            for member in &members {
+                let edge = Relationship {
+                    id: exocortex_kernel::RelationshipId::derive(
+                        abstraction_id,
+                        summarizes,
+                        member.id,
+                        None,
+                    ),
+                    kind: summarizes,
+                    from: abstraction_id,
+                    to: member.id,
+                    visibility: exocortex_kernel::relationship_visibility(
+                        visibility,
+                        member.visibility,
+                    ),
+                    provenance: Provenance::Computed {
+                        producer: exocortex_kernel::provenance::ComputedProducer::Abstraction,
+                        threshold: cohesion,
+                    },
+                    properties: exocortex_kernel::RelationshipProperties {
+                        strength: cohesion.clamp(0.0, 1.0),
+                        confidence: cohesion.clamp(0.0, 1.0),
+                        context: None,
+                        evidence_count: members.len() as u32,
+                        success_rate: None,
+                        validation_count: 0,
+                        counter_evidence_count: 0,
+                        last_validated: now,
+                    },
+                    description: None,
+                    bidirectional: true,
+                    valid_from: now,
+                    valid_until: None,
+                    recorded_at: now,
+                    invalidated_by: None,
+                    lsn: LSN::new_local(0),
+                };
+                if working_set.relationships.contains_key(&edge.id) {
+                    continue;
+                }
+                journal.create_relationship(&edge);
+                new_edges.push(edge);
+            }
+            res.abstracted.push(abstraction_id);
+        }
+        if new_memories.is_empty() && new_edges.is_empty() {
+            return Ok(());
+        }
+        journal.prepare_relationship_writes(&new_edges, &working_set.relationships);
+        let commit = self
+            .storage
+            .upsert_batch_fenced_journaled(
+                &new_memories,
+                &new_edges,
+                &journal.restore(),
+                journal.cycle_id.as_str(),
+                lease,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        journal.record_commit(&commit);
+        for memory in &new_memories {
+            working_set.memories.insert(memory.id, memory.clone());
+        }
+        working_set.apply_relationship_writes(&new_edges);
+        metrics::counter!("exocortex_dreams_abstractions_total")
+            .increment(new_memories.len() as u64);
         Ok(())
     }
 
@@ -2081,6 +2310,58 @@ pub fn discovery_provenance(score: f32) -> Provenance {
 /// Resolve the `SimilarTo` kind id from the linked pack (v1: dev-v1). The
 /// cycle stamps every similarity edge with this kind (§12.1 step 5); the
 /// sparsity diagnostic excludes it (§11.6.1).
+fn summarizes_kind() -> Option<exocortex_kernel::RelKindId> {
+    static KIND: std::sync::OnceLock<Option<exocortex_kernel::RelKindId>> =
+        std::sync::OnceLock::new();
+    *KIND.get_or_init(|| {
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+            .ok()
+            .and_then(|onto| onto.kind_id("Summarizes"))
+    })
+}
+
+/// The abstraction row's CARRIER type: `General`, not a dedicated type —
+/// a dev-v1 type append would renumber every later pack's type ids in
+/// composed ontologies (the mortgage test pins that). Distinguishability
+/// is provenance (the D23 precedent), not a new type.
+fn abstraction_carrier_type() -> Option<u8> {
+    static TYPE: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    *TYPE.get_or_init(|| {
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+            .ok()
+            .and_then(|onto| onto.memory_type_id("General"))
+    })
+}
+
+/// Best-effort type NAME for the abstraction title: dev-v1 ids only
+/// (classes from other packs render as `class-N`).
+fn type_name(class: u8) -> Option<&'static str> {
+    static NAMES: std::sync::OnceLock<Vec<SmolStr>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+            .map(|onto| onto.memory_type_names)
+            .unwrap_or_default()
+    });
+    names.get(class as usize).map(|name| name.as_str())
+}
+
+/// D8: deterministic abstraction identity — blake3 over the sorted
+/// member ids under a domain separator (the grouping-node discipline:
+/// same coordinates ⇒ same row).
+fn derive_abstraction_id(members: &[MemoryId]) -> MemoryId {
+    // The ONE checksum implementation (AGENTS.md rule 5): domain-separated
+    // bytes through wire signing, first 16 bytes of the digest.
+    let mut bytes = Vec::with_capacity(16 + members.len() * 16);
+    bytes.extend_from_slice(b"exocortex-abstraction-v1");
+    for id in members {
+        bytes.extend_from_slice(&id.0);
+    }
+    let digest = exocortex_wire::signing::content_digest(&bytes);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    MemoryId(out)
+}
+
 fn similar_to_kind() -> Option<exocortex_kernel::RelKindId> {
     static KIND: std::sync::OnceLock<Option<exocortex_kernel::RelKindId>> =
         std::sync::OnceLock::new();

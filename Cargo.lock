@@ -1635,6 +1635,7 @@ dependencies = [
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
  "exocortex-storage",
+ "exocortex-wire",
  "futures",
  "metrics",
  "redis 0.27.6",

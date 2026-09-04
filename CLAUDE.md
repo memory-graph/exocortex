@@ -53,9 +53,9 @@ run — read the gate's own output before claiming it passed.
 ## Fingerprint changes mean you broke something
 
 `cargo xtask fingerprint` prints two lines (OC-PRD D1): line 1 is the
-compatibility fingerprint (`2c3ec388…5c23`) — the "if this moved you
-broke something" value; line 2 is the build fingerprint
-(`18dbf33b…49f5`, the unchanged v1-scheme value) which only reports.
+compatibility fingerprint (`4615018b…96c4`) — the "if this moved you
+broke something" value (D8 moved it deliberately from `2c3ec388…5c23`);
+line 2 is the build fingerprint (`3e83aefb…42f4`) which only reports.
 If the compatibility line moves and you did not deliberately change the
 ontology, that is the signal — do not update the golden to make the
 gate green. An intended ontology change updates the golden, `AGENTS.md`,

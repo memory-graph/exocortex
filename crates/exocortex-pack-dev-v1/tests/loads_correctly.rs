@@ -1,6 +1,6 @@
 //! M1 acceptance: the dev-v1 pack loads through the real registration path
-//! with 13/12/48 present, kernel constants bound, and a deterministic
-//! fingerprint.
+//! with 13/12/49 present (D8 appended the computed-only Summarizes kind),
+//! kernel constants bound, and a deterministic fingerprint.
 
 use exocortex_kernel::{kinds, pack::load_registered_packs, OntologyFingerprint};
 use exocortex_pack_dev_v1::{pack_def, EntityType, MemoryType, KIND_TABLE};
@@ -9,19 +9,21 @@ use exocortex_pack_dev_v1::{pack_def, EntityType, MemoryType, KIND_TABLE};
 fn loads_correctly() {
     let onto = load_registered_packs().expect("dev-v1 pack loads");
 
-    // 13 memory types, 12 entity types (§7.18).
+    // 13 memory types, 12 entity types (§7.18). D8 deliberately adds NO
+    // type: type ids run across packs with a shared offset.
     assert_eq!(onto.memory_type_names.len(), 13);
     assert_eq!(onto.entity_type_names.len(), 12);
     assert_eq!(MemoryType::ALL.len(), 13);
     assert_eq!(EntityType::ALL.len(), 12);
 
-    // 48 authored kinds (+ auto-registered inverse companions, R-T4).
+    // 49 authored kinds (D8 appended Summarizes; + auto-registered
+    // inverse companions, R-T4).
     let authored = KIND_TABLE.iter().filter(|r| !r.companion).count();
     assert_eq!(
-        authored, 48,
-        "dev-v1 must register exactly 48 authored kinds"
+        authored, 49,
+        "dev-v1 must register exactly 49 authored kinds"
     );
-    assert!(onto.kinds_by_id.len() > 48, "inverse companions registered");
+    assert!(onto.kinds_by_id.len() > 49, "inverse companions registered");
 
     // Bucket sizes: Solution 5, Causal 7, Context 9, Learning 6, Similarity 4,
     // Workflow 6, Quality 5, Integration 6.
@@ -34,7 +36,7 @@ fn loads_correctly() {
     use exocortex_kernel::RelBucket::*;
     assert_eq!(bucket_counts(Solution), 5);
     assert_eq!(bucket_counts(Causal), 7);
-    assert_eq!(bucket_counts(Context), 9);
+    assert_eq!(bucket_counts(Context), 10); // D8: Summarizes joined Context
     assert_eq!(bucket_counts(Learning), 6);
     assert_eq!(bucket_counts(Similarity), 4);
     assert_eq!(bucket_counts(Workflow), 6);
@@ -125,20 +127,25 @@ fn golden_fingerprint_is_pinned() {
 }
 
 /// W6 (audit): the computed-only marker is a pack declaration consumed
-/// through the ontology — SimilarTo sets it, nothing else does.
+/// through the ontology — SimilarTo and D8's Summarizes set it, nothing
+/// else does.
 #[test]
 fn computed_only_marker_rides_the_ontology() {
     let onto = exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap();
-    let similar = onto
-        .kinds_by_id
-        .values()
-        .find(|k| k.display_name == "SimilarTo")
-        .expect("SimilarTo registered");
-    assert!(similar.computed_only, "SimilarTo is computed-only (R-T14)");
+    for name in ["SimilarTo", "Summarizes"] {
+        let kind = onto
+            .kinds_by_id
+            .values()
+            .find(|k| k.display_name == name)
+            .expect("{name} registered");
+        assert!(kind.computed_only, "{name} is computed-only (R-T14)");
+    }
     let others: Vec<_> = onto
         .kinds_by_id
         .values()
-        .filter(|k| k.computed_only && k.display_name != "SimilarTo")
+        .filter(|k| {
+            k.computed_only && k.display_name != "SimilarTo" && k.display_name != "Summarizes"
+        })
         .map(|k| k.display_name.to_string())
         .collect();
     assert!(
