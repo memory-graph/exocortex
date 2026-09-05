@@ -13,7 +13,7 @@ cp "$source_root/scripts/publish.sh" "$fixture/repo/scripts/publish.sh"
 cp "$source_root/scripts/verify-release.sh" "$fixture/repo/scripts/verify-release.sh"
 
 order=(
-  exocortex-kernel exocortex-pack-dev-v1 exocortex-pack-mortgage-v1 exocortex-wire
+  exocortex-kernel exocortex-pack-dev-v1 exocortex-pack-study-v1 exocortex-pack-mortgage-v1 exocortex-wire
   exocortex-adapter-sdk exocortex-storage exocortex-cache
   exocortex-reasoning exocortex-cluster exocortex-dreams exocortex-ingest
   exocortex-ops exocortex-server exocortex-client exocortex-worker
@@ -36,7 +36,7 @@ printf '%s\n' "$*" >> "$PUBLISH_TEST_LOG"
 if [ "$1" = metadata ]; then
   python3 - <<'PY'
 import json, pathlib, re
-names = "exocortex-kernel exocortex-pack-dev-v1 exocortex-pack-mortgage-v1 exocortex-wire exocortex-adapter-sdk exocortex-storage exocortex-cache exocortex-reasoning exocortex-cluster exocortex-dreams exocortex-ingest exocortex-ops exocortex-server exocortex-client exocortex-worker".split()
+names = "exocortex-kernel exocortex-pack-dev-v1 exocortex-pack-study-v1 exocortex-pack-mortgage-v1 exocortex-wire exocortex-adapter-sdk exocortex-storage exocortex-cache exocortex-reasoning exocortex-cluster exocortex-dreams exocortex-ingest exocortex-ops exocortex-server exocortex-client exocortex-worker".split()
 packages = []
 for name in names:
     manifest = pathlib.Path("crates", name, "Cargo.toml").read_text()

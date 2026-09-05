@@ -282,7 +282,8 @@ This is the product. Everything else exists to serve it.
 - **Kernel + extension packs.** The ontology kernel (types, provenance,
   visibility, actions, functions, rules) is load-bearing and universal.
   Domains ship as packs: v1 ships `exocortex-pack-dev-v1` for the dev
-  loop and `exocortex-pack-mortgage-v1` as the proof a second domain is
+  loop and `exocortex-pack-mortgage-v1` + `exocortex-pack-study-v1` as the
+  proof a second and third domain are
   just another crate — and a legal, medical, or sales ontology is the
   same seam. Packs are code, not config — the
   [ontology development guide](docs/ONTOLOGY_GUIDE.md) covers how to
@@ -484,8 +485,8 @@ system, not in a policy layer bolted on top.
 
 ## Project layout
 
-`exocortex-kernel` (ontology core, zero I/O) · `exocortex-pack-dev-v1`
-and `exocortex-pack-mortgage-v1` (domain packs) · `exocortex-wire`
+`exocortex-kernel` (ontology core, zero I/O) · `exocortex-pack-dev-v1`,
+`exocortex-pack-mortgage-v1`, and `exocortex-pack-study-v1` (domain packs) · `exocortex-wire`
 (protocols + signing) · `exocortex-storage` (FalkorDB + in-memory) ·
 `exocortex-cache` (lock-free read path) · `exocortex-reasoning`
 (Datalog + Scheme rules) · `exocortex-cluster` (leases, SSE feed) ·

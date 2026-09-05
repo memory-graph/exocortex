@@ -9,6 +9,12 @@ planned for `ghcr.io`).
 All 14 crate names were verified available (2026-08-25;
 exocortex-adapter-sdk joined with A1).
 
+**Unreleased (LP1, the study pack)** — `exocortex-pack-study-v1`
+joins the composed set in every binary: 7 memory types, 3 entity
+types, 11 relationship kinds, rules L1-L3, no pack verbs in v1. The
+compatibility fingerprint moves deliberately (4615018b… → 9f92957f…).
+New ORDER entry after `exocortex-pack-dev-v1`.
+
 **Unreleased (D19, SaaS adapters)** — additive: the wire producer-kind
 enum gains `SAAS_ADAPTER` (value 7 — older servers reject it
 fail-closed, the correct rolling-upgrade behavior; no ontology

@@ -33,6 +33,7 @@ testing = []
 exocortex-kernel = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
 exocortex-pack-mortgage-v1 = { workspace = true }
+exocortex-pack-study-v1 = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }

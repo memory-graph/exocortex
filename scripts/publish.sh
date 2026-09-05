@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ORDER=(
-  exocortex-kernel exocortex-pack-dev-v1 exocortex-pack-mortgage-v1 exocortex-wire
+  exocortex-kernel exocortex-pack-dev-v1 exocortex-pack-study-v1 exocortex-pack-mortgage-v1 exocortex-wire
   exocortex-adapter-sdk exocortex-storage exocortex-cache
   exocortex-reasoning exocortex-cluster exocortex-dreams exocortex-ingest
   exocortex-ops exocortex-server exocortex-client exocortex-worker

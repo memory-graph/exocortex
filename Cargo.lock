@@ -1624,6 +1624,7 @@ dependencies = [
  "exocortex-ops",
  "exocortex-pack-dev-v1",
  "exocortex-pack-mortgage-v1",
+ "exocortex-pack-study-v1",
  "exocortex-reasoning",
  "exocortex-server",
  "exocortex-storage",
@@ -1782,6 +1783,7 @@ dependencies = [
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
  "exocortex-pack-mortgage-v1",
+ "exocortex-pack-study-v1",
  "exocortex-reasoning",
  "exocortex-storage",
  "exocortex-wire",
@@ -1817,6 +1819,17 @@ version = "0.4.0"
 dependencies = [
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
+ "inventory",
+ "smol_str",
+]
+
+[[package]]
+name = "exocortex-pack-study-v1"
+version = "0.4.0"
+dependencies = [
+ "exocortex-kernel",
+ "exocortex-pack-dev-v1",
+ "exocortex-pack-mortgage-v1",
  "inventory",
  "smol_str",
 ]
@@ -1865,6 +1878,7 @@ dependencies = [
  "exocortex-ops",
  "exocortex-pack-dev-v1",
  "exocortex-pack-mortgage-v1",
+ "exocortex-pack-study-v1",
  "exocortex-reasoning",
  "exocortex-storage",
  "exocortex-wire",
@@ -1901,6 +1915,7 @@ dependencies = [
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
  "exocortex-pack-mortgage-v1",
+ "exocortex-pack-study-v1",
  "exocortex-wire",
  "falkordb",
  "futures",
@@ -6237,6 +6252,7 @@ dependencies = [
  "exocortex-ops",
  "exocortex-pack-dev-v1",
  "exocortex-pack-mortgage-v1",
+ "exocortex-pack-study-v1",
  "exocortex-wire",
  "flate2",
  "schemars",

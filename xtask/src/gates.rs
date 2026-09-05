@@ -1708,6 +1708,12 @@ pub(crate) const SEAM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "both_packs_register_into_one_ontology",
     ),
     (
+        "pack-study-v1",
+        "exocortex-pack-study-v1",
+        "tests/loads_correctly.rs",
+        "all_three_packs_register_into_one_ontology",
+    ),
+    (
         "wire-signing",
         "exocortex-wire",
         "src/signing.rs",

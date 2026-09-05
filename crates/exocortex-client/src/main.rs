@@ -133,6 +133,7 @@ fn main() -> anyhow::Result<()> {
     if args.dump_fingerprint {
         let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
         let _ = std::hint::black_box(exocortex_pack_mortgage_v1::pack_def().name.clone());
+        let _ = std::hint::black_box(exocortex_pack_study_v1::pack_def().name.clone());
         let onto = exocortex_kernel::pack::load_registered_packs()?;
         let hex = |bytes: &[u8; 32]| -> String {
             use std::fmt::Write as _;

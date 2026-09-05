@@ -165,6 +165,7 @@ fn main() -> anyhow::Result<()> {
     // fingerprint check then fail-closed every standalone/backend client
     // at hydration. Every shipped pack needs a live reference here.
     let _ = std::hint::black_box(exocortex_pack_mortgage_v1::pack_def().name.clone());
+    let _ = std::hint::black_box(exocortex_pack_study_v1::pack_def().name.clone());
     let ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs()?);
     if args.verify_embedder {
         return verify_production_embedder();
@@ -880,6 +881,7 @@ mod tests {
         let composed = exocortex_kernel::Ontology::from_packs(vec![
             exocortex_pack_dev_v1::pack_def(),
             exocortex_pack_mortgage_v1::pack_def(),
+            exocortex_pack_study_v1::pack_def(),
         ])
         .unwrap();
         let names = |o: &exocortex_kernel::Ontology| {

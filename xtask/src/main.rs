@@ -1725,6 +1725,7 @@ fn gen_playbook(write: bool) -> Result<()> {
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
     // PX2: guidance renders from EVERY loaded pack's table.
     let _ = std::hint::black_box(exocortex_pack_mortgage_v1::pack_def().name.clone());
+    let _ = std::hint::black_box(exocortex_pack_study_v1::pack_def().name.clone());
     let onto = exocortex_kernel::pack::load_registered_packs()?;
     let path = std::path::Path::new("crates/exocortex-client/src/playbook/v1_0_0.md");
     let src = std::fs::read_to_string(path)?;

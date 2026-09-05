@@ -879,7 +879,7 @@ fn dump_fingerprint_prints_both_levels_and_the_pack_count() {
     assert_eq!(lines[0].len(), "compatibility ".len() + 64);
     assert!(lines[1].starts_with("build "));
     assert_eq!(lines[1].len(), "build ".len() + 64);
-    assert_eq!(lines[2], "packs 2");
+    assert_eq!(lines[2], "packs 3");
     assert!(lines[3].starts_with("verbs "), "{lines:?}");
     let verbs: usize = lines[3]["verbs ".len()..].trim().parse().unwrap();
     assert!(

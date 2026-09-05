@@ -37,6 +37,7 @@ fn composed_ontology() -> Arc<exocortex_kernel::Ontology> {
         exocortex_kernel::Ontology::from_packs(vec![
             pack_def(),
             exocortex_pack_mortgage_v1::pack_def(),
+            exocortex_pack_study_v1::pack_def(),
         ])
         .unwrap(),
     )

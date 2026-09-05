@@ -41,6 +41,7 @@ steel-core = { workspace = true }
 [dev-dependencies]
 exocortex-pack-dev-v1 = { workspace = true }
 exocortex-pack-mortgage-v1 = { workspace = true }
+exocortex-pack-study-v1 = { workspace = true }
 exocortex-reasoning = { workspace = true }
 schemars = { workspace = true }
 serde_json = { workspace = true }

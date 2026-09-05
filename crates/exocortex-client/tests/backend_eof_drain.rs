@@ -85,6 +85,7 @@ async fn boot_node() -> (
         Ontology::from_packs(vec![
             exocortex_pack_dev_v1::pack_def(),
             exocortex_pack_mortgage_v1::pack_def(),
+            exocortex_pack_study_v1::pack_def(),
         ])
         .expect("composed pack set assembles"),
     );

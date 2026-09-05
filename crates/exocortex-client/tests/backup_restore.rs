@@ -321,9 +321,12 @@ fn superset_ontology_restores_subset_backup() {
     // into the client binary), so the superset grows the LAST pack —
     // appending past mortgage shifts nothing the pin references.
     let grown_dev = exocortex_pack_dev_v1::pack_def();
-    let mut grown_mortgage = exocortex_pack_mortgage_v1::pack_def();
-    grown_mortgage.memory_type_names.push("FutureThing".into());
-    let grown = exocortex_kernel::Ontology::from_packs(vec![grown_dev, grown_mortgage]).unwrap();
+    let grown_mortgage = exocortex_pack_mortgage_v1::pack_def();
+    let mut grown_study = exocortex_pack_study_v1::pack_def();
+    grown_study.memory_type_names.push("FutureThing".into());
+    let grown =
+        exocortex_kernel::Ontology::from_packs(vec![grown_dev, grown_mortgage, grown_study])
+            .unwrap();
 
     let dst = tempdir();
     let wal = exocortex_client::wal::Wal::open(&dst.join("wal")).unwrap();

@@ -1,0 +1,17 @@
+# crates/exocortex-learn-v1/Cargo.toml
+[package]
+name    = "exocortex-pack-study-v1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The learning-tracking ontology pack for Exocortex: 7 memory types, 3 entity types, 11 relationship kinds, and pack-local Crepe rules L1-L3. Composes beside dev-v1 and ln-v1; authored against docs/ONTOLOGY_GUIDE.md."
+
+[dependencies]
+exocortex-kernel = { workspace = true }
+inventory = { workspace = true }
+smol_str = { workspace = true }
+
+[dev-dependencies]
+exocortex-pack-dev-v1 = { workspace = true }
+exocortex-pack-mortgage-v1 = { workspace = true }

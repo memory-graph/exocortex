@@ -1,5 +1,32 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-05, LP1 SHIPPED — the study pack, the third
+ontology; fingerprint moved deliberately; matrix green 201 oks):**
+`crates/exocortex-pack-study-v1` composes beside dev-v1 and ln-v1 in
+every binary: 7 memory types (LearningGoal, Topic, Resource,
+StudySession, ReviewSession, Insight, Question), 3 entity types
+(Subject, Author, Provider), 11 kinds (Pursues, PrerequisiteFor,
+Progresses, Covers, About, StudiedFrom, Answers, Raises,
+FoundDifficult, Reinforces + computed-only ClusteredWith), rules L1-L3
+(transitive prerequisites, answer-source, indirect progress). Two
+design facts the landing proved, both pinned by tests: pack insertion
+order is NAME-SORTED with per-pack id offsets, so a third pack's name
+must sort after the second's or it renumbers the second's ids (the
+study name was chosen for exactly this; the composition test pins
+no-renumbering for both prior packs), and duplicate type names across
+packs are registration errors (Provider, not Institution — ln-v1 owns
+that name). **The authorized fingerprint move:
+`4615018b…96c4` → `9f92957f…69c9`** (a superset event under OC-PRD;
+AGENTS, CLAUDE, and this plan updated in-commit; playbook regenerated
+at 72 kinds / 68 assertable; seam inventory 41). Evidence:
+`pack-study-v1/tests/loads_correctly.rs` (5 tests — assembly,
+no-renumbering, fingerprint stability + superset, kernel-const
+custody, triple enforcement, computed-only marker); the three
+client-side fixtures that pinned the two-pack world updated (pack
+count 3, the eof-drain node pins the 3-pack set, the backup-restore
+superset grows the now-last pack). Matrix: verify-release exit 0, 201
+suite-oks; live legs unexecuted (URLs unset), stated plainly.
+
 **Status (2026-09-04, D19 — Linear + GitHub adapters LANDED; matrix
 green 197 oks; GitHub live leg EXECUTED; Linear live leg awaits a
 LINEAR_API_KEY):** The SaaS family's first two legs shipped in five
