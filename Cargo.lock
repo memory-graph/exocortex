@@ -1617,6 +1617,7 @@ dependencies = [
  "chrono",
  "clap",
  "exocortex-adapter-sdk",
+ "exocortex-api-client",
  "exocortex-cache",
  "exocortex-cluster",
  "exocortex-ingest",

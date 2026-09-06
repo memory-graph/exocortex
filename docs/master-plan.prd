@@ -1,5 +1,22 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-05, CLI1 SHIPPED — exocortex-cli, the human face
+beside MCP; smoke-proven round trip):** `exocortex-cli` (a bin target
+inside exocortex-client): reads (`search`, `get`, `related`, `chain`)
+ride the node's HTTP operations with bearer auth — CR-9 parity with
+MCP by construction — and `add` reuses `EndSessionTool` verbatim (the
+same signed submit path agents use, pinned to `session://cli` so admin
+policy can scope it). Type labels render from the same composed
+ontology. `--json` for machines. The landing re-proved two standing
+lessons: pack crates nothing references are dead-stripped (the CLI
+initially validated against dev-v1 alone and rejected an `Insight` —
+the D27 black_box links now live in the CLI), and an in-process node
+under a current-thread test runtime deadlocks the moment a test blocks
+on a child process (`multi_thread`, the eof-drain precedent). Smoke:
+`tests/cli_smoke.rs` spawns the REAL binary against an in-process node
+— add accepted, search renders `[Insight] <title>`, get returns the
+row — plus 4 unit tests on rendering/args.
+
 **Status (2026-09-05, LP1 SHIPPED — the study pack, the third
 ontology; fingerprint moved deliberately; matrix green 201 oks):**
 `crates/exocortex-pack-study-v1` composes beside dev-v1 and ln-v1 in
