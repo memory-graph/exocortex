@@ -1,5 +1,30 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-05, CLI2+CLI3 SHIPPED — the CLI as the non-MCP
+client bridge, plus the suggested-surface reconciliation):** CLI2: the
+inspiration for CLI1 was Perplexity-class clients (shell commands, no
+MCP); `exocortex-cli --dump-block` now prints the pasteable
+instruction block for those clients' custom instructions (207 words,
+bounded + content-tested; the gen-playbook folding is the recorded
+follow-up if it drifts), and every command carries `--json` as the
+machine contract. CLI3: an external client-suggestion pass (query
+--cypher / get / search / upsert --json / link / delete / export
+--since / stats) was reconciled against the hard rules. ACCEPTED and
+shipped: `add --link Kind:<32-hex-id>` (repeatable; the §4.5
+cross-batch edge via `EdgeHintInput.to_memory_id` — smoke-proven: the
+neighborhood carries the linked row) and `add --draft @file` (the
+upsert --json equivalent; the file's type must agree with the
+positional). REFUSED, with the rule cited: raw `--cypher` (CR-10:
+Cypher never leaves exocortex-storage, and a raw passthrough bypasses
+visibility scoping — search/get/related/chain are the typed
+equivalents) and `delete` (the store is append-only and bi-temporal;
+no producer delete surface exists by design, the D20-recorded
+boundary — supersession and edge retraction are the model's tools).
+RECORDED as follow-ups: an `export` passthrough (the node's
+`--export`/`--export-corpus` already exist) and `stats` (needs a
+counts op; `memories_in_region` is region-bounded). Evidence:
+cli_smoke edge round trip + the block's 5 unit tests.
+
 **Status (2026-09-05, CLI1 SHIPPED — exocortex-cli, the human face
 beside MCP; smoke-proven round trip):** `exocortex-cli` (a bin target
 inside exocortex-client): reads (`search`, `get`, `related`, `chain`)

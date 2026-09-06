@@ -142,4 +142,31 @@ async fn add_search_get_round_trip_through_the_real_binary() {
             .expect("memory title present"),
         "CLI smoke insight about rust closures"
     );
+
+    // Edge round trip: a second row linked to the first via --link
+    // (the section 4.5 cross-batch shape), then the neighborhood
+    // carries it.
+    let (ok, out, err) = run_cli(
+        addr,
+        &[
+            "add",
+            "Topic",
+            "Rust closures topic row",
+            "--content",
+            "The topic the smoke insight is about.",
+            "--visibility",
+            "org",
+            "--link",
+            &format!("RelatedTo:{id}"),
+        ],
+    );
+    assert!(ok, "linked add exited clean: {err}");
+    // One memory row + one edge row.
+    assert!(out.contains("accepted 2"), "linked add ack: {out} / {err}");
+    let (ok, out, err) = run_cli(addr, &["related", &id]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("Rust closures topic row"),
+        "the neighborhood carries the linked row: {out}"
+    );
 }

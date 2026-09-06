@@ -31,8 +31,13 @@ struct Args {
     /// Print raw operation JSON instead of plain text.
     #[arg(long, global = true)]
     json: bool,
+    /// Print the instruction block for non-MCP client harnesses
+    /// (Perplexity-class: they run shell commands, not MCP) and exit.
+    /// Paste the output into the client's custom instructions.
+    #[arg(long, global = true)]
+    dump_block: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,6 +86,15 @@ enum Command {
         /// private|project|team|org.
         #[arg(long, default_value = "project")]
         visibility: String,
+        /// Edge to an EXISTING memory: Kind:<32-hex-id> (repeatable).
+        /// The new memory is the FROM side; the kind must be a
+        /// registered label the triple table accepts.
+        #[arg(long = "link", value_name = "KIND:TO_ID")]
+        links: Vec<String>,
+        /// Read the draft from a JSON file (PreflightMemoryDraft shape)
+        /// instead of the positional title/content arguments.
+        #[arg(long = "draft", value_name = "PATH")]
+        draft_file: Option<String>,
     },
 }
 
@@ -179,6 +193,40 @@ fn render_chain(out: &serde_json::Value, type_names: &[String]) {
     println!("(unrecognized shape; use --json)");
 }
 
+/// The pasteable block for non-MCP client harnesses (CLI2): the
+/// `exocortex-mcp-client --dump-block` equivalent, adapted to CLI
+/// verbs. Hand-authored with a bound + content test; folding it into
+/// the gen-playbook generator is the recorded follow-up if it drifts.
+const INSTRUCTION_BLOCK: &str = r#"# Exocortex memory (CLI bridge - for harnesses without MCP)
+
+You have a shared memory graph, reached by RUNNING SHELL COMMANDS. Setup is
+already in the shell environment: EXOCORTEX_BACKEND, EXOCORTEX_ORG,
+EXOCORTEX_AUTH_TOKEN (and EXOCORTEX_HMAC_KEY for writes) are set, and
+`exocortex-cli` is on PATH.
+
+Read at the start of a task, and whenever stuck:
+  exocortex-cli search "<terms>"          ranked hits: id [Type] title (score)
+  exocortex-cli get <id>                  one memory, full content
+  exocortex-cli related <id>              the k-hop neighborhood
+  exocortex-cli chain <id>                the derivation chain
+Append --json to any command for machine-parseable output.
+
+Write at the end of a turn when ANY of these fire:
+  - you made an edit the user accepted
+  - you ran a non-obvious command and it worked
+  - you answered a why/how question about the codebase
+  - you decided against an alternative for a stated reason
+  - the user said "remember this"
+  - you found a problem, solved or not
+Then run:
+  exocortex-cli add <Type> "<specific title>" --content "<what and why>"       --tags tag1,tag2 --visibility project
+
+Usual types: Fix, Solution, Problem, Error, CodePattern, Command, Technology;
+for learning: Topic, Insight, Question, Resource, StudySession, LearningGoal.
+Titles are subject-verb-object and specific. One memory per distinct fact.
+Never invent confidence scores. Default to project visibility; escalate to
+org only for cross-project knowledge.
+"#;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // The PX1/D27 lesson: a pack crate nothing references is
@@ -189,6 +237,18 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::hint::black_box(exocortex_pack_mortgage_v1::pack_def().name.clone());
     let _ = std::hint::black_box(exocortex_pack_study_v1::pack_def().name.clone());
     let args = Args::parse();
+    if args.dump_block {
+        print!("{INSTRUCTION_BLOCK}");
+        return Ok(());
+    }
+    let command = match args.command {
+        Some(command) => command,
+        None => {
+            use clap::CommandFactory as _;
+            Args::command().print_help()?;
+            return Ok(());
+        }
+    };
     let backend = env_or_flag(args.backend, "EXOCORTEX_BACKEND")?;
     let org = env_or_flag(args.org.clone(), "EXOCORTEX_ORG")?;
     let token = std::env::var("EXOCORTEX_AUTH_TOKEN")
@@ -203,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .map(|n| n.to_string())
         .collect();
-    let (path, body): (&str, serde_json::Value) = match &args.command {
+    let (path, body): (&str, serde_json::Value) = match &command {
         Command::Search { query, limit } => (
             "/v1/search_memories",
             serde_json::json!({ "query": query, "limit": limit }),
@@ -226,15 +286,58 @@ async fn main() -> anyhow::Result<()> {
         content,
         tags,
         visibility,
-    } = &args.command
+        links,
+        draft_file,
+    } = &command
     {
-        let content = if content == "-" {
+        let mut edges: Vec<exocortex_client::tools::end_session::EdgeHintInput> = Vec::new();
+        for link in links {
+            let (kind, to_id) = link
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("--link takes Kind:<32-hex-id>, got {link:?}"))?;
+            anyhow::ensure!(
+                to_id.len() == 32
+                    && to_id.chars().all(|c| c.is_ascii_hexdigit())
+                    && kind.chars().all(|c| c.is_alphabetic()),
+                "--link takes Kind:<32-hex-id>, got {link:?}"
+            );
+            edges.push(exocortex_client::tools::end_session::EdgeHintInput {
+                from_draft_key: "cli-1".into(),
+                to_draft_key: String::new(),
+                to_memory_id: to_id.to_ascii_lowercase(),
+                kind: kind.to_string(),
+                strength: 0.0,
+            });
+        }
+        let draft = if let Some(path) = draft_file {
+            let raw = std::fs::read_to_string(path)?;
+            let value: serde_json::Value = serde_json::from_str(&raw)?;
+            let draft: MemoryDraftInput = serde_json::from_value(value)
+                .map_err(|e| anyhow::anyhow!("draft file must carry the draft shape: {e}"))?;
+            anyhow::ensure!(
+                draft.memory_type == *memory_type,
+                "draft file type {} disagrees with the positional {} (they must match)",
+                draft.memory_type,
+                memory_type
+            );
+            draft
+        } else {
+            MemoryDraftInput {
+                draft_key: "cli-1".into(),
+                memory_type: memory_type.clone(),
+                title: title.clone(),
+                content: content.clone(),
+                visibility: visibility.clone(),
+                tags: tags.clone(),
+            }
+        };
+        let content = if draft.content == "-" {
             use std::io::Read as _;
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
             buf
         } else {
-            content.clone()
+            draft.content.clone()
         };
         let hmac_key = exocortex_wire::signing::decode_hex32(
             &std::env::var("EXOCORTEX_HMAC_KEY")
@@ -292,15 +395,8 @@ async fn main() -> anyhow::Result<()> {
                 session_id: Some("cli".into()),
                 project_id: "cli".into(),
                 team_id: None,
-                memories: vec![MemoryDraftInput {
-                    draft_key: "cli-1".into(),
-                    memory_type: memory_type.clone(),
-                    title: title.clone(),
-                    content,
-                    visibility: visibility.clone(),
-                    tags: tags.clone(),
-                }],
-                edges: vec![],
+                memories: vec![MemoryDraftInput { content, ..draft }],
+                edges,
             })
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -331,7 +427,7 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
-    match args.command {
+    match &command {
         Command::Search { .. } => render_search(&out, &type_names),
         Command::Get { .. } => render_one(&out, &type_names),
         Command::Related { .. } => render_related(&out, &type_names),
@@ -373,6 +469,25 @@ mod tests {
     #[test]
     fn missing_memory_renders_not_found() {
         render_one(&serde_json::json!({ "memory": null }), &[]);
+    }
+
+    #[test]
+    fn instruction_block_is_bounded_and_names_the_surface() {
+        let words = INSTRUCTION_BLOCK.split_whitespace().count();
+        assert!(
+            words <= 300,
+            "the CLI block must stay under 300 words (like the MCP block); it is {words}"
+        );
+        for command in ["search", "get", "related", "chain", "add"] {
+            assert!(INSTRUCTION_BLOCK.contains(command), "names {command}");
+        }
+        for trigger in ["edit the user accepted", "remember this", "why/how"] {
+            assert!(
+                INSTRUCTION_BLOCK.contains(trigger),
+                "carries the {trigger} trigger"
+            );
+        }
+        assert!(INSTRUCTION_BLOCK.contains("--json"));
     }
 
     #[test]
