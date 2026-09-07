@@ -1,0 +1,62 @@
+# Round 11 Review — the prepare-branch verification pass
+
+**Scope:** iteration 2 of the review-fix loop over the same wave
+(`807afc9..0aca877` plus round 10's fixes), run at the owner's request
+via the prepare-branch skill's loop adapted to main (the skill refuses
+main and requires a PR; the loop ran, the GitHub handoff did not — no
+PR exists). Five lenses re-reviewed the full surface with the round-10
+fix diff included. **The pass found 13 new actionable defects —
+including one in round 10's own fix — all fixed in this commit.**
+
+## Blocking (fixed)
+
+| ID | Finding | Fix |
+|----|---------|-----|
+| R11-1 | **Round 10's batch-id fix was half-applied**: the wire trait impl stubbed `to_memory_id` to `""`, so the ONLINE submit path (MCP `end_session` and CLI `add`) still hashed without the cross-batch target — the exact defect R10-6 set out to close; the parity test only exercised empty targets. | The wire impl returns its real field; new test pins differing-target -> differing-id. |
+| R11-2 | **GitHub windows split PRs from their closing-reference rows**: chunking walked raw rows with no affinity, so an edge's endpoints could land in different windows — the SDK rejects the unit (`InvalidUnit`) and a resubmit dies at the same straddle forever. | The chunker groups each PR atomically with its closing refs (lib-level `chunk_windows`, `Window` type); tests pin affinity. |
+| R11-3 | The `known` set was never updated when appending closing refs — a doubly-closed issue produced duplicate draft keys in one unit (`InvalidUnit`). | Dedupe moved into the chunker (carried refs never also stand alone); test pins single-row. |
+| R11-4 | **Per-window cursors could regress mid-run** (closing refs appended unsorted; per-chunk max dipped; the unconditional write persisted the regression). | Groups emit oldest-first by their NEWEST row; chunk cursors monotonic by construction; test pins it. |
+| R11-5 | Cursor writes were plain `fs::write` — a torn write truncates the resume point (the SDK itself uses tmp+rename). | `save_cursor_atomic` (tmp+rename) in all three adapter mains. |
+| R11-6 | **git `--range` one-shot clobbered the sequential cursor**: writing the range's HEAD strands the gap before it; the next run sees `HEAD..HEAD` and the gap is never ingested. | The operator cursor advances only in sequential mode. |
+| R11-7 | git's cursor read swallowed all errors (the sibling adapters' NotFound-vs-fatal pattern existed; git lacked it). | Same fail-closed read as linear/github. |
+
+## Advisory (fixed)
+
+- **R11-8** README's operator docs omitted kind 7 from the policy list;
+  MILESTONE said 1-5. Both corrected (an admin following the old README
+  would re-introduce R10-7's mislabeled-provenance workaround).
+- **R11-9** No regression net for the policy-kind table (R10-7) or the
+  operator-cursor writes (R10-1). Added: kinds 6/7 + 8-fails-closed in
+  the server's policy test; a REAL-BINARY git test asserting the
+  operator cursor file is written after a settled window.
+- **R11-10** `--draft` had zero coverage. cli_smoke now writes a draft
+  file with its own `draft_key`, links via `--link`, and asserts the
+  edge landed — the exact R10-5 regression shape.
+- **R11-11** GitHub's chunker was main-private and untested. Now
+  lib-level with four tests (affinity, monotonic cursors, oversize
+  bail, no-duplicate rows).
+- **R11-12** The rate-limit test asserted only `is_some()`; now pins
+  the variant and both payload fields. Plus cleanup: `title` expect
+  over silent-default, api-client stale header ("GitHub's next") and
+  double no-retries claim, `panic_reason` helper dedupe, github header
+  line contradicting R10-2, tautological `has_next ||` assert, comment
+  trims.
+- **R11-13** Adapters exited 0 with permanently-rejected rows behind
+  the advanced cursor (silent terminal loss to a scheduler). All three
+  now finish the run, then exit 2 with a named count.
+
+## Recorded (not fixed)
+
+- Linear/GitHub binary-level cursor-write tests (the mock-server spawn
+  pattern is proven by git's new test; the two mains need the same
+  harness) — follow-up with the R10-18 adapter-runner extraction.
+- The lib-level helper twins (`parse_visibility` etc.) join the
+  R10-18 duplication record.
+
+## Carried unverified (dispositions)
+
+Retired: epoch-0 `observed_at` (the live GitHub leg committed with
+it); server-side duplicate-edge dedup (moot — deduped client-side).
+Carried: GitHub `filterBy.since` inclusivity, `gte: null` acceptance,
+tonic over https backends, hyper error Display embedding URIs — all
+external-API behaviors needing a live leg to adjudicate.

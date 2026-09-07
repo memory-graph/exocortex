@@ -490,7 +490,8 @@ proto-sync-guarded copy).
   clients also receive a separately provisioned `EXOCORTEX_SSE_KEY`, so their
   producer signing key is never reused as cluster/SSE verification material.
 - **Producer-kind authority is a fail-closed source-policy migration.** Each
-  source-policy row also requires numeric `producer_kind` (1–5). Missing,
+  source-policy row also requires numeric `producer_kind` (1–7 as
+  of round 10; the prose said 1–5 and had drifted). Missing,
   unspecified, or unknown values stop startup; the administrator value, not a
   producer registration or restart-local LRU entry, controls provenance.
 - **Dreams fire transport is org-scoped rather than globally keyed.** PRD

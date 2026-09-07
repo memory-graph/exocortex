@@ -320,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
             MemoryDraftInput {
                 draft_key: "cli-1".into(),
                 memory_type: memory_type.clone(),
-                title: title.clone().unwrap_or_default(),
+                title: title.clone().expect("clap requires title unless --draft"),
                 content: content.clone(),
                 visibility: visibility.clone(),
                 tags: tags.clone(),

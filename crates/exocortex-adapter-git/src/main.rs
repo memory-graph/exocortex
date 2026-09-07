@@ -37,6 +37,14 @@ struct Args {
     range: Option<String>,
 }
 
+fn save_cursor_atomic(path: &std::path::Path, value: &str) -> std::io::Result<()> {
+    // tmp+rename like the SDK's own save_cursor: a torn plain write
+    // truncates the resume point and the next run replays from a
+    // wrong-but-parseable instant.
+    let tmp = path.with_extension("cursor.tmp");
+    std::fs::write(&tmp, value)?;
+    std::fs::rename(&tmp, path)
+}
 fn git(repo: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
     let out = std::process::Command::new("git")
         .current_dir(repo)
@@ -75,10 +83,18 @@ async fn main() -> anyhow::Result<()> {
 
     // The revision range: <cursor>..HEAD (or --all on a fresh cursor, or
     // an explicit one-shot range).
-    let cursor_sha = std::fs::read_to_string(&args.cursor)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let cursor_sha = match std::fs::read_to_string(&args.cursor) {
+        Ok(content) => {
+            let content = content.trim().to_string();
+            if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => anyhow::bail!("reading cursor file {}: {error}", args.cursor.display()),
+    };
     let range = match (&args.range, &cursor_sha) {
         (Some(explicit), _) => explicit.clone(),
         (None, Some(sha)) => format!("{sha}..HEAD"),
@@ -138,10 +154,12 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_default();
         let outcome = session.submit_window(vec![unit], &newest).await?;
         // The operator-facing cursor advances with every settled
-        // window (the SDK keeps its own file; this one is what the
-        // next run's revision range starts from — round-10 R10-1
-        // found it was never written).
-        std::fs::write(&args.cursor, &newest)?;
+        // window in SEQUENTIAL mode only: a one-shot --range may sit
+        // mid-history, and writing its HEAD would strand the gap
+        // before it (round-11 R11-6).
+        if args.range.is_none() {
+            save_cursor_atomic(&args.cursor, &newest)?;
+        }
         tracing::info!(
             accepted = outcome.accepted,
             duplicates = outcome.duplicates,

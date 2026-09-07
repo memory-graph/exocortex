@@ -203,11 +203,12 @@ async fn main() -> anyhow::Result<()> {
         after = Some(end_cursor);
     }
     let total = fetched.len();
+    let mut rejected_rows: usize = 0;
     for (index, chunk) in exocortex_adapter_linear::chunk_windows(fetched, args.max_window)
         .into_iter()
         .enumerate()
     {
-        submit_chunk(
+        rejected_rows += submit_chunk(
             &mut session,
             &args.workspace,
             &chunk,
@@ -219,23 +220,37 @@ async fn main() -> anyhow::Result<()> {
         // window (the SDK keeps its own file; this one is what the
         // next run resumes from).
         if let Some(cursor) = exocortex_adapter_linear::cursor_for(&chunk) {
-            std::fs::write(&args.cursor, &cursor)?;
+            save_cursor_atomic(&args.cursor, &cursor)?;
         }
     }
     println!(
         "ingested {total} issues (resume at or after {:?})",
         resume.as_deref().unwrap_or("the beginning")
     );
+    if rejected_rows > 0 {
+        // Permanently rejected rows sit behind the advanced cursor and
+        // never retry; a scheduler must see failure, not silent loss.
+        eprintln!("{rejected_rows} rows permanently rejected (see the log); they will not retry");
+        std::process::exit(2);
+    }
     Ok(())
 }
 
+fn save_cursor_atomic(path: &std::path::Path, value: &str) -> std::io::Result<()> {
+    // tmp+rename like the SDK's own save_cursor: a torn plain write
+    // truncates the resume point and the next run replays from a
+    // wrong-but-parseable instant.
+    let tmp = path.with_extension("cursor.tmp");
+    std::fs::write(&tmp, value)?;
+    std::fs::rename(&tmp, path)
+}
 async fn submit_chunk(
     session: &mut exocortex_adapter_sdk::AdapterSession,
     workspace: &str,
     chunk: &[exocortex_adapter_linear::LinearIssue],
     index: u64,
     visibility: i32,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let unit = exocortex_adapter_linear::map_issues(
         workspace,
         chunk,
@@ -255,5 +270,5 @@ async fn submit_chunk(
     for rejection in &outcome.permanent_rejections {
         tracing::error!(key = %rejection.draft_key, code = %rejection.code, "{}", rejection.detail);
     }
-    Ok(())
+    Ok(outcome.permanent_rejections.len())
 }

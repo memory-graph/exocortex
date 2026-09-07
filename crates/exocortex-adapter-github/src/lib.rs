@@ -506,6 +506,108 @@ pub fn map_window(
     }
 }
 
+/// Split one fetch into windows whose MEMORY row count respects the
+/// bound, with two invariants the naive row-split violated (round-11
+/// R11-2/3/4):
+///
+/// - **Affinity** — a PR and every closing-reference row its edges
+///   need stay in ONE window (§18.1 forbids an edge whose endpoint is
+///   not in the batch); the SDK rejects a split unit and a resubmit
+///   would die at the same straddle forever.
+/// - **Monotonic cursors** — groups emit oldest-first by their
+///   NEWEST row, so each settled window's cursor is >= the last and
+///   the operator cursor file never regresses mid-run.
+///
+/// A single group whose cost exceeds the bound is an error naming the
+/// fix (raise `--max-window`), never a silently-oversized window the
+/// SDK would reject on every attempt.
+/// One settled window: its issue rows and its pull rows.
+pub type Window = (Vec<GhIssue>, Vec<GhPull>);
+
+pub fn chunk_windows(
+    issues: Vec<GhIssue>,
+    pulls: Vec<GhPull>,
+    max_window: u64,
+) -> Result<Vec<Window>, String> {
+    // Closing-reference numbers ride with their pull, never standalone.
+    let mut carried: std::collections::BTreeSet<u64> = Default::default();
+    for pull in &pulls {
+        for issue in &pull.closing {
+            carried.insert(issue.number);
+        }
+    }
+    struct Group {
+        sort_key: String,
+        issues: Vec<GhIssue>,
+        pull: Option<GhPull>,
+        cost: u64,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for issue in issues {
+        if carried.contains(&issue.number) {
+            continue;
+        }
+        groups.push(Group {
+            sort_key: issue.updated_at.clone(),
+            issues: vec![issue],
+            pull: None,
+            cost: 1,
+        });
+    }
+    for pull in pulls {
+        let mut issues = pull.closing.clone();
+        let key = issues
+            .iter()
+            .map(|i| i.updated_at.as_str())
+            .chain(std::iter::once(pull.updated_at.as_str()))
+            .max()
+            .unwrap_or_default()
+            .to_string();
+        let cost = 1 + issues.len() as u64;
+        if cost > max_window {
+            return Err(format!(
+                "a pull request carries {} closing references, exceeding the window bound                  {max_window}; raise --max-window above {}",
+                issues.len(),
+                cost
+            ));
+        }
+        issues.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        groups.push(Group {
+            sort_key: key,
+            issues,
+            pull: Some(pull),
+            cost,
+        });
+    }
+    groups.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+
+    let mut out: Vec<(Vec<GhIssue>, Vec<GhPull>)> = Vec::new();
+    let mut rows: u64 = 0;
+    let mut chunk_issues: Vec<GhIssue> = Vec::new();
+    let mut chunk_pulls: Vec<GhPull> = Vec::new();
+    for group in groups {
+        if rows + group.cost > max_window && !(chunk_issues.is_empty() && chunk_pulls.is_empty()) {
+            out.push((
+                std::mem::take(&mut chunk_issues),
+                std::mem::take(&mut chunk_pulls),
+            ));
+            rows = 0;
+        }
+        let Group {
+            issues, pull, cost, ..
+        } = group;
+        chunk_issues.extend(issues);
+        if let Some(pull) = pull {
+            chunk_pulls.push(pull);
+        }
+        rows += cost;
+    }
+    if !chunk_issues.is_empty() || !chunk_pulls.is_empty() {
+        out.push((chunk_issues, chunk_pulls));
+    }
+    Ok(out)
+}
+
 /// The window cursor: max updatedAt across the window's rows.
 pub fn cursor_for(issues: &[GhIssue], pulls: &[GhPull]) -> Option<String> {
     issues
@@ -817,6 +919,149 @@ mod tests {
         let b = map_window("acme", "api", &issues, &pulls, "seed", 3);
         assert_eq!(a.memories, b.memories);
         assert_eq!(a.relationships, b.relationships);
+    }
+
+    fn bare_issue(n: u64, at: &str) -> GhIssue {
+        GhIssue {
+            number: n,
+            title: format!("i{n}"),
+            body: String::new(),
+            url: String::new(),
+            updated_at: at.into(),
+            closed_at: String::new(),
+            state: "open".into(),
+            author: String::new(),
+            labels: vec![],
+        }
+    }
+
+    #[test]
+    fn chunk_windows_keep_pulls_with_their_closing_refs() {
+        let closing = vec![
+            bare_issue(101, "2026-09-01T00:00:00Z"),
+            bare_issue(102, "2026-09-01T01:00:00Z"),
+        ];
+        let pr = GhPull {
+            number: 55,
+            title: "p".into(),
+            body: String::new(),
+            url: String::new(),
+            updated_at: "2026-09-02T00:00:00Z".into(),
+            closed_at: String::new(),
+            state: "open".into(),
+            author: String::new(),
+            head_branch: "b".into(),
+            base_branch: "main".into(),
+            closing,
+        };
+        let issues: Vec<GhIssue> = (0..6)
+            .map(|n| bare_issue(n, "2026-08-31T00:00:00Z"))
+            .collect();
+        // Bound 4: the PR group alone costs 3; standalone issues cost 1 each.
+        let windows = chunk_windows(issues, vec![pr.clone()], 4).unwrap();
+        for (issues, pulls) in &windows {
+            for pull in pulls {
+                for issue in &pull.closing {
+                    assert!(
+                        issues.iter().any(|i| i.number == issue.number),
+                        "closing ref {} rides WITH its pull (affinity)",
+                        issue.number
+                    );
+                }
+            }
+        }
+        // The PR window carries the pull and its refs together.
+        let pr_window = windows
+            .iter()
+            .find(|(_, pulls)| pulls.iter().any(|p| p.number == 55))
+            .unwrap();
+        assert!(pr_window.0.iter().any(|i| i.number == 101));
+        assert!(pr_window.0.iter().any(|i| i.number == 102));
+    }
+
+    #[test]
+    fn chunk_windows_cursors_are_monotonic() {
+        let closing = vec![bare_issue(101, "2026-09-01T00:00:00Z")]; // older than the PR
+        let pr = GhPull {
+            number: 9,
+            title: "p".into(),
+            body: String::new(),
+            url: String::new(),
+            updated_at: "2026-09-02T00:00:00Z".into(),
+            closed_at: String::new(),
+            state: "open".into(),
+            author: String::new(),
+            head_branch: "b".into(),
+            base_branch: "main".into(),
+            closing,
+        };
+        let issues = vec![
+            bare_issue(1, "2026-08-30T00:00:00Z"),
+            bare_issue(2, "2026-08-31T00:00:00Z"),
+        ];
+        let windows = chunk_windows(issues, vec![pr], 2).unwrap();
+        let cursors: Vec<Option<String>> = windows
+            .iter()
+            .map(|(issues, pulls)| cursor_for(issues, pulls))
+            .collect();
+        for pair in cursors.windows(2) {
+            if let (Some(a), Some(b)) = (&pair[0], &pair[1]) {
+                assert!(a <= b, "cursor regressed mid-run: {a} -> {b}");
+            }
+        }
+        assert!(cursors.iter().all(|c| c.is_some()));
+    }
+
+    #[test]
+    fn chunk_windows_bail_on_an_oversized_group() {
+        let closing: Vec<GhIssue> = (0..5)
+            .map(|n| bare_issue(n, "2026-09-01T00:00:00Z"))
+            .collect();
+        let pr = GhPull {
+            number: 1,
+            title: "p".into(),
+            body: String::new(),
+            url: String::new(),
+            updated_at: "2026-09-02T00:00:00Z".into(),
+            closed_at: String::new(),
+            state: "open".into(),
+            author: String::new(),
+            head_branch: "b".into(),
+            base_branch: "main".into(),
+            closing,
+        };
+        let err = chunk_windows(vec![], vec![pr], 4).unwrap_err();
+        assert!(err.contains("raise --max-window"), "names the fix: {err}");
+    }
+
+    #[test]
+    fn closing_refs_are_not_also_standalone_rows() {
+        let closing = vec![bare_issue(42, "2026-09-01T00:00:00Z")];
+        let pr = GhPull {
+            number: 7,
+            title: "p".into(),
+            body: String::new(),
+            url: String::new(),
+            updated_at: "2026-09-02T00:00:00Z".into(),
+            closed_at: String::new(),
+            state: "open".into(),
+            author: String::new(),
+            head_branch: "b".into(),
+            base_branch: "main".into(),
+            closing,
+        };
+        let standalone_also = bare_issue(42, "2026-09-01T00:00:00Z");
+        let windows = chunk_windows(vec![standalone_also], vec![pr], 10).unwrap();
+        // Rows are the chunk's issue vecs (a pull's `closing` is the
+        // reference source, not a second row).
+        let rows: usize = windows
+            .iter()
+            .map(|(issues, _)| issues.iter().filter(|i| i.number == 42).count())
+            .sum();
+        assert_eq!(
+            rows, 1,
+            "issue 42 is ONE row, inside its pull's group (not standalone too)"
+        );
     }
 
     #[test]

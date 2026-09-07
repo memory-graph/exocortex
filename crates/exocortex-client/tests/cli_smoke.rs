@@ -169,4 +169,48 @@ async fn add_search_get_round_trip_through_the_real_binary() {
         out.contains("Rust closures topic row"),
         "the neighborhood carries the linked row: {out}"
     );
+
+    // --draft: the file carries its own draft_key, type must agree,
+    // and --link targets THAT key (round-11 R11 coverage).
+    let draft = serde_json::json!({
+        "draft_key": "file-key-7",
+        "memory_type": "Insight",
+        "title": "Draft-file insight rows link by their own key",
+        "content": "Written via --draft, linked via --link.",
+        "visibility": "org",
+        "tags": ["cli", "draft"]
+    });
+    let draft_path = std::env::temp_dir().join("exocortex-cli-smoke-draft.json");
+    std::fs::write(&draft_path, serde_json::to_string(&draft).unwrap()).unwrap();
+    let (ok, out, err) = run_cli(
+        addr,
+        &[
+            "add",
+            "Insight",
+            "placeholder-title-ignored",
+            "--draft",
+            draft_path.to_str().unwrap(),
+            "--link",
+            &format!("RelatedTo:{id}"),
+        ],
+    );
+    assert!(ok, "draft add exited clean: {err}");
+    assert!(
+        out.contains("accepted 2"),
+        "draft add ack (memory + edge): {out} / {err}"
+    );
+    let (ok, out, err) = run_cli(addr, &["search", "link by their own key", "--json"]);
+    assert!(ok, "{err}");
+    let json: serde_json::Value = serde_json::from_str(&out).expect("search --json parses");
+    let draft_id = json["memories"][0]["id"]
+        .as_str()
+        .expect("hit id")
+        .to_string();
+    let (ok, out, err) = run_cli(addr, &["related", &id]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("link by their own key"),
+        "the draft row's edge landed: {out}"
+    );
+    let _ = draft_id;
 }

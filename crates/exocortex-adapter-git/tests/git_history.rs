@@ -254,3 +254,39 @@ async fn declared_bound_stops_the_window() {
     assert!(!cursor.exists());
     mock.stop();
 }
+
+/// Round-11: the BINARY writes the operator-facing cursor after a
+/// settled window (round-10 R10-1 found it never written). Spawns the
+/// real adapter against the SDK mock and asserts the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_binary_writes_the_operator_cursor() {
+    let repo = fixture_repo();
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cursor = dir.path().join("op.cursor");
+    mock.push_script(vec![MockSubmit::Accept, MockSubmit::Accept]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-adapter-git"))
+        .args([
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--backend",
+            &mock.url(),
+            "--org",
+            "org",
+            "--producer",
+            "git-test",
+            "--cursor",
+            cursor.to_str().unwrap(),
+        ])
+        .env("EXOCORTEX_AUTH_TOKEN", "test-bearer")
+        .env("EXOCORTEX_HMAC_KEY", "42".repeat(32))
+        .output()
+        .expect("spawn the git adapter binary");
+    assert!(
+        output.status.success(),
+        "adapter exited clean: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let written = std::fs::read_to_string(&cursor).expect("operator cursor written");
+    assert_eq!(written.trim().len(), 40, "a full sha: {}", written);
+}

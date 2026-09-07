@@ -377,16 +377,22 @@ mod tests {
             (403, RateState::default(), false),
             (200, RateState::default(), false),
         ] {
-            assert_eq!(
-                rate_limited(status, &rate).is_some(),
-                hits,
-                "status {status} with {rate:?} should {}",
-                if hits {
-                    "map to RateLimited"
-                } else {
-                    "pass through"
+            match (rate_limited(status, &rate), hits) {
+                (
+                    Some(ApiError::RateLimited {
+                        retry_after,
+                        remaining,
+                    }),
+                    true,
+                ) => {
+                    assert_eq!(retry_after, rate.retry_after, "payload carries the delay");
+                    assert_eq!(remaining, rate.remaining, "payload carries the quota");
                 }
-            );
+                (None, false) => {}
+                (other, _) => {
+                    panic!("status {status} with {rate:?}: expected hits={hits}, got {other:?}")
+                }
+            }
         }
     }
 

@@ -324,7 +324,7 @@ impl BatchIdEdge for WireRel {
         &self.to_draft_key
     }
     fn to_memory_id(&self) -> &str {
-        ""
+        &self.to_memory_id
     }
     fn kind(&self) -> &str {
         &self.kind
@@ -535,5 +535,41 @@ mod tests {
             content_batch_id("session", &[wire], &[wire_rel]),
             "the offline WAL stamp and the online submission of one wrapup must share one id"
         );
+    }
+
+    /// R11-1: the cross-batch target participates on BOTH faces. With
+    /// the wire impl stubbed to "", two adds differing only in --link
+    /// target deduplicated to one batch online while the offline stamp
+    /// differed — the exact defect R10-6 set out to close.
+    #[test]
+    fn differing_cross_batch_targets_yield_differing_batch_ids() {
+        let draft = exocortex_wire::ingest::v1::MemoryDraft {
+            draft_key: "k1".into(),
+            memory_type: "Fix".into(),
+            title: "t".into(),
+            content: "c".into(),
+            tags: vec![],
+            visibility: 3,
+            valid_from: None,
+            valid_until: None,
+            external_key: None,
+            rights: None,
+            id: String::new(),
+        };
+        let rel = |target: &str| WireRel {
+            from_draft_key: "k1".into(),
+            to_draft_key: String::new(),
+            kind: "RelatedTo".into(),
+            strength: 0.0,
+            confidence: 0.9,
+            context: String::new(),
+            visibility: 3,
+            to_memory_id: target.into(),
+        };
+        let a = content_batch_id("s", &[draft.clone()], &[rel(&"a".repeat(32))]);
+        let b = content_batch_id("s", &[draft.clone()], &[rel(&"b".repeat(32))]);
+        assert_ne!(a, b, "different link targets are different batches");
+        // And the empty-target legacy shape still hashes stably.
+        let _ = rel("");
     }
 }

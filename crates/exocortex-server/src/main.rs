@@ -990,7 +990,35 @@ mod tests {
             r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":9,"producer_kind":4,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
         )
         .unwrap();
-        assert!(load_source_policy(Some(&path)).is_err());
+        let error = load_source_policy(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("ceiling"), "{error}");
+        // R11-9: the admin table must accept every shipped kind — the
+        // round-10 fix (6 and 7) has no other regression net; kind 8+
+        // stays fail-closed.
+        for (kind, expected) in [
+            (6, exocortex_kernel::ProducerKind::Extracted),
+            (7, exocortex_kernel::ProducerKind::SaaSAdapter),
+        ] {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"[{{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":3,"producer_kind":{kind},"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}}]"#
+                ),
+            )
+            .unwrap();
+            let rows = load_source_policy(Some(&path))
+                .unwrap_or_else(|e| panic!("kind {kind} must provision: {e}"));
+            assert_eq!(rows[0].1.kind, expected, "kind {kind} maps correctly");
+        }
+        std::fs::write(
+            &path,
+            r#"[{"org_id":"org","source_uri":"s","producer_id":"p","ceiling":3,"producer_kind":8,"hmac_key":"4242424242424242424242424242424242424242424242424242424242424242"}]"#,
+        )
+        .unwrap();
+        assert!(
+            load_source_policy(Some(&path)).is_err(),
+            "kind 8 fails closed"
+        );
     }
 
     #[test]

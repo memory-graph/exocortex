@@ -83,6 +83,14 @@ async fn graphql_page(
     }
 }
 
+fn save_cursor_atomic(path: &std::path::Path, value: &str) -> std::io::Result<()> {
+    // tmp+rename like the SDK's own save_cursor: a torn plain write
+    // truncates the resume point and the next run replays from a
+    // wrong-but-parseable instant.
+    let tmp = path.with_extension("cursor.tmp");
+    std::fs::write(&tmp, value)?;
+    std::fs::rename(&tmp, path)
+}
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -270,21 +278,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Closing references ride the window as their own rows so every
     // edge has both endpoints in-batch (deduped against window issues).
-    let mut window_issues = issues;
-    let known: std::collections::BTreeSet<u64> =
-        window_issues.iter().map(|issue| issue.number).collect();
-    for pull in &pulls {
-        for issue in &pull.closing {
-            if !known.contains(&issue.number) {
-                window_issues.push(issue.clone());
-            }
-        }
-    }
-
-    let total = window_issues.len() + pulls.len();
-    for (index, (issue_chunk, pull_chunk)) in chunk_windows(window_issues, pulls, args.max_window)?
-        .into_iter()
-        .enumerate()
+    // Standalone issues plus every PR group; the lib chunker carries
+    // closing references with their pull (affinity) and emits
+    // oldest-first by each group's newest row (monotonic cursors).
+    let total = issues.len() + pulls.len();
+    let mut rejected_rows: usize = 0;
+    for (index, (issue_chunk, pull_chunk)) in
+        exocortex_adapter_github::chunk_windows(issues, pulls, args.max_window)
+            .map_err(anyhow::Error::msg)?
+            .into_iter()
+            .enumerate()
     {
         let unit = exocortex_adapter_github::map_window(
             &args.owner,
@@ -300,7 +303,7 @@ async fn main() -> anyhow::Result<()> {
         // The operator-facing cursor advances with every settled
         // window (the SDK keeps its own file; this one is what the
         // next run resumes from).
-        std::fs::write(&args.cursor, &cursor)?;
+        save_cursor_atomic(&args.cursor, &cursor)?;
         tracing::info!(
             accepted = outcome.accepted,
             duplicates = outcome.duplicates,
@@ -308,6 +311,7 @@ async fn main() -> anyhow::Result<()> {
             cursor = %cursor,
             "window settled"
         );
+        rejected_rows += outcome.permanent_rejections.len();
         for rejection in &outcome.permanent_rejections {
             tracing::error!(key = %rejection.draft_key, code = %rejection.code, "{}", rejection.detail);
         }
@@ -316,77 +320,12 @@ async fn main() -> anyhow::Result<()> {
         "ingested {total} issues+pulls (resume at or after {:?})",
         resume.as_deref().unwrap_or("the beginning")
     );
-    Ok(())
-}
-
-/// Chunk (issues, pulls) into windows whose MEMORY row count (items +
-/// closing-reference rows) respects the bound. Items keep their order;
-/// a chunk closes when adding the next item (and, for a PR, its
-/// closing refs) would exceed the bound. Returns `(issue_chunk,
-/// pull_chunk)` pairs, oldest-first.
-fn chunk_windows(
-    issues: Vec<GhIssue>,
-    pulls: Vec<GhPull>,
-    max_window: u64,
-) -> anyhow::Result<Vec<(Vec<GhIssue>, Vec<GhPull>)>> {
-    let mut out: Vec<(Vec<GhIssue>, Vec<GhPull>)> = Vec::new();
-    let mut issue_iter = issues.into_iter().peekable();
-    let mut pull_iter = pulls.into_iter().peekable();
-    // Interleave by updatedAt so each window is a contiguous oldest-first
-    // slice of the stream: whichever head is older goes next.
-    loop {
-        let mut chunk_issues: Vec<GhIssue> = Vec::new();
-        let mut chunk_pulls: Vec<GhPull> = Vec::new();
-        let mut rows: u64 = 0;
-        loop {
-            let next_cost = match (issue_iter.peek(), pull_iter.peek()) {
-                (Some(issue), Some(pull)) => {
-                    if issue.updated_at <= pull.updated_at {
-                        Some(1)
-                    } else {
-                        Some(1 + pull.closing.len() as u64)
-                    }
-                }
-                (Some(_), None) => Some(1),
-                (None, Some(pull)) => Some(1 + pull.closing.len() as u64),
-                (None, None) => None,
-            };
-            let Some(cost) = next_cost else { break };
-            if rows + cost > max_window && !(chunk_issues.is_empty() && chunk_pulls.is_empty()) {
-                break;
-            }
-            if chunk_issues.is_empty()
-                && chunk_pulls.is_empty()
-                && rows + cost > max_window
-                && cost > 1
-            {
-                // A single item whose closing references alone exceed
-                // the declared bound cannot be submitted without
-                // violating it — name the fix rather than building an
-                // unsplittable window the SDK must reject forever
-                // (round-10 R10-3).
-                anyhow::bail!(
-                    "a pull request carries {} closing references, exceeding --max-window                      {max_window}; raise --max-window above its cost",
-                    cost - 1
-                );
-            }
-            let take_issue = match (issue_iter.peek(), pull_iter.peek()) {
-                (Some(issue), Some(pull)) => issue.updated_at <= pull.updated_at,
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                (None, None) => unreachable!("cost was Some"),
-            };
-            if take_issue {
-                chunk_issues.push(issue_iter.next().unwrap());
-            } else {
-                chunk_pulls.push(pull_iter.next().unwrap());
-            }
-            rows += cost;
-        }
-        if chunk_issues.is_empty() && chunk_pulls.is_empty() {
-            break;
-        }
-        out.push((chunk_issues, chunk_pulls));
+    if rejected_rows > 0 {
+        // Permanently rejected rows sit behind the advanced cursor and
+        // will never retry: a cron scheduler must see failure, not
+        // success-with-lost-rows (round-11 R11-13).
+        eprintln!("{rejected_rows} rows permanently rejected (see the log); they will not retry");
+        std::process::exit(2);
     }
-    Ok(out)
+    Ok(())
 }

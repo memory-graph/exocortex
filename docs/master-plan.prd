@@ -1,5 +1,19 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-05, ROUND 11 LANDED — the verification pass of the
+review loop; 13 more defects fixed, including one in round 10's own
+fix):** `docs/reviews/round-11-review.prd`. The headline: R10-6's
+batch-id fix was half-applied — the wire trait impl still stubbed
+`to_memory_id` to `""`, so the ONLINE path (MCP end_session, CLI add)
+kept hashing without the cross-batch target. Alongside it: GitHub
+windows split PRs from their closing rows (an SDK `InvalidUnit`
+livelock), per-window cursors could regress mid-run, cursor writes
+were non-atomic, git's `--range` one-shot clobbered the sequential
+cursor (stranding the gap before it), the policy-kind table and
+operator-cursor writes had no regression net (both now tested), and
+adapters exited 0 with permanently-rejected rows. Operator docs
+corrected (README omitted kind 7; MILESTONE said 1-5).
+
 **Status (2026-09-05, ROUND 10 LANDED — the deep review of the
 D19/LP1/CLI wave; 9 blockers + 8 advisories fixed in one commit,
 matrix green):** `docs/reviews/round-10-review.prd` — nine lenses over
