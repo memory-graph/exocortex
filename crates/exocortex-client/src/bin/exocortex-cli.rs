@@ -75,8 +75,10 @@ enum Command {
     Add {
         /// Memory type (a registered label, e.g. Task, Insight, Topic).
         memory_type: String,
-        /// Title (1..=200 chars).
-        title: String,
+        /// Title (1..=200 chars). Optional only with --draft, which
+        /// carries its own.
+        #[arg(required_unless_present = "draft_file")]
+        title: Option<String>,
         /// Content ('-' reads stdin).
         #[arg(long, default_value = "-")]
         content: String,
@@ -98,16 +100,11 @@ enum Command {
     },
 }
 
-fn env_or_flag(value: Option<String>, env_name: &str) -> Result<String, anyhow::Error> {
+fn env_or_flag(value: Option<String>, env_name: &str, flag: &str) -> Result<String, anyhow::Error> {
     value
         .filter(|v| !v.is_empty())
         .or_else(|| std::env::var(env_name).ok().filter(|v| !v.is_empty()))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "--{flag} or {env_name} is required",
-                flag = env_name.to_lowercase()
-            )
-        })
+        .ok_or_else(|| anyhow::anyhow!("--{flag} or {env_name} is required"))
 }
 
 async fn op(
@@ -249,8 +246,8 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
     };
-    let backend = env_or_flag(args.backend, "EXOCORTEX_BACKEND")?;
-    let org = env_or_flag(args.org.clone(), "EXOCORTEX_ORG")?;
+    let backend = env_or_flag(args.backend, "EXOCORTEX_BACKEND", "backend")?;
+    let org = env_or_flag(args.org.clone(), "EXOCORTEX_ORG", "org")?;
     let token = std::env::var("EXOCORTEX_AUTH_TOKEN")
         .ok()
         .filter(|v| !v.is_empty())
@@ -290,7 +287,7 @@ async fn main() -> anyhow::Result<()> {
         draft_file,
     } = &command
     {
-        let mut edges: Vec<exocortex_client::tools::end_session::EdgeHintInput> = Vec::new();
+        let mut edges: Vec<(String, String)> = Vec::new();
         for link in links {
             let (kind, to_id) = link
                 .split_once(':')
@@ -301,13 +298,11 @@ async fn main() -> anyhow::Result<()> {
                     && kind.chars().all(|c| c.is_alphabetic()),
                 "--link takes Kind:<32-hex-id>, got {link:?}"
             );
-            edges.push(exocortex_client::tools::end_session::EdgeHintInput {
-                from_draft_key: "cli-1".into(),
-                to_draft_key: String::new(),
-                to_memory_id: to_id.to_ascii_lowercase(),
-                kind: kind.to_string(),
-                strength: 0.0,
-            });
+            // Resolved to a real EdgeHintInput after the draft loads:
+            // a --draft file carries its own draft_key and --link must
+            // target it (round-10 R10-5 found the hardcoded "cli-1"
+            // dangling under --draft).
+            edges.push((kind.to_string(), to_id.to_ascii_lowercase()));
         }
         let draft = if let Some(path) = draft_file {
             let raw = std::fs::read_to_string(path)?;
@@ -325,12 +320,24 @@ async fn main() -> anyhow::Result<()> {
             MemoryDraftInput {
                 draft_key: "cli-1".into(),
                 memory_type: memory_type.clone(),
-                title: title.clone(),
+                title: title.clone().unwrap_or_default(),
                 content: content.clone(),
                 visibility: visibility.clone(),
                 tags: tags.clone(),
             }
         };
+        let edges: Vec<exocortex_client::tools::end_session::EdgeHintInput> = edges
+            .into_iter()
+            .map(
+                |(kind, to_id)| exocortex_client::tools::end_session::EdgeHintInput {
+                    from_draft_key: draft.draft_key.clone(),
+                    to_draft_key: String::new(),
+                    to_memory_id: to_id,
+                    kind,
+                    strength: 0.0,
+                },
+            )
+            .collect();
         let content = if draft.content == "-" {
             use std::io::Read as _;
             let mut buf = String::new();
@@ -493,6 +500,6 @@ mod tests {
     #[test]
     fn env_or_flag_prefers_flag_then_env() {
         // (unit-level: flag wins over env; env fills an absent flag)
-        assert_eq!(env_or_flag(Some("x".into()), "PATH").unwrap(), "x");
+        assert_eq!(env_or_flag(Some("x".into()), "PATH", "path").unwrap(), "x");
     }
 }

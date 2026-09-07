@@ -32,9 +32,9 @@ use std::time::Duration;
 /// tens of KiB; 16 MiB is two orders of headroom and still bounded.
 pub const BODY_CAP: usize = 16 * 1024 * 1024;
 
-/// A request timeout covering connect + headers + body, applied by the
-/// caller through [`tokio::time::timeout`] (kept here so every adapter
-/// agrees on one number).
+/// A request timeout covering connect + headers + body, applied
+/// internally to every request this client sends (kept here so every
+/// adapter agrees on one number).
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Rate-limit signals pulled out of one response's headers.
@@ -173,11 +173,8 @@ impl ApiClient {
         let status = response.status().as_u16();
         let rate = RateState::from_headers(response.headers());
         let bytes = read_capped(response).await?;
-        if status == 429 || (status == 403 && rate.remaining == Some(0)) {
-            return Err(ApiError::RateLimited {
-                retry_after: rate.retry_after,
-                remaining: rate.remaining,
-            });
+        if let Some(limited) = rate_limited(status, &rate) {
+            return Err(limited);
         }
         if !(200..300).contains(&status) {
             return Err(ApiError::Status {
@@ -218,6 +215,23 @@ impl ApiClient {
         }
         Ok(json.get("data").cloned().unwrap_or(serde_json::Value::Null))
     }
+}
+
+/// The rate-limit decision over one response's status + signals,
+/// extracted so the mapping itself is testable without a network.
+/// 429 is always rate limiting. A 403 counts when GitHub reports an
+/// exhausted primary quota (`x-ratelimit-remaining: 0`) OR when the
+/// server stated a delay (`Retry-After`) — the secondary/abuse
+/// limiters return 403 with Retry-After but a non-zero primary
+/// remaining, and aborting a run on a server that said "wait 30s"
+/// wastes the run.
+fn rate_limited(status: u16, rate: &RateState) -> Option<ApiError> {
+    let quota_exhausted = status == 403 && rate.remaining == Some(0);
+    let server_stated_delay = status == 403 && rate.retry_after.is_some();
+    (status == 429 || quota_exhausted || server_stated_delay).then_some(ApiError::RateLimited {
+        retry_after: rate.retry_after,
+        remaining: rate.remaining,
+    })
 }
 
 fn summarize(bytes: &[u8]) -> String {
@@ -338,6 +352,42 @@ mod tests {
         assert_eq!(rate.retry_after, None, "date form is not guessed");
         assert_eq!(rate.remaining, None, "non-numeric is not guessed");
         assert_eq!(rate, RateState::default());
+    }
+
+    #[test]
+    fn rate_limited_maps_429_exhausted_quota_and_secondary_limits() {
+        for (status, rate, hits) in [
+            (429u16, RateState::default(), true),
+            (
+                403,
+                RateState {
+                    remaining: Some(0),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                403,
+                RateState {
+                    retry_after: Some(Duration::from_secs(30)),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (403, RateState::default(), false),
+            (200, RateState::default(), false),
+        ] {
+            assert_eq!(
+                rate_limited(status, &rate).is_some(),
+                hits,
+                "status {status} with {rate:?} should {}",
+                if hits {
+                    "map to RateLimited"
+                } else {
+                    "pass through"
+                }
+            );
+        }
     }
 
     #[test]

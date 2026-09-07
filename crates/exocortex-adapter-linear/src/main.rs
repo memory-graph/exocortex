@@ -33,13 +33,21 @@ struct Args {
     /// Durable cursor file (stores the newest settled updatedAt).
     #[arg(long, default_value = "linear-adapter.cursor")]
     cursor: std::path::PathBuf,
-    /// Maximum issues per submit window (D21-a bound).
-    #[arg(long, default_value = "100")]
+    /// Maximum memory rows per submit window (D21-a bound). At least
+    /// 2: an issue plus the project it introduces is the smallest
+    /// legal window.
+    #[arg(long, default_value = "100", value_parser = clap::value_parser!(u64).range(2..))]
     max_window: u64,
     /// Seed the cursor on a first run (RFC3339); later runs resume from
     /// the file.
     #[arg(long)]
     since: Option<String>,
+    /// Visibility stamped on every row (private|project|team|org).
+    /// Default org mirrors a single-tenant deployment whose boundary
+    /// is the Linear workspace; tighten per source when the org is
+    /// wider than the workspace's ACLs.
+    #[arg(long, default_value = "org")]
+    visibility: String,
     /// Page size for the source API.
     #[arg(long, default_value = "50")]
     page_size: u32,
@@ -95,6 +103,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
+    let visibility = exocortex_adapter_linear::parse_visibility(&args.visibility)
+        .ok_or_else(|| anyhow::anyhow!("--visibility must be private|project|team|org"))?;
+
     let api_key = std::env::var("LINEAR_API_KEY")
         .ok()
         .filter(|v| !v.is_empty())
@@ -111,11 +122,22 @@ async fn main() -> anyhow::Result<()> {
     )
     .map_err(anyhow::Error::msg)?;
 
-    let resume = std::fs::read_to_string(&args.cursor)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| args.since.clone());
+    // A missing cursor is the normal first run; any OTHER read error
+    // is fatal — silently degrading to a full re-fetch contradicts
+    // the SDK's own corrupt-cursor rule.
+    let resume = match std::fs::read_to_string(&args.cursor) {
+        Ok(content) => {
+            let content = content.trim().to_string();
+            if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => anyhow::bail!("reading cursor file {}: {error}", args.cursor.display()),
+    }
+    .or_else(|| args.since.clone());
 
     let mut config = exocortex_adapter_sdk::AdapterConfig::new(
         &args.org,
@@ -156,6 +178,11 @@ async fn main() -> anyhow::Result<()> {
             args.page_size,
         )
         .await?;
+        if data.get("issues").is_none() {
+            anyhow::bail!(
+                "unexpected response shape: no `issues` connection (a renamed field or a                  200-error body would otherwise ingest as silence)"
+            );
+        }
         let (issues, skipped, has_next, end_cursor) =
             exocortex_adapter_linear::parse_issues_page(&data);
         if skipped > 0 {
@@ -180,7 +207,20 @@ async fn main() -> anyhow::Result<()> {
         .into_iter()
         .enumerate()
     {
-        submit_chunk(&mut session, &args.workspace, &chunk, index as u64).await?;
+        submit_chunk(
+            &mut session,
+            &args.workspace,
+            &chunk,
+            index as u64,
+            visibility,
+        )
+        .await?;
+        // The operator-facing cursor advances with every settled
+        // window (the SDK keeps its own file; this one is what the
+        // next run resumes from).
+        if let Some(cursor) = exocortex_adapter_linear::cursor_for(&chunk) {
+            std::fs::write(&args.cursor, &cursor)?;
+        }
     }
     println!(
         "ingested {total} issues (resume at or after {:?})",
@@ -194,8 +234,14 @@ async fn submit_chunk(
     workspace: &str,
     chunk: &[exocortex_adapter_linear::LinearIssue],
     index: u64,
+    visibility: i32,
 ) -> anyhow::Result<()> {
-    let unit = exocortex_adapter_linear::map_issues(workspace, chunk, &format!("window-{index}"));
+    let unit = exocortex_adapter_linear::map_issues(
+        workspace,
+        chunk,
+        &format!("window-{index}"),
+        visibility,
+    );
     let cursor = exocortex_adapter_linear::cursor_for(chunk)
         .ok_or_else(|| anyhow::anyhow!("empty chunk has no cursor"))?;
     let outcome = session.submit_window(vec![unit], &cursor).await?;

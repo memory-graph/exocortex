@@ -9,6 +9,10 @@ planned for `ghcr.io`).
 All 14 crate names were verified available (2026-08-25;
 exocortex-adapter-sdk joined with A1).
 
+**Unreleased (round-10)** — the SaaS adapters gain direct `chrono` +
+`prost-types` deps (RFC3339 -> protobuf Timestamp; both pre-existing
+workspace deps, recorded here per rule 9).
+
 **Unreleased (LP1, the study pack)** — `exocortex-pack-study-v1`
 joins the composed set in every binary: 7 memory types, 3 entity
 types, 11 relationship kinds, rules L1-L3, no pack verbs in v1. The

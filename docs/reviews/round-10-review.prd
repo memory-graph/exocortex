@@ -1,0 +1,91 @@
+# Round 10 Review — the D19 / LP1 / CLI1-3 wave
+
+**Scope:** `807afc9..dac6f80` (10 commits): the SaaS adapter family
+(exocortex-api-client, adapter-linear, adapter-github), the study
+pack, exocortex-cli, and their gate/wiring edits. Method: the deep
+review skill — nine lenses (8 mandatory + hazard-class grids for two
+fired triggers), every finding verified against the code before
+grading. **19 verified findings: 9 blocking, 10 advisory.** All 9
+blockers and 8 advisories are fixed in the round's single commit; 2
+advisories are recorded below with dispositions. Matrix green on the
+fixed tree.
+
+## Blocking (all fixed)
+
+| ID | Finding | Fix |
+|----|---------|-----|
+| R10-1 | **The adapters' resume cursor never advanced** — the fetch loop reads `--cursor` but only the SDK ever wrote `args.cursor.with_extension("sdk-cursor")` (a DIFFERENT file); every run re-fetched from the seed/ beginning, and past `fetch_bound` the newest rows were permanently starved while runs reported success. Found independently by three lenses. The git adapter (D18, pre-wave) has the identical defect — never wrote its cursor either. | All three binaries write the operator-facing cursor file after every settled window (linear, github, git). |
+| R10-2 | **The GitHub PR walk discarded its boundary page whole** — `break 'walk` fired before `pulls.extend(page)`, dropping PRs NEWER than the cursor that shared a page with one older row; the inline comment claimed the page was kept. | The page is kept whole; the walk stops after it (older rows replay idempotently). |
+| R10-3 | **A GitHub PR whose closing references alone exceeded `--max-window` built an unsplittable window the SDK rejects forever** (deterministic livelock; with R10-1, no progress and no error naming the cause). | `chunk_windows` bails naming the PR's reference count and the fix (raise `--max-window`). |
+| R10-4 | **Linear's chunker clamped its bound to 2 while the declared projection carried the raw `--max-window 1`** — the first issue+project window exceeds the declaration and the run aborts at window 0 forever. | Both adapters reject `--max-window < 2` at parse (the smallest legal window is an issue plus what it introduces). |
+| R10-5 | **CLI `--link` under `--draft` built edges with a hardcoded `from_draft_key: "cli-1"` while the draft submitted under the file's own key** — a dangling edge reference the end-session path silently clamps to private. | Edges resolve after the draft loads, targeting the draft's actual key; `title` is now optional under `--draft` (was a required-but-dead positional). |
+| R10-6 | **The batch-id hash omitted the cross-batch edge target** — `content_batch_id` hashed source/to-draft/kind/strength but not `to_memory_id`, so two CLI adds differing only in `--link` target deduplicated to one batch and the second edge silently never landed. Affects the MCP `end_session` path identically (shared builder). | `to_memory_id` joins the hash; the `PreflightEdgeHint` impl returns its real field (the wire impl legitimately returns empty). One-time consequence: previously-identical replays get new batch ids once. |
+| R10-7 | **The server's admin source-policy kind table lacked values 6 and 7** — a `producer_kind: 7` policy failed node boot, and the kind-5 workaround mislabeled SaaS provenance as `Custom` (the admin kind is authoritative). The additive-wire-value claim held on the RPC path but not the admin-config path; value 6 (D23) was already broken the same way. | Arms 6 and 7 added. |
+| R10-8 | **Linear double-emitted mirrored relations** — a blocks/blocked_by pair stated from both issues produced two identical directed edges. | Deduplicated in `map_issues` (BTreeSet), fixture extended to state the pair from both sides and pin one edge, direction preserved. |
+| R10-9 | **A structurally wrong 200 parsed as silence** — a renamed field or error-shaped body yielded zero nodes, `has_next: false`, and exit 0 ("ingested 0"). Also: cursor-file read errors were flattened into "no cursor" (silent full re-fetch), contradicting the SDK's own corrupt-cursor rule. | Both adapters bail when the expected connection object is absent, and distinguish NotFound (normal first run) from any other cursor read error. |
+
+## Advisory (fixed unless noted)
+
+- **R10-10** api-client: all transport mapping was untested (tests were
+  parse-only). The rate-limit decision is now a pure fn
+  (`rate_limited`) with a table test covering 429, exhausted-quota
+  403, secondary-limiter 403 (Retry-After with non-zero primary —
+  previously a fatal abort on a server that said "wait 30s"), plain
+  403, and 200.
+- **R10-11** `REQUEST_TIMEOUT`'s doc claimed callers apply it; it is
+  applied internally. Doc corrected.
+- **R10-12** The composed fingerprint literal appeared only in prose.
+  `pack-study-v1` now pins `9f92957f…69c9` in code (golden-style).
+- **R10-13** `ONTOLOGY_GUIDE` claimed adding a pack "never renumbers"
+  unconditionally — false: ids assign in name-sorted pack order, so a
+  pack sorting before an existing one renumbers it (LP1 hit this).
+  The guide now states the sort constraint and the current last name.
+- **R10-14** `provenance.rs` cited a kernel unit test that does not
+  exist (the enum-sync drift net). The comment now points at the real
+  evidence (`wire_kind_to_kernel` + its two newest-arm tests).
+- **R10-15** GitHub's `Solves` selection cell was named by a test but
+  never pinned (the test asserted the other two cells). Pinned.
+- **R10-16** Adapters hardcoded `visibility: 3` (org) with no
+  override — a Linear/GitHub body is org-wide, embedding-indexed,
+  full-text searchable, and a pasted staging key in a ticket would be
+  too. Both adapters gain `--visibility` (default org, documented as
+  the single-tenant-mirror choice; tighten per source when the org is
+  wider than the source's ACLs).
+- **R10-17** The two adapter libs' 18-line restating header bullets
+  trimmed to the identity + resume shape (comment-volume discipline).
+- **R10-18** (recorded, not fixed) **~80 duplicated lines across the
+  two adapter mains** (retry ladder, credential reads, config block,
+  submit logging) + ~55 across the libs (field helpers,
+  `table_uuid_for` re-implementing `exocortex_adapter_table`'s). Not
+  unified now: the shared-fn swap risks `ExternalKey` identity
+  (byte-identical hashing unproven) and the mains' pagination
+  semantics genuinely differ. Next adapter (Jira) should extract the
+  shared runner with an identity-pinning test.
+- **R10-19** (recorded, not fixed) Per-request TLS connector + trust
+  store load in api-client (no connection pooling across page loops);
+  the CLI assembling the full ontology twice per `add`. Both bounded
+  and small at current scale; fold into the R10-18 runner extraction.
+
+## Hazard grids (summary)
+
+Class (a) non-idempotent mutation — the CLI's durable dedup
+(`content_batch_id`) held for exact re-runs; the defects were R10-1,
+R10-3/4, R10-6 as graded above. Concurrent identical CLI adds are
+guarded by the server's claim (code-read, not race-tested). Class (b)
+sensitive-data movement — tokens/keys verified env-only, never logged,
+never on disk; cursors carry timestamps only; `--dump-block` pastes
+clean. The one real cell was R10-16 (source content at org
+visibility). Grids: axes bounded for the enumerated sites; downstream
+read surfaces (explorer/SSE/backup) out of this round's scope.
+
+## Verify-clauses
+
+- `linear::mapping_transcribes_only_in_window_relations` — the
+  mirrored blocks/blocked_by pair is ONE edge, direction pinned.
+- `github::solution_prs_use_solves_and_tasks_fall_back_to_relatedto`
+  — the Solves cell pinned.
+- `api_client::rate_limited_maps_429_exhausted_quota_and_secondary_limits`.
+- `pack-study-v1::composed_fingerprint_differs_and_is_stable` — the
+  literal golden pinned.
+- `cli_smoke` — add/search/get/related still round-trip through the
+  real binary on the fixed tree.

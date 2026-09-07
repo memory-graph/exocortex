@@ -93,8 +93,13 @@ Block by block:
 
 - **`memory_types!` / `entity_types!`** — plain identifier lists. They
   expand to `#[repr(u8)]` enums compiled into the crate. Type ids are
-  assigned per-pack with a running offset, so *adding your pack never
-  renumbers another pack's ids* — existing stored rows stay valid.
+  assigned per-pack with a running offset **in name-sorted pack
+  order**, so adding your pack never renumbers another pack's ids
+  **iff your pack's name sorts after every already-shipped pack's**
+  (today: after `exocortex-pack-study-v1` — pick `exocortex-pack-<t..z>-v1`).
+  A pack sorting before an existing one shifts that pack's ids in
+  composed ontologies and silently re-types stored rows; the LP1
+  landing hit exactly this and renamed around it.
 - **`kinds!`** — one row per relationship kind. `bucket` places it in a
   reasoning family (the eight buckets below); `inverse` names the
   auto-registered companion label (`Solves`/`SolvedBy` — companions are

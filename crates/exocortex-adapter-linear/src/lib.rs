@@ -7,23 +7,14 @@
 //! Linear states structurally, transcribed rather than inferred.
 //!
 //! - one memory per issue (`Bug`-class labels -> `Problem`; everything
-//!   else -> `Task` — a work item on the board), identity-stable across
-//!   runs by `ExternalKey` (`logical_pk` = the issue uuid),
-//! - one `Project` memory per referenced project, `InProject` edges
-//!   from each issue to it,
-//! - `Blocks` from Linear `blocks`/`blocked_by` relations,
-//!   `RelatedTo` from `related_to`/`duplicate`,
-//!   `Contains` from parent -> sub-issue — only when BOTH endpoints are
-//!   in the window (§18.1 forbids cross-batch draft references); a
-//!   relation to an issue outside the window waits for that issue's
-//!   next update (recorded boundary, not silent loss),
-//! - canceled issues close (`valid_until` = canceledAt); completed
-//!   issues stay open — completion is a true belief, cancellation
-//!   retires one,
-//! - description, state, team, assignee, creator, labels, branch, url,
-//!   and attachment urls ride content so the server's own entity
-//!   extraction converges `Person`/`Url`/`Concept` entities exactly as
-//!   it does for session wrapups (the D18 precedent).
+//!   else -> `Task`), one `Project` memory per referenced project with
+//!   `InProject` edges,
+//! - the structured relations transcribed (`Blocks`, `RelatedTo`,
+//!   `Contains`), both endpoints in-window only, deduplicated,
+//! - canceled issues close (`valid_until`); completed issues stay
+//!   open — completion is a true belief, cancellation retires one,
+//! - description/state/team/assignee/labels/branch/urls/attachments
+//!   ride content for entity extraction (the D18 precedent).
 //!
 //! Re-runs are idempotent by construction: the resume filter is
 //! `updatedAt >= cursor` (inclusive), so boundary ties re-fetch and
@@ -315,6 +306,18 @@ fn bound_4000(s: &str) -> String {
     }
 }
 
+/// Parse the CLI visibility word to the wire discriminant. Unknown
+/// words are a configuration error, not a guess.
+pub fn parse_visibility(word: &str) -> Option<i32> {
+    match word.to_ascii_lowercase().as_str() {
+        "private" => Some(0),
+        "project" => Some(1),
+        "team" => Some(2),
+        "org" => Some(3),
+        _ => None,
+    }
+}
+
 /// The window cursor: the max updatedAt in the window (ties re-fetch —
 /// the gte resume is inclusive and replays idempotently).
 pub fn cursor_for(issues: &[LinearIssue]) -> Option<String> {
@@ -355,7 +358,12 @@ pub fn chunk_windows(issues: Vec<LinearIssue>, max_window: u64) -> Vec<Vec<Linea
 /// Map one window of parsed issues to a submission unit: issue
 /// memories, project memories, and the structured-relation edges whose
 /// endpoints are both in the window. Deterministic for a given input.
-pub fn map_issues(workspace: &str, issues: &[LinearIssue], batch_id_seed: &str) -> BatchUnit {
+pub fn map_issues(
+    workspace: &str,
+    issues: &[LinearIssue],
+    batch_id_seed: &str,
+    visibility: i32,
+) -> BatchUnit {
     let table = table_uuid_for(workspace);
     let by_id: std::collections::BTreeMap<&str, usize> = issues
         .iter()
@@ -376,6 +384,9 @@ pub fn map_issues(workspace: &str, issues: &[LinearIssue], batch_id_seed: &str) 
 
     let mut memories: Vec<MemoryDraft> = Vec::new();
     let mut relationships: Vec<RelationshipDraft> = Vec::new();
+    // Linear states a blocks/blocked_by pair from BOTH issues; one
+    // directed edge is the fact, emitted once.
+    let mut seen_edges: std::collections::BTreeSet<(String, String, String)> = Default::default();
 
     for issue in issues {
         let key = format!("issue-{}", issue.id);
@@ -452,7 +463,7 @@ pub fn map_issues(workspace: &str, issues: &[LinearIssue], batch_id_seed: &str) 
             title: truncate_200(&issue.title),
             content,
             tags: vec!["linear".into(), "issue".into()],
-            visibility: 3,
+            visibility,
             // Cancellation retires the belief; completion does not.
             valid_from: None,
             valid_until: if issue.canceled_at.is_empty() {
@@ -477,18 +488,22 @@ pub fn map_issues(workspace: &str, issues: &[LinearIssue], batch_id_seed: &str) 
                 "blocked_by" => (format!("issue-{other}"), key.clone()),
                 _ => (key.clone(), format!("issue-{other}")), // related_to, duplicate
             };
+            let edge_kind = if kind == "blocks" || kind == "blocked_by" {
+                "Blocks"
+            } else {
+                "RelatedTo"
+            };
+            if !seen_edges.insert((from.clone(), to.clone(), edge_kind.to_string())) {
+                continue;
+            }
             relationships.push(RelationshipDraft {
                 from_draft_key: from,
                 to_draft_key: to,
-                kind: if kind == "blocks" || kind == "blocked_by" {
-                    "Blocks".into()
-                } else {
-                    "RelatedTo".into()
-                },
+                kind: edge_kind.into(),
                 strength: 0.0,
                 confidence: 0.9,
                 context: format!("linear relation {kind} ({workspace})"),
-                visibility: 3,
+                visibility,
                 to_memory_id: String::new(),
             });
         }
@@ -503,7 +518,7 @@ pub fn map_issues(workspace: &str, issues: &[LinearIssue], batch_id_seed: &str) 
                     strength: 0.0,
                     confidence: 0.9,
                     context: format!("linear sub-issue ({workspace})"),
-                    visibility: 3,
+                    visibility,
                     to_memory_id: String::new(),
                 });
             }
@@ -518,7 +533,7 @@ pub fn map_issues(workspace: &str, issues: &[LinearIssue], batch_id_seed: &str) 
                 strength: 0.0,
                 confidence: 0.9,
                 context: format!("linear project membership ({workspace})"),
-                visibility: 3,
+                visibility,
                 to_memory_id: String::new(),
             });
         }
@@ -533,7 +548,7 @@ pub fn map_issues(workspace: &str, issues: &[LinearIssue], batch_id_seed: &str) 
             title: truncate_200(name),
             content: format!("Linear project {name} (workspace {workspace})."),
             tags: vec!["linear".into(), "project".into()],
-            visibility: 3,
+            visibility,
             valid_from: None,
             valid_until: None,
             external_key: Some(ExternalKey {
@@ -644,7 +659,9 @@ mod tests {
                         "project": { "id": "proj-1", "name": "Collateral Review" },
                         "parent": { "id": "uuid-a" },
                         "labels": { "nodes": [ { "name": "Improvement" } ] },
-                        "relations": { "nodes": [] },
+                        "relations": { "nodes": [
+                            { "type": "blocked_by", "issue": { "id": "uuid-a" } }
+                        ] },
                         "attachments": { "nodes": [] }
                     },
                     { "id": "", "updatedAt": "2026-09-02T12:00:00.000Z" }
@@ -679,14 +696,24 @@ mod tests {
     #[test]
     fn mapping_transcribes_only_in_window_relations() {
         let (issues, _, _, _) = parse_issues_page(&page_json());
-        let unit = map_issues("acme", &issues, "seed");
+        let unit = map_issues("acme", &issues, "seed", 3);
         // 2 issues + 1 project.
         assert_eq!(unit.memories.len(), 3);
-        // blocks (uuid-a -> uuid-b) + contains (uuid-a -> uuid-b) + 2 InProject.
+        // blocks (uuid-a -> uuid-b, stated from BOTH sides, deduped to
+        // one) + contains + 2 InProject.
         assert_eq!(unit.relationships.len(), 4);
-        assert!(unit.relationships.iter().any(|r| r.kind == "Blocks"
-            && r.from_draft_key == "issue-uuid-a"
-            && r.to_draft_key == "issue-uuid-b"));
+        let blocks_edges: Vec<_> = unit
+            .relationships
+            .iter()
+            .filter(|r| r.kind == "Blocks")
+            .collect();
+        assert_eq!(
+            blocks_edges.len(),
+            1,
+            "the mirrored blocks/blocked_by pair is ONE edge"
+        );
+        assert_eq!(blocks_edges[0].from_draft_key, "issue-uuid-a");
+        assert_eq!(blocks_edges[0].to_draft_key, "issue-uuid-b");
         assert!(unit.relationships.iter().any(|r| r.kind == "Contains"
             && r.from_draft_key == "issue-uuid-a"
             && r.to_draft_key == "issue-uuid-b"));
@@ -742,8 +769,8 @@ mod tests {
     #[test]
     fn mapping_is_deterministic_and_cursor_is_max_updated() {
         let (issues, _, _, _) = parse_issues_page(&page_json());
-        let a = map_issues("acme", &issues, "seed");
-        let b = map_issues("acme", &issues, "seed");
+        let a = map_issues("acme", &issues, "seed", 3);
+        let b = map_issues("acme", &issues, "seed", 3);
         assert_eq!(a.memories, b.memories);
         assert_eq!(a.relationships, b.relationships);
         assert_eq!(
@@ -775,7 +802,7 @@ mod tests {
             relations: vec![],
             attachments: vec![],
         };
-        let unit = map_issues("acme", &[issue], "seed");
+        let unit = map_issues("acme", &[issue], "seed", 3);
         let memory = &unit.memories[0];
         assert!(memory
             .content

@@ -5,24 +5,17 @@
 //! inference, no LLM: the one cross-type relationship below
 //! (`closingIssuesReferences`) is one GitHub states structurally.
 //!
-//! - one memory per issue (bug-class labels -> `Problem`; everything
-//!   else -> `Task`), identity-stable by `ExternalKey`
-//!   (`logical_pk` = `issue:<number>`),
-//! - one memory per pull request: `fix:`-prefixed titles -> `Fix`
-//!   (the D18 classifier); a PR with closing references -> `Solution`;
-//!   everything else -> `Command` (a change executed against the tree);
+//! - one memory per issue (`Bug`-class labels -> `Problem`; else
+//!   `Task`), one per pull request (`fix:` prefix -> `Fix`, any
+//!   closing reference -> `Solution`, else `Command`),
 //! - the closing-reference edge: `Fixes` when a Fix PR closes a
-//!   Problem, `Solves` when a Solution PR closes one, `RelatedTo`
-//!   otherwise (type triples forbid solution kinds onto `Task`) —
-//!   closing issues ride the window as their own rows so both edge
-//!   endpoints are always in-batch (§18.1),
-//! - closed-but-unmerged PRs close (`valid_until` = closedAt:
-//!   abandonment retires the belief); merged PRs and closed issues
-//!   stay open — completion is a true belief, the Linear adapter's
-//!   same rule,
-//! - body, author, labels, branches, and urls ride content so the
-//!   server's entity extraction converges `Person`/`Url`/`File`
-//!   entities with D18's git graph on shared names.
+//!   `Problem`, `Solves` when a Solution PR closes one, `RelatedTo`
+//!   otherwise — closing issues ride the window as their own rows so
+//!   both endpoints are always in-batch,
+//! - closed-but-unmerged PRs close (`valid_until`); merged PRs and
+//!   closed issues stay open — completion is a true belief,
+//! - body/author/labels/branches/urls ride content for entity
+//!   extraction with D18's git graph on shared names.
 //!
 //! Resume shape: issues page ascending under `filterBy: {since}` (the
 //! inclusive cursor re-fetches ties, which replay idempotently); PRs
@@ -273,6 +266,18 @@ fn parse_connection<T>(
     (out, skipped, has_next, end_cursor)
 }
 
+/// Parse the CLI visibility word to the wire discriminant. Unknown
+/// words are a configuration error, not a guess.
+pub fn parse_visibility(word: &str) -> Option<i32> {
+    match word.to_ascii_lowercase().as_str() {
+        "private" => Some(0),
+        "project" => Some(1),
+        "team" => Some(2),
+        "org" => Some(3),
+        _ => None,
+    }
+}
+
 /// The issue classifier: bug-class label vocabulary -> `Problem`,
 /// everything else -> `Task` (the Linear adapter's same rule).
 pub fn issue_memory_type_for(labels: &[String]) -> &'static str {
@@ -372,6 +377,7 @@ pub fn map_window(
     issues: &[GhIssue],
     pulls: &[GhPull],
     batch_id_seed: &str,
+    visibility: i32,
 ) -> BatchUnit {
     let table = table_uuid_for(owner, repo);
     let mut memories: Vec<MemoryDraft> = Vec::new();
@@ -387,7 +393,7 @@ pub fn map_window(
             title: truncate_200(&issue.title),
             content: issue_content("Issue", issue),
             tags: vec!["github".into(), "issue".into()],
-            visibility: 3,
+            visibility,
             // A closed issue is a resolved problem (a true belief), so
             // it stays open; abandonment has no issue-side state here.
             valid_from: None,
@@ -442,7 +448,7 @@ pub fn map_window(
             title: truncate_200(&pull.title),
             content,
             tags: vec!["github".into(), "pull-request".into()],
-            visibility: 3,
+            visibility,
             valid_from: None,
             // A closed-but-unmerged PR is an abandoned change: retired.
             // Merged PRs stay open (the change happened).
@@ -473,7 +479,7 @@ pub fn map_window(
                 strength: 0.0,
                 confidence: 0.9,
                 context: format!("github closingIssuesReferences ({owner}/{repo})"),
-                visibility: 3,
+                visibility,
                 to_memory_id: String::new(),
             });
         }
@@ -684,7 +690,7 @@ mod tests {
         // dedupe rule, exercised here by hand).
         let mut window_issues = issues.clone();
         window_issues.push(pulls[0].closing[1].clone());
-        let unit = map_window("acme", "api", &window_issues, &pulls, "seed");
+        let unit = map_window("acme", "api", &window_issues, &pulls, "seed", 3);
         // 3 issues + 2 PRs.
         assert_eq!(unit.memories.len(), 5);
         // PR 55 (Fix) closes 101 (Problem) -> Fixes and 103 (Problem) -> Fixes.
@@ -767,11 +773,28 @@ mod tests {
             &[task_issue.clone()],
             &[solution_pull.clone()],
             "seed",
+            3,
         );
         assert_eq!(unit.relationships.len(), 1);
         assert_eq!(
             unit.relationships[0].kind, "RelatedTo",
             "Task targets take RelatedTo"
+        );
+        // The Solution -> Problem cell the selection table owns
+        // (round-10 R10-9: named by this test but never pinned).
+        let problem_target = GhIssue {
+            labels: vec!["Bug".into()],
+            ..task_issue.clone()
+        };
+        let solution_pr = GhPull {
+            title: "Add the docs page".into(),
+            closing: vec![problem_target.clone()],
+            ..solution_pull.clone()
+        };
+        let unit = map_window("acme", "api", &[problem_target], &[solution_pr], "seed", 3);
+        assert_eq!(
+            unit.relationships[0].kind, "Solves",
+            "the Solution -> Problem cell of the selection table"
         );
         let problem_issue = GhIssue {
             labels: vec!["Bug".into()],
@@ -782,7 +805,7 @@ mod tests {
             closing: vec![problem_issue.clone()],
             ..solution_pull.clone()
         };
-        let unit = map_window("acme", "api", &[problem_issue], &[fix_pull], "seed");
+        let unit = map_window("acme", "api", &[problem_issue], &[fix_pull], "seed", 3);
         assert_eq!(unit.relationships[0].kind, "Fixes");
     }
 
@@ -790,8 +813,8 @@ mod tests {
     fn mapping_is_deterministic() {
         let (issues, _, _, _) = parse_issues_page(&issues_page());
         let (pulls, _, _, _) = parse_pulls_page(&pulls_page());
-        let a = map_window("acme", "api", &issues, &pulls, "seed");
-        let b = map_window("acme", "api", &issues, &pulls, "seed");
+        let a = map_window("acme", "api", &issues, &pulls, "seed", 3);
+        let b = map_window("acme", "api", &issues, &pulls, "seed", 3);
         assert_eq!(a.memories, b.memories);
         assert_eq!(a.relationships, b.relationships);
     }

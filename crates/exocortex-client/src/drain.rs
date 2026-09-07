@@ -289,6 +289,7 @@ pub trait BatchIdDraft {
 /// Fields of an edge hint that participate in the content-bound batch id.
 pub trait BatchIdEdge {
     fn source_key(&self) -> &str;
+    fn to_memory_id(&self) -> &str;
     fn to_draft_key(&self) -> &str;
     fn kind(&self) -> &str;
     fn strength(&self) -> f32;
@@ -321,6 +322,9 @@ impl BatchIdEdge for WireRel {
     }
     fn to_draft_key(&self) -> &str {
         &self.to_draft_key
+    }
+    fn to_memory_id(&self) -> &str {
+        ""
     }
     fn kind(&self) -> &str {
         &self.kind
@@ -371,6 +375,9 @@ impl BatchIdEdge for exocortex_ops::preflight::PreflightEdgeHint {
     fn to_draft_key(&self) -> &str {
         &self.to_draft_key
     }
+    fn to_memory_id(&self) -> &str {
+        &self.to_memory_id
+    }
     fn kind(&self) -> &str {
         &self.kind
     }
@@ -406,6 +413,11 @@ pub fn content_batch_id<D: BatchIdDraft, E: BatchIdEdge>(
     }
     for r in rels {
         hasher.update(r.source_key().as_bytes());
+        hasher.update(&[0x1e]);
+        // R10-6: the cross-batch target participates in the batch id —
+        // two adds differing only in --link target are different
+        // batches, or the second edge silently dedupes away.
+        hasher.update(r.to_memory_id().as_bytes());
         hasher.update(&[0x1e]);
         hasher.update(r.to_draft_key().as_bytes());
         hasher.update(&[0x1e]);

@@ -137,6 +137,11 @@ async fn main() -> anyhow::Result<()> {
             .map(|commit| commit.sha.clone())
             .unwrap_or_default();
         let outcome = session.submit_window(vec![unit], &newest).await?;
+        // The operator-facing cursor advances with every settled
+        // window (the SDK keeps its own file; this one is what the
+        // next run's revision range starts from — round-10 R10-1
+        // found it was never written).
+        std::fs::write(&args.cursor, &newest)?;
         tracing::info!(
             accepted = outcome.accepted,
             duplicates = outcome.duplicates,

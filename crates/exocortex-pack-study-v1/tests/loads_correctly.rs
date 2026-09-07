@@ -72,6 +72,19 @@ fn composed_fingerprint_differs_and_is_stable() {
     // OC-PRD: the composed summary is a superset of the prior set —
     // additive composition, a non-event for existing graphs.
     assert!(without_learn.summary.is_subset_of(&onto.summary));
+    // The literal golden (round-10 R10-12): the docs carry this value
+    // in prose; an accidental ontology change must fail HERE, not in
+    // the next release note.
+    let hex = OntologyFingerprint::compute(&[dev_pack(), learn_pack(), mortgage_pack()]);
+    let mut pinned = String::new();
+    for b in hex.0 {
+        use std::fmt::Write as _;
+        let _ = write!(pinned, "{b:02x}");
+    }
+    assert_eq!(
+        pinned, "9f92957f27855baf16922be8d794573f004f6022a97aa9e6668c1b727ab769c9",
+        "the composed compatibility fingerprint moved"
+    );
 }
 
 #[test]

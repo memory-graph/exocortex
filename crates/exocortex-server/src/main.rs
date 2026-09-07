@@ -827,6 +827,8 @@ fn load_source_policy(path: Option<&std::path::Path>) -> anyhow::Result<Vec<Sour
                 3 => exocortex_kernel::ProducerKind::DocsAdapter,
                 4 => exocortex_kernel::ProducerKind::AnalyticsAdapter,
                 5 => exocortex_kernel::ProducerKind::Custom,
+                6 => exocortex_kernel::ProducerKind::Extracted,
+                7 => exocortex_kernel::ProducerKind::SaaSAdapter,
                 _ => anyhow::bail!("source policy producer_kind is invalid"),
             };
             Ok((

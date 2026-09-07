@@ -67,8 +67,7 @@ pub enum ComputedProducer {
 
 /// D8: the closed producer-kind set, mirrored from the wire enum. The
 /// kernel owns the stored shape; the wire owns the transport shape; the
-/// two are held in sync by a unit test in this crate's test suite
-/// (values, not names — the wire enum is prost-generated).
+/// The two are held in sync at the ingest boundary: `wire_kind_to_kernel` in `exocortex-ingest` maps every value fail-closed, and its tests (`extraction_producers_are_stamped_distinguishably`, `saas_producers_are_stamped_distinguishably`) pin the newest arms.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub enum ProducerKind {
     /// Registration rejected it; stored rows never carry it. The serde

@@ -36,13 +36,20 @@ struct Args {
     /// Durable cursor file (stores the newest settled updatedAt).
     #[arg(long, default_value = "github-adapter.cursor")]
     cursor: std::path::PathBuf,
-    /// Maximum memory rows per submit window (D21-a bound).
-    #[arg(long, default_value = "100")]
+    /// Maximum memory rows per submit window (D21-a bound). At least
+    /// 2: a PR plus a closing reference is the smallest legal window.
+    #[arg(long, default_value = "100", value_parser = clap::value_parser!(u64).range(2..))]
     max_window: u64,
     /// Seed the cursor on a first run (RFC3339); later runs resume
     /// from the file.
     #[arg(long)]
     since: Option<String>,
+    /// Visibility stamped on every row (private|project|team|org).
+    /// Default org mirrors a single-tenant deployment whose boundary
+    /// is the GitHub org; tighten per source when the org is wider
+    /// than the repo's collaborator ACLs.
+    #[arg(long, default_value = "org")]
+    visibility: String,
     /// Page size for the source API.
     #[arg(long, default_value = "50")]
     page_size: u32,
@@ -84,6 +91,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
+    let visibility = exocortex_adapter_github::parse_visibility(&args.visibility)
+        .ok_or_else(|| anyhow::anyhow!("--visibility must be private|project|team|org"))?;
+
     let api_token = std::env::var("GITHUB_TOKEN")
         .ok()
         .filter(|v| !v.is_empty())
@@ -100,11 +110,22 @@ async fn main() -> anyhow::Result<()> {
     )
     .map_err(anyhow::Error::msg)?;
 
-    let resume = std::fs::read_to_string(&args.cursor)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| args.since.clone());
+    // A missing cursor is the normal first run; any OTHER read error
+    // is fatal (the SDK's own corrupt-cursor rule: never silently
+    // re-ingest the world).
+    let resume = match std::fs::read_to_string(&args.cursor) {
+        Ok(content) => {
+            let content = content.trim().to_string();
+            if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => anyhow::bail!("reading cursor file {}: {error}", args.cursor.display()),
+    }
+    .or_else(|| args.since.clone());
 
     let mut config = exocortex_adapter_sdk::AdapterConfig::new(
         &args.org,
@@ -157,6 +178,15 @@ async fn main() -> anyhow::Result<()> {
             &mut variables,
         )
         .await?;
+        if data
+            .get("repository")
+            .and_then(|r| r.get("issues"))
+            .is_none()
+        {
+            anyhow::bail!(
+                "unexpected response shape: no repository.issues connection (a renamed field                  or a 200-error body would otherwise ingest as silence)"
+            );
+        }
         let (page, skipped, has_next, end_cursor) =
             exocortex_adapter_github::parse_issues_page(&data);
         if skipped > 0 {
@@ -195,22 +225,33 @@ async fn main() -> anyhow::Result<()> {
             &mut variables,
         )
         .await?;
+        if data
+            .get("repository")
+            .and_then(|r| r.get("pullRequests"))
+            .is_none()
+        {
+            anyhow::bail!(
+                "unexpected response shape: no repository.pullRequests connection (a renamed                  field or a 200-error body would otherwise ingest as silence)"
+            );
+        }
         let (page, skipped, has_next, end_cursor) =
             exocortex_adapter_github::parse_pulls_page(&data);
         if skipped > 0 {
             tracing::warn!(skipped, "malformed pull nodes skipped");
         }
-        for pull in &page {
-            // Stop (after keeping this page) at rows older than the
-            // cursor; ties re-emit and replay idempotently.
-            if let Some(cursor) = resume.as_deref() {
-                if !cursor.is_empty() && pull.updated_at.as_str() < cursor {
-                    break 'walk;
-                }
-            }
-        }
+        // The page is KEPT whole: pages mix rows newer than the cursor
+        // with older ones, and dropping the page would drop the newer
+        // rows too (round-10 R10-2). Older rows replay idempotently;
+        // the walk stops after this page.
+        let reached_backlog = page.iter().any(|pull| match resume.as_deref() {
+            Some(cursor) if !cursor.is_empty() => pull.updated_at.as_str() < cursor,
+            _ => false,
+        });
         rows_estimate += page.iter().map(|p| 1 + p.closing.len() as u64).sum::<u64>();
         pulls.extend(page);
+        if reached_backlog {
+            break 'walk;
+        }
         if rows_estimate >= fetch_bound {
             tracing::warn!(
                 rows_estimate,
@@ -241,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let total = window_issues.len() + pulls.len();
-    for (index, (issue_chunk, pull_chunk)) in chunk_windows(window_issues, pulls, args.max_window)
+    for (index, (issue_chunk, pull_chunk)) in chunk_windows(window_issues, pulls, args.max_window)?
         .into_iter()
         .enumerate()
     {
@@ -251,10 +292,15 @@ async fn main() -> anyhow::Result<()> {
             &issue_chunk,
             &pull_chunk,
             &format!("window-{index}"),
+            visibility,
         );
         let cursor = exocortex_adapter_github::cursor_for(&issue_chunk, &pull_chunk)
             .ok_or_else(|| anyhow::anyhow!("empty window has no cursor"))?;
         let outcome = session.submit_window(vec![unit], &cursor).await?;
+        // The operator-facing cursor advances with every settled
+        // window (the SDK keeps its own file; this one is what the
+        // next run resumes from).
+        std::fs::write(&args.cursor, &cursor)?;
         tracing::info!(
             accepted = outcome.accepted,
             duplicates = outcome.duplicates,
@@ -282,7 +328,7 @@ fn chunk_windows(
     issues: Vec<GhIssue>,
     pulls: Vec<GhPull>,
     max_window: u64,
-) -> Vec<(Vec<GhIssue>, Vec<GhPull>)> {
+) -> anyhow::Result<Vec<(Vec<GhIssue>, Vec<GhPull>)>> {
     let mut out: Vec<(Vec<GhIssue>, Vec<GhPull>)> = Vec::new();
     let mut issue_iter = issues.into_iter().peekable();
     let mut pull_iter = pulls.into_iter().peekable();
@@ -309,6 +355,21 @@ fn chunk_windows(
             if rows + cost > max_window && !(chunk_issues.is_empty() && chunk_pulls.is_empty()) {
                 break;
             }
+            if chunk_issues.is_empty()
+                && chunk_pulls.is_empty()
+                && rows + cost > max_window
+                && cost > 1
+            {
+                // A single item whose closing references alone exceed
+                // the declared bound cannot be submitted without
+                // violating it — name the fix rather than building an
+                // unsplittable window the SDK must reject forever
+                // (round-10 R10-3).
+                anyhow::bail!(
+                    "a pull request carries {} closing references, exceeding --max-window                      {max_window}; raise --max-window above its cost",
+                    cost - 1
+                );
+            }
             let take_issue = match (issue_iter.peek(), pull_iter.peek()) {
                 (Some(issue), Some(pull)) => issue.updated_at <= pull.updated_at,
                 (Some(_), None) => true,
@@ -327,5 +388,5 @@ fn chunk_windows(
         }
         out.push((chunk_issues, chunk_pulls));
     }
-    out
+    Ok(out)
 }

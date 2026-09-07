@@ -45,7 +45,7 @@ async fn one_live_page_parses_and_maps() -> anyhow::Result<()> {
         issues.len()
     );
     if !issues.is_empty() {
-        let unit = exocortex_adapter_linear::map_issues("live", &issues, "live-page");
+        let unit = exocortex_adapter_linear::map_issues("live", &issues, "live-page", 3);
         assert!(unit.snapshot.is_some());
         assert_eq!(unit.memories.len() >= issues.len(), true);
     }

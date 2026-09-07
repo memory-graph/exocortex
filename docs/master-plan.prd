@@ -1,5 +1,33 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-05, ROUND 10 LANDED — the deep review of the
+D19/LP1/CLI wave; 9 blockers + 8 advisories fixed in one commit,
+matrix green):** `docs/reviews/round-10-review.prd` — nine lenses over
+`807afc9..dac6f80` found 19 verified defects. The worst, found
+independently by three lenses: **the adapters' resume cursor never
+advanced** (the fetch loop read `--cursor`; only the SDK's differently
+named file was ever written — every run re-fetched from the seed and,
+past the fetch bound, the newest rows were permanently starved while
+runs reported success; the D18 git adapter had the identical
+never-written-cursor defect and is fixed with them). Alongside it: the
+GitHub walk dropped its boundary page whole (including PRs NEWER than
+the cursor), an oversize-PR window livelocked the SDK bound check, the
+CLI `--link`+`--draft` pair built a dangling edge key, the batch-id
+hash omitted the cross-batch edge target (identical adds with
+different link targets deduplicated to one — MCP path included), the
+server's admin policy table rejected producer kinds 6 AND 7 (SaaS
+adapters could not be provisioned on backend-node; 6 was broken since
+D23), mirrored Linear relations double-emitted, and a structurally
+wrong 200 ingested as silence. Fixed advisories include `--visibility`
+on both adapters (org default was hardcoded onto every row — source
+bodies are embedding-indexed and org-searchable), the Solves selection
+cell finally pinned, the composed fingerprint pinned as a literal
+golden, and the ONTOLOGY_GUIDE's false "never renumbers" claim
+corrected to state the name-sort constraint. Recorded, not fixed (the
+round doc owns them): the ~135 duplicated lines across the two adapter
+mains/libs (unification risks ExternalKey identity; extract with the
+next adapter) and per-request TLS setup (bounded, same extraction).
+
 **Status (2026-09-05, CLI2+CLI3 SHIPPED — the CLI as the non-MCP
 client bridge, plus the suggested-surface reconciliation):** CLI2: the
 inspiration for CLI1 was Perplexity-class clients (shell commands, no
@@ -23,7 +51,7 @@ boundary — supersession and edge retraction are the model's tools).
 RECORDED as follow-ups: an `export` passthrough (the node's
 `--export`/`--export-corpus` already exist) and `stats` (needs a
 counts op; `memories_in_region` is region-bounded). Evidence:
-cli_smoke edge round trip + the block's 5 unit tests.
+cli_smoke edge round trip + the block's bounded-and-complete unit test (the bin's other 4 unit tests cover rendering/args).
 
 **Status (2026-09-05, CLI1 SHIPPED — exocortex-cli, the human face
 beside MCP; smoke-proven round trip):** `exocortex-cli` (a bin target
