@@ -199,18 +199,28 @@ async fn add_search_get_round_trip_through_the_real_binary() {
         out.contains("accepted 2"),
         "draft add ack (memory + edge): {out} / {err}"
     );
-    let (ok, out, err) = run_cli(addr, &["search", "link by their own key", "--json"]);
-    assert!(ok, "{err}");
-    let json: serde_json::Value = serde_json::from_str(&out).expect("search --json parses");
-    let draft_id = json["memories"][0]["id"]
-        .as_str()
-        .expect("hit id")
-        .to_string();
     let (ok, out, err) = run_cli(addr, &["related", &id]);
     assert!(ok, "{err}");
     assert!(
         out.contains("link by their own key"),
         "the draft row's edge landed: {out}"
     );
-    let _ = draft_id;
+
+    // The draft contract's other two clauses: no title needed under
+    // --draft, and a disagreeing type is rejected with the named cause.
+    let (ok, out, err) = run_cli(
+        addr,
+        &["add", "Insight", "--draft", draft_path.to_str().unwrap()],
+    );
+    assert!(ok, "title is optional under --draft: {err}");
+    assert!(out.contains("accepted"), "{out} / {err}");
+    let (ok, out, err) = run_cli(
+        addr,
+        &["add", "Topic", "--draft", draft_path.to_str().unwrap()],
+    );
+    assert!(!ok, "a disagreeing type must fail the run");
+    assert!(
+        out.contains("disagrees") || err.contains("disagrees"),
+        "the rejection names the disagreement: {out} / {err}"
+    );
 }

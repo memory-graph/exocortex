@@ -566,7 +566,7 @@ pub fn chunk_windows(
         let cost = 1 + issues.len() as u64;
         if cost > max_window {
             return Err(format!(
-                "a pull request carries {} closing references, exceeding the window bound                  {max_window}; raise --max-window above {}",
+                "a pull request carries {} closing references, exceeding the window bound {max_window}; raise --max-window above {}",
                 issues.len(),
                 cost
             ));
@@ -596,7 +596,18 @@ pub fn chunk_windows(
         let Group {
             issues, pull, cost, ..
         } = group;
-        chunk_issues.extend(issues);
+        // Per-window dedupe: two PRs closing the same issue would put
+        // one row twice into a shared window (a duplicate draft_key the
+        // SDK rejects). Across windows a repeat is legal and replays
+        // idempotently (same external key) — an edge's endpoint must
+        // simply be in ITS window, and each pull carries its refs.
+        let mut seen: std::collections::BTreeSet<u64> =
+            chunk_issues.iter().map(|issue| issue.number).collect();
+        for issue in issues {
+            if seen.insert(issue.number) {
+                chunk_issues.push(issue);
+            }
+        }
         if let Some(pull) = pull {
             chunk_pulls.push(pull);
         }
@@ -977,6 +988,75 @@ mod tests {
             .unwrap();
         assert!(pr_window.0.iter().any(|i| i.number == 101));
         assert!(pr_window.0.iter().any(|i| i.number == 102));
+    }
+
+    #[test]
+    fn chunk_windows_sort_groups_before_emitting() {
+        // The fetch hands issues in ASC order but pulls in DESC; a
+        // closing ref can also be NEWER than its PR. Without the sort,
+        // group order follows input order and per-window cursors
+        // regress.
+        let newer_than_pr = bare_issue(77, "2026-09-03T00:00:00Z");
+        let pr = GhPull {
+            number: 5,
+            updated_at: "2026-09-02T00:00:00Z".into(),
+            closing: vec![newer_than_pr],
+            title: "p".into(),
+            body: String::new(),
+            url: String::new(),
+            closed_at: String::new(),
+            state: "open".into(),
+            author: String::new(),
+            head_branch: "b".into(),
+            base_branch: "main".into(),
+        };
+        // Standalone issue BETWEEN the two group keys, pulls newest-first.
+        let issues = vec![
+            bare_issue(1, "2026-08-30T00:00:00Z"),
+            bare_issue(2, "2026-09-02T12:00:00Z"),
+        ];
+        let windows = chunk_windows(issues, vec![pr], 3).unwrap();
+        let cursors: Vec<String> = windows
+            .iter()
+            .map(|(issues, pulls)| cursor_for(issues, pulls).unwrap())
+            .collect();
+        for pair in cursors.windows(2) {
+            assert!(
+                pair[0] <= pair[1],
+                "cursor regressed: {:?} -> {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // The ref-newer-than-PR case sorts the GROUP by its newest row.
+        assert!(cursors.contains(&"2026-09-03T00:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn two_prs_closing_the_same_issue_do_not_duplicate_a_row_within_a_window() {
+        let closing = || vec![bare_issue(42, "2026-09-01T00:00:00Z")];
+        let pr = |number: u64| GhPull {
+            number,
+            updated_at: "2026-09-02T00:00:00Z".into(),
+            closing: closing(),
+            title: "p".into(),
+            body: String::new(),
+            url: String::new(),
+            closed_at: String::new(),
+            state: "open".into(),
+            author: String::new(),
+            head_branch: "b".into(),
+            base_branch: "main".into(),
+        };
+        let windows = chunk_windows(vec![], vec![pr(7), pr(8)], 10).unwrap();
+        assert_eq!(windows.len(), 1, "both groups fit one window");
+        let (issues, pulls) = &windows[0];
+        assert_eq!(
+            issues.iter().filter(|i| i.number == 42).count(),
+            1,
+            "one row for issue 42 inside the shared window"
+        );
+        assert_eq!(pulls.len(), 2);
     }
 
     #[test]

@@ -290,3 +290,70 @@ async fn the_binary_writes_the_operator_cursor() {
     let written = std::fs::read_to_string(&cursor).expect("operator cursor written");
     assert_eq!(written.trim().len(), 40, "a full sha: {}", written);
 }
+
+/// Round-11: a one-shot `--range` run must NOT advance the sequential
+/// operator cursor (it may sit mid-history; writing its HEAD strands
+/// the gap before it).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_shot_range_does_not_clobber_the_sequential_cursor() {
+    let repo = fixture_repo();
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cursor = dir.path().join("op2.cursor");
+    // Sequential run first: seeds the cursor.
+    mock.push_script(vec![MockSubmit::Accept]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-adapter-git"))
+        .args([
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--backend",
+            &mock.url(),
+            "--org",
+            "org",
+            "--producer",
+            "git-test",
+            "--cursor",
+            cursor.to_str().unwrap(),
+        ])
+        .env("EXOCORTEX_AUTH_TOKEN", "test-bearer")
+        .env("EXOCORTEX_HMAC_KEY", "42".repeat(32))
+        .output()
+        .expect("sequential run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sequential = std::fs::read_to_string(&cursor).expect("cursor after sequential run");
+    // One-shot range run: the cursor must be untouched.
+    mock.push_script(vec![MockSubmit::Accept]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-adapter-git"))
+        .args([
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--backend",
+            &mock.url(),
+            "--org",
+            "org",
+            "--producer",
+            "git-test",
+            "--cursor",
+            cursor.to_str().unwrap(),
+            "--range",
+            "HEAD~2..HEAD",
+        ])
+        .env("EXOCORTEX_AUTH_TOKEN", "test-bearer")
+        .env("EXOCORTEX_HMAC_KEY", "42".repeat(32))
+        .output()
+        .expect("range run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cursor).unwrap(),
+        sequential,
+        "--range is one-shot; it must not move the sequential cursor"
+    );
+}

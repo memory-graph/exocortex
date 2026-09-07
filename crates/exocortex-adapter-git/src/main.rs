@@ -140,19 +140,43 @@ async fn main() -> anyhow::Result<()> {
     config.cursor_path = args.cursor.with_extension("sdk-cursor");
     config.projection = Some(exocortex_adapter_git::projection(args.max_window));
 
+    let mut rejected_rows: usize = 0;
     let mut session = exocortex_adapter_sdk::AdapterSession::connect(config).await?;
     // One window per bounded slice, oldest first (so a parent commit is
     // ingested before its child references it).
-    for (index, chunk) in commits.chunks(args.max_window as usize).enumerate() {
+    // Windows are bounded by MEMORY rows (commits + the distinct file
+    // rows they introduce), not commits — the SDK counts memories
+    // against the declared bound (round-11; github and linear already
+    // counted rows).
+    let mut windows: Vec<Vec<exocortex_adapter_git::GitCommit>> = Vec::new();
+    let mut window: Vec<exocortex_adapter_git::GitCommit> = Vec::new();
+    let mut paths: std::collections::BTreeSet<String> = Default::default();
+    for commit in commits.clone() {
+        let introduces = commit.files.iter().filter(|p| !paths.contains(*p)).count();
+        if !window.is_empty() && window.len() + paths.len() + introduces > args.max_window as usize
+        {
+            windows.push(std::mem::take(&mut window));
+            paths.clear();
+        }
+        for path in &commit.files {
+            paths.insert(path.clone());
+        }
+        window.push(commit);
+    }
+    if !window.is_empty() {
+        windows.push(window);
+    }
+    for (index, chunk) in windows.into_iter().enumerate() {
         if chunk.len() as u64 > args.max_window {
             unreachable!("chunks() honors the bound");
         }
-        let unit = exocortex_adapter_git::map_history(&repo_id, chunk, &format!("window-{index}"));
+        let unit = exocortex_adapter_git::map_history(&repo_id, &chunk, &format!("window-{index}"));
         let newest = chunk
             .last()
             .map(|commit| commit.sha.clone())
             .unwrap_or_default();
         let outcome = session.submit_window(vec![unit], &newest).await?;
+        rejected_rows += outcome.permanent_rejections.len();
         // The operator-facing cursor advances with every settled
         // window in SEQUENTIAL mode only: a one-shot --range may sit
         // mid-history, and writing its HEAD would strand the gap
@@ -174,5 +198,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     println!("ingested {} commits (range {range})", commits.len());
+    if rejected_rows > 0 {
+        // Permanently rejected rows sit behind the advanced cursor and
+        // never retry; a scheduler must see failure, not silent loss
+        // (round-11, matching the sibling adapters).
+        eprintln!("{rejected_rows} rows permanently rejected (see the log); they will not retry");
+        std::process::exit(2);
+    }
     Ok(())
 }

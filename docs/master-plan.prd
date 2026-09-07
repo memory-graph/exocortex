@@ -1,5 +1,14 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-05, ROUND 11 COMPLETE — loop iterations 1-4; the
+verification pass found 8 more, all fixed):** the round-11 doc carries
+both waves. The second wave's worst: two PRs closing the same issue
+duplicated a row within one window (another SDK InvalidUnit livelock);
+git lacked the exit-2 path and had bound its windows by commits not
+memory rows (the exact arithmetic bug fixed in github earlier); three
+operator-facing error strings carried rewrap artifacts. Loop status:
+not yet a verified-clean exit — one more full pass required.
+
 **Status (2026-09-05, ROUND 11 LANDED — the verification pass of the
 review loop; 13 more defects fixed, including one in round 10's own
 fix):** `docs/reviews/round-11-review.prd`. The headline: R10-6's

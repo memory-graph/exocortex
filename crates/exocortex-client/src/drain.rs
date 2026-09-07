@@ -569,7 +569,5 @@ mod tests {
         let a = content_batch_id("s", &[draft.clone()], &[rel(&"a".repeat(32))]);
         let b = content_batch_id("s", &[draft.clone()], &[rel(&"b".repeat(32))]);
         assert_ne!(a, b, "different link targets are different batches");
-        // And the empty-target legacy shape still hashes stably.
-        let _ = rel("");
     }
 }

@@ -60,3 +60,35 @@ it); server-side duplicate-edge dedup (moot — deduped client-side).
 Carried: GitHub `filterBy.since` inclusivity, `gte: null` acceptance,
 tonic over https backends, hyper error Display embedding URIs — all
 external-API behaviors needing a live leg to adjudicate.
+
+## The verification pass (iteration 3) — 8 more, all fixed
+
+A full-charter pass over the round-11 diff found the loop had not yet
+converged; all eight are fixed in the same commit as this addendum:
+
+- **R11V-1 (blocking)** Two PRs closing the SAME issue put one row
+  twice into a shared window (duplicate draft_key -> SDK `InvalidUnit`
+  -> permanent livelock). Windows now dedupe rows within themselves;
+  a row repeated ACROSS windows is legal and replays idempotently.
+  Test pins the shared-window case.
+- **R11V-2** git lacked the exit-2-on-permanent-rejections path its
+  siblings gained (R11-13).
+- **R11V-3** git's three round-11 fixes had no net: added a REAL-BINARY
+  test that a `--range` one-shot run leaves the sequential cursor
+  untouched (and dropped a dead mock script entry).
+- **R11V-4** The monotonicity test could not fail without the sort
+  (inputs were pre-sorted). New test feeds pulls newest-first with a
+  closing ref NEWER than its PR and an interleaved standalone issue.
+- **R11V-5** The `--draft` contract's other clauses (title optional;
+  disagreeing type rejected by name) now pinned in cli_smoke.
+- **R11V-6** Two vacuous asserts (`let _ = rel("")`, `let _ = draft_id`)
+  and an unreachable `unwrap_or_default` removed.
+- **R11V-7** Three operator-facing bail strings carried rewrap
+  artifacts (long space runs) — rewritten as single lines.
+- **R11V-8 (pre-existing, same class)** git's windows bounded COMMITS,
+  not memory rows (commits + their file rows); a busy window exceeded
+  the declared bound exactly as github's did before R11-3. Windows now
+  count commits plus the distinct paths they introduce.
+
+Loop status after this fix: iterations 1-4 complete; a further full
+pass is required before claiming a clean exit.
