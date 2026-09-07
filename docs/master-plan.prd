@@ -1,5 +1,27 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-05, LIVING STATE RECONCILED at `6b5e621`):** main
+carries, in order of landing: the **SaaSAdapter kind** end to end
+(wire 7, no fingerprint move); **D19's first two legs** —
+exocortex-api-client plus the Linear and GitHub adapters, the GitHub
+live leg EXECUTED on real rows (it caught three transport defects);
+**LP1** the study pack, the third ontology (the authorized fingerprint
+move `4615018b… → 9f92957f…`, pinned as a literal golden); **CLI1-3**
+exocortex-cli (reads over the HTTP ops, add/link/draft over the
+agents' signed path, `--dump-block` for Perplexity-class clients); and
+**rounds 10-11**, forty verified findings fixed across four review
+passes. Matrix green on the exact tree (verify-release exit 0, 203
+suite-oks; live FALKOR/REDIS/POSTGRES legs unexecuted, URLs unset,
+stated plainly). **Next, in order:** (1) the review loop's iteration-5
+pass — the only thing between the wave and a verified-clean exit;
+(2) the owner mints a LINEAR_API_KEY, then the Linear live leg and one
+backend-submit run per adapter close D19 (the PX4 precedent); (3) the
+v0.4.1 release decision — every precondition is green under the
+standing authorization whenever the owner calls it; (4) the recorded
+deferrals: the adapter-runner extraction with identity-pinning test
+(R10-18/R11), binary-level cursor tests for linear/github, and the
+export passthrough + stats op the CLI reconciliation deferred.
+
 **Status (2026-09-05, ROUND 11 COMPLETE — loop iterations 1-4; the
 verification pass found 8 more, all fixed):** the round-11 doc carries
 both waves. The second wave's worst: two PRs closing the same issue
@@ -1812,10 +1834,11 @@ closed; keep current as rows open, park, or close):**
   deliverable is the design decision its PRD § names — the
   common-subset fingerprint for D3, the authorization-DSL shape for
   D15 — before any code.
-- **Credentials-gated — park and surface:** none currently parked; D19
-  was unparked 2026-09-03 when the owner supplied Linear + GitHub
-  credentials (its Jira/Salesforce/ServiceNow extensions re-park on
-  their own credentials when this row's Linear + GitHub legs close).
+- **Credentials-gated — park and surface:** D19's remaining Linear
+  live leg parks on the owner minting a LINEAR_API_KEY (the MCP
+  authorization cannot ride the adapter); the GitHub leg ran on the
+  owner's gh CLI token. Jira/Salesforce/ServiceNow extensions re-park
+  on their own credentials when this row's Linear + GitHub legs close.
 - **Demand-gated — park, never invent demand:** D14 (a deployment
   that demands 10M), D16 (a third pack proposed from outside), D26
   (scale pressure or the training direction being accepted), and the
