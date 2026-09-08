@@ -163,6 +163,10 @@ impl PackVersion {
 /// linked binary and produces the effective ontology. Fails if:
 /// - two packs share a name (R-Pk1)
 /// - some kernel-constant `RelKindId` has no concrete kind bound (R-Pk2)
+/// - a memory/entity type name is declared twice (KP2)
+/// - a `RelKindId` is declared twice (pack id collision)
+/// - a kind DISPLAY name is declared twice (round 12: names are the
+///   wire-facing identity surface `kind_id` resolves by)
 pub fn load_registered_packs() -> Result<crate::Ontology, crate::KernelError> {
     // Implementation in ontology.rs — this fn is the entry point.
     crate::ontology::Ontology::from_registered_packs()

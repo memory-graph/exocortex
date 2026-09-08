@@ -128,12 +128,12 @@ pub struct ApiClient {
 /// A loopback or link-local host: plaintext `http` is the local-mock
 /// case, not a credential hazard.
 fn is_local_host(host: &str) -> bool {
+    // Loopback literals only: an mDNS `.local` name can resolve to any
+    // LAN peer, and the warning is exactly for that case.
+    let host = host.strip_prefix('[').unwrap_or(host);
+    let host = host.strip_suffix(']').unwrap_or(host);
     let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
-    matches!(
-        host,
-        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
-    ) || host.ends_with(".local")
-        || host.ends_with(".localhost")
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
 }
 
 impl ApiClient {

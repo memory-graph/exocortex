@@ -53,6 +53,8 @@ for name in names:
             dependencies.append({"name": match.group(1), "kind": None})
         elif match and section == "dev-dependencies":
             dependencies.append({"name": match.group(1), "kind": "dev"})
+        elif match and section == "build-dependencies":
+            dependencies.append({"name": match.group(1), "kind": "build"})
     packages.append({"name": name, "version": version, "dependencies": dependencies})
 print(json.dumps({"packages": packages}))
 PY
@@ -132,4 +134,23 @@ grep -q 'not published earlier in ORDER' "$fixture/undep.out"
 # Only the metadata probe ran — no verification, no publish command.
 [ "$(wc -l < "$PUBLISH_TEST_LOG" | tr -d ' ')" = 1 ]
 grep -q '^metadata --format-version 1 --no-deps$' "$PUBLISH_TEST_LOG"
+
+# A BUILD-dependency on an unpublished member is the same mid-release
+# failure class — refused by the same guard.
+printf '[package]
+name = "exocortex-client"
+version = "0.2.2"
+
+[build-dependencies]
+exocortex-adapter-github = { path = "../exocortex-adapter-github" }
+'   > crates/exocortex-client/Cargo.toml
+git add Cargo.toml Cargo.lock crates
+git commit -qm build-dep-fixture
+rm -f "$PUBLISH_TEST_LOG"
+if bash scripts/publish.sh >"$fixture/builddep.out" 2>&1; then
+  echo 'expected build-dep refusal' >&2
+  cat "$fixture/builddep.out" >&2
+  exit 1
+fi
+grep -q 'not published earlier in ORDER' "$fixture/builddep.out"
 echo 'publish fixture ok: fail-closed, verified, byte-preserving'

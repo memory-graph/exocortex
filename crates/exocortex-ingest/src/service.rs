@@ -275,14 +275,17 @@ fn hint_visible(entry: &RecentEmbedding, draft: &exocortex_kernel::MemoryContext
     use exocortex_kernel::Visibility;
     match entry.visibility {
         Visibility::Public | Visibility::Org => true,
-        Visibility::Project => match &entry.project_id {
-            Some(project) => draft.project_id.as_deref() == Some(project.as_str()),
-            None => true,
-        },
-        Visibility::Team => match &entry.team_id {
-            Some(team) => draft.team_id.as_deref() == Some(team.as_str()),
-            None => true,
-        },
+        // Missing scope never widens (the memory_visible rule): a
+        // scope-less scoped row is unreadable by every principal, and
+        // its title is nobody's to receive in an ack.
+        Visibility::Project => entry
+            .project_id
+            .as_deref()
+            .is_some_and(|project| draft.project_id.as_deref() == Some(project)),
+        Visibility::Team => entry
+            .team_id
+            .as_deref()
+            .is_some_and(|team| draft.team_id.as_deref() == Some(team)),
         Visibility::Private => {
             entry.user_id.is_some() && entry.user_id.as_deref() == draft.user_id.as_deref()
         }
@@ -988,7 +991,11 @@ impl<S: Storage> IngestServer<S> {
     ) -> Vec<exocortex_wire::ingest::v1::SimilarToHint> {
         let mut hints = Vec::new();
         {
-            let ring = self.recent.lock().unwrap();
+            // Snapshot, then compute outside the lock: the pair scan is
+            // O(rows x ring x dims) and the seeding snapshot shares this
+            // mutex — holding it across the scan serializes concurrent
+            // submits behind one cosine loop.
+            let ring: Vec<RecentEmbedding> = self.recent.lock().unwrap().iter().cloned().collect();
             for (draft_key, m) in committed {
                 let Some(emb) = &m.embedding else { continue };
                 let mut best: Option<(f32, &RecentEmbedding)> = None;
@@ -1009,15 +1016,19 @@ impl<S: Storage> IngestServer<S> {
                     // Classification (§4.10b): cross-type near-duplicates
                     // are refutations regardless of text overlap — the
                     // type disagreement IS the signal.
-                    let suggestion = if e.memory_type != m.memory_type {
-                        "contradicts"
-                    } else if e.content_exact
-                        == format!(
+                    let draft_exact = blake3::hash(
+                        format!(
                             "{}
 {}",
                             m.title, m.content
                         )
-                    {
+                        .as_bytes(),
+                    )
+                    .to_hex()
+                    .to_string();
+                    let suggestion = if e.memory_type != m.memory_type {
+                        "contradicts"
+                    } else if e.content_exact == draft_exact {
                         "duplicate"
                     } else {
                         "replaces"
@@ -1046,11 +1057,16 @@ impl<S: Storage> IngestServer<S> {
                     project_id: m.context.project_id.as_ref().map(|p| p.to_string()),
                     team_id: m.context.team_id.as_ref().map(|t| t.to_string()),
                     user_id: m.context.user_id.as_ref().map(|u| u.to_string()),
-                    content_exact: format!(
-                        "{}
+                    content_exact: blake3::hash(
+                        format!(
+                            "{}
 {}",
-                        m.title, m.content
-                    ),
+                            m.title, m.content
+                        )
+                        .as_bytes(),
+                    )
+                    .to_hex()
+                    .to_string(),
                     embedding: emb.clone(),
                 });
             }
@@ -2363,6 +2379,13 @@ impl<S: Storage + 'static> IngestServer<S> {
             return;
         };
         let now = chrono::Utc::now();
+        if rows
+            .producer_memories
+            .iter()
+            .all(|memory| memory.embedding.is_none())
+        {
+            return; // nothing seedable in this batch
+        }
         let mut edges: Vec<exocortex_kernel::Relationship> = Vec::new();
         {
             // Snapshot the ring, then compute outside the lock: the

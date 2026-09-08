@@ -145,8 +145,13 @@ async fn abstraction_rows_carry_the_class_with_computed_membership() {
         .collect();
     assert_eq!(abstractions.len(), 1, "one abstraction for the one class");
     let abstraction = abstractions[0];
+    // Round 12 scope partition: the Private member (i == 0) no longer
+    // joins the Org members' abstraction — one abstraction row cannot
+    // faithfully carry two owners' read restrictions, and the old
+    // narrowest-label row exposed the private member's title to the
+    // first member's author.
     assert!(
-        abstraction.title.as_str().contains("5"),
+        abstraction.title.as_str().contains("4"),
         "{}",
         abstraction.title
     );
@@ -157,8 +162,13 @@ async fn abstraction_rows_carry_the_class_with_computed_membership() {
             ..
         }
     ));
-    // Narrowest member visibility (one member is Private).
-    assert_eq!(abstraction.visibility, Visibility::Private);
+    // The abstraction carries the Org scope of its four Org members —
+    // never the private member's label.
+    assert_eq!(abstraction.visibility, Visibility::Org);
+    assert!(
+        !abstraction.content.contains("member 0"),
+        "the private member's title never rides the Org abstraction"
+    );
     // The centroid embedding carries the members' common model.
     let embedding = abstraction.embedding.as_ref().expect("centroid");
     assert_eq!(embedding.model.name.as_str(), "bge-small");
@@ -169,7 +179,7 @@ async fn abstraction_rows_carry_the_class_with_computed_membership() {
         .iter()
         .filter(|edge| edge.kind == summarizes)
         .collect();
-    assert_eq!(membership.len(), 5, "{edges:?}");
+    assert_eq!(membership.len(), 4, "{edges:?}");
     for edge in &membership {
         assert_eq!(edge.from, abstraction.id);
         assert!(edge.bidirectional);
@@ -180,7 +190,7 @@ async fn abstraction_rows_carry_the_class_with_computed_membership() {
                 ..
             }
         ));
-        assert_eq!(edge.visibility, Visibility::Private);
+        assert_eq!(edge.visibility, Visibility::Org);
     }
 
     // The result stamp carries the abstraction ROW id (its documented
@@ -252,7 +262,7 @@ async fn abstraction_identity_is_idempotent_across_cycles() {
         .iter()
         .filter(|edge| edge.kind == onto_kind_summarizes())
         .count();
-    assert_eq!(membership, 5, "no duplicate membership rows");
+    assert_eq!(membership, 4, "no duplicate membership rows");
 }
 
 fn onto_kind_summarizes() -> exocortex_kernel::RelKindId {

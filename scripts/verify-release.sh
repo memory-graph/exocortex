@@ -30,10 +30,14 @@ fi
 # hides the skip line from a passing run — echo the leg status at the
 # shell level like the Postgres leg so a green run never implies live
 # coverage it did not execute.
-if [ -z "${GITHUB_TOKEN:-}" ]; then
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+  cargo test -p exocortex-adapter-github --features integration --test github_live -- --nocapture
+else
   echo "live GitHub adapter suite UNEXECUTED (GITHUB_TOKEN unset)"
 fi
-if [ -z "${LINEAR_API_KEY:-}" ]; then
+if [ -n "${LINEAR_API_KEY:-}" ]; then
+  cargo test -p exocortex-adapter-linear --features integration --test linear_live -- --nocapture
+else
   echo "live Linear adapter suite UNEXECUTED (LINEAR_API_KEY unset)"
 fi
 cargo xtask write-path-parity

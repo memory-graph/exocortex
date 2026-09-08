@@ -264,3 +264,106 @@ its entry; the commit carrying this document is the closing evidence.
 The loop is NOT yet at a verified-clean exit: this pass found and
 fixed 25, so the iteration-6 full pass is the next gate (the round-11
 precedent: keep passing until a pass returns zero).
+
+## Iteration 6 — the second wave (2026-09-08)
+
+The loop continued per its own rule (a pass that finds work is not an
+exit). Nine lenses + Codex over the fix commit itself found **14 more
+verified findings, all fixed**:
+
+**R12-26 — R12-5 was inert in production.** The closing-refs GraphQL
+query never requested `repository { nameWithOwner }` — the edit that
+added it was the one failed hunk in iteration 5's batch, and the
+synthetic test fixtures supplied the field the query could not
+return. Foreign refs parsed `repo: None` and collided with local
+identity exactly as before. Fixed (query + tests that fail without
+the field), plus case-insensitive same-repo folding (`--owner
+Microsoft` vs canonical `microsoft/vscode`) and unsanitized draft
+keys (`a-b/c` vs `a/b-c` cannot collide).
+
+**R12-27 — retired SaaS rows were permanently rejected.** A
+closed-unmerged PR sets `valid_until = closedAt` (past) with
+`valid_from = None`; ingest defaults valid_from to now and rejects
+`valid_until < valid_from` (Permanent) — the cursor advanced past
+every retired row. Both adapters now fetch `createdAt` and stamp it
+as valid_from.
+
+**R12-28 — zero-file commits were dropped** (merges list no paths
+under plain `--name-only`): the bounded mapper's slice loop never ran,
+the row never emitted, the frontier advanced past it. Fixed
+(commit-only slices).
+
+**R12-29 — one commit sliced twice could land twice in one unit**
+(shared paths + tight row room): duplicate `commit-{sha}` draft key →
+SDK `InvalidUnit` on every retry. A commit's slices never share a
+group now (pinned).
+
+**R12-30 — Dreams abstracted across private members.** The
+abstraction carried the first member's context under the narrowest
+label: a Private-member abstraction readable by member 0's author
+named other authors' private titles in its content. Classes now
+partition by (visibility, scope subject); mixed-scope classes never
+share an abstraction (the dataset test now pins the private member's
+exclusion).
+
+**R12-31 — the hint gate's scope-less carve-out contradicted
+`memory_visible`.** Scope-less Project/Team rows are unreadable by
+every principal, yet hinted everyone — and new scope-less rows are
+still creatable. The gate now denies them (aligned with "missing
+scope never widens"); the D10c test submits scoped rows and pins the
+scope-less exclusion.
+
+**R12-32 — the ring re-retained full title+content text** (512 × 64
+KiB potential): `content_exact` is a blake3 digest now. The hint
+scan also left the ring mutex (snapshot like the seeding path), and
+seeding early-returns when the batch has no embedded rows.
+
+**R12-33 — `--max-commits` bounded the Vec, not the read**: the log
+was captured whole. The read is streamed and cut at the bound.
+
+**R12-34 — api-client redaction gaps:** the GraphQL error path joined
+server messages unredacted; summarize truncated BEFORE redacting
+(boundary-straddling echoes leaked prefixes); `.local` hosts were
+exempt from the plaintext-bearer warning. All fixed.
+
+**R12-35 — `Summarizes` renumbered dev-v1 kind ids** (D8 inserted it
+mid-list; `Teaches` and everything after shifted a local id — the
+opposite of a superset for stored RelKindIds). Moved to the END; the
+authorized fingerprint move `9f92957f… → a427b3ad…` (golden + study
+literal + AGENTS/CLAUDE/plan updated in-commit).
+
+**R12-36 — the CLI write path:** `add` exited 0 on rejected writes
+(exit 3 now) and hardcoded the `cli` project with no team surface
+(`EXOCORTEX_PROJECT`/`EXOCORTEX_TEAM` honored).
+
+**R12-37 — verify-release's live-leg echoes were one-sided:** with a
+token set the legs never ran and nothing said so. They run now
+(matching the Postgres leg's contract).
+
+**R12-38 — guard/doc gaps:** publish guard covers build-deps
+(+fixture scenario); git adapter carries `publish = false` like its
+siblings; PUBLISHING's manual order listed ingest before dreams and
+omitted study; README documents the D5 and CLI env vars; the kernel
+entry-point doc lists all five failure modes; `DuplicateKindName`
+has its fail-without-it test; the SDK memory ceiling is pinned at the
+PACKING level (a >256-memory welded component is unreachable while
+the edge ceiling is tighter — a component of N memories carries >=
+N-1 edges — so the edge arm provably fires first; the invariant is
+stated at the arm).
+
+**R12-39 — `map_history` retired:** the unbounded single-unit mapper
+was production-dead after R12-8 (test-only); deleted, E2E tests ported
+to the bounded path, the stale doc link and the duplicated WHY block
+removed.
+
+**New deferral: R12-D2** — reindex's LSN recheck is check-then-act; a
+write landing between recheck and commit is still overwritten. The
+real fix is an LSN-preconditioned (conditional) upsert at the storage
+seam — recorded in the plan with the other v2 items.
+
+**Not fixed, recorded:** github/linear binary exit-2 legs need a dual
+mock harness (GraphQL + backend) — folded into the binary-cursor-tests
+deferral. Carried unverified: GitHub `since` inclusivity (live);
+Linear same-id re-emission; Falkor stream snapshot semantics;
+wire_fanout wall-clock floor flake posture; hyper-rustls allowlist
+naming; drain.rs:248 rust-analyzer report (matrix green = artifact).

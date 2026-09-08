@@ -399,6 +399,12 @@ non-empty `bearer_token` to `org_id`, `user_id`, explicit `project_ids` and
 principal protects HTTP operations, SSE, metrics, and every gRPC method; a
 caller-supplied org or project/team scope never overrides this policy.
 
+Two optional backend flags ride the environment:
+`EXOCORTEX_INGEST_SIMILARITY_SEEDING=1` enables ingest-time SimilarTo
+seeding (D5, default off), and the CLI honors `EXOCORTEX_PROJECT` /
+`EXOCORTEX_TEAM` to request the operator's real project/team scope on
+writes (defaults to the `cli` session project).
+
 `sources.json` is also administrator-owned. Each row contains `org_id`,
 `source_uri`, `producer_id`, `ceiling`, `producer_kind`, and a 64-hex
 `hmac_key`. `producer_kind` is the protobuf numeric enum value (1 coding

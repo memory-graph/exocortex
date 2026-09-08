@@ -59,7 +59,7 @@ for i, name in enumerate(order):
     if name not in members:
         raise SystemExit(f"publish refused: {name} is not a workspace member")
     for dep in deps_by_pkg.get(name, []):
-        if dep.get("kind") is None and dep["name"] in members and dep["name"] not in order[:i]:
+        if (dep.get("kind") in (None, "build")) and dep["name"] in members and dep["name"] not in order[:i]:
             raise SystemExit(
                 "publish refused: " + name + " depends on workspace member "
                 + dep["name"] + ", which is not published earlier in ORDER "

@@ -1,5 +1,5 @@
 //! D18: the git-history adapter binary. Reads `git log` from a local
-//! checkout, maps it through [`exocortex_adapter_git::map_history`], and
+//! checkout, maps it through [`exocortex_adapter_git::map_history_bounded`], and
 //! submits through the signed Ingestion Protocol. Secrets come from the
 //! environment (never argv): `EXOCORTEX_AUTH_TOKEN` (bearer) and
 //! `EXOCORTEX_HMAC_KEY` (64 hex chars).
@@ -50,20 +50,66 @@ fn save_cursor_atomic(path: &std::path::Path, value: &str) -> std::io::Result<()
     std::fs::write(&tmp, value)?;
     std::fs::rename(&tmp, path)
 }
-fn git(repo: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = std::process::Command::new("git")
+
+/// Stream `git log` and retain at most `max_records` complete records
+/// (a record starts with the `` separator). Returns the retained
+/// text and whether more history followed the cut.
+fn git_log_bounded(
+    repo: &std::path::Path,
+    range: &str,
+    max_records: usize,
+) -> anyhow::Result<(String, bool)> {
+    use std::io::Read as _;
+    let mut child = std::process::Command::new("git")
         .current_dir(repo)
-        .args(args)
-        .output()
+        .args([
+            "log",
+            "--reverse",
+            &format!("--format={}", exocortex_adapter_git::GIT_LOG_FORMAT),
+            "--name-only",
+            range,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| anyhow::anyhow!("git: {e}"))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git {:?}: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut retained: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut separators = 0usize;
+    let mut truncated = false;
+    let mut cut = false;
+    'read: loop {
+        let n = stdout
+            .read(&mut buf)
+            .map_err(|e| anyhow::anyhow!("git log: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if cut {
+            truncated = true; // history still flowing past the cut
+            continue;
+        }
+        for (i, byte) in buf[..n].iter().enumerate() {
+            if *byte == 0x1e {
+                separators += 1;
+                if separators >= max_records {
+                    if i + 1 < n {
+                        truncated = true;
+                    }
+                    retained.extend_from_slice(&buf[..=i]);
+                    cut = true;
+                    continue 'read;
+                }
+            }
+        }
+        retained.extend_from_slice(&buf[..n]);
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let status = child.wait().map_err(|e| anyhow::anyhow!("git: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("git log in {}: {status}", repo.display());
+    }
+    Ok((String::from_utf8_lossy(&retained).into_owned(), truncated))
 }
 
 #[tokio::main]
@@ -105,26 +151,18 @@ async fn main() -> anyhow::Result<()> {
         (None, Some(sha)) => format!("{sha}..HEAD"),
         (None, None) => "--all".into(),
     };
-    let log = git(
-        &args.repo,
-        &[
-            "log",
-            "--reverse",
-            &format!("--format={}", exocortex_adapter_git::GIT_LOG_FORMAT),
-            "--name-only",
-            &range,
-        ],
-    )?;
-    let (mut commits, skipped) = exocortex_adapter_git::parse_git_log(&log);
+    // The READ is bounded, not just the post-parse Vec: streaming the
+    // log and retaining at most max_commits records keeps peak memory
+    // proportional to the bound, not to the repo's whole history.
+    let (log, truncated) = git_log_bounded(&args.repo, &range, args.max_commits)?;
+    let (commits, skipped) = exocortex_adapter_git::parse_git_log(&log);
     if skipped > 0 {
         tracing::warn!(skipped, "malformed git log records skipped");
     }
-    if commits.len() > args.max_commits {
-        let remaining = commits.len() - args.max_commits;
-        commits.truncate(args.max_commits);
+    if truncated {
         eprintln!(
-            "history truncated at {} commits ({} newer remain; re-run to continue)",
-            args.max_commits, remaining
+            "history truncated at {} commits (newer ones remain; re-run to continue)",
+            args.max_commits
         );
     }
     tracing::info!(commits = commits.len(), "parsed history");
@@ -155,14 +193,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut rejected_rows: usize = 0;
     let mut session = exocortex_adapter_sdk::AdapterSession::connect(config).await?;
-    // Units are bounded by MEMORY rows (commits + distinct file rows)
-    // AND by the protocol's per-batch edge ceiling: shared paths weld
-    // commits into one component, and an over-ceiling component would
-    // be permanently rejected with the cursor already past it (R12).
-    // Oldest first, so a parent commit lands before its child
-    // references it. A commit wider than the edge ceiling is sliced
-    // across units; the cursor only advances past a commit once its
-    // last slice has settled.
+    // See map_history_bounded for the row+edge bounding and slicing
+    // contract; oldest first so a parent lands before its child.
     let bounded = exocortex_adapter_git::map_history_bounded(
         &repo_id,
         &commits,

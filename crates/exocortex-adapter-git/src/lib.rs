@@ -135,64 +135,6 @@ fn truncate_200(s: &str) -> String {
     s.chars().take(200).collect()
 }
 
-/// Map parsed commits to one submission unit: commit memories, file
-/// memories for every changed path, and `Modifies` edges from each
-/// commit to its paths. Deterministic for a given input.
-pub fn map_history(repo_id: &str, commits: &[GitCommit], batch_id_seed: &str) -> BatchUnit {
-    let table = table_uuid_for(repo_id);
-    // Stable draft keys: one per path (sorted), one per commit.
-    let mut paths: std::collections::BTreeSet<String> = Default::default();
-    for commit in commits {
-        paths.extend(commit.files.iter().cloned());
-    }
-    let file_key: std::collections::HashMap<String, String> = paths
-        .into_iter()
-        .enumerate()
-        .map(|(index, path)| (path, format!("file-{index}")))
-        .collect();
-    // File memories emit in sorted-path order so the unit is
-    // order-deterministic (HashMap iteration is not).
-    let sorted_paths: Vec<&String> = {
-        let mut names: Vec<&String> = file_key.keys().collect();
-        names.sort();
-        names
-    };
-
-    let mut memories: Vec<MemoryDraft> = Vec::new();
-    let mut relationships: Vec<RelationshipDraft> = Vec::new();
-
-    for commit in commits {
-        let commit_key = format!("commit-{}", commit.sha);
-        memories.push(commit_memory(&table, commit, &commit_key));
-        for path in &commit.files {
-            relationships.push(modifies_edge(&commit_key, &file_key[path], &commit.sha));
-        }
-    }
-
-    for path in sorted_paths {
-        memories.push(file_memory(&table, repo_id, path, &file_key[path]));
-    }
-
-    BatchUnit {
-        batch_id_seed: batch_id_seed.into(),
-        memories,
-        relationships,
-        snapshot: Some(ExternalSnapshotInfo {
-            snapshot_id: commits
-                .last()
-                .map(|commit| commit.sha.clone())
-                .unwrap_or_else(|| "empty".into()),
-            // The canonical 32-byte digest over the declared column set
-            // — the same value the server derives from the registration
-            // (a 16-byte table uuid here was rejected by every real
-            // backend; the mock now enforces the width).
-            schema_hash: exocortex_wire::projection::schema_hash(&git_source_columns()).to_vec(),
-            source_flavor: "custom".into(),
-        }),
-        observed_at: std::time::UNIX_EPOCH,
-    }
-}
-
 /// One bounded unit plus the revision frontier it completes: the newest
 /// commit sha whose rows AND edges have all landed by the end of this
 /// unit (empty when the unit ends mid-commit).
@@ -274,7 +216,31 @@ pub fn map_history_bounded(
         seen = idx + 1;
         pending.insert(idx);
         let mut remaining: Vec<String> = commit.files.clone();
-        while !remaining.is_empty() {
+        let mut slices_this_commit = 0usize;
+        loop {
+            if remaining.is_empty() {
+                // Zero-file commits (merges under plain `--name-only`,
+                // `--allow-empty`): the commit row still lands — a
+                // dropped row with the frontier advancing past it is
+                // permanent loss.
+                if slices_this_commit == 0 {
+                    current.slices.push((idx, Vec::new()));
+                }
+                break;
+            }
+            // A commit's slices never share a group: two slices of one
+            // commit would emit the same draft_key twice and the SDK
+            // rejects the whole unit (InvalidUnit) on every retry.
+            if slices_this_commit > 0 && !current.slices.is_empty() {
+                close_group(
+                    &mut groups,
+                    &mut current,
+                    &mut frontiers,
+                    commits,
+                    &pending,
+                    seen,
+                );
+            }
             let new_paths = remaining
                 .iter()
                 .filter(|path| !current.paths.contains(*path))
@@ -306,6 +272,7 @@ pub fn map_history_bounded(
             }
             current.edges += slice.len();
             current.slices.push((idx, slice));
+            slices_this_commit += 1;
         }
         pending.remove(&idx);
     }
@@ -523,31 +490,39 @@ mod tests {
     #[test]
     fn mapping_is_deterministic_with_stable_identities() {
         let (commits, _) = parse_git_log(&log_text());
-        let a = map_history("repo-id", &commits, "seed");
-        let b = map_history("repo-id", &commits, "seed");
-        assert_eq!(a.memories.len(), b.memories.len());
-        assert_eq!(a.relationships.len(), b.relationships.len());
+        let a = map_history_bounded("repo-id", &commits, "seed", 256, 64);
+        let b = map_history_bounded("repo-id", &commits, "seed", 256, 64);
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.len(), 1, "small history packs into one unit");
+        let ua = &a[0].unit;
+        let ub = &b[0].unit;
+        assert_eq!(ua.memories.len(), ub.memories.len());
+        assert_eq!(ua.relationships.len(), ub.relationships.len());
         // 2 commits + 3 distinct paths.
-        assert_eq!(a.memories.len(), 5);
+        assert_eq!(ua.memories.len(), 5);
         // 2 + 1 Modifies edges.
-        assert_eq!(a.relationships.len(), 3);
-        assert!(a.relationships.iter().all(|r| r.kind == "Modifies"));
-        let fix = a
+        assert_eq!(ua.relationships.len(), 3);
+        assert!(ua.relationships.iter().all(|r| r.kind == "Modifies"));
+        let fix = ua
             .memories
             .iter()
             .find(|m| m.memory_type == "Fix")
             .expect("fix: commit classifies as Fix");
         assert_eq!(fix.external_key.as_ref().unwrap().logical_pk, "aaaa");
-        let file = a
+        let file = ua
             .memories
             .iter()
             .find(|m| m.memory_type == "FileContext")
             .expect("file memories emitted");
         assert_eq!(file.title, "src/drain.rs");
         // Identity is repo-scoped: a different repo id forks the table.
-        let other = map_history("other-repo", &commits, "seed");
+        let other = map_history_bounded("other-repo", &commits, "seed", 256, 64);
         assert_ne!(
-            other.memories[0].external_key.as_ref().unwrap().table_uuid,
+            other[0].unit.memories[0]
+                .external_key
+                .as_ref()
+                .unwrap()
+                .table_uuid,
             fix.external_key.as_ref().unwrap().table_uuid
         );
         // Commit content names the paths so entity extraction converges.
@@ -647,6 +622,60 @@ mod tests {
             units.iter().any(|b| b.completes_through.as_str() != "b2"),
             "at least one unit ends before commit b2 completes"
         );
+    }
+
+    #[test]
+    fn zero_file_commits_still_emit_their_row() {
+        // Merge commits list no paths under plain `--name-only` (and
+        // `--allow-empty` commits list none either): their row must
+        // land — a dropped row with the frontier advancing past it is
+        // permanent loss.
+        let commits = vec![
+            commit("c1", &["a"]),
+            commit("c2", &[]),
+            commit("c3", &["b"]),
+        ];
+        let units = map_history_bounded("repo", &commits, "w", 256, 64);
+        let keys: Vec<&str> = units
+            .iter()
+            .flat_map(|b| b.unit.memories.iter().map(|m| m.draft_key.as_str()))
+            .collect();
+        assert!(
+            keys.contains(&"commit-c2"),
+            "empty commit row emitted: {keys:?}"
+        );
+        assert_eq!(units.last().unwrap().completes_through, "c3");
+    }
+
+    #[test]
+    fn one_commit_never_lands_twice_in_a_unit() {
+        // Shared paths tempt the packer to continue a group mid-slice;
+        // two slices of one commit in one group emit the same draft_key
+        // twice and the SDK rejects the unit on every retry.
+        let commits = vec![
+            commit("s1", &["a", "b", "c"]),
+            commit("s2", &["a", "b", "c"]),
+        ];
+        let units = map_history_bounded("repo", &commits, "w", 7, 64);
+        assert!(!units.is_empty());
+        for bounded in &units {
+            let mut keys: Vec<&str> = bounded
+                .unit
+                .memories
+                .iter()
+                .map(|m| m.draft_key.as_str())
+                .collect();
+            keys.sort();
+            let before = keys.len();
+            keys.dedup();
+            assert_eq!(
+                before,
+                keys.len(),
+                "duplicate draft keys in one unit: {keys:?}"
+            );
+        }
+        let edges: usize = units.iter().map(|b| b.unit.relationships.len()).sum();
+        assert_eq!(edges, 6, "both commits keep all their edges");
     }
 
     #[test]

@@ -551,17 +551,48 @@ async fn supersession_floors_target_confidence() {
 }
 
 /// D10c (§4.10b): a near-duplicate submit returns an advisory hint
-/// naming the prior memory; the batch still commits.
+/// naming the prior memory; the batch still commits. Submitted under a
+/// principal with a requested project scope — hints surface only rows
+/// the submitter could already read (round 12), so the fixture's rows
+/// must carry that scope.
 #[tokio::test]
 async fn near_duplicate_hint_rides_the_ack() {
+    use exocortex_storage::types::VisibilityContext;
+    use exocortex_wire::ingest::v1::ingest_service_server::IngestService as _;
+
+    fn vc() -> VisibilityContext {
+        VisibilityContext {
+            user_id: "dup-user".into(),
+            org_id: "org".into(),
+            project_ids: vec!["p".into()].into(),
+            team_ids: Vec::new().into(),
+            max_visibility: exocortex_kernel::Visibility::Org,
+        }
+    }
+    async fn submit_scoped(
+        srv: &IngestServer<InMemoryStorage>,
+        mut b: IngestBatch,
+    ) -> exocortex_wire::ingest::v1::IngestAck {
+        b.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+        if let Some(producer) = b.producer.as_mut() {
+            let mut metadata = producer.client_metadata.take().unwrap_or_default();
+            metadata.project_id = "p".into();
+            producer.client_metadata = Some(metadata);
+        }
+        exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
+        let mut req = Request::new(b);
+        req.extensions_mut().insert(vc());
+        srv.submit(req).await.unwrap().into_inner()
+    }
+
     let srv = server();
     register(&srv, "dup").await;
     let body = "Fixed the connection pool in src/pool.rs";
-    let a1 = submit(&srv, batch("dup", "b1", vec![draft("k", "Fix", body)])).await;
+    let a1 = submit_scoped(&srv, batch("dup", "b1", vec![draft("k", "Fix", body)])).await;
     assert_eq!(a1.rejected, 0, "{:?}", a1.rejections);
 
     // Same title + content: exact duplicate → cosine 1.0 against the ring.
-    let a2 = submit(&srv, batch("dup", "b2", vec![draft("k2", "Fix", body)])).await;
+    let a2 = submit_scoped(&srv, batch("dup", "b2", vec![draft("k2", "Fix", body)])).await;
     assert_eq!(a2.rejected, 0, "the hint is advisory — the batch commits");
     assert_eq!(a2.similar_to.len(), 1, "one hint for the duplicate draft");
     let hint = &a2.similar_to[0];
@@ -570,12 +601,40 @@ async fn near_duplicate_hint_rides_the_ack() {
     assert_eq!(hint.suggestion, "duplicate");
 
     // Different-type near-duplicate → contradicts.
-    let a3 = submit(&srv, batch("dup", "b3", vec![draft("k3", "Problem", body)])).await;
+    let a3 = submit_scoped(&srv, batch("dup", "b3", vec![draft("k3", "Problem", body)])).await;
     assert_eq!(a3.rejected, 0);
     assert!(
         a3.similar_to.iter().any(|h| h.suggestion == "contradicts"),
         "{:?}",
         a3.similar_to
+    );
+
+    // Round 12: a scope-less Project row (no principal, no requested
+    // scope) is unreadable by every principal — its title hints nobody.
+    // (Earlier same-project rows share this text, so the pin is by id.)
+    let a4 = submit(&srv, batch("dup", "b4", vec![draft("k4", "Fix", body)])).await;
+    assert_eq!(a4.rejected, 0, "{:?}", a4.rejections);
+    let scope_less = memories(&srv)
+        .await
+        .into_iter()
+        .find(|m| m.context.project_id.is_none() && m.title == body)
+        .expect("the scope-less row committed");
+    let scope_less_hex = {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for b in scope_less.id.0 {
+            let _ = write!(out, "{b:02x}");
+        }
+        out
+    };
+    let a5 = submit_scoped(&srv, batch("dup", "b5", vec![draft("k5", "Fix", body)])).await;
+    assert_eq!(a5.rejected, 0);
+    assert!(
+        !a5.similar_to
+            .iter()
+            .any(|h| h.existing_memory_id == scope_less_hex),
+        "the scope-less row's title never surfaces: {:?}",
+        a5.similar_to
     );
 }
 

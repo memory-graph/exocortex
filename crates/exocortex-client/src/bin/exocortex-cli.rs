@@ -400,9 +400,15 @@ async fn main() -> anyhow::Result<()> {
                 // One deterministic session for all CLI writes: the
                 // backend groups them (and admin source policy can pin
                 // session://cli with its own ceiling and signing key).
+                // The requested project/team scopes default to "cli",
+                // overridable by env so an authenticated backend's
+                // project/team membership checks can pass for the
+                // operator's REAL scopes.
                 session_id: Some("cli".into()),
-                project_id: "cli".into(),
-                team_id: None,
+                project_id: std::env::var("EXOCORTEX_PROJECT").unwrap_or_else(|_| "cli".into()),
+                team_id: std::env::var("EXOCORTEX_TEAM")
+                    .ok()
+                    .filter(|t| !t.is_empty()),
                 memories: vec![MemoryDraftInput { content, ..draft }],
                 edges,
             })
@@ -421,6 +427,12 @@ async fn main() -> anyhow::Result<()> {
                     rejection.code, rejection.draft_key, rejection.detail
                 );
             }
+        }
+        // A write that persisted nothing must not exit 0 — shell
+        // automation cannot detect silent loss otherwise.
+        if ack.rejected > 0 || ack.accepted == 0 {
+            eprintln!("write rejected; nothing persisted");
+            std::process::exit(3);
         }
         return Ok(());
     }

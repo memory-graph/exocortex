@@ -68,7 +68,7 @@ query IssuesWindow($after: String, $gte: DateTime, $first: Int) {
   issues(after: $after, first: $first, orderBy: updatedAt,
          filter: {updatedAt: {gte: $gte}}) {
     nodes {
-      id identifier title description updatedAt canceledAt url branchName
+      id identifier title description createdAt updatedAt canceledAt url branchName
       state { name type }
       team { key name }
       assignee { name }
@@ -98,6 +98,7 @@ pub struct LinearIssue {
     /// updatedAt, RFC3339.
     pub updated_at: String,
     /// canceledAt, RFC3339; empty while open.
+    pub created_at: String,
     pub canceled_at: String,
     /// URL.
     pub url: String,
@@ -179,6 +180,7 @@ pub fn parse_issues_page(json: &serde_json::Value) -> (Vec<LinearIssue>, usize, 
             // than the bound anyway.
             description: bound_4000(&str_field(node, "description")),
             updated_at,
+            created_at: str_field(node, "createdAt"),
             canceled_at: str_field(node, "canceledAt"),
             url: str_field(node, "url"),
             branch: str_field(node, "branchName"),
@@ -465,7 +467,10 @@ pub fn map_issues(
             tags: vec!["linear".into(), "issue".into()],
             visibility,
             // Cancellation retires the belief; completion does not.
-            valid_from: None,
+            // Retired rows: the belief began at creation, so a
+            // canceledAt in the past satisfies retention-before-valid
+            // instead of being permanently rejected.
+            valid_from: rfc3339_to_timestamp(&issue.created_at),
             valid_until: if issue.canceled_at.is_empty() {
                 None
             } else {
@@ -788,6 +793,7 @@ mod tests {
             identifier: "LOA-9".into(),
             title: "t".into(),
             description: long,
+            created_at: String::new(),
             updated_at: "2026-09-01T00:00:00.000Z".into(),
             canceled_at: String::new(),
             url: String::new(),
@@ -824,6 +830,7 @@ mod tests {
             identifier: String::new(),
             title: String::new(),
             description: String::new(),
+            created_at: String::new(),
             updated_at: format!("2026-09-01T00:00:{id_len:0>2}.000Z", id_len = id.len()),
             canceled_at: String::new(),
             url: String::new(),

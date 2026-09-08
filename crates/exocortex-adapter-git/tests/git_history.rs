@@ -6,7 +6,7 @@
 
 use std::process::Command;
 
-use exocortex_adapter_git::{map_history, parse_git_log, projection, GIT_LOG_FORMAT};
+use exocortex_adapter_git::{parse_git_log, projection, GIT_LOG_FORMAT};
 use exocortex_adapter_sdk::testing::{MockServer, MockSubmit};
 use exocortex_adapter_sdk::{AdapterSession, SdkError};
 
@@ -106,26 +106,41 @@ fn fixture_history_maps_deterministically() {
     assert_eq!(skipped, 0);
     assert_eq!(commits.len(), 3);
     // The classifier saw one fix and two non-fix commits.
-    let unit = map_history("fixture-repo", &commits, "seed");
-    let fixes = unit
-        .memories
+    let units = bounded_units("fixture-repo", &commits);
+    let fixes: usize = units
         .iter()
+        .flat_map(|u| u.memories.iter())
         .filter(|m| m.memory_type == "Fix")
         .count();
-    let commands = unit
-        .memories
+    let commands: usize = units
         .iter()
+        .flat_map(|u| u.memories.iter())
         .filter(|m| m.memory_type == "Command")
         .count();
     assert_eq!((fixes, commands), (1, 2));
     // 3 commits + 2 distinct paths.
-    assert_eq!(unit.memories.len(), 5);
+    assert_eq!(units.iter().map(|u| u.memories.len()).sum::<usize>(), 5);
     // README.md and src/drain.rs each carry Modifies edges.
-    assert_eq!(unit.relationships.len(), 2);
+    assert_eq!(
+        units.iter().map(|u| u.relationships.len()).sum::<usize>(),
+        2
+    );
     // Running the mapper twice over the same log is identical.
-    let again = map_history("fixture-repo", &commits, "seed");
-    assert_eq!(unit.memories.len(), again.memories.len());
-    assert_eq!(unit.relationships.len(), again.relationships.len());
+    let again = bounded_units("fixture-repo", &commits);
+    assert_eq!(
+        units.iter().map(|u| u.memories.len()).collect::<Vec<_>>(),
+        again.iter().map(|u| u.memories.len()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        units
+            .iter()
+            .map(|u| u.relationships.len())
+            .collect::<Vec<_>>(),
+        again
+            .iter()
+            .map(|u| u.relationships.len())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -155,21 +170,25 @@ async fn history_flows_through_the_ingestion_protocol() {
     );
 
     let (commits, _) = parse_git_log(&log_of(repo.path(), "--all"));
-    let unit = map_history("fixture-repo", &commits, "window-0");
+    let units = bounded_units("fixture-repo", &commits);
     let newest = commits.last().unwrap().sha.clone();
-    mock.push_script(vec![MockSubmit::Accept]);
-    let outcome = session.submit_window(vec![unit], &newest).await.unwrap();
-    assert_eq!(outcome.accepted, 5, "commits plus file contexts");
-    assert!(outcome.cursor_advanced);
+    mock.push_script(vec![MockSubmit::Accept; units.len()]);
+    let mut accepted = 0;
+    for unit in units {
+        let outcome = session.submit_window(vec![unit], &newest).await.unwrap();
+        accepted += outcome.accepted;
+        assert!(outcome.cursor_advanced);
+    }
+    assert_eq!(accepted, 5, "commits plus file contexts");
     assert_eq!(std::fs::read_to_string(&cursor).unwrap(), newest);
 
-    // The submitted batch carries the external coordinates the server
+    // The submitted batches carry the external coordinates the server
     // needs for identity-stable re-runs.
     let submitted = mock.submitted();
-    assert_eq!(submitted.len(), 1);
-    assert!(submitted[0]
-        .memories
+    assert!(!submitted.is_empty());
+    assert!(submitted
         .iter()
+        .flat_map(|b| b.memories.iter())
         .all(|m| m.external_key.is_some()));
     // §18.6: the snapshot schema_hash is the canonical 32-byte digest
     // over the declared column set — the exact value the server
@@ -197,32 +216,38 @@ async fn rerun_is_an_idempotent_replay() {
     .await
     .unwrap();
     let (commits, _) = parse_git_log(&log_of(repo.path(), "--all"));
-    let unit = map_history("fixture-repo", &commits, "window-0");
+    let units = bounded_units("fixture-repo", &commits);
+    let n = units.len();
     let newest = commits.last().unwrap().sha.clone();
-    mock.push_script(vec![MockSubmit::Accept, MockSubmit::Accept]);
-    session
-        .submit_window(
-            vec![map_history("fixture-repo", &commits, "window-0")],
-            &newest,
-        )
-        .await
-        .unwrap();
-    // Same seed + same history: the batch id is content-bound, so the
-    // re-submission carries the SAME id the server's idempotency
+    mock.push_script(vec![MockSubmit::Accept; n * 2]);
+    for unit in units.clone() {
+        session.submit_window(vec![unit], &newest).await.unwrap();
+    }
+    // Same seed + same history: the batch ids are content-bound, so the
+    // re-submission carries the SAME ids the server's idempotency
     // registry settles (DUPLICATE_BATCH disposition, §18.8.5).
-    session.submit_window(vec![unit], &newest).await.unwrap();
+    for unit in units {
+        session.submit_window(vec![unit], &newest).await.unwrap();
+    }
     let submitted = mock.submitted();
-    assert_eq!(submitted.len(), 2);
+    assert_eq!(submitted.len(), n * 2);
+    let first: Vec<&str> = submitted[..submitted.len() / 2]
+        .iter()
+        .map(|b| b.batch_id.as_str())
+        .collect();
+    let second: Vec<&str> = submitted[submitted.len() / 2..]
+        .iter()
+        .map(|b| b.batch_id.as_str())
+        .collect();
     assert_eq!(
-        submitted[0].batch_id, submitted[1].batch_id,
-        "re-runs derive the same content-bound batch id"
+        first, second,
+        "re-runs derive the same content-bound batch ids"
     );
     mock.stop();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn declared_bound_stops_the_window() {
-    let repo = fixture_repo();
     let mock = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
     let cursor = dir.path().join("c.cursor");
@@ -232,8 +257,10 @@ async fn declared_bound_stops_the_window() {
     )
     .await
     .unwrap();
-    let (commits, _) = parse_git_log(&log_of(repo.path(), "--all"));
-    let unit = map_history("fixture-repo", &commits, "window-0");
+    // A hand-built over-bound unit (the bounded mapper cannot produce
+    // one): the declared window bound must still stop it before the
+    // wire, cursor untouched.
+    let unit = oversized_unit();
     let err = session
         .submit_window(vec![unit], "whatever")
         .await
@@ -461,4 +488,42 @@ async fn max_window_below_two_is_rejected_at_parse() {
         .expect("spawn the git adapter binary");
     assert!(!output.status.success(), "parse rejection is an error");
     assert!(!mock.calls().iter().any(|c| c == "submit"));
+}
+
+/// The binary's mapping path: bounded units for the fixture history.
+fn bounded_units(
+    repo_id: &str,
+    commits: &[exocortex_adapter_git::GitCommit],
+) -> Vec<exocortex_adapter_sdk::BatchUnit> {
+    exocortex_adapter_git::map_history_bounded(repo_id, commits, "w", 256, 64)
+        .into_iter()
+        .map(|b| b.unit)
+        .collect()
+}
+
+/// Five independent rows in one unit: over the declared max_rows_per_window=2.
+fn oversized_unit() -> exocortex_adapter_sdk::BatchUnit {
+    use exocortex_adapter_sdk::BatchUnit;
+    use exocortex_wire::ingest::v1::MemoryDraft;
+    BatchUnit {
+        batch_id_seed: "oversized".into(),
+        memories: (0..5)
+            .map(|i| MemoryDraft {
+                rights: None,
+                draft_key: format!("row-{i}"),
+                id: String::new(),
+                memory_type: "Command".into(),
+                title: format!("row {i}"),
+                content: "oversized fixture row".into(),
+                tags: vec![],
+                visibility: 3,
+                valid_from: None,
+                valid_until: None,
+                external_key: None,
+            })
+            .collect(),
+        relationships: vec![],
+        snapshot: None,
+        observed_at: std::time::UNIX_EPOCH,
+    }
 }

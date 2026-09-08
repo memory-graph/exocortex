@@ -152,6 +152,10 @@ pub fn split_unit(
         // ResourceLimitExceeded — a PERMANENT rejection that settles the
         // window and advances the cursor past the rows (R12). A batch
         // the server would permanently reject must never leave the SDK.
+        // Unreachable while MAX_MEMORIES_PER_BATCH > MAX_EDGES_PER_BATCH
+        // (a connected component of N memories carries >= N-1 edges, so
+        // the edge arm below fires first); kept for a future ceiling
+        // change and provably correct if one lands.
         if comp.0.len() > MAX_MEMORIES_PER_BATCH {
             let mut keys: Vec<String> = comp.0.iter().map(|m| m.draft_key.clone()).collect();
             keys.sort();

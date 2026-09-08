@@ -69,13 +69,6 @@ pack! {
         InProject     => bucket: Context,    inverse: ProjectHas,   bi: false, default_strength: 0.80,
         WrittenIn     => bucket: Context,    inverse: Powers,       bi: false, default_strength: 0.65,
         Modifies      => bucket: Context,    inverse: ModifiedBy,    bi: false, default_strength: 0.65,
-        // D8 (§12.1 step 4): abstraction→member membership, server-written
-        // only (computed_only above). Symmetric like SimilarTo — one row
-        // serves both traversal directions. The abstraction row itself is
-        // a `General` memory (provenance-distinguished), NOT a new type:
-        // type ids run across packs with a shared offset, so a dev-v1
-        // type append would renumber every later pack.
-        Summarizes    => bucket: Context,    inverse: Self,          bi: true,  default_strength: 0.70,
 
         // Learning bucket (6)
         Teaches       => bucket: Learning,   inverse: LearnedFrom,  bi: false, default_strength: 0.70,
@@ -113,6 +106,18 @@ pack! {
         Exposes       => bucket: Integration,inverse: ExposedBy,    bi: false, default_strength: 0.65,
         Wraps         => bucket: Integration,inverse: WrappedBy,    bi: false, default_strength: 0.70,
         Bridges       => bucket: Integration,inverse: BridgedBy,    bi: false, default_strength: 0.70,
+
+        // D8 (§12.1 step 4): abstraction→member membership, server-written
+        // only (computed_only above). Symmetric like SimilarTo — one row
+        // serves both traversal directions. The abstraction row itself is
+        // a `General` memory (provenance-distinguished), NOT a new type:
+        // type ids run across packs with a shared offset, so a dev-v1
+        // type append would renumber every later pack. APPENDED LAST
+        // (round 12): kind local ids are declaration-sequential, and a
+        // mid-list insert renumbers every later kind — shifting what
+        // v0.4.0-stored RelKindIds decode to (id stability is the
+        // upgrade contract; only an append is a superset).
+        Summarizes    => bucket: Context,    inverse: Self,          bi: true,  default_strength: 0.70,
     }
 
     type_triples! {

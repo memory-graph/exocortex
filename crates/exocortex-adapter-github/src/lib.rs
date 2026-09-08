@@ -81,12 +81,13 @@ query PullsWindow($owner: String!, $repo: String!, $after: String, $first: Int!)
   repository(owner: $owner, name: $repo) {
     pullRequests(first: $first, after: $after,
                  orderBy: {field: UPDATED_AT, direction: DESC}) {
-      nodes { number title body url updatedAt closedAt state mergedAt
+      nodes { number title body url createdAt updatedAt closedAt state mergedAt
               author { login }
               headRefName baseRefName
               closingIssuesReferences(first: 20) {
                 nodes { number title body url updatedAt closedAt state
                         author { login }
+                        repository { nameWithOwner }
                         labels(first: 20) { nodes { name } } }
               } }
       pageInfo { hasNextPage endCursor }
@@ -132,6 +133,10 @@ pub struct GhPull {
     pub body: String,
     /// URL.
     pub url: String,
+    /// createdAt, RFC3339; the belief's natural valid_from (a retired
+    /// row whose closedAt predates "now" is otherwise permanently
+    /// rejected by the retention-before-valid rule).
+    pub created_at: String,
     /// updatedAt, RFC3339.
     pub updated_at: String,
     /// closedAt, RFC3339; empty while open.
@@ -215,6 +220,7 @@ fn parse_pull_node(node: &serde_json::Value) -> Option<GhPull> {
         title: str_field(node, "title"),
         body: bound_4000(&str_field(node, "body")),
         url: str_field(node, "url"),
+        created_at: str_field(node, "createdAt"),
         updated_at: str_field(node, "updatedAt"),
         closed_at: str_field(node, "closedAt"),
         state: str_field(node, "state").to_ascii_lowercase(),
@@ -385,8 +391,10 @@ fn issue_content(prefix: &str, issue: &GhIssue) -> String {
 /// overwrite) this repo's #10 — identity is (repo, number), not number.
 fn issue_identity(owner: &str, repo: &str, issue: &GhIssue) -> (String, String) {
     match &issue.repo {
-        Some(foreign) if foreign != &format!("{owner}/{repo}") => (
-            format!("issue-{}-{}", foreign.replace('/', "-"), issue.number),
+        Some(foreign) if !same_repo(foreign, owner, repo) => (
+            // The slash is kept: owner/repo names cannot contain '/',
+            // so the composite cannot collide across distinct repos.
+            format!("issue-{foreign}-{}", issue.number),
             format!("issue:{foreign}#{}", issue.number),
         ),
         _ => (
@@ -401,13 +409,28 @@ fn issue_identity(owner: &str, repo: &str, issue: &GhIssue) -> (String, String) 
 /// like top-level issues of this repo (one row per number, idempotent
 /// replays).
 pub fn normalize_closing_repos(pulls: &mut [GhPull], owner: &str, repo: &str) {
-    let target = format!("{owner}/{repo}");
     for pull in pulls {
         for issue in &mut pull.closing {
-            if issue.repo.as_deref() == Some(target.as_str()) {
+            if issue
+                .repo
+                .as_deref()
+                .is_some_and(|foreign| same_repo(foreign, owner, repo))
+            {
                 issue.repo = None;
             }
         }
+    }
+}
+
+/// Case-insensitive owner/repo equality: GitHub canonicalizes
+/// `nameWithOwner` casing, and an operator passing `--owner Microsoft`
+/// must not turn every same-repo ref foreign.
+fn same_repo(name_with_owner: &str, owner: &str, repo: &str) -> bool {
+    match name_with_owner.split_once('/') {
+        Some((their_owner, their_repo)) => {
+            their_owner.eq_ignore_ascii_case(owner) && their_repo.eq_ignore_ascii_case(repo)
+        }
+        None => false,
     }
 }
 
@@ -522,7 +545,11 @@ pub fn map_window(
             content,
             tags: vec!["github".into(), "pull-request".into()],
             visibility,
-            valid_from: None,
+            // The belief began at creation: valid_from = createdAt, so
+            // a retired row (closedAt in the past) satisfies
+            // retention-before-valid instead of being permanently
+            // rejected with the cursor advancing past it.
+            valid_from: rfc3339_to_timestamp(&pull.created_at),
             // A closed-but-unmerged PR is an abandoned change: retired.
             // Merged PRs stay open (the change happened).
             valid_until: if pull.state == "closed" && !pull.closed_at.is_empty() {
@@ -838,6 +865,7 @@ mod tests {
                 title: "fix: x".into(),
                 body: String::new(),
                 url: String::new(),
+                created_at: String::new(),
                 updated_at: String::new(),
                 closed_at: String::new(),
                 state: String::new(),
@@ -951,6 +979,7 @@ mod tests {
             title: "Add the docs page".into(),
             body: String::new(),
             url: String::new(),
+            created_at: String::new(),
             updated_at: "2026-09-02T00:00:00Z".into(),
             closed_at: String::new(),
             state: "open".into(),
@@ -1039,6 +1068,7 @@ mod tests {
             title: "p".into(),
             body: String::new(),
             url: String::new(),
+            created_at: String::new(),
             updated_at: "2026-09-02T00:00:00Z".into(),
             closed_at: String::new(),
             state: "open".into(),
@@ -1081,6 +1111,7 @@ mod tests {
         let newer_than_pr = bare_issue(77, "2026-09-03T00:00:00Z");
         let pr = GhPull {
             number: 5,
+            created_at: String::new(),
             updated_at: "2026-09-02T00:00:00Z".into(),
             closing: vec![newer_than_pr],
             title: "p".into(),
@@ -1119,6 +1150,7 @@ mod tests {
         let closing = || vec![bare_issue(42, "2026-09-01T00:00:00Z")];
         let pr = |number: u64| GhPull {
             number,
+            created_at: String::new(),
             updated_at: "2026-09-02T00:00:00Z".into(),
             closing: closing(),
             title: "p".into(),
@@ -1149,6 +1181,7 @@ mod tests {
             title: "p".into(),
             body: String::new(),
             url: String::new(),
+            created_at: String::new(),
             updated_at: "2026-09-02T00:00:00Z".into(),
             closed_at: String::new(),
             state: "open".into(),
@@ -1184,6 +1217,7 @@ mod tests {
             title: "p".into(),
             body: String::new(),
             url: String::new(),
+            created_at: String::new(),
             updated_at: "2026-09-02T00:00:00Z".into(),
             closed_at: String::new(),
             state: "open".into(),
@@ -1209,6 +1243,7 @@ mod tests {
             title: "fix it".into(),
             body: String::new(),
             url: String::new(),
+            created_at: String::new(),
             updated_at: "2026-09-02T00:00:00Z".into(),
             closed_at: String::new(),
             state: "open".into(),
@@ -1226,7 +1261,7 @@ mod tests {
             .iter()
             .find(|r| r.from_draft_key == "pull-7")
             .expect("closing edge emitted");
-        assert_eq!(edge.to_draft_key, "issue-other-repo-10");
+        assert_eq!(edge.to_draft_key, "issue-other/repo-10");
         // The chunker's dedupe key is composite too: a PR closing foreign
         // #10 while local #10 stands alone leaves BOTH rows in the window.
         let windows = chunk_windows(vec![local], vec![pull], 64).unwrap();
@@ -1242,7 +1277,7 @@ mod tests {
             "local issue keeps its key: {keys:?}"
         );
         assert!(
-            keys.contains(&"issue-other-repo-10"),
+            keys.contains(&"issue-other/repo-10"),
             "foreign issue carries its own key: {keys:?}"
         );
         let pks: Vec<&str> = unit
@@ -1264,6 +1299,7 @@ mod tests {
             title: String::new(),
             body: String::new(),
             url: String::new(),
+            created_at: String::new(),
             updated_at: String::new(),
             closed_at: String::new(),
             state: String::new(),
@@ -1274,9 +1310,11 @@ mod tests {
         };
         let mut same = bare_issue(3, "2026-09-01T00:00:00Z");
         same.repo = Some("o/r".into());
+        let mut differently_cased = bare_issue(5, "2026-09-01T00:00:00Z");
+        differently_cased.repo = Some("O/R".into());
         let mut other = bare_issue(4, "2026-09-01T00:00:00Z");
         other.repo = Some("other/repo".into());
-        pull.closing = vec![same, other];
+        pull.closing = vec![same, other, differently_cased];
         let mut pulls = [pull];
         normalize_closing_repos(&mut pulls, "o", "r");
         assert_eq!(
@@ -1287,6 +1325,10 @@ mod tests {
             pulls[0].closing[1].repo.as_deref(),
             Some("other/repo"),
             "foreign ref keeps its repo"
+        );
+        assert_eq!(
+            pulls[0].closing[2].repo, None,
+            "case-differing same-repo refs fold too (GitHub canonicalizes casing)"
         );
     }
 
@@ -1333,6 +1375,7 @@ mod tests {
             title: "p".into(),
             body: String::new(),
             url: String::new(),
+            created_at: String::new(),
             updated_at: "2026-09-02T00:00:00Z".into(),
             closed_at: String::new(),
             state: "open".into(),

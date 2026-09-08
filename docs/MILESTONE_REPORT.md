@@ -573,7 +573,7 @@ Deviations recorded for the pack-registered Actions/Functions delivery
 - **Intended fingerprint move (both levels)** — `PackDef` gained
   signature-level verb sections, moving every pack's fingerprints once.
   Over the composed set every linked binary now loads: compatibility
-  `2c3ec388…5c23` gates, build `18dbf33b…49f5` reports. Goldens,
+  `a427b3ad…ed9d` gates, build `e21654cb…989f` reports. Goldens,
   AGENTS.md, and CLAUDE.md updated in the same change (per the OC-PRD
   managed-change discipline Wave 0 was built for).
 

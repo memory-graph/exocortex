@@ -1529,17 +1529,44 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             return Ok(());
         };
         let now = chrono::Utc::now();
-        let mut by_class: std::collections::BTreeMap<u32, Vec<&MemoryWithEmbedding>> =
+        // Group by class AND access scope: one abstraction row carries
+        // one visibility label and one context, so it can only
+        // faithfully represent members whose read restrictions
+        // coincide — a Private-member abstraction under the first
+        // member's author would expose other authors' private titles
+        // through `memory_visible` (the abstraction names up to 8 of
+        // them in its content). Scope-less Project/Team rows (legacy)
+        // group together; scoped rows group only with the same scope.
+        let scope_of = |id: &MemoryId,
+                        visibility: exocortex_kernel::Visibility|
+         -> (u8, Option<smol_str::SmolStr>) {
+            working_set
+                .memories
+                .get(id)
+                .and_then(|row| match visibility {
+                    exocortex_kernel::Visibility::Project => row.context.project_id.clone(),
+                    exocortex_kernel::Visibility::Team => row.context.team_id.clone(),
+                    exocortex_kernel::Visibility::Private => row.context.user_id.clone(),
+                    exocortex_kernel::Visibility::Org | exocortex_kernel::Visibility::Public => {
+                        None
+                    }
+                })
+                .map(|subject| (visibility as u8, Some(subject)))
+                .unwrap_or((visibility as u8, None))
+        };
+        /// (class, (visibility label, scope subject)) -> members.
+        type ScopeKey = (u32, (u8, Option<smol_str::SmolStr>));
+        let mut by_class: std::collections::BTreeMap<ScopeKey, Vec<&MemoryWithEmbedding>> =
             Default::default();
         for anchor in anchors.iter().filter(|a| !res.merged.contains(&a.id)) {
             by_class
-                .entry(anchor.class as u32)
+                .entry((anchor.class as u32, scope_of(&anchor.id, anchor.visibility)))
                 .or_default()
                 .push(anchor);
         }
         let mut new_memories: Vec<Memory> = Vec::new();
         let mut new_edges: Vec<Relationship> = Vec::new();
-        for (_class, members) in by_class {
+        for (_class_and_scope, members) in by_class {
             if members.len() < MIN_ABSTRACT_MEMBERS {
                 continue;
             }

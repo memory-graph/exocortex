@@ -228,3 +228,24 @@ fn duplicate_type_names_across_packs_rejected() {
         "got {err:?}"
     );
 }
+
+/// Round 12: a duplicate kind DISPLAY name across packs is a
+/// registration error — `kind_id` resolves by name, and two owners of
+/// one name would make resolution depend on HashMap order.
+#[test]
+fn duplicate_kind_display_names_are_rejected() {
+    let mut second = pack_def();
+    second.name = SmolStr::new_static("zz-kind-dup-pack");
+    // Same display names under DIFFERENT ids: the by-id check cannot
+    // fire; only the name check catches it.
+    for kind in second.kinds.iter_mut() {
+        kind.id = exocortex_kernel::RelKindId(kind.id.0 | 0x4000_0000);
+    }
+    second.memory_type_names = vec![]; // isolate: no type-name clash first
+    second.entity_type_names = vec![];
+    let err = Ontology::from_packs(vec![pack_def(), second]).unwrap_err();
+    assert!(
+        matches!(err, KernelError::DuplicateKindName(_)),
+        "got {err:?}"
+    );
+}

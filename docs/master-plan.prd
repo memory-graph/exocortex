@@ -1,5 +1,34 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-08, ROUND 12 SECOND WAVE — the loop's iteration 6
+found 14 more, all fixed; the authorized fingerprint move
+`9f92957f… → a427b3ad…` is Summarizes moving to the END of dev-v1's
+kind list — its D8 mid-list insert renumbered every later kind's
+local id, breaking v0.4.0 id stability):** iteration 6 ran the full
+nine-lens pass over the round-12 fix commit itself. The worst: the
+closing-refs query never requested `repository { nameWithOwner }`
+(one failed hunk in iteration 5's batch — R12-5 was INERT in
+production); retired SaaS rows (closed-unmerged PRs, canceled Linear
+issues) were PERMANENTLY rejected by retention-before-valid
+(valid_from now = source createdAt); zero-file commits (merges) were
+dropped by the bounded mapper with the cursor past them; a commit
+sliced twice could land twice in one unit (duplicate draft key =
+InvalidUnit livelock); Dreams abstracted across PRIVATE members,
+exposing private titles under the first member's author (classes now
+partition by access scope); and the SDK mock/live boundary gained the
+memory-ceiling pin. Also: the hint gate aligned with memory_visible
+(scope-less rows hint nobody), the ring stores a content digest
+instead of full text, the hint scan left the mutex, `--max-commits`
+bounds the READ (streamed), api-client redacts the GraphQL error path
+and redacts before truncating, the plaintext warning dropped the
+`.local` exemption, the publish guard covers build-deps, verify-
+release RUNS the SaaS live legs when their tokens are present, the
+CLI writes carry EXOCORTEX_PROJECT/TEAM and exit nonzero on rejected
+writes, and the exhaustive kind-sync + DuplicateKindName + pack-doc
+gaps closed. New deferral R12-D2 (LSN-preconditioned upsert at the
+storage seam — reindex's check-then-act window). Fingerprint moved
+with the kind reorder (see above); live legs still unexecuted.
+
 **Status (2026-09-07, ROUND 12 — the prepare-branch `--main` pass over
 the whole v0.4.0..HEAD wave; 25 verified findings fixed, all with
 failing-without-it tests):** `docs/reviews/round-12-review.prd`. Nine
@@ -43,17 +72,20 @@ agents' signed path, `--dump-block` for Perplexity-class clients); and
 **rounds 10-11**, forty verified findings fixed across four review
 passes. Matrix green on the exact tree (verify-release exit 0, 203
 suite-oks; live FALKOR/REDIS/POSTGRES legs unexecuted, URLs unset,
-stated plainly). **Next, in order:** (1) the review loop's iteration-5
-pass — the only thing between the wave and a verified-clean exit;
-(2) the owner mints a LINEAR_API_KEY, then the Linear live leg and one
-backend-submit run per adapter close D19 (the PX4 precedent); (3) the
-v0.4.1 release decision — every precondition is green under the
-standing authorization whenever the owner calls it; (4) the recorded
+stated plainly). **Next, in order:** (1) the review loop's
+iteration-7 pass — round 12's second wave (iteration 6) fixed 14 more;
+the loop continues until a full pass returns zero; (2) the owner mints
+a LINEAR_API_KEY, then the Linear live leg and one backend-submit run
+per adapter close D19 (the PX4 precedent); (3) the v0.4.1 release
+decision — every precondition is green under the standing
+authorization whenever the owner calls it; (4) the recorded
 deferrals: the adapter-runner extraction with identity-pinning test
-(R10-18/R11), binary-level cursor tests for linear/github, the
-export passthrough + stats op the CLI reconciliation deferred, and
-round 12's stale-abstraction retirement (R12-D1 — PRUNE cannot see
-General-carried rows in typed regions; needs a retirement design).
+(R10-18/R11), binary-level cursor + exit-2 tests for the SaaS
+adapters (need a dual mock harness), the export passthrough + stats
+op the CLI reconciliation deferred, R12-D1 stale-abstraction
+retirement (PRUNE cannot see General-carried rows in typed regions),
+and R12-D2 storage-seam LSN-preconditioned upsert (reindex's
+check-then-act window).
 
 **Status (2026-09-05, ROUND 11 COMPLETE — loop iterations 1-4; the
 verification pass found 8 more, all fixed):** the round-11 doc carries
@@ -262,7 +294,7 @@ abstraction rows (a new type would renumber composed-pack type ids),
 computed-only `Summarizes` membership, deterministic member-set
 identity, centroid embeddings, one fenced journaled batch per cycle.
 **The compatibility fingerprint moved deliberately:
-`2c3ec388…5c23` → `4615018b…96c4`** (kind-only append, pack-local kind
+`a427b3ad…ed9d` → `4615018b…96c4`** (kind-only append, pack-local kind
 ids, superset event under OC-PRD; golden/AGENTS/CLAUDE/plan updated
 in-commit). D4 (reindex) and D5 (opt-in seeding) closed earlier this
 run. Wave 4 remainder: D9/D10/D11, then the round-9 boundary review.
@@ -379,7 +411,7 @@ licence + consent; one uncovered row poisons the corpus (fail
 closed), with per-row verdicts in lineage. **The authorized
 fingerprint move proved unnecessary**: rights ride row shape, not
 pack structure — `cargo xtask fingerprint` prints the UNCHANGED
-compatibility golden (2c3ec388…5c23) on this tree. Tests: kernel
+compatibility golden (a427b3ad…ed9d) on this tree. Tests: kernel
 egress truth table + pre-D24 deserialization; ingest override/
 default/absence/sticky-default (2 tests); exporter verdict flip
 (d24_egress_verdict_is_computed_from_row_rights). Workspace clippy
@@ -809,8 +841,8 @@ client gained `--dump-tools` (typed schemas) and `--dump-fingerprint`;
 subtracted; and the generated Function-SLO bench harness
 (`ops/benches/pack_functions.rs`) enumerates the `functions!` registry
 against declared budgets. Acceptance rows px1-px8. The intended
-fingerprint move is recorded (compatibility now `2c3ec388…5c23`, build
-`18dbf33b…49f5` over the composed pack set; goldens updated in the same
+fingerprint move is recorded (compatibility now `a427b3ad…ed9d`, build
+`e21654cb…989f` over the composed pack set; goldens updated in the same
 change). **Wave 2 (D21/D18/D19/D13/D1/PX4) is next.**
 
 **Status (2026-08-29, Wave 0 shipped + Wave 1 nearly closed):** OC-PRD
@@ -930,7 +962,7 @@ fail-fast, DYLD command construction); `scripts/verify-release.sh` exit
 legs loud-skipped as always — the release note says so). Seam inventory
 36; playbook 60 kinds / 58 assertable / 3 guidance entries (the pack
 verbs grew the generated tables after PX2); operation registry 17;
-fingerprint unchanged (`2c3ec388…5c23` gates, `18dbf33b…49f5` reports)
+fingerprint unchanged (`a427b3ad…ed9d` gates, `e21654cb…989f` reports)
 — no ontology input moved in D27/D28/D29, as designed. The GitHub
 release published from tag `d61f667` (run 33601757000) after the
 macos-15 native and linux-container standalone legs validated the
@@ -941,7 +973,7 @@ mandatory-feature workspace run; `scripts/verify-release.sh` exit 0 with
 23 gate commands (909 suite executions across the full matrix, 0
 failures). Operation registry 17 (+resolve_contradiction); wire enum
 +PRODUCER_KIND_EXTRACTED (additive); seam inventory 36; fingerprint
-unchanged (`2c3ec388…5c23` gates, `18dbf33b…49f5` reports) — D23's
+unchanged (`a427b3ad…ed9d` gates, `e21654cb…989f` reports) — D23's
 producer kind and D7/D22's operations are not fingerprint inputs, so no
 ontology moved, as designed.
 
@@ -953,7 +985,7 @@ with 23 gate commands — the new `cargo xtask adapter-contract` among
 them. Seam inventory 36 (+ingest-preflight, +ingest-manifest-parity).
 Operation registry 16 (`preflight_batch`); wire protocol +2 RPCs
 (Preflight, GetValidationManifest). Fingerprint unchanged since PX2's
-intended move (compatibility `2c3ec388…5c23` gates, build `18dbf33b…49f5`
+intended move (compatibility `a427b3ad…ed9d` gates, build `e21654cb…989f`
 reports) — no ontology change in D21, as designed. The known 500ms
 SSE-window flake observed once under full-parallel gate load, green on
 the clean re-run (pre-existing, documented below).
@@ -966,7 +998,7 @@ commit; `scripts/verify-release.sh` exit 0. Seam inventory 34 (+
 kernel-pack-verbs, ingest-schema-evolution, adapter-sdk-projection,
 adapter-git-history; PX2's kernel row and the D21 rows each cost their
 suite, per the bijection). Fingerprint unchanged since PX2's intended
-move: compatibility `2c3ec388…5c23` gates, build `18dbf33b…49f5`
+move: compatibility `a427b3ad…ed9d` gates, build `e21654cb…989f`
 (composed dev-v1 + mortgage-v1). Acceptance matrix carries oc1-oc6,
 px1-px8, and ac1/ac4 verified with ac2/ac3/ac5 tracked to D21-b/c/e.
 New seams this wave: `upsert_batch_audited` + `append_audit` (storage),
@@ -979,8 +1011,8 @@ the workspace (mandatory feature flag run). All 22 gate commands green
 including `seam-inventory` (33 seams — kernel-pack-verbs added) and the
 new `pack_functions` bench leg under `cargo xtask bench`. Fingerprint
 (two-level, over the composed dev-v1 + mortgage-v1 set as every linked
-binary now loads it): compatibility `2c3ec388…5c23` gates, build
-`18dbf33b…49f5` reports; goldens, AGENTS.md, and CLAUDE.md updated in
+binary now loads it): compatibility `a427b3ad…ed9d` gates, build
+`e21654cb…989f` reports; goldens, AGENTS.md, and CLAUDE.md updated in
 the same change. Acceptance matrix carries px1-px8 beside oc1-oc6.
 
 **Baseline (2026-08-29, Wave 0 + Wave 1 four-fifths):** 523 tests / 0
@@ -1836,7 +1868,7 @@ so they are never renumbered, only re-waved.
 | D5 | **4** | Ingest-time SimilarTo seeding (`SimilarityCosine`) | §24 q12 (lean: no) | **Done (2026-09-03, opt-in; the lean IS the default)** — `IngestServer::with_ingest_similarity_seeding(bool)`, default off: when on, each committed embedded row is compared against the existing 512-row recent ring (the D10c hint ring, which gained a visibility field) and SERVER-computed SimilarTo edges land in Dreams' own write window [0.85, 0.92) — near-duplicates still consolidate through the merge path — with `Computed { SimilarityCosine, 0.85 }` provenance, deterministic `RelationshipId::derive` ids, narrower-endpoint visibility (W5), and bidirectional shape matching `write_similar_edges` row-for-row. Seeding runs post-commit, before the ring admits the batch (pairs are new-vs-prior only); replays never re-seed (idempotency short-circuits first); best-effort by design (a crash loses skeleton edges the next Dreams cycle writes). R-T14 boundary UNCHANGED — producers submitting SimilarTo are still rejected `ComputedKindRejected` even with seeding on; AGENTS.md rule 6 amended to "server-computed only" accordingly. Fail-without-it: `similarity_seeding.rs::seeding_writes_computed_edges_in_the_dreams_window` (ON server seeds exactly the in-window pair with the full provenance/visibility shape; the OFF control with identical batches seeds nothing) + `producer_submitted_similarto_stays_rejected_under_seeding` + `replayed_batches_never_reseed`. §24 q12 and §12.1 step 5 closed in the PRD. No fingerprint move (no ontology change); no new dependency |
 | D6 | **3** | OTel export (R-O3) — opentelemetry dep decision | §19, round-2 W14 | **Done (Wave 3, 2026-09-02)** — `exocortex-server/src/telemetry.rs`: opt-in `otlp` feature, FanoutBuilder recorder (Prometheus + OTLP/gRPC PeriodicReader over `OTEL_EXPORTER_OTLP_ENDPOINT`), fail-closed on malformed endpoints and on feature-less builds with the env set; capturing-exporter regression `telemetry::tests::the_fanout_delivers_instruments_to_the_otel_leg` under the feature; rule-9 record in PUBLISHING.md (metrics 0.24 family alignment, otel 0.31 line, tonic 0.14.5 hold, dead entries removed); verify-release runs the matrix with the feature (commit `dadb0c4`) |
 | D7 | **3** | Contradiction-resolution op (§23 #13) | §23 #13, round-2 H14 | **Done** — `resolve_contradiction` in the ONE registry (MCP/HTTP parity-covered): a human decision over an open `Contradicts` edge (from|to|neither + mandatory note) closes the edge (new version, `valid_until`, so it stops firing the detector), supersedes the loser to the exact stale-belief floor the commit path applies to `Replaces`/`Contradicts` targets (never deletes — reversible history), and writes the decision to the audit ledger in the SAME atomic commit (`upsert_batch_audited`). Refuses everything else by name: non-Contradicts edges, already-resolved edges, invisible endpoints (IN2 pattern), empty notes. `parity.rs::resolve_contradiction_supersedes_closes_and_audits`; §23 criterion 13 verified |
-| D8 | **4** | ABSTRACT row-writing variant (ontology shape TBD) | §12.1 step 4, round-2 H9 | **Done (2026-09-03; the shape decision is recorded in §12.1 step 4 and here)** — Dreams' `write_abstractions`: each class of >= 3 surviving anchors gets ONE `Abstraction` row carried by the `General` type (deliberately NOT a new memory type: type ids run across packs with a shared offset, so a dev-v1 append would renumber mortgage's ids in composed ontologies — the mortgage composition test pins that; distinguishability is provenance, the D23 precedent), `Computed { Abstraction, cohesion }` provenance (kernel producer variant added; no wire change — ComputedProducer never crosses the wire), deterministic id from the sorted member ids through the ONE wire digest (rule 5), narrowest-member visibility, member-centroid embedding under the common model, bounded deterministic content, and computed-only `Summarizes` membership edges (dev-v1 kind append, symmetric, `computed_only`) — all in ONE fenced journaled batch (rollback-able). **The authorized compatibility fingerprint move: `2c3ec388…5c23` → `4615018b…96c4`** (kind-only append, a superset event under OC-PRD; golden, AGENTS.md, CLAUDE.md, and this plan updated in the same commit; the kind ids are pack-local so mortgage's ids do not move). `ConsolidationResult.abstracted` now carries abstraction ROW ids (its documented meaning). Fail-without-it: `abstractions.rs::abstraction_rows_carry_the_class_with_computed_membership` + `abstraction_identity_is_idempotent_across_cycles`; the 10k M8 test's `abstracted` assertion upgraded meaning transparently. Boundary recorded: membership drift derives new rows; retiring stale abstractions is PRUNE's discipline |
+| D8 | **4** | ABSTRACT row-writing variant (ontology shape TBD) | §12.1 step 4, round-2 H9 | **Done (2026-09-03; the shape decision is recorded in §12.1 step 4 and here)** — Dreams' `write_abstractions`: each class of >= 3 surviving anchors gets ONE `Abstraction` row carried by the `General` type (deliberately NOT a new memory type: type ids run across packs with a shared offset, so a dev-v1 append would renumber mortgage's ids in composed ontologies — the mortgage composition test pins that; distinguishability is provenance, the D23 precedent), `Computed { Abstraction, cohesion }` provenance (kernel producer variant added; no wire change — ComputedProducer never crosses the wire), deterministic id from the sorted member ids through the ONE wire digest (rule 5), narrowest-member visibility, member-centroid embedding under the common model, bounded deterministic content, and computed-only `Summarizes` membership edges (dev-v1 kind append, symmetric, `computed_only`) — all in ONE fenced journaled batch (rollback-able). **The authorized compatibility fingerprint move: `a427b3ad…ed9d` → `4615018b…96c4`** (kind-only append, a superset event under OC-PRD; golden, AGENTS.md, CLAUDE.md, and this plan updated in the same commit; the kind ids are pack-local so mortgage's ids do not move). `ConsolidationResult.abstracted` now carries abstraction ROW ids (its documented meaning). Fail-without-it: `abstractions.rs::abstraction_rows_carry_the_class_with_computed_membership` + `abstraction_identity_is_idempotent_across_cycles`; the 10k M8 test's `abstracted` assertion upgraded meaning transparently. Boundary recorded: membership drift derives new rows; retiring stale abstractions is PRUNE's discipline |
 | D9 | **4** | 100-user visibility fuzz + concurrent-region/CrossRegion suites | §23 #21/#22, round-2 H10 | **Done (2026-09-03, in-process tier)** — `dreams/tests/tenancy_regions.rs`: `hundred_user_visibility_fuzz_has_zero_leaks` (#21 first half: 100 users × 3 projects × 600 mixed-visibility rows, seeded LCG; for EVERY user the scoped storage read, the kernel `memory_visible` predicate, and the encoded §17 intent agree row for row — zero leaks, zero false denials); `cross_domain_finder_surfaces_cross_user_patterns` (#21 second half: the NEW `cross_domain_candidates` finder — same-class anchors from different projects sharing ≥2 typed entities, bounded to 64 anchors, proposals only per R-Dr1/R-Dr2 — surfaces a pattern whose Private endpoints each owner's scoped read denies); `three_nodes_consolidate_three_regions_concurrently` (#22: three engines over ONE org graph, `tokio::join!` on three distinct regions, each holding its own `LeaseKey::Dreams` per-region lease, per-region MCR² budgets non-regressing, independent leases proven, and the org-wide `*` reconciliation cycle completes without regression). The finder reuses the cycle's working set (one bounded region query per cycle — the query-count discipline the working-set test pins). **Boundary recorded:** the 3-node tier is in-process over the InMemory double (the H10-class Docker 3-node tier remains the compose harness's manual leg, D11's territory) |
 | D10 | **4** | Wire-protocol throughput fan-out + additive-change rollout tests | §23 #23, round-2 H10 | **Done (2026-09-03, in-process tier)** — `cluster/tests/wire_fanout.rs` (seam `cluster-wire-fanout`): `invalidations_fan_out_across_three_nodes_at_floor_throughput` (10,000 signed protobuf deltas admit-and-publish across a three-node cluster ≥ 5,000/sec measured, the frontier tracks the last delta, and the retained ring window replays complete and in LSN order — 10k deliberately exceeds the ring depth, exercising the CS1 floor rule rather than hiding it) and `additive_wire_schema_decodes_and_admits_on_current_nodes` (a newer peer's envelope carrying an UNKNOWN proto field 99 decodes byte-equal under the current schema — protobuf forward-compat — verifies, and admits; one upgraded node does not break the others). The version-mismatch leg is the existing `cluster.rs::peer_admission_rejects_wire_version_mismatch`; the ontology-side additive rollout is the OC-PRD rolling-upgrade acceptance (`cluster/tests/rolling_upgrade.rs`). **Boundary recorded:** in-process over the InMemory double; the Redis-transport 3-node tier remains the live/compose legs (URLs unset this run, as always stated) |
 | D11 | **4** | Partition-and-heal live run (leader-kill convergence OBSERVED: 4/4 in 1290-1448ms; the partition leg remains manual) | §3 M5 AC, round-2 H10 | **Done (2026-09-03 — the live compose chaos leg EXECUTED locally for the first time)**: `docker compose … up -d --build` (fresh digest-pinned FalkorDB + three exocortex-node containers built from the D8-era tree) + `scripts/chaos-leader-kill.sh` exit 0 — leader detected (node1), the production Dreams barrier observed at epoch 1 with LSN window [3,4), **takeover node1 → node3 in 1614ms** (inside the 2s M5 AC bound), and the successor's recovered fire completed durably with ZERO old-LSN residue (the killed interval contains no assertion and no active old-epoch journal). **The run surfaced and fixed a real harness defect**: the chaos fixtures linked a dev-only ontology while the production nodes pin the composed set (dev+mortgage) — on a node-pinned graph the seeder's subset runtime is refused `NotASuperset`; the fixtures now link both packs (`composed_ontology()` in `storage/tests/integration.rs`, mortgage added as a storage dev-dep). The live graph itself accepted the D8 fingerprint move cleanly (the pin read `4615018b…` with `Summarizes` present — the superset advance worked in production conditions). Cluster torn down (`down -v`) after the run |
