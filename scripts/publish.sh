@@ -4,7 +4,7 @@ set -euo pipefail
 
 ORDER=(
   exocortex-kernel exocortex-pack-dev-v1 exocortex-pack-study-v1 exocortex-pack-mortgage-v1 exocortex-wire
-  exocortex-adapter-sdk exocortex-storage exocortex-cache
+  exocortex-api-client exocortex-adapter-sdk exocortex-storage exocortex-cache
   exocortex-reasoning exocortex-cluster exocortex-dreams exocortex-ingest
   exocortex-ops exocortex-server exocortex-client exocortex-worker
 )
@@ -43,6 +43,31 @@ if [ -n "${PUBLISH_VERSION:-}" ] && [ "$PUBLISH_VERSION" != "$release_version" ]
   exit 1
 fi
 echo "release version: $release_version"
+
+# A published crate's regular dependencies on workspace MEMBERS must be
+# published earlier in ORDER (PUBLISHING.md: "a crate must exist on
+# crates.io before its dependents verify") — a `publish = false` member
+# can never satisfy a published dependent, and the failure would
+# otherwise surface mid-release, after earlier crates already shipped.
+if ! python3 -c '
+import json, sys
+meta = json.load(sys.stdin)
+order = sys.argv[1:]
+members = {p["name"] for p in meta["packages"]}
+deps_by_pkg = {p["name"]: p.get("dependencies", []) for p in meta["packages"]}
+for i, name in enumerate(order):
+    if name not in members:
+        raise SystemExit(f"publish refused: {name} is not a workspace member")
+    for dep in deps_by_pkg.get(name, []):
+        if dep.get("kind") is None and dep["name"] in members and dep["name"] not in order[:i]:
+            raise SystemExit(
+                "publish refused: " + name + " depends on workspace member "
+                + dep["name"] + ", which is not published earlier in ORDER "
+                + "(a publish = false member can never satisfy a published dependent)"
+            )
+' "${ORDER[@]}" <<<"$metadata"; then
+  exit 1
+fi
 
 # No mutation or publication occurs until every mandatory release check passes.
 if ! bash scripts/verify-release.sh; then

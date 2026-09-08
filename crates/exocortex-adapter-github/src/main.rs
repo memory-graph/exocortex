@@ -161,8 +161,11 @@ async fn main() -> anyhow::Result<()> {
     let fetch_bound = run_rows_bound / 2;
     let mut rows_estimate: u64 = 0;
 
-    // Issues: ascending under the inclusive since filter.
+    // Issues: ascending under the inclusive since filter. A run that
+    // stops at the fetch bound must not let the cursor past what it
+    // fetched (tracked per stream; the shared cursor is clamped below).
     let mut issues: Vec<GhIssue> = Vec::new();
+    let mut issues_truncated = false;
     let mut after: Option<String> = None;
     loop {
         let mut variables = serde_json::json!({
@@ -192,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
             .is_none()
         {
             anyhow::bail!(
-                "unexpected response shape: no repository.issues connection (a renamed field                  or a 200-error body would otherwise ingest as silence)"
+                "unexpected response shape: no repository.issues connection (a renamed field or a 200-error body would otherwise ingest as silence)"
             );
         }
         let (page, skipped, has_next, end_cursor) =
@@ -203,10 +206,11 @@ async fn main() -> anyhow::Result<()> {
         rows_estimate += page.len() as u64;
         issues.extend(page);
         if rows_estimate >= fetch_bound {
+            issues_truncated = true;
             tracing::warn!(
                 rows_estimate,
                 fetch_bound,
-                "fetch bound reached (issues); re-run to continue"
+                "fetch bound reached (issues); the cursor holds at the fetched frontier — re-run continues after it"
             );
             break;
         }
@@ -218,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
 
     // PRs: newest-first walk stopping at the cursor.
     let mut pulls: Vec<GhPull> = Vec::new();
+    let mut pulls_truncated = false;
     let mut after: Option<String> = None;
     'walk: loop {
         let mut variables = serde_json::json!({
@@ -239,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
             .is_none()
         {
             anyhow::bail!(
-                "unexpected response shape: no repository.pullRequests connection (a renamed                  field or a 200-error body would otherwise ingest as silence)"
+                "unexpected response shape: no repository.pullRequests connection (a renamed field or a 200-error body would otherwise ingest as silence)"
             );
         }
         let (page, skipped, has_next, end_cursor) =
@@ -261,12 +266,13 @@ async fn main() -> anyhow::Result<()> {
             break 'walk;
         }
         if rows_estimate >= fetch_bound {
+            pulls_truncated = true;
             tracing::warn!(
                 rows_estimate,
                 fetch_bound,
-                "fetch bound reached (pulls); re-run to continue"
+                "fetch bound reached (pulls) before the backlog; the cursor holds at the resume point — raise --max-window to cross the backlog"
             );
-            break;
+            break 'walk;
         }
         if !has_next || end_cursor.is_empty() {
             break;
@@ -275,6 +281,20 @@ async fn main() -> anyhow::Result<()> {
     }
     // New pages arrive newest-first; windows emit oldest-first.
     pulls.reverse();
+    // Closing references pointing back at THIS repository fold onto
+    // the repo-local identity; foreign ones keep their own repo (a
+    // foreign #10 must never collide with local #10).
+    exocortex_adapter_github::normalize_closing_repos(&mut pulls, &args.owner, &args.repo);
+    // The cursor ceiling for a truncated run: never advance past rows
+    // a walk did not fetch (issues hold at their fetched frontier; an
+    // un-backlogged pulls walk holds at the resume point).
+    let issues_frontier = issues.iter().map(|i| i.updated_at.as_str()).max();
+    let cursor_ceiling = exocortex_adapter_github::safe_cursor_ceiling(
+        issues_truncated,
+        issues_frontier,
+        pulls_truncated,
+        resume.as_deref(),
+    );
 
     // Closing references ride the window as their own rows so every
     // edge has both endpoints in-batch (deduped against window issues).
@@ -302,13 +322,27 @@ async fn main() -> anyhow::Result<()> {
         let outcome = session.submit_window(vec![unit], &cursor).await?;
         // The operator-facing cursor advances with every settled
         // window (the SDK keeps its own file; this one is what the
-        // next run resumes from).
-        save_cursor_atomic(&args.cursor, &cursor)?;
+        // next run resumes from) — clamped to the truncation ceiling
+        // so a fetch-bounded run never strands un-fetched rows.
+        let effective_cursor = match &cursor_ceiling {
+            Some(ceiling) if !ceiling.is_empty() => {
+                std::cmp::min(ceiling.as_str(), cursor.as_str()).to_string()
+            }
+            Some(_) => String::new(),
+            None => cursor,
+        };
+        if !effective_cursor.is_empty() {
+            save_cursor_atomic(&args.cursor, &effective_cursor)?;
+        }
         tracing::info!(
             accepted = outcome.accepted,
             duplicates = outcome.duplicates,
             rejected = outcome.permanent_rejections.len(),
-            cursor = %cursor,
+            cursor = %if effective_cursor.is_empty() {
+                "(held: fetch bound truncated a walk)".to_string()
+            } else {
+                effective_cursor.clone()
+            },
             "window settled"
         );
         rejected_rows += outcome.permanent_rejections.len();

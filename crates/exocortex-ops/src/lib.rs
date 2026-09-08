@@ -96,6 +96,10 @@ pub struct ReindexStats {
     pub reembedded: u64,
     /// Rows already at the target model and vector.
     pub unchanged: u64,
+    /// Rows skipped because they changed (or were retired) after the
+    /// scan — never overwritten with the stale scan; the next reindex
+    /// run picks them up under their new content.
+    pub superseded: u64,
     /// The model every row now carries.
     pub model_name: String,
     /// Its revision.

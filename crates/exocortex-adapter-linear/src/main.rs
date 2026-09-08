@@ -180,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
         if data.get("issues").is_none() {
             anyhow::bail!(
-                "unexpected response shape: no `issues` connection (a renamed field or a                  200-error body would otherwise ingest as silence)"
+                "unexpected response shape: no `issues` connection (a renamed field or a 200-error body would otherwise ingest as silence)"
             );
         }
         let (issues, skipped, has_next, end_cursor) =

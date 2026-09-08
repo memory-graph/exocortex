@@ -14,10 +14,14 @@ exocortex_kernel::pack! {
     memory_types! { Hazard }
     entity_types! { Nothing }
     kinds! {
-        RelatedTo => bucket: Similarity, inverse: Self, bi: true, default_strength: 0.30,
+        // Fixture-local name: a pack kind named `RelatedTo` alongside
+        // dev-v1's is a duplicate display name — the composition error
+        // R12-17 made loud (name resolution is the wire identity
+        // surface and must stay unambiguous).
+        FixtureRelates => bucket: Similarity, inverse: Self, bi: true, default_strength: 0.30,
     }
     type_triples! {
-        RelatedTo => (_, _),
+        FixtureRelates => (_, _),
     }
     crepe_rules! {
     }

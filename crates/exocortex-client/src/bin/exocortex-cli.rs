@@ -163,27 +163,28 @@ fn render_one(out: &serde_json::Value, type_names: &[String]) {
 }
 
 fn render_related(out: &serde_json::Value, type_names: &[String]) {
-    // find_related output shape: rows of (memory, path); render flat.
-    for key in ["memories", "rows", "neighbors"] {
-        if let Some(rows) = out.get(key).and_then(|v| v.as_array()) {
-            if rows.is_empty() {
-                println!("nothing related");
-            }
-            for row in rows {
-                let memory = row.get("memory").unwrap_or(row);
-                println!("{}", render_memory(memory, type_names));
-            }
-            return;
+    // find_related output shape: a flat `memories` array (the registry
+    // pins FindRelatedOutput; CR-9 parity means the HTTP answer is the
+    // registry's own serialization).
+    if let Some(rows) = out.get("memories").and_then(|v| v.as_array()) {
+        if rows.is_empty() {
+            println!("nothing related");
         }
+        for row in rows {
+            println!("{}", render_memory(row, type_names));
+        }
+        return;
     }
     println!("(unrecognized shape; use --json)");
 }
 
-fn render_chain(out: &serde_json::Value, type_names: &[String]) {
+fn render_chain(out: &serde_json::Value) {
+    // get_chain output shape: hex memory ids, origin first (the
+    // registry pins GetChainOutput { chain: Vec<String> }).
     if let Some(steps) = out.get("chain").and_then(|v| v.as_array()) {
         for (index, step) in steps.iter().enumerate() {
-            let memory = step.get("memory").unwrap_or(step);
-            println!("{:>2}. {}", index + 1, render_memory(memory, type_names));
+            let id = step.as_str().unwrap_or("(unparseable id)");
+            println!("{:>2}. {}", index + 1, id);
         }
         return;
     }
@@ -438,7 +439,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Search { .. } => render_search(&out, &type_names),
         Command::Get { .. } => render_one(&out, &type_names),
         Command::Related { .. } => render_related(&out, &type_names),
-        Command::Chain { .. } => render_chain(&out, &type_names),
+        Command::Chain { .. } => render_chain(&out),
         Command::Add { .. } => unreachable!("add handled above"),
     }
     Ok(())

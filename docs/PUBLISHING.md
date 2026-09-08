@@ -13,6 +13,22 @@ exocortex-adapter-sdk joined with A1).
 `prost-types` deps (RFC3339 -> protobuf Timestamp; both pre-existing
 workspace deps, recorded here per rule 9).
 
+**Unreleased (round-12)** — three rule-9 records: `exocortex-dreams`
+depends on `exocortex-wire` (D8: the deterministic abstraction row id
+goes through the ONE canonical `signing::content_digest`, mirroring the
+storage→wire precedent below); `exocortex-cluster` gains a `prost`
+DEV-dependency (D10: the wire-fanout test decodes an additive-only
+envelope); and `exocortex-api-client` becomes PUBLISHABLE with an ORDER
+entry before `exocortex-client` (the published client crate depends on
+it — a `publish = false` dependent's dependency can never resolve from
+the registry, and the failure would have landed mid-release). The two
+SaaS adapter binaries are now explicitly `publish = false` leaves.
+Rolling upgrades are forward-only: `ProducerKind` is a serde enum with
+no unknown-variant fallback, so a binary downgrade across a new kind
+value fails closed at the persisted registry (every producer's Submit
+rejected) rather than mislabeling provenance — roll forward, never
+back, across a producer-kind addition.
+
 **Unreleased (LP1, the study pack)** — `exocortex-pack-study-v1`
 joins the composed set in every binary: 7 memory types, 3 entity
 types, 11 relationship kinds, rules L1-L3, no pack verbs in v1. The
@@ -23,13 +39,14 @@ New ORDER entry after `exocortex-pack-dev-v1`.
 enum gains `SAAS_ADAPTER` (value 7 — older servers reject it
 fail-closed, the correct rolling-upgrade behavior; no ontology
 fingerprint move). New workspace members — `exocortex-api-client`
-(`publish = false`, the shared first-party hyper/rustls JSON+GraphQL
-client; no new dependency: hyper 0.14 + hyper-rustls 0.24 + serde_json
-were already workspace deps), `exocortex-adapter-linear`, and
-`exocortex-adapter-github` (leaf binary crates, not ORDER entries; the
-standing adapter-crate policy below) — carry the SaaS transcription
-path. Direct API credentials (LINEAR_API_KEY / GITHUB_TOKEN) live in
-`.env.local`, never in manifests.
+(the shared first-party hyper/rustls JSON+GraphQL client; no new
+dependency: hyper 0.14 + hyper-rustls 0.24 + serde_json were already
+workspace deps; published from round-12 because the published
+`exocortex-client` depends on it), `exocortex-adapter-linear`, and
+`exocortex-adapter-github` (`publish = false` leaf binary crates, not
+ORDER entries; the standing adapter-crate policy below) — carry the
+SaaS transcription path. Direct API credentials (LINEAR_API_KEY /
+GITHUB_TOKEN) live in `.env.local`, never in manifests.
 
 **0.4.0 (2026-09-02)** — the data-breadth and surface wave, additive
 throughout: wire gains the `projection` module (the canonical
@@ -68,11 +85,14 @@ repository script:
 PUBLISH_VERSION=0.4.0 scripts/publish.sh
 ```
 
-It refuses dirty manifests/lockfiles and mixed package versions, runs the full
-mandatory correctness prerequisite before changing a manifest or contacting
-crates.io, publishes without `--no-verify`, and restores temporary
-dev-dependency edits byte-for-byte. Unrelated worktree changes are neither
-rejected nor touched. Its disposable regression is
+It refuses dirty manifests/lockfiles, mixed package versions, and an
+ORDER crate whose regular dependencies name a workspace member that is
+not published earlier (a `publish = false` member can never satisfy a
+published dependent); it runs the full mandatory correctness
+prerequisite before changing a manifest or contacting crates.io,
+publishes without `--no-verify`, and restores temporary
+dev-dependency edits byte-for-byte. Unrelated worktree changes are
+neither rejected nor touched. Its disposable regression is
 `bash scripts/tests/publish.sh`.
 
 Manual equivalent (order matters — same-batch path deps are fine, but a
@@ -81,6 +101,7 @@ crate must exist on crates.io before its dependents verify):
 ```
 exocortex-kernel
   -> exocortex-pack-dev-v1, exocortex-pack-mortgage-v1, exocortex-wire
+  -> exocortex-api-client
   -> exocortex-adapter-sdk
   -> exocortex-storage
   -> exocortex-cache, exocortex-reasoning
@@ -94,6 +115,15 @@ Per crate: `cargo publish -p <name>` (run from the repo root so the
 workspace license/repository metadata applies).
 
 `xtask` is `publish = false` — it is build tooling and never ships.
+
+## Downgrade posture
+
+Rolling upgrades are forward-only. Persisted serde payloads (the source
+registry's `producer_kind`, `props_json`) decode newer enum values only
+on the binary that knows them; a rollback across a producer-kind
+addition fails closed (the whole registry read errors, ingest rejects)
+instead of mislabeling provenance. Never roll a node back past a
+serde-visible enum addition — roll forward.
 
 ## Requirements already in place
 

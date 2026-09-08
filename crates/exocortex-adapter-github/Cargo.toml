@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "GitHub adapter (D19): issues, pull requests, and their structured closing references transcribed deterministically into the dev-v1 ontology through the signed Ingestion Protocol. Direct GraphQL with a PAT — no MCP, no inference, no LLM."
 
 [[bin]]

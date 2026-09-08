@@ -26,6 +26,16 @@ if [ -n "${POSTGRES_URL:-}" ]; then
 else
   echo "live Postgres CDC suite UNEXECUTED (POSTGRES_URL unset)"
 fi
+# The SaaS adapters' live legs skip inside libtest, whose output capture
+# hides the skip line from a passing run — echo the leg status at the
+# shell level like the Postgres leg so a green run never implies live
+# coverage it did not execute.
+if [ -z "${GITHUB_TOKEN:-}" ]; then
+  echo "live GitHub adapter suite UNEXECUTED (GITHUB_TOKEN unset)"
+fi
+if [ -z "${LINEAR_API_KEY:-}" ]; then
+  echo "live Linear adapter suite UNEXECUTED (LINEAR_API_KEY unset)"
+fi
 cargo xtask write-path-parity
 cargo xtask dead-enforcement
 cargo xtask auth-coverage

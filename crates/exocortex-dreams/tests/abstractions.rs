@@ -208,6 +208,29 @@ async fn abstraction_identity_is_idempotent_across_cycles() {
 
     // Same member set ⇒ same derived id, one row, five edges.
     assert_eq!(first.abstracted, second.abstracted);
+    // R12: idempotent means NOT REWRITTEN — the committed row keeps its
+    // original timestamps (the old working-set guard could never fire in
+    // a typed region, so every cycle re-created the row with fresh
+    // stamps and a journaled create over a preimage-holding row made
+    // rollback delete the prior cycle's committed abstraction).
+    let row_after_first = storage
+        .get_memory(&first.abstracted[0])
+        .await
+        .unwrap()
+        .expect("row after cycle 1");
+    let row_after_second = storage
+        .get_memory(&second.abstracted[0])
+        .await
+        .unwrap()
+        .expect("row after cycle 2");
+    assert_eq!(
+        row_after_first.valid_from, row_after_second.valid_from,
+        "cycle 2 must not rewrite the committed abstraction row"
+    );
+    assert_eq!(
+        row_after_first.recorded_at, row_after_second.recorded_at,
+        "cycle 2 must not restamp the committed abstraction row"
+    );
     let memories = all_memories(&storage).await;
     let general = onto_kind_carrier();
     let abstractions = memories
@@ -291,4 +314,126 @@ async fn org_wide_cycles_do_not_reconsolidate_abstractions() {
     assert!(row.valid_until.is_none(), "not closed by the wide cycle");
     // Anchors are the five members, not the members + abstraction.
     assert_eq!(org_wide.memories_input, 5, "computed rows are not anchors");
+}
+
+/// R9-1's anchor filter, exercised where it actually runs: a
+/// GENERAL-typed region's cycle DOES see the General-carried abstraction
+/// row in its working set, so the `Provenance::Computed` filter is the
+/// only thing keeping the cycle from re-anchoring its own output. (The
+/// org-wide test above uses a type-3 region, which filters the row at
+/// the query and never reaches this code.)
+#[tokio::test]
+async fn general_region_cycles_exclude_computed_rows_from_anchors() {
+    let onto = ontology();
+    let storage = InMemoryStorage::new(onto.clone());
+    for row in dataset() {
+        storage.upsert_memory(&row).await.unwrap();
+    }
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        false,
+        "dreams-general".into(),
+    );
+    // Produce the abstraction row (General-carried) via a type-3 cycle.
+    let typed = engine
+        .try_consolidate(&region())
+        .await
+        .expect("typed cycle");
+    assert_eq!(typed.abstracted.len(), 1);
+    let abstraction = typed.abstracted[0];
+
+    // One General-typed ASSERTED row joins the region.
+    let mut asserted = member(99, [0.1, 0.2, 0.3, 0.4]);
+    asserted.memory_type = onto_kind_carrier();
+    storage.upsert_memory(&asserted).await.unwrap();
+
+    // The General region's working set now holds the computed
+    // abstraction row AND the asserted row — only the asserted row may
+    // anchor.
+    let general = engine
+        .try_consolidate(&RegionKey {
+            org: "o".into(),
+            project: "p".into(),
+            memory_type: onto_kind_carrier(),
+        })
+        .await
+        .expect("general cycle");
+    assert_eq!(
+        general.memories_input, 1,
+        "the computed abstraction row is not an anchor in its own carrier region"
+    );
+    assert!(
+        !general.merged.contains(&abstraction),
+        "computed rows are never merge targets"
+    );
+}
+
+/// R12: cross-domain proposals pair human-asserted rows only — a
+/// General-carried abstraction row inherits its members' entities, and
+/// machine rows pairing into CrossDomain proposals is evidence-free
+/// pairing the finder's own doc disclaims.
+#[tokio::test]
+async fn cross_domain_proposals_skip_computed_rows() {
+    use exocortex_dreams::DiscoveryKind;
+    let onto = ontology();
+    let storage = InMemoryStorage::new(onto.clone());
+    // Two projects' rows sharing two entities (the finder's floor).
+    let mut a = member(1, [0.9, 0.1, 0.0, 0.0]);
+    a.memory_type = 3;
+    a.context.project_id = Some("p0".into());
+    a.context.entities = vec![
+        exocortex_kernel::EntityId::from_parts("o", 4, "rust"),
+        exocortex_kernel::EntityId::from_parts("o", 4, "falkordb"),
+    ]
+    .into();
+    let mut b = member(2, [0.1, 0.9, 0.0, 0.0]);
+    b.memory_type = 3;
+    b.context.project_id = Some("p1".into());
+    b.context.entities = a.context.entities.clone();
+    storage.upsert_memory(&a).await.unwrap();
+    storage.upsert_memory(&b).await.unwrap();
+
+    // A COMPUTED row of the region's own type carrying the same
+    // entities (what machine-written rows look like to the finder;
+    // abstractions carry the members' entities by construction).
+    let mut computed = member(3, [0.5, 0.5, 0.0, 0.0]);
+    computed.context.project_id = Some("p2".into());
+    computed.context.entities = a.context.entities.clone();
+    computed.provenance = Provenance::Computed {
+        producer: exocortex_kernel::provenance::ComputedProducer::Abstraction,
+        threshold: 0.9,
+    };
+    storage.upsert_memory(&computed).await.unwrap();
+
+    let engine = DreamsEngine::new(
+        Arc::new(storage.clone_dyn()),
+        DreamsTrigger::default(),
+        0.01,
+        0.05,
+        false,
+        "dreams-xdomain".into(),
+    );
+    let discoveries = engine
+        .run_discovery(&RegionKey {
+            org: "o".into(),
+            project: "*".into(),
+            memory_type: 3,
+        })
+        .await
+        .expect("discovery");
+    let cross: Vec<_> = discoveries
+        .iter()
+        .filter(|d| d.kind == DiscoveryKind::CrossDomain)
+        .collect();
+    assert!(!cross.is_empty(), "the asserted pair still proposes");
+    for discovery in &cross {
+        assert!(
+            discovery.endpoints.0 != computed.id && discovery.endpoints.1 != computed.id,
+            "computed rows never pair: {:?}",
+            discovery.endpoints
+        );
+    }
 }

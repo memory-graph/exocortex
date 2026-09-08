@@ -340,7 +340,7 @@ async fn a_one_shot_range_does_not_clobber_the_sequential_cursor() {
             "--cursor",
             cursor.to_str().unwrap(),
             "--range",
-            "HEAD~2..HEAD",
+            "HEAD~2..HEAD~1",
         ])
         .env("EXOCORTEX_AUTH_TOKEN", "test-bearer")
         .env("EXOCORTEX_HMAC_KEY", "42".repeat(32))
@@ -356,4 +356,109 @@ async fn a_one_shot_range_does_not_clobber_the_sequential_cursor() {
         sequential,
         "--range is one-shot; it must not move the sequential cursor"
     );
+}
+
+/// The cursor test's value pin: the operator cursor must equal the
+/// repo's actual HEAD sha (writing the OLDEST sha, or writing before a
+/// window settles, must fail here).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_operator_cursor_is_the_newest_settled_sha() {
+    let repo = fixture_repo();
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cursor = dir.path().join("op3.cursor");
+    mock.push_script(vec![MockSubmit::Accept]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-adapter-git"))
+        .args([
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--backend",
+            &mock.url(),
+            "--org",
+            "org",
+            "--producer",
+            "git-test",
+            "--cursor",
+            cursor.to_str().unwrap(),
+        ])
+        .env("EXOCORTEX_AUTH_TOKEN", "test-bearer")
+        .env("EXOCORTEX_HMAC_KEY", "42".repeat(32))
+        .output()
+        .expect("spawn the git adapter binary");
+    assert!(output.status.success());
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    assert_eq!(
+        std::fs::read_to_string(&cursor).unwrap().trim(),
+        head,
+        "the cursor is the newest settled commit, not merely some sha"
+    );
+}
+
+/// R11-13: permanently rejected rows sit behind an advanced cursor and
+/// never retry — a scheduler must see failure (exit 2), not
+/// success-with-lost-rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn permanent_rejections_exit_nonzero() {
+    let repo = fixture_repo();
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cursor = dir.path().join("op4.cursor");
+    mock.push_script(vec![MockSubmit::RejectRows(
+        exocortex_wire::ingest::v1::RejectCode::ResourceLimitExceeded as i32,
+        "fixture rejection",
+    )]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-adapter-git"))
+        .args([
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--backend",
+            &mock.url(),
+            "--org",
+            "org",
+            "--producer",
+            "git-test",
+            "--cursor",
+            cursor.to_str().unwrap(),
+        ])
+        .env("EXOCORTEX_AUTH_TOKEN", "test-bearer")
+        .env("EXOCORTEX_HMAC_KEY", "42".repeat(32))
+        .output()
+        .expect("spawn the git adapter binary");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "exit 2 names lost rows: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// R10-4's parse guard, which round 10 gave the SaaS adapters but not
+/// git: `--max-window < 2` cannot represent a window and must be
+/// rejected at parse, before any fetch.
+#[tokio::test(flavor = "multi_thread")]
+async fn max_window_below_two_is_rejected_at_parse() {
+    let repo = fixture_repo();
+    let mock = MockServer::start().await;
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_exocortex-adapter-git"))
+        .args([
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--backend",
+            &mock.url(),
+            "--org",
+            "org",
+            "--max-window",
+            "1",
+        ])
+        .env("EXOCORTEX_AUTH_TOKEN", "test-bearer")
+        .env("EXOCORTEX_HMAC_KEY", "42".repeat(32))
+        .output()
+        .expect("spawn the git adapter binary");
+    assert!(!output.status.success(), "parse rejection is an error");
+    assert!(!mock.calls().iter().any(|c| c == "submit"));
 }

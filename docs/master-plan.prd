@@ -1,5 +1,36 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-07, ROUND 12 — the prepare-branch `--main` pass over
+the whole v0.4.0..HEAD wave; 25 verified findings fixed, all with
+failing-without-it tests):** `docs/reviews/round-12-review.prd`. Nine
+lenses + a Codex pass over the full Wave-5 range. The blockers: the
+next release would have failed mid-run (published `exocortex-client`
+depended on `publish = false` api-client — api-client is now
+publishable with an ORDER entry and publish.sh refuses an ORDER crate
+whose deps name an unpublished member); the SDK packed batches by bytes
+only, so a >64-edge welded component was PERMANENTLY rejected with the
+cursor advanced past the lost rows (split now enforces the count
+ceilings pre-wire and the mock enforces them too); a fetch-bounded
+GitHub run stranded un-fetched rows forever (per-stream truncation
+tracking + a cursor ceiling); reindex overwrote concurrent writes with
+no version precondition (optimistic LSN recheck + a `superseded`
+count); a cross-repo closing reference overwrote local issue identity
+(composite repo#number identity); and every Dreams cycle rewrote its
+committed abstraction rows, with rollback deleting them (idempotency
+now consults storage). Plus 19 advisories: git-adapter wide-commit
+livelock and unbounded history read (bounded slicing mapper), untimed
+api-client bodies + per-request TLS + token echo, SimilarTo hints
+leaking scoped titles, non-deterministic cross-domain capping over a
+full working-set clone, the deleted exhaustive kind-sync pin, README
+kind 7 + the rewrap remnants, D5's missing operator surface
+(`EXOCORTEX_INGEST_SIMILARITY_SEEDING`), the three-node fan-out test
+that never touched nodes b/c, the CLI's wrong-shape chain/related
+rendering, and the invisible live-leg skips in CI. One new deferral
+recorded: **R12-D1 stale-abstraction retirement** (PRUNE cannot see
+General-carried rows in typed regions; v2). The loop is NOT at a
+verified-clean exit — iteration 6 is next. Release note: live
+FALKOR/REDIS/POSTGRES/Linear legs remain unexecuted (URLs/key unset).
+
 **Status (2026-09-05, LIVING STATE RECONCILED at `6b5e621`):** main
 carries, in order of landing: the **SaaSAdapter kind** end to end
 (wire 7, no fingerprint move); **D19's first two legs** —
@@ -19,8 +50,10 @@ backend-submit run per adapter close D19 (the PX4 precedent); (3) the
 v0.4.1 release decision — every precondition is green under the
 standing authorization whenever the owner calls it; (4) the recorded
 deferrals: the adapter-runner extraction with identity-pinning test
-(R10-18/R11), binary-level cursor tests for linear/github, and the
-export passthrough + stats op the CLI reconciliation deferred.
+(R10-18/R11), binary-level cursor tests for linear/github, the
+export passthrough + stats op the CLI reconciliation deferred, and
+round 12's stale-abstraction retirement (R12-D1 — PRUNE cannot see
+General-carried rows in typed regions; needs a retirement design).
 
 **Status (2026-09-05, ROUND 11 COMPLETE — loop iterations 1-4; the
 verification pass found 8 more, all fixed):** the round-11 doc carries

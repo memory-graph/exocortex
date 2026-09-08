@@ -445,6 +445,9 @@ pub struct ReindexEmbeddingsOutput {
     pub reembedded: u64,
     /// Rows already at the target model.
     pub unchanged: u64,
+    /// Rows skipped: they changed after the scan (a stale scan must
+    /// never overwrite a newer assertion); the next run re-embeds them.
+    pub superseded: u64,
     /// The model every row now carries.
     pub model_name: String,
     /// Its revision.
@@ -486,6 +489,7 @@ impl Operation for ReindexEmbeddingsOp {
             scanned: stats.scanned,
             reembedded: stats.reembedded,
             unchanged: stats.unchanged,
+            superseded: stats.superseded,
             model_name: stats.model_name,
             model_version: stats.model_version,
         })

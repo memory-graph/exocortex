@@ -174,7 +174,10 @@ pub fn parse_issues_page(json: &serde_json::Value) -> (Vec<LinearIssue>, usize, 
             id,
             identifier: str_field(node, "identifier"),
             title: str_field(node, "title"),
-            description: str_field(node, "description"),
+            // Bounded at PARSE time: the pre-windowing buffer holds one
+            // struct per fetched row, and map time never needs more
+            // than the bound anyway.
+            description: bound_4000(&str_field(node, "description")),
             updated_at,
             canceled_at: str_field(node, "canceledAt"),
             url: str_field(node, "url"),
@@ -365,11 +368,8 @@ pub fn map_issues(
     visibility: i32,
 ) -> BatchUnit {
     let table = table_uuid_for(workspace);
-    let by_id: std::collections::BTreeMap<&str, usize> = issues
-        .iter()
-        .enumerate()
-        .map(|(index, issue)| (issue.id.as_str(), index))
-        .collect();
+    let known_ids: std::collections::BTreeSet<&str> =
+        issues.iter().map(|issue| issue.id.as_str()).collect();
 
     // Projects, deduped and sorted by id (deterministic emission).
     let projects: std::collections::BTreeMap<&str, &str> = issues
@@ -480,7 +480,7 @@ pub fn map_issues(
 
         // Relations: transcribed, both endpoints in-window only.
         for (kind, other) in &issue.relations {
-            if !by_id.contains_key(other.as_str()) {
+            if !known_ids.contains(other.as_str()) {
                 continue;
             }
             let (from, to) = match kind.as_str() {
@@ -510,7 +510,7 @@ pub fn map_issues(
 
         // Hierarchy: parent contains sub-issue.
         if let Some(parent) = &issue.parent_id {
-            if by_id.contains_key(parent.as_str()) {
+            if known_ids.contains(parent.as_str()) {
                 relationships.push(RelationshipDraft {
                     from_draft_key: format!("issue-{parent}"),
                     to_draft_key: key.clone(),

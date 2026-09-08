@@ -578,3 +578,120 @@ async fn near_duplicate_hint_rides_the_ack() {
         a3.similar_to
     );
 }
+
+/// R12: a hint discloses the prior row's TITLE to the submitting
+/// producer — only rows that producer could already read may surface
+/// (the D5 seeding narrowing, applied to the sibling disclosure path).
+#[tokio::test]
+async fn hints_respect_row_visibility_scope() {
+    use exocortex_kernel::Visibility as Scope;
+    use exocortex_storage::types::VisibilityContext;
+
+    fn vc(user: &str, project: &str) -> VisibilityContext {
+        VisibilityContext {
+            user_id: user.into(),
+            org_id: "org".into(),
+            project_ids: vec![project.into()].into(),
+            team_ids: Vec::new().into(),
+            max_visibility: Scope::Org,
+        }
+    }
+    async fn submit_as(
+        srv: &IngestServer<InMemoryStorage>,
+        mut b: IngestBatch,
+        context: VisibilityContext,
+    ) -> exocortex_wire::ingest::v1::IngestAck {
+        b.ontology_fingerprint = srv.ontology.fingerprint.0.to_vec();
+        // The row's project scope comes from the batch's requested
+        // client_metadata scope (server-verified against the principal).
+        if let Some(producer) = b.producer.as_mut() {
+            let mut metadata = producer.client_metadata.take().unwrap_or_default();
+            metadata.project_id = context
+                .project_ids
+                .first()
+                .map(|p| p.to_string())
+                .unwrap_or_default();
+            producer.client_metadata = Some(metadata);
+        }
+        exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
+        let mut req = Request::new(b);
+        req.extensions_mut().insert(context);
+        srv.submit(req).await.unwrap().into_inner()
+    }
+
+    let onto = Arc::new(exocortex_kernel::Ontology::from_packs(vec![pack_def()]).unwrap());
+    let srv = IngestServer::new(
+        Arc::new(InMemoryStorage::new(onto.clone())),
+        onto,
+        [5u8; 32],
+    )
+    .allow_personal_scopes()
+    .with_embedder(Arc::new(
+        exocortex_ingest::embedding::FakeEmbedder::default(),
+    ));
+    register(&srv, "vis").await;
+    let body = "Fixed the connection pool in src/pool.rs";
+
+    // A project-scoped row lands under project pa.
+    let mut scoped = draft("s1", "Fix", body);
+    scoped.visibility = 1;
+    let a1 = submit_as(&srv, batch("vis", "v1", vec![scoped]), vc("alice", "pa")).await;
+    assert_eq!(a1.rejected, 0, "{:?}", a1.rejections);
+
+    // A DIFFERENT project's producer submits a near-duplicate: no hint
+    // (the pa row's title is not theirs to see).
+    let mut foreign = draft("s2", "Fix", body);
+    foreign.visibility = 1;
+    let a2 = submit_as(&srv, batch("vis", "v2", vec![foreign]), vc("bob", "pb")).await;
+    assert_eq!(a2.rejected, 0);
+    assert!(
+        a2.similar_to.is_empty(),
+        "a cross-project hint leaks the scoped row's title: {:?}",
+        a2.similar_to
+    );
+
+    // Same project, different user: the row IS readable there, the hint
+    // surfaces.
+    let mut same_project = draft("s3", "Fix", body);
+    same_project.visibility = 1;
+    let a3 = submit_as(
+        &srv,
+        batch("vis", "v3", vec![same_project]),
+        vc("carol", "pa"),
+    )
+    .await;
+    assert_eq!(a3.rejected, 0);
+    assert_eq!(a3.similar_to.len(), 1, "same-project hint surfaces");
+
+    // A PRIVATE row hints its author only — never another producer.
+    let mut private = draft("s4", "Fix", body);
+    private.visibility = 0;
+    let a4 = submit_as(&srv, batch("vis", "v4", vec![private]), vc("alice", "pa")).await;
+    assert_eq!(a4.rejected, 0, "{:?}", a4.rejections);
+    let private_row = memories(&srv)
+        .await
+        .into_iter()
+        .find(|m| m.visibility == exocortex_kernel::Visibility::Private)
+        .expect("the private row committed");
+    let private_hex = {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for b in private_row.id.0 {
+            let _ = write!(out, "{b:02x}");
+        }
+        out
+    };
+    let mut probe = draft("s5", "Fix", body);
+    probe.visibility = 0;
+    let a5 = submit_as(&srv, batch("vis", "v5", vec![probe]), vc("dave", "pa")).await;
+    assert_eq!(a5.rejected, 0);
+    // The precise claim: dave's probe may hint the same-project row
+    // (his to read), but NEVER the private row.
+    assert!(
+        a5.similar_to
+            .iter()
+            .all(|h| h.existing_memory_id != private_hex),
+        "a private row's title never crosses producers: {:?}",
+        a5.similar_to
+    );
+}

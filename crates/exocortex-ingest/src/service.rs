@@ -223,6 +223,10 @@ pub struct ReindexReport {
     pub reembedded: u64,
     /// Rows already at the target model and vector.
     pub unchanged: u64,
+    /// Rows skipped because they changed (or were retired) after the
+    /// scan — the stale scan must never overwrite a newer assertion;
+    /// the next reindex run picks them up under their new content.
+    pub superseded: u64,
     /// The model every row now carries.
     pub model_name: String,
     /// Its revision.
@@ -245,10 +249,44 @@ pub struct RecentEmbedding {
     pub content_exact: String,
     /// Row visibility — D5 seeding narrows edge visibility by endpoint
     /// (the W5 discipline); the ring carries it so the pair is decided
-    /// without a storage read.
+    /// without a storage read. Hints gate on it too: a hint discloses
+    /// the prior row's TITLE to the submitting producer, so only rows
+    /// that producer could already read may surface.
     pub visibility: exocortex_kernel::Visibility,
+    /// Owning project (visibility gate for Project-scoped rows).
+    pub project_id: Option<String>,
+    /// Owning team (visibility gate for Team-scoped rows).
+    pub team_id: Option<String>,
+    /// Author (visibility gate for Private rows).
+    pub user_id: Option<String>,
     /// The embedding (None rows are not ringed).
     pub embedding: exocortex_kernel::Embedding,
+}
+
+/// A hint may only surface a prior row the submitting producer could
+/// already read. Scoped rows hint within their scope (Private -> same
+/// author, Project -> same project, Team -> same team, mirroring
+/// `memory_visible` — the draft's own context is the submitter's scope
+/// proxy); scope-less Project/Team rows keep the D10c advisory contract
+/// (hints on legacy scope-less rows); an author-less Private row is
+/// unreadable by every principal and hints nobody. Mirrors the D5
+/// seeding narrowing — the two disclosure paths must not disagree.
+fn hint_visible(entry: &RecentEmbedding, draft: &exocortex_kernel::MemoryContext) -> bool {
+    use exocortex_kernel::Visibility;
+    match entry.visibility {
+        Visibility::Public | Visibility::Org => true,
+        Visibility::Project => match &entry.project_id {
+            Some(project) => draft.project_id.as_deref() == Some(project.as_str()),
+            None => true,
+        },
+        Visibility::Team => match &entry.team_id {
+            Some(team) => draft.team_id.as_deref() == Some(team.as_str()),
+            None => true,
+        },
+        Visibility::Private => {
+            entry.user_id.is_some() && entry.user_id.as_deref() == draft.user_id.as_deref()
+        }
+    }
 }
 
 /// Ring bound: hints are a recency heuristic; beyond this the Dreams
@@ -958,6 +996,7 @@ impl<S: Storage> IngestServer<S> {
                     if e.org != org
                         || e.embedding.model != emb.model
                         || e.embedding.vector.len() != emb.vector.len()
+                        || !hint_visible(e, &m.context)
                     {
                         continue;
                     }
@@ -1004,6 +1043,9 @@ impl<S: Storage> IngestServer<S> {
                     memory_type: m.memory_type,
                     title: m.title.to_string(),
                     visibility: m.visibility,
+                    project_id: m.context.project_id.as_ref().map(|p| p.to_string()),
+                    team_id: m.context.team_id.as_ref().map(|t| t.to_string()),
+                    user_id: m.context.user_id.as_ref().map(|u| u.to_string()),
                     content_exact: format!(
                         "{}
 {}",
@@ -1657,16 +1699,17 @@ impl<S: Storage + 'static> IngestServer<S> {
             // R9-3: a mid-run failure names its progress — earlier chunks
             // stay committed (idempotent rerun continues), and the
             // operator can see exactly how far it got.
-            let (reembedded, unchanged) =
+            let (reembedded, unchanged, superseded) =
                 self.reindex_chunk(rows, actor).await.map_err(|error| {
                     format!(
                         "reindex failed after {} rows scanned / {} re-embedded: {error}",
                         report.scanned, report.reembedded
                     )
                 })?;
-            report.scanned += reembedded + unchanged;
+            report.scanned += reembedded + unchanged + superseded;
             report.reembedded += reembedded;
             report.unchanged += unchanged;
+            report.superseded += superseded;
             if at_end {
                 break;
             }
@@ -1679,11 +1722,12 @@ impl<S: Storage + 'static> IngestServer<S> {
 
     /// Re-embed one bounded chunk and commit the changed rows with their
     /// audit event atomically (the promote_visibility discipline).
+    /// Returns `(reembedded, unchanged, superseded)`.
     async fn reindex_chunk(
         &self,
         mut rows: Vec<Memory>,
         actor: &str,
-    ) -> Result<(u64, u64), String> {
+    ) -> Result<(u64, u64, u64), String> {
         let before: Vec<_> = rows.iter().map(|row| row.embedding.clone()).collect();
         let texts = rows
             .iter()
@@ -1691,21 +1735,42 @@ impl<S: Storage + 'static> IngestServer<S> {
             .collect::<Vec<_>>();
         let vectors = self.embed_texts(&texts).await?;
         self.stamp_embeddings(&mut rows, vectors);
-        let mut reembedded = 0u64;
         let mut unchanged = 0u64;
         let mut changed: Vec<Memory> = Vec::new();
         for (row, previous) in rows.into_iter().zip(before) {
             if row.embedding == previous {
                 unchanged += 1;
             } else {
-                reembedded += 1;
                 changed.push(row);
             }
         }
         if changed.is_empty() {
-            return Ok((reembedded, unchanged));
+            return Ok((0, unchanged, 0));
         }
-        let org_id = changed[0]
+        // Optimistic concurrency: a row updated or retired after the
+        // scan but before this commit must not be overwritten with the
+        // stale scan (or resurrected by it). Re-read each changed row
+        // and keep only those whose LSN still matches the scan; the
+        // next reindex run picks superseded rows up under their new
+        // content.
+        let mut commit: Vec<Memory> = Vec::with_capacity(changed.len());
+        let mut superseded = 0u64;
+        for row in changed {
+            let still_current = match self.storage.get_memory(&row.id).await {
+                Ok(Some(current)) => current.lsn == row.lsn,
+                _ => false,
+            };
+            if still_current {
+                commit.push(row);
+            } else {
+                superseded += 1;
+            }
+        }
+        if commit.is_empty() {
+            return Ok((0, unchanged, superseded));
+        }
+        let reembedded = commit.len() as u64;
+        let org_id = commit[0]
             .context
             .tenant_id
             .clone()
@@ -1730,16 +1795,16 @@ impl<S: Storage + 'static> IngestServer<S> {
                 .as_bytes(),
             )
             .as_bytes(),
-            output_ids: changed.iter().map(|row| row.id.to_hex().into()).collect(),
+            output_ids: commit.iter().map(|row| row.id.to_hex().into()).collect(),
             fingerprint: self.storage.ontology_fingerprint(),
             lease_epoch: None,
             recorded_at: chrono::Utc::now(),
         };
         self.storage
-            .upsert_batch_audited(&changed, &[], &audit)
+            .upsert_batch_audited(&commit, &[], &audit)
             .await
             .map_err(|error| format!("reindex chunk commit failed: {error}"))?;
-        Ok((reembedded, unchanged))
+        Ok((reembedded, unchanged, superseded))
     }
 
     /// D21-c (adapter-contract PRD D3): compile the rulebook as data —
@@ -2300,7 +2365,11 @@ impl<S: Storage + 'static> IngestServer<S> {
         let now = chrono::Utc::now();
         let mut edges: Vec<exocortex_kernel::Relationship> = Vec::new();
         {
-            let ring = self.recent.lock().unwrap();
+            // Snapshot the ring, then compute outside the lock: the
+            // pair scan is O(rows x ring x dims) and hint admission
+            // shares this mutex — holding it across the scan would
+            // serialize every concurrent submit behind one cosine loop.
+            let ring: Vec<RecentEmbedding> = self.recent.lock().unwrap().iter().cloned().collect();
             for memory in &rows.producer_memories {
                 let Some(embedding) = &memory.embedding else {
                     continue;
@@ -2827,7 +2896,7 @@ fn parse_hex_id(s: &str) -> Option<exocortex_kernel::MemoryId> {
 /// D8: the wire enum value -> the kernel's stored enum. Unknown
 /// discriminants (a client compiled against a NEWER enum than this
 /// server) fail closed to None — registration rejects.
-fn wire_kind_to_kernel(v: i32) -> Option<exocortex_kernel::ProducerKind> {
+pub fn wire_kind_to_kernel(v: i32) -> Option<exocortex_kernel::ProducerKind> {
     use exocortex_kernel::ProducerKind;
     match v {
         1 => Some(ProducerKind::CodingAgent),
@@ -2867,6 +2936,7 @@ fn kernel_error_to_reject(e: &exocortex_kernel::KernelError) -> RejectCode {
         KernelError::InvalidActionInput(_) => RejectCode::Unknown,
         KernelError::DuplicatePack(_)
         | KernelError::DuplicateKind(_)
+        | KernelError::DuplicateKindName(_)
         | KernelError::DuplicateTypeName(_)
         | KernelError::UnboundKernelConstant(_) => RejectCode::Unknown,
     }

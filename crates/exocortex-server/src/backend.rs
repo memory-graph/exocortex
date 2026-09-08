@@ -316,6 +316,7 @@ impl<S: Storage + 'static> EmbeddingReindex for RegistryReindex<S> {
             scanned: report.scanned,
             reembedded: report.reembedded,
             unchanged: report.unchanged,
+            superseded: report.superseded,
             model_name: report.model_name,
             model_version: report.model_version,
         })
@@ -890,6 +891,16 @@ async fn run_backend_node_inner<S: Storage + 'static>(
     }
 
     // Ingest: gRPC IngestService, embedding-enabled, reasoning-wired.
+    // D5's operator surface: EXOCORTEX_INGEST_SIMILARITY_SEEDING=1
+    // turns on ingest-time SimilarTo seeding (default off — the lean
+    // the plan recorded).
+    let similarity_seeding = matches!(
+        std::env::var("EXOCORTEX_INGEST_SIMILARITY_SEEDING")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "on" | "yes"
+    );
     let ingest = match standalone_producer_key {
         Some(key) => {
             IngestServer::new(storage.clone(), ontology.clone(), key).allow_personal_scopes()
@@ -903,6 +914,7 @@ async fn run_backend_node_inner<S: Storage + 'static>(
     .with_reasoning(reasoning.clone())
     .with_dreams(dreams.clone())
     .with_org(&org)
+    .with_ingest_similarity_seeding(similarity_seeding)
     .require_request_principal();
     #[cfg(feature = "fastembed")]
     let ingest = ingest.with_embedder(Arc::new(

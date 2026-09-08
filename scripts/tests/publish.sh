@@ -14,17 +14,18 @@ cp "$source_root/scripts/verify-release.sh" "$fixture/repo/scripts/verify-releas
 
 order=(
   exocortex-kernel exocortex-pack-dev-v1 exocortex-pack-study-v1 exocortex-pack-mortgage-v1 exocortex-wire
-  exocortex-adapter-sdk exocortex-storage exocortex-cache
+  exocortex-api-client exocortex-adapter-sdk exocortex-storage exocortex-cache
   exocortex-reasoning exocortex-cluster exocortex-dreams exocortex-ingest
   exocortex-ops exocortex-server exocortex-client exocortex-worker
 )
 printf '[workspace]\n' > "$fixture/repo/Cargo.toml"
 printf '# lock\n' > "$fixture/repo/Cargo.lock"
-for crate in "${order[@]}"; do
+for crate in "${order[@]}" exocortex-adapter-github; do
   mkdir -p "$fixture/repo/crates/$crate"
   printf '[package]\nname = "%s"\nversion = "0.2.2"\n' "$crate" \
     > "$fixture/repo/crates/$crate/Cargo.toml"
 done
+printf 'publish = false\n' >> "$fixture/repo/crates/exocortex-adapter-github/Cargo.toml"
 cat >> "$fixture/repo/crates/exocortex-cluster/Cargo.toml" <<'EOF'
 [dev-dependencies]
 exocortex-server = "0.2.2"
@@ -36,12 +37,23 @@ printf '%s\n' "$*" >> "$PUBLISH_TEST_LOG"
 if [ "$1" = metadata ]; then
   python3 - <<'PY'
 import json, pathlib, re
-names = "exocortex-kernel exocortex-pack-dev-v1 exocortex-pack-study-v1 exocortex-pack-mortgage-v1 exocortex-wire exocortex-adapter-sdk exocortex-storage exocortex-cache exocortex-reasoning exocortex-cluster exocortex-dreams exocortex-ingest exocortex-ops exocortex-server exocortex-client exocortex-worker".split()
+names = "exocortex-kernel exocortex-pack-dev-v1 exocortex-pack-study-v1 exocortex-pack-mortgage-v1 exocortex-wire exocortex-api-client exocortex-adapter-sdk exocortex-storage exocortex-cache exocortex-reasoning exocortex-cluster exocortex-dreams exocortex-ingest exocortex-ops exocortex-server exocortex-client exocortex-worker exocortex-adapter-github".split()
 packages = []
 for name in names:
     manifest = pathlib.Path("crates", name, "Cargo.toml").read_text()
     version = re.search(r'^version = "([^"]+)"', manifest, re.MULTILINE).group(1)
-    packages.append({"name": name, "version": version})
+    dependencies = []
+    section = None
+    for line in manifest.splitlines():
+        if line.startswith("["):
+            section = line.strip("[]")
+            continue
+        match = re.match(r"^([A-Za-z0-9_-]+)\s*=", line)
+        if match and section == "dependencies":
+            dependencies.append({"name": match.group(1), "kind": None})
+        elif match and section == "dev-dependencies":
+            dependencies.append({"name": match.group(1), "kind": "dev"})
+    packages.append({"name": name, "version": version, "dependencies": dependencies})
 print(json.dumps({"packages": packages}))
 PY
   exit 0
@@ -100,6 +112,24 @@ if bash scripts/publish.sh >"$fixture/mixed.out" 2>&1; then
   echo 'expected mixed-version refusal' >&2; exit 1
 fi
 grep -q 'mixed package versions' "$fixture/mixed.out"
+[ "$(wc -l < "$PUBLISH_TEST_LOG" | tr -d ' ')" = 1 ]
+grep -q '^metadata --format-version 1 --no-deps$' "$PUBLISH_TEST_LOG"
+
+# A published crate that regularly depends on a `publish = false` workspace
+# member (never in ORDER) is refused BEFORE any publish command runs —
+# the failure would otherwise land mid-release, after earlier crates ship.
+printf '[package]\nname = "exocortex-client"\nversion = "0.2.2"\n\n[dependencies]\nexocortex-adapter-github = { path = "../exocortex-adapter-github" }\n' \
+  > crates/exocortex-client/Cargo.toml
+git add Cargo.toml Cargo.lock crates
+git commit -qm unpublished-dep-fixture
+rm -f "$PUBLISH_TEST_LOG"
+if bash scripts/publish.sh >"$fixture/undep.out" 2>&1; then
+  echo 'expected unpublished-member-dep refusal' >&2
+  cat "$fixture/undep.out" >&2
+  exit 1
+fi
+grep -q 'not published earlier in ORDER' "$fixture/undep.out"
+# Only the metadata probe ran — no verification, no publish command.
 [ "$(wc -l < "$PUBLISH_TEST_LOG" | tr -d ' ')" = 1 ]
 grep -q '^metadata --format-version 1 --no-deps$' "$PUBLISH_TEST_LOG"
 echo 'publish fixture ok: fail-closed, verified, byte-preserving'

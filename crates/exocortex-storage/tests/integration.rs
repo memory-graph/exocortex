@@ -29,7 +29,7 @@ fn ontology() -> Arc<exocortex_kernel::Ontology> {
 }
 
 /// The chaos fixtures join the PRODUCTION graph, whose nodes pin the
-/// composed pack set (dev-v1 + mortgage-v1) — a dev-only runtime is a
+/// composed pack set (dev-v1 + mortgage-v1 + study-v1) — a dev-only runtime is a
 /// subset of that pin and is refused (NotASuperset). The harness links
 /// exactly what production links.
 fn composed_ontology() -> Arc<exocortex_kernel::Ontology> {

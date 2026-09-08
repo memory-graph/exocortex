@@ -301,13 +301,18 @@ pub enum SdkError {
         /// Fingerprint the backend now reports.
         got: [u8; 32],
     },
-    /// A connected component exceeds `max_batch_bytes` (R-I2) and cannot
-    /// be split without severing a relationship from its endpoints
-    /// (§18.1 forbids cross-batch draft references).
-    #[error("component exceeds max_batch_bytes and cannot be split")]
+    /// A connected component exceeds a per-batch ceiling — `max_batch_bytes`
+    /// (R-I2) or a server count ceiling (`max_memories_per_batch` /
+    /// `max_edges_per_batch`) — and cannot be split without severing a
+    /// relationship from its endpoints (§18.1 forbids cross-batch draft
+    /// references). Raised BEFORE any wire traffic, so the cursor never
+    /// advances past rows the server would permanently reject.
+    #[error("component exceeds {bound} and cannot be split")]
     Unsplittable {
         /// The component's draft keys.
         draft_keys: Vec<String>,
+        /// Which ceiling was hit.
+        bound: &'static str,
     },
     /// D21-a: the submission exceeds a declared projection bound. The
     /// window stops with the cursor untouched; never truncated silently.
@@ -729,7 +734,10 @@ impl AdapterSession {
                             .iter()
                             .flat_map(|b| b.memories.iter().map(|m| m.draft_key.clone()))
                             .collect();
-                        return Err(SdkError::Unsplittable { draft_keys: keys });
+                        return Err(SdkError::Unsplittable {
+                            draft_keys: keys,
+                            bound: "max_batch_bytes",
+                        });
                     }
                     tracing::debug!(over, next, "re-splitting under tightened R-I2 budget");
                     budget = next;

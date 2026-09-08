@@ -30,11 +30,16 @@ struct Args {
     #[arg(long, default_value = "git-adapter.cursor")]
     cursor: std::path::PathBuf,
     /// Maximum rows per submit window (D21-a bound).
-    #[arg(long, default_value = "256")]
+    #[arg(long, default_value = "256", value_parser = clap::value_parser!(u64).range(2..))]
     max_window: u64,
     /// Revision range instead of cursor..HEAD (one-shot mode).
     #[arg(long)]
     range: Option<String>,
+    /// Maximum commits read per run: git log output is buffered whole,
+    /// so an unbounded read of a huge history is an unbounded process
+    /// (the oldest commits land first; the rest wait for the next run).
+    #[arg(long, default_value = "20000")]
+    max_commits: usize,
 }
 
 fn save_cursor_atomic(path: &std::path::Path, value: &str) -> std::io::Result<()> {
@@ -110,9 +115,17 @@ async fn main() -> anyhow::Result<()> {
             &range,
         ],
     )?;
-    let (commits, skipped) = exocortex_adapter_git::parse_git_log(&log);
+    let (mut commits, skipped) = exocortex_adapter_git::parse_git_log(&log);
     if skipped > 0 {
         tracing::warn!(skipped, "malformed git log records skipped");
+    }
+    if commits.len() > args.max_commits {
+        let remaining = commits.len() - args.max_commits;
+        commits.truncate(args.max_commits);
+        eprintln!(
+            "history truncated at {} commits ({} newer remain; re-run to continue)",
+            args.max_commits, remaining
+        );
     }
     tracing::info!(commits = commits.len(), "parsed history");
     if commits.is_empty() {
@@ -142,53 +155,42 @@ async fn main() -> anyhow::Result<()> {
 
     let mut rejected_rows: usize = 0;
     let mut session = exocortex_adapter_sdk::AdapterSession::connect(config).await?;
-    // One window per bounded slice, oldest first (so a parent commit is
-    // ingested before its child references it).
-    // Windows are bounded by MEMORY rows (commits + the distinct file
-    // rows they introduce), not commits — the SDK counts memories
-    // against the declared bound (round-11; github and linear already
-    // counted rows).
-    let mut windows: Vec<Vec<exocortex_adapter_git::GitCommit>> = Vec::new();
-    let mut window: Vec<exocortex_adapter_git::GitCommit> = Vec::new();
-    let mut paths: std::collections::BTreeSet<String> = Default::default();
-    for commit in commits.clone() {
-        let introduces = commit.files.iter().filter(|p| !paths.contains(*p)).count();
-        if !window.is_empty() && window.len() + paths.len() + introduces > args.max_window as usize
-        {
-            windows.push(std::mem::take(&mut window));
-            paths.clear();
+    // Units are bounded by MEMORY rows (commits + distinct file rows)
+    // AND by the protocol's per-batch edge ceiling: shared paths weld
+    // commits into one component, and an over-ceiling component would
+    // be permanently rejected with the cursor already past it (R12).
+    // Oldest first, so a parent commit lands before its child
+    // references it. A commit wider than the edge ceiling is sliced
+    // across units; the cursor only advances past a commit once its
+    // last slice has settled.
+    let bounded = exocortex_adapter_git::map_history_bounded(
+        &repo_id,
+        &commits,
+        "window",
+        args.max_window as usize,
+        exocortex_wire::limits::MAX_EDGES_PER_BATCH,
+    );
+    let mut frontier = cursor_sha.clone().unwrap_or_default();
+    for bounded_unit in bounded {
+        if !bounded_unit.completes_through.is_empty() {
+            frontier = bounded_unit.completes_through;
         }
-        for path in &commit.files {
-            paths.insert(path.clone());
-        }
-        window.push(commit);
-    }
-    if !window.is_empty() {
-        windows.push(window);
-    }
-    for (index, chunk) in windows.into_iter().enumerate() {
-        if chunk.len() as u64 > args.max_window {
-            unreachable!("chunks() honors the bound");
-        }
-        let unit = exocortex_adapter_git::map_history(&repo_id, &chunk, &format!("window-{index}"));
-        let newest = chunk
-            .last()
-            .map(|commit| commit.sha.clone())
-            .unwrap_or_default();
-        let outcome = session.submit_window(vec![unit], &newest).await?;
+        let outcome = session
+            .submit_window(vec![bounded_unit.unit], &frontier)
+            .await?;
         rejected_rows += outcome.permanent_rejections.len();
         // The operator-facing cursor advances with every settled
         // window in SEQUENTIAL mode only: a one-shot --range may sit
         // mid-history, and writing its HEAD would strand the gap
         // before it (round-11 R11-6).
         if args.range.is_none() {
-            save_cursor_atomic(&args.cursor, &newest)?;
+            save_cursor_atomic(&args.cursor, &frontier)?;
         }
         tracing::info!(
             accepted = outcome.accepted,
             duplicates = outcome.duplicates,
             rejected = outcome.permanent_rejections.len(),
-            cursor = %newest,
+            cursor = %frontier,
             "window settled"
         );
         if !outcome.permanent_rejections.is_empty() {

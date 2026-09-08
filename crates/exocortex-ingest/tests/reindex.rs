@@ -364,3 +364,71 @@ async fn reindex_failure_names_partial_progress() {
         "progress named: {err}"
     );
 }
+
+/// R12: a row that changes after the scan but before the chunk commit
+/// must NOT be overwritten with the stale scan (or resurrected by it):
+/// the commit re-checks each changed row's LSN, skips superseded rows,
+/// and reports them.
+#[tokio::test(flavor = "multi_thread")]
+async fn reindex_skips_rows_superseded_after_the_scan() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct SupersedingEmbedder {
+        storage: Arc<InMemoryStorage>,
+        row: exocortex_kernel::Memory,
+        fired: AtomicBool,
+    }
+    impl Embedder for SupersedingEmbedder {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+            Ok(vec![0.9; 64])
+        }
+        fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                // The scan has already captured this row; a concurrent
+                // writer lands a newer assertion on it mid-reindex.
+                let storage = self.storage.clone();
+                let mut row = self.row.clone();
+                row.content = "concurrent update wins".into();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async move {
+                        storage.upsert_memory(&row).await.unwrap();
+                    })
+                });
+            }
+            texts.iter().map(|text| self.embed(text)).collect()
+        }
+        fn model_id(&self) -> &'static str {
+            "superseding"
+        }
+        fn model_version(&self) -> &'static str {
+            "v1"
+        }
+        fn dim(&self) -> usize {
+            64
+        }
+    }
+
+    let (storage, mut server) = server_with_rows(3).await;
+    let rows = current_rows(&storage).await;
+    assert_eq!(rows.len(), 3);
+    let target = rows[0].clone();
+    server.embedder = Some(Arc::new(SupersedingEmbedder {
+        storage: storage.clone(),
+        row: target.clone(),
+        fired: AtomicBool::new(false),
+    }));
+    let report = server.reindex_embeddings("audit").await.expect("reindex");
+    assert_eq!(
+        report.superseded, 1,
+        "the concurrently-updated row is skipped, not overwritten"
+    );
+    let after = storage
+        .get_memory(&target.id)
+        .await
+        .unwrap()
+        .expect("row present");
+    assert_eq!(
+        after.content, "concurrent update wins",
+        "the stale scan never overwrites the newer assertion"
+    );
+}

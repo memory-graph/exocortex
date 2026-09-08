@@ -18,6 +18,10 @@ pub enum KernelError {
     DuplicatePack(smol_str::SmolStr),
     /// Duplicate RelKindId across packs.
     DuplicateKind(RelKindId),
+    /// Two packs declare the same kind DISPLAY name — the wire-facing
+    /// identity surface (`kind_id` resolves by name); duplicate names
+    /// would make resolution depend on HashMap order.
+    DuplicateKindName(smol_str::SmolStr),
     /// Kernel constant not bound by any registered pack (R-Pk2).
     UnboundKernelConstant(RelKindId),
     /// Unknown RelKindId in effective ontology.
@@ -62,6 +66,10 @@ impl std::fmt::Display for KernelError {
         match self {
             KernelError::DuplicatePack(name) => write!(f, "two packs share the name `{name}` (R-Pk1)"),
             KernelError::DuplicateKind(id) => write!(f, "duplicate RelKindId {id:?} across packs"),
+            KernelError::DuplicateKindName(name) => write!(
+                f,
+                "two packs declare the kind name `{name}` (name resolution is the wire identity surface)"
+            ),
             KernelError::UnboundKernelConstant(id) => {
                 write!(f, "kernel constant {id:?} is not bound by any registered pack (R-Pk2)")
             }

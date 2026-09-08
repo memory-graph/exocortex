@@ -402,6 +402,7 @@ fn kernel_correction(e: &exocortex_kernel::KernelError) -> String {
         }
         KernelError::DuplicatePack(_)
         | KernelError::DuplicateKind(_)
+        | KernelError::DuplicateKindName(_)
         | KernelError::DuplicateTypeName(_)
         | KernelError::UnboundKernelConstant(_) => {
             "Ontology assembly error; surface to the user.".to_string()

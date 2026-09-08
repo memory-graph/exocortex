@@ -22,9 +22,11 @@
 //!
 //! `https` endpoints use the platform trust store via rustls
 //! (native-tokio); `http` is permitted for local mocks and proxies the
-//! operator pins deliberately. Response bodies are capped
-//! ([`BODY_CAP`]) so a hostile or broken endpoint cannot exhaust the
-//! host; exceeding the cap is an error, never a truncation.
+//! operator pins deliberately — a non-local plaintext endpoint draws a
+//! loud warning, because the bearer token would travel unencrypted.
+//! Response bodies are capped ([`BODY_CAP`]) so a hostile or broken
+//! endpoint cannot exhaust the host; exceeding the cap is an error,
+//! never a truncation.
 
 use std::time::Duration;
 
@@ -114,10 +116,24 @@ pub enum ApiError {
 }
 
 /// A minimal bearer-authenticated JSON POST client for one endpoint.
+/// The connection (and TLS session) is built ONCE and reused for every
+/// request — a per-request client pays a TCP+TLS handshake and a
+/// platform-trust-store load per page.
 pub struct ApiClient {
     endpoint: hyper::Uri,
-    use_tls: bool,
     user_agent: String,
+    client: hyper::Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>, hyper::Body>,
+}
+
+/// A loopback or link-local host: plaintext `http` is the local-mock
+/// case, not a credential hazard.
+fn is_local_host(host: &str) -> bool {
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
+    ) || host.ends_with(".local")
+        || host.ends_with(".localhost")
 }
 
 impl ApiClient {
@@ -127,20 +143,28 @@ impl ApiClient {
         let uri: hyper::Uri = endpoint
             .parse()
             .map_err(|e| ApiError::InvalidEndpoint(format!("{endpoint}: {e}")))?;
-        let use_tls = match uri.scheme_str() {
-            Some("https") => true,
+        match uri.scheme_str() {
+            Some("https") => {}
             // Local mocks and pinned proxies only; never a live SaaS API.
-            Some("http") => false,
+            Some("http") => {
+                let host = uri.host().unwrap_or_default();
+                if !is_local_host(host) {
+                    tracing::warn!(
+                        endpoint,
+                        "plaintext http endpoint: the bearer token travels unencrypted; local mocks and pinned proxies only"
+                    );
+                }
+            }
             other => {
                 return Err(ApiError::InvalidEndpoint(format!(
                     "{endpoint}: scheme must be http or https, got {other:?}"
                 )));
             }
-        };
+        }
         Ok(Self {
             endpoint: uri,
-            use_tls,
             user_agent: format!("exocortex-api-client/{}", env!("CARGO_PKG_VERSION")),
+            client: hyper::Client::builder().build(build_connector()?),
         })
     }
 
@@ -169,22 +193,34 @@ impl ApiClient {
             .header(hyper::header::USER_AGENT, &self.user_agent)
             .body(hyper::Body::from(payload))
             .map_err(|e| ApiError::Transport(format!("build request: {e}")))?;
-        let response = do_request(self.use_tls, request).await?;
-        let status = response.status().as_u16();
-        let rate = RateState::from_headers(response.headers());
-        let bytes = read_capped(response).await?;
+        // ONE deadline over connect + headers + BODY: a timeout that
+        // ends at the headers leaves a trickling-body endpoint free to
+        // hang the adapter forever.
+        let (status, rate, bytes) = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let response = self
+                .client
+                .request(request)
+                .await
+                .map_err(|e| ApiError::Transport(e.to_string()))?;
+            let status = response.status().as_u16();
+            let rate = RateState::from_headers(response.headers());
+            let bytes = read_capped(response).await?;
+            Ok::<_, ApiError>((status, rate, bytes))
+        })
+        .await
+        .map_err(|_| ApiError::Transport("request timed out".into()))??;
         if let Some(limited) = rate_limited(status, &rate) {
             return Err(limited);
         }
         if !(200..300).contains(&status) {
             return Err(ApiError::Status {
                 status,
-                summary: summarize(&bytes),
+                summary: summarize(&bytes, token),
                 rate,
             });
         }
         let json = serde_json::from_slice(&bytes)
-            .map_err(|e| ApiError::NotJson(format!("{e}; body: {}", summarize(&bytes))))?;
+            .map_err(|e| ApiError::NotJson(format!("{e}; body: {}", summarize(&bytes, token))))?;
         Ok((status, rate, json))
     }
 
@@ -234,72 +270,67 @@ fn rate_limited(status: u16, rate: &RateState) -> Option<ApiError> {
     })
 }
 
-fn summarize(bytes: &[u8]) -> String {
+/// Leading bytes of a response body for operator-facing error strings,
+/// with any echo of the request's own bearer token redacted (a hostile
+/// or misbehaving endpoint that echoes the `Authorization` header back
+/// must not land the credential in logs).
+fn summarize(bytes: &[u8], secret: &str) -> String {
     let text = String::from_utf8_lossy(bytes);
-    text.chars().take(500).collect()
+    let summary: String = text.chars().take(500).collect();
+    if secret.len() >= 4 {
+        summary.replace(secret, "***")
+    } else {
+        summary
+    }
 }
 
-async fn do_request(
-    use_tls: bool,
-    request: hyper::Request<hyper::Body>,
-) -> Result<hyper::Response<hyper::Body>, ApiError> {
-    // The trust-store load can panic on platforms without roots; a panic
-    // here is an environment error the operator can fix, so it surfaces
-    // as a typed error instead (the exocortex-client SSE precedent).
-    let response_future: std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<hyper::Response<hyper::Body>, hyper::Error>>>,
-    > = if use_tls {
-        // `with_native_roots` loads the platform trust store eagerly and
-        // PANICS on failure. On macOS the Keychain read flakes
-        // intermittently (security-framework -36, observed live in the
-        // D19 GitHub leg: one run loads, the next does not), so the
-        // load is retried a bounded three times before surfacing — the
-        // D29 supervisor lesson: name WHY, and do not die on a
-        // transient the second attempt survives.
-        let mut attempt = 0u32;
-        let connector = loop {
-            attempt += 1;
-            match std::panic::catch_unwind(|| {
-                hyper_rustls::HttpsConnectorBuilder::new()
-                    .with_native_roots()
-                    .https_only()
-                    .enable_http1()
-                    .enable_http2()
-                    .build()
-            }) {
-                Ok(connector) => break connector,
-                Err(payload) if attempt < 3 => {
-                    let reason = payload
-                        .downcast_ref::<&str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "(panic payload not a string)".into());
-                    tracing::warn!(attempt, %reason, "platform trust store load failed; retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(attempt)))
-                        .await;
-                }
-                Err(payload) => {
-                    let reason = payload
-                        .downcast_ref::<&str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "(panic payload not a string)".into());
-                    return Err(ApiError::Transport(format!(
-                        "failed to load the platform TLS trust store after {attempt} attempts: {reason}"
-                    )));
-                }
+/// Build the process-reusable TLS connector (both schemes: the pinned
+/// endpoint's URI decides per request; the scheme is validated at
+/// construction). The trust-store load can panic on platforms without
+/// roots — an environment error the operator can fix, surfaced as a
+/// typed error (the exocortex-client SSE precedent).
+fn build_connector() -> Result<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>, ApiError>
+{
+    // `with_native_roots` loads the platform trust store eagerly and
+    // PANICS on failure. On macOS the Keychain read flakes
+    // intermittently (security-framework -36, observed live in the
+    // D19 GitHub leg: one run loads, the next does not), so the
+    // load is retried a bounded three times before surfacing — the
+    // D29 supervisor lesson: name WHY, and do not die on a
+    // transient the second attempt survives.
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match std::panic::catch_unwind(|| {
+            hyper_rustls::HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .https_or_http()
+                .enable_http1()
+                .enable_http2()
+                .build()
+        }) {
+            Ok(connector) => return Ok(connector),
+            Err(payload) if attempt < 3 => {
+                let reason = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "(panic payload not a string)".into());
+                tracing::warn!(attempt, %reason, "platform trust store load failed; retrying");
+                std::thread::sleep(std::time::Duration::from_millis(250 * u64::from(attempt)));
             }
-        };
-        let client = hyper::Client::builder().build::<_, hyper::Body>(connector);
-        Box::pin(async move { client.request(request).await })
-    } else {
-        let client = hyper::Client::new();
-        Box::pin(async move { client.request(request).await })
-    };
-    tokio::time::timeout(REQUEST_TIMEOUT, response_future)
-        .await
-        .map_err(|_| ApiError::Transport("request timed out".into()))?
-        .map_err(|e| ApiError::Transport(e.to_string()))
+            Err(payload) => {
+                let reason = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "(panic payload not a string)".into());
+                return Err(ApiError::Transport(format!(
+                    "failed to load the platform TLS trust store after {attempt} attempts: {reason}"
+                )));
+            }
+        }
+    }
 }
 
 async fn read_capped(response: hyper::Response<hyper::Body>) -> Result<Vec<u8>, ApiError> {
@@ -403,5 +434,18 @@ mod tests {
         for bad in ["ftp://x", "api.linear.app", ""] {
             assert!(ApiClient::new(bad).is_err(), "{bad} must be refused");
         }
+    }
+
+    #[test]
+    fn summaries_redact_the_bearer_token() {
+        // A hostile or misbehaving endpoint that echoes the
+        // Authorization header back in its error body must not land
+        // the credential in operator-facing error strings.
+        let token = "ghp_secrettoken1234567890";
+        let body = format!("Authorization: Bearer {token} and more text");
+        let summary = summarize(body.as_bytes(), token);
+        assert!(!summary.contains(token), "token redacted: {summary}");
+        assert!(summary.contains("***"), "redaction marker present");
+        assert!(summary.contains("and more text"), "context preserved");
     }
 }

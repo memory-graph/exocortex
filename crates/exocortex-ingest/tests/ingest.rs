@@ -2173,3 +2173,37 @@ async fn saas_producers_are_stamped_distinguishably() {
         other => panic!("expected asserted provenance with a kind, got {other:?}"),
     }
 }
+
+/// R12: the wire ProducerKind values and the kernel enum are held in
+/// sync by an EXHAUSTIVE pin — every shipped value maps, and the next
+/// value fails closed. (Round 10 deleted the kernel-crate's exhaustive
+/// test and left only the newest arms pinned; a renumbering of arms
+/// 0-5 passed every gate.)
+#[test]
+fn wire_producer_kinds_map_exhaustively_to_the_kernel() {
+    use exocortex_kernel::ProducerKind;
+    let expected: [(i32, ProducerKind); 7] = [
+        (1, ProducerKind::CodingAgent),
+        (2, ProducerKind::ResearchAgent),
+        (3, ProducerKind::DocsAdapter),
+        (4, ProducerKind::AnalyticsAdapter),
+        (5, ProducerKind::Custom),
+        (6, ProducerKind::Extracted),
+        (7, ProducerKind::SaaSAdapter),
+    ];
+    for (wire, kernel) in expected {
+        assert_eq!(
+            exocortex_ingest::service::wire_kind_to_kernel(wire),
+            Some(kernel),
+            "wire value {wire}"
+        );
+    }
+    // Zero (UNSPECIFIED) and every unknown value fail closed.
+    for unknown in [0, 8, 9, -1, 99] {
+        assert_eq!(
+            exocortex_ingest::service::wire_kind_to_kernel(unknown),
+            None,
+            "wire value {unknown} fails closed"
+        );
+    }
+}

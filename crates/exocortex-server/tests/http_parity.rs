@@ -286,9 +286,6 @@ async fn every_operation_answers_over_http_with_auth() {
                     "finding_content": "c",
                 },
             }),
-            // D4: no input surface; this shared ctx carries no embedding
-            // handle, so both surfaces answer the same loud error.
-            "reindex_embeddings" => serde_json::json!({}),
             other => panic!("no test input crafted for op {other}"),
         }
     };

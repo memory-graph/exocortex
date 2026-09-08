@@ -1,4 +1,4 @@
-# crates/exocortex-learn-v1/Cargo.toml
+# crates/exocortex-pack-study-v1/Cargo.toml
 [package]
 name    = "exocortex-pack-study-v1"
 version.workspace = true

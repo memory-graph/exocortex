@@ -403,7 +403,8 @@ caller-supplied org or project/team scope never overrides this policy.
 `source_uri`, `producer_id`, `ceiling`, `producer_kind`, and a 64-hex
 `hmac_key`. `producer_kind` is the protobuf numeric enum value (1 coding
 agent, 2 research agent, 3 docs adapter, 4 analytics adapter, 5 custom,
-6 extraction producer — zero and unknown values fail closed). The key is
+6 extraction producer, 7 SaaS adapter — zero and unknown values fail
+closed). The key is
 unique producer authentication material for that exact identity; it is not
 the cluster secret and cannot authenticate a different source or producer.
 

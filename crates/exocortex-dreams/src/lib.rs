@@ -1546,7 +1546,21 @@ impl<S: Storage + 'static> DreamsEngine<S> {
             let mut member_ids: Vec<MemoryId> = members.iter().map(|m| m.id).collect();
             member_ids.sort();
             let abstraction_id = derive_abstraction_id(&member_ids);
-            if working_set.memories.contains_key(&abstraction_id) {
+            // Idempotency consults STORAGE, not the working set: the
+            // working set is region-type-filtered and the abstraction
+            // row is General-carried, so in a typed region the row is
+            // never in the set — the old check could not fire, every
+            // cycle rewrote the row, and the journaled `create_memory`
+            // on a preimage-holding row made rollback DELETE the prior
+            // cycle's committed abstraction.
+            if working_set.memories.contains_key(&abstraction_id)
+                || self
+                    .storage
+                    .get_memory(&abstraction_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .is_some()
+            {
                 // Same member set already abstracted (re-run or repeat
                 // cycle): idempotent, no second row.
                 res.abstracted.push(abstraction_id);
@@ -1867,22 +1881,33 @@ impl<S: Storage + 'static> DreamsEngine<S> {
         // discovery run loads at the cycle's own region budget, then the
         // pairing pass is bounded to the cap (memories_in_region ERRORS
         // past its limit, it does not truncate).
+        // Deterministic and clone-free: references sorted by id (the
+        // standalone path's own storage ordering), then capped — a
+        // HashMap-order cap picked a different arbitrary 64-subset
+        // every process, disagreeing with the standalone path and the
+        // documented determinism, and the clone moved the whole region
+        // working set to use 64 rows.
         let loaded;
-        let memories: &[Memory] = match working_set {
-            Some(set) => &set.memories.values().cloned().collect::<Vec<_>>(),
+        let mut memories: Vec<&Memory> = match working_set {
+            Some(set) => set.memories.values().collect(),
             None => {
                 loaded = self
                     .storage
                     .memories_in_region(region, MAX_REGION_MEMORIES as u32)
                     .await?;
-                &loaded
+                loaded.iter().collect()
             }
         };
+        memories.sort_by_key(|memory| memory.id);
+        // Anchors only, like select_anchors: computed rows (abstraction
+        // outputs) are machine rows — a CrossDomain proposal over two
+        // machine rows is evidence-free pairing the doc disclaims.
+        memories.retain(|memory| !matches!(memory.provenance, Provenance::Computed { .. }));
         let memories = &memories[..memories.len().min(CROSS_DOMAIN_ANCHOR_CAP)];
         let mut proposals = Vec::new();
         for i in 0..memories.len() {
             for j in (i + 1)..memories.len() {
-                let (a, b) = (&memories[i], &memories[j]);
+                let (a, b) = (memories[i], memories[j]);
                 if a.memory_type != b.memory_type
                     || a.id == b.id
                     || a.context.project_id == b.context.project_id

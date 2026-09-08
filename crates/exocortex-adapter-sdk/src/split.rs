@@ -1,11 +1,15 @@
 //! Batch splitting (R9/R10/R11): one `BatchUnit` becomes ≥1 signed
-//! `IngestBatch`es, each within `max_batch_bytes` (R-I2), each with every
-//! relationship co-located with its endpoint drafts (§18.1 forbids
-//! cross-batch `draft_key` references), each with a stable id.
+//! `IngestBatch`es, each within `max_batch_bytes` (R-I2) AND within the
+//! server's per-batch count ceilings (`MAX_MEMORIES_PER_BATCH`,
+//! `MAX_EDGES_PER_BATCH` — a batch the server would permanently reject
+//! must never leave the SDK), each with every relationship co-located
+//! with its endpoint drafts (§18.1 forbids cross-batch `draft_key`
+//! references), each with a stable id.
 
 use std::collections::BTreeMap;
 
 use exocortex_wire::ingest::v1::{IngestBatch, MemoryDraft, RelationshipDraft};
+use exocortex_wire::limits::{MAX_EDGES_PER_BATCH, MAX_MEMORIES_PER_BATCH};
 
 use crate::{BatchUnit, SdkError};
 
@@ -68,6 +72,8 @@ pub fn split_unit(
     let mut out: Vec<IngestBatch> = Vec::new();
     let mut pending: Vec<(Vec<MemoryDraft>, Vec<RelationshipDraft>)> = Vec::new();
     let mut pending_bytes = 0usize;
+    let mut pending_memories = 0usize;
+    let mut pending_edges = 0usize;
     let mut index: u32 = 0;
     let flush = |out: &mut Vec<IngestBatch>,
                  pending: &mut Vec<(Vec<MemoryDraft>, Vec<RelationshipDraft>)>,
@@ -141,32 +147,65 @@ pub fn split_unit(
 
     for (_root, comp) in components {
         let bytes = component_bytes(producer_id, unit, &comp, index)?;
+        // Per-batch COUNT ceilings mirror the byte budget: the server
+        // rejects a batch over 256 memories or 64 relationships with
+        // ResourceLimitExceeded — a PERMANENT rejection that settles the
+        // window and advances the cursor past the rows (R12). A batch
+        // the server would permanently reject must never leave the SDK.
+        if comp.0.len() > MAX_MEMORIES_PER_BATCH {
+            let mut keys: Vec<String> = comp.0.iter().map(|m| m.draft_key.clone()).collect();
+            keys.sort();
+            return Err(SdkError::Unsplittable {
+                draft_keys: keys,
+                bound: "max_memories_per_batch",
+            });
+        }
+        if comp.1.len() > MAX_EDGES_PER_BATCH {
+            let mut keys: Vec<String> = comp.0.iter().map(|m| m.draft_key.clone()).collect();
+            keys.sort();
+            return Err(SdkError::Unsplittable {
+                draft_keys: keys,
+                bound: "max_edges_per_batch",
+            });
+        }
         if bytes > max_batch_bytes {
             if comp.0.len() == 1 && comp.1.is_empty() && pending.is_empty() && out.is_empty() {
                 // A single oversized memory: unsplittable (R10).
                 return Err(SdkError::Unsplittable {
                     draft_keys: comp.0.iter().map(|m| m.draft_key.clone()).collect(),
+                    bound: "max_batch_bytes",
                 });
             }
             if !comp.1.is_empty() {
                 // A connected component that cannot fit: unsplittable.
                 let mut keys: Vec<String> = comp.0.iter().map(|m| m.draft_key.clone()).collect();
                 keys.sort();
-                return Err(SdkError::Unsplittable { draft_keys: keys });
+                return Err(SdkError::Unsplittable {
+                    draft_keys: keys,
+                    bound: "max_batch_bytes",
+                });
             }
             // Independent oversized memories flush alone; if even alone
             // they exceed the limit, unsplittable.
             if bytes > max_batch_bytes {
                 return Err(SdkError::Unsplittable {
                     draft_keys: comp.0.iter().map(|m| m.draft_key.clone()).collect(),
+                    bound: "max_batch_bytes",
                 });
             }
         }
-        if pending_bytes + bytes > max_batch_bytes && !pending.is_empty() {
+        let overflows = pending_bytes + bytes > max_batch_bytes
+            || pending_memories + comp.0.len() > MAX_MEMORIES_PER_BATCH
+            || pending_edges + comp.1.len() > MAX_EDGES_PER_BATCH;
+        if overflows && !pending.is_empty() {
             flush(&mut out, &mut pending, &mut index);
             pending_bytes = 0;
+            pending_memories = 0;
+            pending_edges = 0;
         }
         pending_bytes += bytes;
+        pending_memories += comp.0.len();
+        pending_edges += comp.1.len();
         pending.push(comp);
     }
     flush(&mut out, &mut pending, &mut index);
@@ -177,10 +216,18 @@ pub fn split_unit(
     use prost::Message;
     for b in &mut out {
         b.checksum = exocortex_wire::signing::canonical_checksum(b);
+        debug_assert!(
+            b.memories.len() <= MAX_MEMORIES_PER_BATCH
+                && b.relationships.len() <= MAX_EDGES_PER_BATCH,
+            "packing must respect the per-batch count ceilings"
+        );
         if b.encoded_len() > max_batch_bytes {
             let mut keys: Vec<String> = b.memories.iter().map(|m| m.draft_key.clone()).collect();
             keys.sort();
-            return Err(SdkError::Unsplittable { draft_keys: keys });
+            return Err(SdkError::Unsplittable {
+                draft_keys: keys,
+                bound: "max_batch_bytes",
+            });
         }
     }
     Ok(out)
@@ -396,9 +443,70 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            SdkError::Unsplittable { draft_keys } => {
+            SdkError::Unsplittable { draft_keys, bound } => {
                 assert_eq!(draft_keys, vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(bound, "max_batch_bytes");
             }
+            other => panic!("expected Unsplittable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batches_respect_the_per_batch_count_ceilings() {
+        // 300 independent memories: no batch may carry more than
+        // MAX_MEMORIES_PER_BATCH (256) however large the byte budget.
+        let memories: Vec<_> = (0..300).map(|i| draft(&format!("m{i}"), true)).collect();
+        let batches = split_unit("p", &unit("s", memories, vec![]), 10_000_000).unwrap();
+        assert!(batches.len() >= 2);
+        for b in &batches {
+            assert!(
+                b.memories.len() <= exocortex_wire::limits::MAX_MEMORIES_PER_BATCH,
+                "batch carries {} memories",
+                b.memories.len()
+            );
+        }
+
+        // 100 independent 1-edge components (2 memories + 1 relationship
+        // each): no batch may carry more than MAX_EDGES_PER_BATCH (64).
+        let mut memories = Vec::new();
+        let mut rels = Vec::new();
+        for i in 0..100 {
+            memories.push(draft(&format!("a{i}"), true));
+            memories.push(draft(&format!("b{i}"), true));
+            rels.push(rel(&format!("a{i}"), &format!("b{i}")));
+        }
+        let batches = split_unit("p", &unit("s", memories, rels), 10_000_000).unwrap();
+        assert!(batches.len() >= 2);
+        for b in &batches {
+            assert!(
+                b.relationships.len() <= exocortex_wire::limits::MAX_EDGES_PER_BATCH,
+                "batch carries {} relationships",
+                b.relationships.len()
+            );
+            assert!(
+                b.memories.len() <= exocortex_wire::limits::MAX_MEMORIES_PER_BATCH,
+                "batch carries {} memories",
+                b.memories.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_component_over_an_edge_ceiling_is_unsplittable_before_the_wire() {
+        // One commit-shaped component: 1 hub + 65 file rows + 65 edges —
+        // the server would reject every row with ResourceLimitExceeded
+        // (Permanent), settling the window and advancing the cursor past
+        // the lost rows. The SDK must refuse to build that batch.
+        let mut memories = vec![draft("commit", true)];
+        let mut rels = Vec::new();
+        for i in 0..65 {
+            let file = format!("file{i}");
+            memories.push(draft(&file, true));
+            rels.push(rel("commit", &file));
+        }
+        let err = split_unit("p", &unit("s", memories, rels), 10_000_000).unwrap_err();
+        match err {
+            SdkError::Unsplittable { bound, .. } => assert_eq!(bound, "max_edges_per_batch"),
             other => panic!("expected Unsplittable, got {other:?}"),
         }
     }

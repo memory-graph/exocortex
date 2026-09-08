@@ -84,12 +84,20 @@ impl Ontology {
         check(packs.iter().flat_map(|p| p.entity_type_names.iter()))?;
 
         // R-Pk2 groundwork: duplicate kind detection, then kernel-constant
-        // coverage.
+        // coverage. Kinds are keyed by id; their DISPLAY names are the
+        // wire-facing identity surface (`kind_id` resolves by name), so
+        // a duplicate name across packs is a registration error too —
+        // two packs owning "Covers" would make name resolution depend
+        // on HashMap order.
         let mut kinds_by_id: HashMap<RelKindId, RelMeta> = HashMap::new();
+        let mut kind_names: std::collections::HashSet<SmolStr> = std::collections::HashSet::new();
         for p in &packs {
             for k in &p.kinds {
                 if kinds_by_id.insert(k.id, k.clone()).is_some() {
                     return Err(KernelError::DuplicateKind(k.id));
+                }
+                if !kind_names.insert(k.display_name.clone()) {
+                    return Err(KernelError::DuplicateKindName(k.display_name.clone()));
                 }
             }
         }

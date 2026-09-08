@@ -992,10 +992,16 @@ mod tests {
         .unwrap();
         let error = load_source_policy(Some(&path)).unwrap_err().to_string();
         assert!(error.contains("ceiling"), "{error}");
-        // R11-9: the admin table must accept every shipped kind — the
-        // round-10 fix (6 and 7) has no other regression net; kind 8+
-        // stays fail-closed.
+        // R11-9: the admin table must accept every shipped kind and map
+        // it to the right kernel variant — the exhaustive pin (a
+        // renumbered proto or a swapped mapping fails here, not in
+        // production provenance); kind 8+ stays fail-closed.
         for (kind, expected) in [
+            (1, exocortex_kernel::ProducerKind::CodingAgent),
+            (2, exocortex_kernel::ProducerKind::ResearchAgent),
+            (3, exocortex_kernel::ProducerKind::DocsAdapter),
+            (4, exocortex_kernel::ProducerKind::AnalyticsAdapter),
+            (5, exocortex_kernel::ProducerKind::Custom),
             (6, exocortex_kernel::ProducerKind::Extracted),
             (7, exocortex_kernel::ProducerKind::SaaSAdapter),
         ] {

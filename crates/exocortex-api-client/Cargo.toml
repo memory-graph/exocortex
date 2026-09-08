@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 description = "D19: the shared first-party HTTPS client SaaS adapters speak through — POST JSON with a bearer token over the workspace's existing hyper + rustls stack, with rate-limit signals surfaced as typed values. Transport only: no retries, no inference, no LLM."
 
 [dependencies]

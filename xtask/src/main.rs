@@ -1732,7 +1732,7 @@ fn gen_playbook(write: bool) -> Result<()> {
 
     // ---- gen:kinds — bucket-grouped, computed-only flagged ----
     let mut kinds_section = String::from(
-        "<!-- gen:kinds — do not edit by hand; regenerated from exocortex-pack-dev-v1 -->\n",
+        "<!-- gen:kinds — do not edit by hand; regenerated from the loaded packs -->\n",
     );
     let bucket_name = |b: exocortex_kernel::RelBucket| -> &'static str {
         use exocortex_kernel::RelBucket::*;

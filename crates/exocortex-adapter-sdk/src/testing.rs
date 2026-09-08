@@ -230,6 +230,20 @@ impl IngestService for MockService {
                 detail,
             )));
         }
+        // Per-batch resource ceilings, enforced by the real ingest
+        // boundary as a PERMANENT rejection (the window would settle and
+        // the cursor advance past the rows). The mock enforces them so
+        // an SDK packing regression fails its own tests instead of
+        // silently losing rows on a live backend.
+        if let Err(detail) =
+            exocortex_wire::limits::validate_batch_resources(&batch.memories, &batch.relationships)
+        {
+            return Ok(Response::new(reject_all(
+                batch,
+                exocortex_wire::ingest::v1::RejectCode::ResourceLimitExceeded as i32,
+                detail,
+            )));
+        }
         let action = self
             .0
             .script

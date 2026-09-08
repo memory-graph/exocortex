@@ -115,6 +115,10 @@ pub struct GhIssue {
     pub author: String,
     /// Label names.
     pub labels: Vec<String>,
+    /// Owning repository (`owner/name`) for closing references that
+    /// point at a DIFFERENT repository; `None` for rows of the target
+    /// repo (a foreign #10 must never collide with local #10).
+    pub repo: Option<String>,
 }
 
 /// One parsed pull request with its structured closing references.
@@ -180,13 +184,21 @@ fn parse_issue_node(node: &serde_json::Value) -> Option<GhIssue> {
     Some(GhIssue {
         number,
         title: str_field(node, "title"),
-        body: str_field(node, "body"),
+        // Bounded at PARSE time: the pre-windowing buffer holds one
+        // struct per fetched row, and map time never needs more than
+        // the bound anyway.
+        body: bound_4000(&str_field(node, "body")),
         url: str_field(node, "url"),
         updated_at: str_field(node, "updatedAt"),
         closed_at: str_field(node, "closedAt"),
         state: str_field(node, "state").to_ascii_lowercase(),
         author: login_of(node),
         labels: labels_of(node),
+        repo: node
+            .get("repository")
+            .and_then(|r| r.get("nameWithOwner"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -201,7 +213,7 @@ fn parse_pull_node(node: &serde_json::Value) -> Option<GhPull> {
     Some(GhPull {
         number,
         title: str_field(node, "title"),
-        body: str_field(node, "body"),
+        body: bound_4000(&str_field(node, "body")),
         url: str_field(node, "url"),
         updated_at: str_field(node, "updatedAt"),
         closed_at: str_field(node, "closedAt"),
@@ -368,6 +380,66 @@ fn issue_content(prefix: &str, issue: &GhIssue) -> String {
     content
 }
 
+/// Identity for an issue row: a foreign closing reference carries its
+/// own repository, so `other/repo` #10 must never collide with (or
+/// overwrite) this repo's #10 — identity is (repo, number), not number.
+fn issue_identity(owner: &str, repo: &str, issue: &GhIssue) -> (String, String) {
+    match &issue.repo {
+        Some(foreign) if foreign != &format!("{owner}/{repo}") => (
+            format!("issue-{}-{}", foreign.replace('/', "-"), issue.number),
+            format!("issue:{foreign}#{}", issue.number),
+        ),
+        _ => (
+            format!("issue-{}", issue.number),
+            format!("issue:{}", issue.number),
+        ),
+    }
+}
+
+/// Fold closing references that point back at the TARGET repository
+/// onto `repo: None`, so identity and dedupe keys treat them exactly
+/// like top-level issues of this repo (one row per number, idempotent
+/// replays).
+pub fn normalize_closing_repos(pulls: &mut [GhPull], owner: &str, repo: &str) {
+    let target = format!("{owner}/{repo}");
+    for pull in pulls {
+        for issue in &mut pull.closing {
+            if issue.repo.as_deref() == Some(target.as_str()) {
+                issue.repo = None;
+            }
+        }
+    }
+}
+
+/// The highest cursor value a truncated run may safely write. The
+/// shared dual-stream cursor must never advance past rows a walk did
+/// NOT fetch: the ascending issues walk stops at its newest fetched
+/// row (a higher cursor would exclude the un-fetched newer issues
+/// from every later run's `since` filter), and a newest-first pulls
+/// walk that stopped before the backlog must not advance past the
+/// resume point at all (the un-walked middle would sit behind the new
+/// cursor forever). RFC3339 timestamps compare lexicographically;
+/// `Some("")` means hold — write nothing.
+pub fn safe_cursor_ceiling(
+    issues_truncated: bool,
+    issues_frontier: Option<&str>,
+    pulls_truncated: bool,
+    resume: Option<&str>,
+) -> Option<String> {
+    let mut ceiling: Option<String> = None;
+    if issues_truncated {
+        ceiling = Some(issues_frontier.unwrap_or("").to_string());
+    }
+    if pulls_truncated {
+        let hold = resume.unwrap_or("").to_string();
+        ceiling = Some(match ceiling {
+            Some(existing) if !existing.is_empty() => std::cmp::min(existing, hold),
+            _ => hold,
+        });
+    }
+    ceiling
+}
+
 /// Map one window (issues + PRs, already deduped: closing references
 /// not among `issues` are appended as issue rows by the caller) to a
 /// submission unit. Deterministic for a given input.
@@ -385,9 +457,10 @@ pub fn map_window(
 
     // Issues first, in given (oldest-first) order.
     for issue in issues {
+        let (draft_key, logical_pk) = issue_identity(owner, repo, issue);
         memories.push(MemoryDraft {
             rights: None,
-            draft_key: format!("issue-{}", issue.number),
+            draft_key,
             id: String::new(),
             memory_type: issue_memory_type_for(&issue.labels).into(),
             title: truncate_200(&issue.title),
@@ -400,7 +473,7 @@ pub fn map_window(
             valid_until: None,
             external_key: Some(ExternalKey {
                 table_uuid: table.to_vec(),
-                logical_pk: format!("issue:{}", issue.number),
+                logical_pk,
                 mapping_version: 1,
             }),
         });
@@ -465,7 +538,7 @@ pub fn map_window(
         });
 
         for issue in &pull.closing {
-            let issue_key = format!("issue-{}", issue.number);
+            let (issue_key, _) = issue_identity(owner, repo, issue);
             let issue_type = issue_memory_type_for(&issue.labels);
             let kind = match (pull_memory_type_for(pull), issue_type) {
                 ("Fix", "Problem") => "Fixes",
@@ -529,11 +602,12 @@ pub fn chunk_windows(
     pulls: Vec<GhPull>,
     max_window: u64,
 ) -> Result<Vec<Window>, String> {
-    // Closing-reference numbers ride with their pull, never standalone.
-    let mut carried: std::collections::BTreeSet<u64> = Default::default();
+    // Closing-reference identities ride with their pull, never
+    // standalone (composite: a foreign repo's #10 is not this repo's).
+    let mut carried: std::collections::BTreeSet<(Option<String>, u64)> = Default::default();
     for pull in &pulls {
         for issue in &pull.closing {
-            carried.insert(issue.number);
+            carried.insert((issue.repo.clone(), issue.number));
         }
     }
     struct Group {
@@ -544,7 +618,7 @@ pub fn chunk_windows(
     }
     let mut groups: Vec<Group> = Vec::new();
     for issue in issues {
-        if carried.contains(&issue.number) {
+        if carried.contains(&(issue.repo.clone(), issue.number)) {
             continue;
         }
         groups.push(Group {
@@ -585,6 +659,15 @@ pub fn chunk_windows(
     let mut rows: u64 = 0;
     let mut chunk_issues: Vec<GhIssue> = Vec::new();
     let mut chunk_pulls: Vec<GhPull> = Vec::new();
+    // Per-window dedupe, maintained incrementally (a per-group rebuild
+    // cost O(window^2) set inserts on large windows): two PRs closing
+    // the same issue would put one row twice into a shared window (a
+    // duplicate draft_key the SDK rejects). Across windows a repeat is
+    // legal and replays idempotently (same external key) — an edge's
+    // endpoint must simply be in ITS window, and each pull carries its
+    // refs. Keyed by (repo, number): a foreign repo's #10 is a
+    // different row from this repo's #10.
+    let mut seen: std::collections::BTreeSet<(Option<String>, u64)> = Default::default();
     for group in groups {
         if rows + group.cost > max_window && !(chunk_issues.is_empty() && chunk_pulls.is_empty()) {
             out.push((
@@ -592,19 +675,13 @@ pub fn chunk_windows(
                 std::mem::take(&mut chunk_pulls),
             ));
             rows = 0;
+            seen.clear();
         }
         let Group {
             issues, pull, cost, ..
         } = group;
-        // Per-window dedupe: two PRs closing the same issue would put
-        // one row twice into a shared window (a duplicate draft_key the
-        // SDK rejects). Across windows a repeat is legal and replays
-        // idempotently (same external key) — an edge's endpoint must
-        // simply be in ITS window, and each pull carries its refs.
-        let mut seen: std::collections::BTreeSet<u64> =
-            chunk_issues.iter().map(|issue| issue.number).collect();
         for issue in issues {
-            if seen.insert(issue.number) {
+            if seen.insert((issue.repo.clone(), issue.number)) {
                 chunk_issues.push(issue);
             }
         }
@@ -789,6 +866,7 @@ mod tests {
                 state: String::new(),
                 author: String::new(),
                 labels: vec![],
+                repo: None,
             }],
             ..pulls[1].clone()
         };
@@ -866,6 +944,7 @@ mod tests {
             state: "open".into(),
             author: String::new(),
             labels: vec![],
+            repo: None,
         };
         let solution_pull = GhPull {
             number: 90,
@@ -897,6 +976,7 @@ mod tests {
         // (round-10 R10-9: named by this test but never pinned).
         let problem_target = GhIssue {
             labels: vec!["Bug".into()],
+            repo: None,
             ..task_issue.clone()
         };
         let solution_pr = GhPull {
@@ -911,6 +991,7 @@ mod tests {
         );
         let problem_issue = GhIssue {
             labels: vec!["Bug".into()],
+            repo: None,
             ..task_issue.clone()
         };
         let fix_pull = GhPull {
@@ -943,6 +1024,7 @@ mod tests {
             state: "open".into(),
             author: String::new(),
             labels: vec![],
+            repo: None,
         }
     }
 
@@ -1112,6 +1194,135 @@ mod tests {
         };
         let err = chunk_windows(vec![], vec![pr], 4).unwrap_err();
         assert!(err.contains("raise --max-window"), "names the fix: {err}");
+    }
+
+    #[test]
+    fn foreign_closing_references_keep_their_own_identity() {
+        // A PR can close an issue in ANOTHER repository; that issue's #10
+        // must never collide with (or overwrite) this repo's #10 —
+        // identity is (repo, number), not number.
+        let local = bare_issue(10, "2026-09-01T00:00:00Z");
+        let mut foreign = bare_issue(10, "2026-09-01T00:00:00Z");
+        foreign.repo = Some("other/repo".into());
+        let pull = GhPull {
+            number: 7,
+            title: "fix it".into(),
+            body: String::new(),
+            url: String::new(),
+            updated_at: "2026-09-02T00:00:00Z".into(),
+            closed_at: String::new(),
+            state: "open".into(),
+            author: String::new(),
+            head_branch: "b".into(),
+            base_branch: "main".into(),
+            closing: vec![foreign],
+        };
+        // The closing edge targets the FOREIGN identity; the foreign row
+        // itself rides the window as an issue row the CHUNKER appends
+        // (map_window emits rows for `issues` + pulls only).
+        let unit = map_window("o", "r", &[local.clone()], &[pull.clone()], "w", 3);
+        let edge = unit
+            .relationships
+            .iter()
+            .find(|r| r.from_draft_key == "pull-7")
+            .expect("closing edge emitted");
+        assert_eq!(edge.to_draft_key, "issue-other-repo-10");
+        // The chunker's dedupe key is composite too: a PR closing foreign
+        // #10 while local #10 stands alone leaves BOTH rows in the window.
+        let windows = chunk_windows(vec![local], vec![pull], 64).unwrap();
+        let rows: Vec<&GhIssue> = windows
+            .iter()
+            .flat_map(|(issues, _)| issues.iter())
+            .collect();
+        assert_eq!(rows.len(), 2, "both #10s survive dedupe: {rows:?}");
+        let unit = map_window("o", "r", &[rows[0].clone(), rows[1].clone()], &[], "w2", 3);
+        let keys: Vec<&str> = unit.memories.iter().map(|m| m.draft_key.as_str()).collect();
+        assert!(
+            keys.contains(&"issue-10"),
+            "local issue keeps its key: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"issue-other-repo-10"),
+            "foreign issue carries its own key: {keys:?}"
+        );
+        let pks: Vec<&str> = unit
+            .memories
+            .iter()
+            .filter_map(|m| m.external_key.as_ref().map(|k| k.logical_pk.as_str()))
+            .collect();
+        assert!(pks.contains(&"issue:10"));
+        assert!(
+            pks.contains(&"issue:other/repo#10"),
+            "pk namespaces the repo"
+        );
+    }
+
+    #[test]
+    fn normalize_closing_repos_folds_same_repo_refs() {
+        let mut pull = GhPull {
+            number: 1,
+            title: String::new(),
+            body: String::new(),
+            url: String::new(),
+            updated_at: String::new(),
+            closed_at: String::new(),
+            state: String::new(),
+            author: String::new(),
+            head_branch: String::new(),
+            base_branch: String::new(),
+            closing: vec![],
+        };
+        let mut same = bare_issue(3, "2026-09-01T00:00:00Z");
+        same.repo = Some("o/r".into());
+        let mut other = bare_issue(4, "2026-09-01T00:00:00Z");
+        other.repo = Some("other/repo".into());
+        pull.closing = vec![same, other];
+        let mut pulls = [pull];
+        normalize_closing_repos(&mut pulls, "o", "r");
+        assert_eq!(
+            pulls[0].closing[0].repo, None,
+            "target-repo ref folds to local"
+        );
+        assert_eq!(
+            pulls[0].closing[1].repo.as_deref(),
+            Some("other/repo"),
+            "foreign ref keeps its repo"
+        );
+    }
+
+    #[test]
+    fn truncated_runs_hold_the_cursor_below_unfetched_rows() {
+        use super::safe_cursor_ceiling;
+        // Neither walk truncated: no ceiling, the cursor may advance.
+        assert_eq!(safe_cursor_ceiling(false, None, false, None), None);
+        // Issues truncated at the fetch bound: hold at the fetched
+        // frontier — every un-fetched issue is NEWER than it.
+        assert_eq!(
+            safe_cursor_ceiling(true, Some("2026-09-01T00:00:00Z"), false, None),
+            Some("2026-09-01T00:00:00Z".into())
+        );
+        // Pulls truncated before the backlog: the un-walked middle sits
+        // between the resume point and the oldest fetched pull — hold at
+        // the resume point.
+        assert_eq!(
+            safe_cursor_ceiling(false, None, true, Some("2026-08-01T00:00:00Z")),
+            Some("2026-08-01T00:00:00Z".into())
+        );
+        // Both truncated: the binding (lower) constraint wins.
+        assert_eq!(
+            safe_cursor_ceiling(
+                true,
+                Some("2026-09-05T00:00:00Z"),
+                true,
+                Some("2026-08-01T00:00:00Z")
+            ),
+            Some("2026-08-01T00:00:00Z".into())
+        );
+        // First run, pulls truncated, no resume: hold — write nothing.
+        assert_eq!(
+            safe_cursor_ceiling(false, None, true, None),
+            Some(String::new())
+        );
     }
 
     #[test]

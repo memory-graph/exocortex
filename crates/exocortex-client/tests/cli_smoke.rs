@@ -180,7 +180,19 @@ async fn add_search_get_round_trip_through_the_real_binary() {
         "visibility": "org",
         "tags": ["cli", "draft"]
     });
-    let draft_path = std::env::temp_dir().join("exocortex-cli-smoke-draft.json");
+    // Unique per run: two concurrent `cargo test` invocations (or a
+    // stale file from a crashed earlier run) must not race on one
+    // shared temp path.
+    let draft_dir = std::env::temp_dir().join(format!(
+        "exocortex-cli-smoke-draft-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&draft_dir).unwrap();
+    let draft_path = draft_dir.join("draft.json");
     std::fs::write(&draft_path, serde_json::to_string(&draft).unwrap()).unwrap();
     let (ok, out, err) = run_cli(
         addr,

@@ -163,70 +163,14 @@ pub fn map_history(repo_id: &str, commits: &[GitCommit], batch_id_seed: &str) ->
 
     for commit in commits {
         let commit_key = format!("commit-{}", commit.sha);
-        let mut content = format!(
-            "{}\n\nAuthor: {} <{}>\nDate: {}\nCommit: {}\n",
-            commit.subject, commit.author_name, commit.author_email, commit.authored_at, commit.sha
-        );
-        if !commit.body.is_empty() {
-            content.push('\n');
-            content.push_str(&commit.body);
-            content.push('\n');
-        }
-        content.push_str("\nChanged paths:");
+        memories.push(commit_memory(&table, commit, &commit_key));
         for path in &commit.files {
-            content.push_str("\n- ");
-            content.push_str(path);
-        }
-        memories.push(MemoryDraft {
-            rights: None,
-            draft_key: commit_key.clone(),
-            id: String::new(),
-            memory_type: memory_type_for(&commit.subject).into(),
-            title: truncate_200(&commit.subject),
-            content,
-            tags: vec!["git".into(), "commit".into()],
-            visibility: 3,
-            valid_from: None,
-            valid_until: None,
-            external_key: Some(ExternalKey {
-                table_uuid: table.to_vec(),
-                logical_pk: commit.sha.clone(),
-                mapping_version: 1,
-            }),
-        });
-        for path in &commit.files {
-            relationships.push(RelationshipDraft {
-                from_draft_key: commit_key.clone(),
-                to_draft_key: file_key[path].clone(),
-                kind: "Modifies".into(),
-                strength: 0.0,
-                confidence: 0.9,
-                context: format!("changed in {}", commit.sha),
-                visibility: 3,
-                to_memory_id: String::new(),
-            });
+            relationships.push(modifies_edge(&commit_key, &file_key[path], &commit.sha));
         }
     }
 
     for path in sorted_paths {
-        let key = &file_key[path];
-        memories.push(MemoryDraft {
-            rights: None,
-            draft_key: key.clone(),
-            id: String::new(),
-            memory_type: "FileContext".into(),
-            title: truncate_200(path),
-            content: format!("Repository path {path} (repo {repo_id})."),
-            tags: vec!["git".into(), "file".into()],
-            visibility: 3,
-            valid_from: None,
-            valid_until: None,
-            external_key: Some(ExternalKey {
-                table_uuid: table.to_vec(),
-                logical_pk: (*path).clone(),
-                mapping_version: 1,
-            }),
-        });
+        memories.push(file_memory(&table, repo_id, path, &file_key[path]));
     }
 
     BatchUnit {
@@ -246,6 +190,256 @@ pub fn map_history(repo_id: &str, commits: &[GitCommit], batch_id_seed: &str) ->
             source_flavor: "custom".into(),
         }),
         observed_at: std::time::UNIX_EPOCH,
+    }
+}
+
+/// One bounded unit plus the revision frontier it completes: the newest
+/// commit sha whose rows AND edges have all landed by the end of this
+/// unit (empty when the unit ends mid-commit).
+pub struct BoundedUnit {
+    /// The submission unit.
+    pub unit: BatchUnit,
+    /// Newest fully-emitted commit sha (monotonic across units; empty
+    /// until the first commit completes).
+    pub completes_through: String,
+}
+
+/// Accumulated slice group: each commit appears at most once (its
+/// slices span consecutive groups), so rows = slices + distinct paths.
+struct SliceGroup {
+    slices: Vec<(usize, Vec<String>)>,
+    paths: std::collections::BTreeSet<String>,
+    edges: usize,
+}
+
+impl SliceGroup {
+    fn rows(&self) -> usize {
+        self.slices.len() + self.paths.len()
+    }
+}
+
+fn close_group(
+    groups: &mut Vec<SliceGroup>,
+    current: &mut SliceGroup,
+    frontiers: &mut Vec<String>,
+    commits: &[GitCommit],
+    pending: &std::collections::BTreeSet<usize>,
+    seen: usize,
+) {
+    let frontier = (0..seen)
+        .rev()
+        .find(|idx| !pending.contains(idx))
+        .map(|idx| commits[idx].sha.clone())
+        .unwrap_or_default();
+    frontiers.push(frontier);
+    groups.push(std::mem::replace(
+        current,
+        SliceGroup {
+            slices: Vec::new(),
+            paths: Default::default(),
+            edges: 0,
+        },
+    ));
+}
+
+/// Map parsed commits into units bounded by BOTH the declared row
+/// ceiling and the protocol's per-batch edge ceiling. Shared paths weld
+/// commits into one inseparable component, so a window bounded only by
+/// rows can weld more edges than any batch may carry — the server
+/// rejects an over-ceiling component permanently and the cursor
+/// advances past the lost rows (R12). A single commit with more paths
+/// than the edge ceiling is sliced across units: every slice repeats
+/// the commit row (idempotent by external key, full changed-path
+/// content), and the frontier advances past a commit only once its
+/// last slice has landed.
+pub fn map_history_bounded(
+    repo_id: &str,
+    commits: &[GitCommit],
+    seed_prefix: &str,
+    max_rows: usize,
+    max_edges: usize,
+) -> Vec<BoundedUnit> {
+    let table = table_uuid_for(repo_id);
+    let mut groups: Vec<SliceGroup> = Vec::new();
+    let mut current = SliceGroup {
+        slices: Vec::new(),
+        paths: Default::default(),
+        edges: 0,
+    };
+    // Commits whose slices have not all been placed yet.
+    let mut pending: std::collections::BTreeSet<usize> = Default::default();
+    let mut frontiers: Vec<String> = Vec::new();
+    let mut seen = 0usize;
+    for (idx, commit) in commits.iter().enumerate() {
+        seen = idx + 1;
+        pending.insert(idx);
+        let mut remaining: Vec<String> = commit.files.clone();
+        while !remaining.is_empty() {
+            let new_paths = remaining
+                .iter()
+                .filter(|path| !current.paths.contains(*path))
+                .count();
+            let fits = current.slices.is_empty()
+                || (current.rows() + 1 + new_paths <= max_rows
+                    && current.edges + remaining.len() <= max_edges);
+            if !fits {
+                close_group(
+                    &mut groups,
+                    &mut current,
+                    &mut frontiers,
+                    commits,
+                    &pending,
+                    seen,
+                );
+            }
+            // This group may take paths bounded by both the remaining
+            // edge room and the row room (files are rows too).
+            let edge_room = max_edges.saturating_sub(current.edges).max(1);
+            let row_room = max_rows
+                .saturating_sub(current.rows() + 1)
+                .max(1)
+                .min(edge_room);
+            let take = remaining.len().min(row_room);
+            let slice: Vec<String> = remaining.drain(..take).collect();
+            for path in &slice {
+                current.paths.insert(path.clone());
+            }
+            current.edges += slice.len();
+            current.slices.push((idx, slice));
+        }
+        pending.remove(&idx);
+    }
+    if !current.slices.is_empty() {
+        close_group(
+            &mut groups,
+            &mut current,
+            &mut frontiers,
+            commits,
+            &pending,
+            seen,
+        );
+    }
+
+    groups
+        .into_iter()
+        .zip(frontiers)
+        .enumerate()
+        .map(|(index, (group, completes_through))| {
+            let mut memories: Vec<MemoryDraft> = Vec::new();
+            let mut relationships: Vec<RelationshipDraft> = Vec::new();
+            for (commit_idx, slice) in &group.slices {
+                let commit = &commits[*commit_idx];
+                let commit_key = format!("commit-{}", commit.sha);
+                memories.push(commit_memory(&table, commit, &commit_key));
+                for path in slice {
+                    let file_key = file_draft_key(&group.paths, path);
+                    relationships.push(modifies_edge(&commit_key, &file_key, &commit.sha));
+                }
+            }
+            for path in &group.paths {
+                memories.push(file_memory(
+                    &table,
+                    repo_id,
+                    path,
+                    &file_draft_key(&group.paths, path),
+                ));
+            }
+            let unit = BatchUnit {
+                batch_id_seed: format!("{seed_prefix}-{index}"),
+                memories,
+                relationships,
+                snapshot: Some(ExternalSnapshotInfo {
+                    snapshot_id: group
+                        .slices
+                        .last()
+                        .map(|(idx, _)| commits[*idx].sha.clone())
+                        .unwrap_or_else(|| "empty".into()),
+                    schema_hash: exocortex_wire::projection::schema_hash(&git_source_columns())
+                        .to_vec(),
+                    source_flavor: "custom".into(),
+                }),
+                observed_at: std::time::UNIX_EPOCH,
+            };
+            BoundedUnit {
+                unit,
+                completes_through,
+            }
+        })
+        .collect()
+}
+
+/// Draft key for a path within one group's sorted path set.
+fn file_draft_key(paths: &std::collections::BTreeSet<String>, path: &str) -> String {
+    format!(
+        "file-{}",
+        paths.iter().position(|p| p == path).expect("path in set")
+    )
+}
+
+fn commit_memory(table: &[u8; 16], commit: &GitCommit, draft_key: &str) -> MemoryDraft {
+    let mut content = format!(
+        "{}\n\nAuthor: {} <{}>\nDate: {}\nCommit: {}\n",
+        commit.subject, commit.author_name, commit.author_email, commit.authored_at, commit.sha
+    );
+    if !commit.body.is_empty() {
+        content.push('\n');
+        content.push_str(&commit.body);
+        content.push('\n');
+    }
+    content.push_str("\nChanged paths:");
+    for path in &commit.files {
+        content.push_str("\n- ");
+        content.push_str(path);
+    }
+    MemoryDraft {
+        rights: None,
+        draft_key: draft_key.into(),
+        id: String::new(),
+        memory_type: memory_type_for(&commit.subject).into(),
+        title: truncate_200(&commit.subject),
+        content,
+        tags: vec!["git".into(), "commit".into()],
+        visibility: 3,
+        valid_from: None,
+        valid_until: None,
+        external_key: Some(ExternalKey {
+            table_uuid: table.to_vec(),
+            logical_pk: commit.sha.clone(),
+            mapping_version: 1,
+        }),
+    }
+}
+
+fn file_memory(table: &[u8; 16], repo_id: &str, path: &str, draft_key: &str) -> MemoryDraft {
+    MemoryDraft {
+        rights: None,
+        draft_key: draft_key.into(),
+        id: String::new(),
+        memory_type: "FileContext".into(),
+        title: truncate_200(path),
+        content: format!("Repository path {path} (repo {repo_id})."),
+        tags: vec!["git".into(), "file".into()],
+        visibility: 3,
+        valid_from: None,
+        valid_until: None,
+        external_key: Some(ExternalKey {
+            table_uuid: table.to_vec(),
+            logical_pk: path.into(),
+            mapping_version: 1,
+        }),
+    }
+}
+
+fn modifies_edge(commit_key: &str, file_key: &str, sha: &str) -> RelationshipDraft {
+    RelationshipDraft {
+        from_draft_key: commit_key.into(),
+        to_draft_key: file_key.into(),
+        kind: "Modifies".into(),
+        strength: 0.0,
+        confidence: 0.9,
+        context: format!("changed in {sha}"),
+        visibility: 3,
+        to_memory_id: String::new(),
     }
 }
 
@@ -365,5 +559,109 @@ mod tests {
     fn parser_skips_malformed_records_loudly() {
         let (commits, skipped) = parse_git_log("garbage\nmore garbage\u{1e}");
         assert_eq!((commits.len(), skipped), (0, 1));
+    }
+
+    fn commit(sha: &str, files: &[&str]) -> GitCommit {
+        GitCommit {
+            sha: sha.into(),
+            author_name: "A".into(),
+            author_email: "a@example".into(),
+            authored_at: "2026-09-01T00:00:00+00:00".into(),
+            subject: "fix: thing".into(),
+            body: String::new(),
+            files: files.iter().map(|f| (*f).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn bounded_units_respect_the_edge_ceiling() {
+        // A merge commit with 70 distinct files: one welded component
+        // with 70 Modifies edges. A window bounded only by rows would
+        // pack it whole and the server would reject it PERMANENTLY with
+        // the cursor advanced past the rows (R12). The bounded mapper
+        // slices it; every slice repeats the commit row (full content),
+        // and the union still carries every file row and edge.
+        let files: Vec<String> = (0..70).map(|i| format!("src/f{i}.rs")).collect();
+        let files_ref: Vec<&str> = files.iter().map(String::as_str).collect();
+        let commits = vec![commit("aaaa", &files_ref)];
+        let units = map_history_bounded("repo", &commits, "w", 256, 64);
+        assert!(
+            units.len() >= 2,
+            "70 edges must slice: {} units",
+            units.len()
+        );
+        for bounded in &units {
+            assert!(
+                bounded.unit.relationships.len() <= 64,
+                "unit carries {} edges",
+                bounded.unit.relationships.len()
+            );
+            let commit_row = bounded
+                .unit
+                .memories
+                .iter()
+                .find(|m| m.draft_key == "commit-aaaa")
+                .expect("every slice repeats the commit row");
+            assert_eq!(
+                commit_row.content.matches("src/f").count(),
+                70,
+                "commit content always lists the FULL changed-path set"
+            );
+        }
+        let all_files: std::collections::BTreeSet<&str> = units
+            .iter()
+            .flat_map(|b| b.unit.memories.iter())
+            .filter_map(|m| m.external_key.as_ref().map(|k| k.logical_pk.as_str()))
+            .filter(|pk| pk.starts_with("src/"))
+            .collect();
+        assert_eq!(all_files.len(), 70, "every file row present exactly once");
+        let edges: usize = units.iter().map(|b| b.unit.relationships.len()).sum();
+        assert_eq!(edges, 70);
+    }
+
+    #[test]
+    fn bounded_frontier_advances_only_past_complete_commits() {
+        // Commit 1 lands whole; commit 2 is wide enough to slice. The
+        // unit that ends mid-commit-2 must not report a frontier past
+        // commit 1 — the operator cursor may only advance past commits
+        // whose rows AND edges have all settled.
+        let files: Vec<String> = (0..70).map(|i| format!("p{i}")).collect();
+        let files_ref: Vec<&str> = files.iter().map(String::as_str).collect();
+        let commits = vec![commit("b1", &["one"]), commit("b2", &files_ref)];
+        let units = map_history_bounded("repo", &commits, "w", 256, 64);
+        assert!(units.len() >= 2);
+        let mut last = "";
+        for bounded in &units {
+            if !bounded.completes_through.is_empty() {
+                assert!(
+                    bounded.completes_through.as_str() >= last,
+                    "frontier is monotonic"
+                );
+                last = bounded.completes_through.as_str();
+            }
+        }
+        assert_eq!(last, "b2", "the final unit completes both commits");
+        // Some unit before the end ends mid-commit (frontier still b1 or
+        // empty) — the slicing is real, not one unit per commit.
+        assert!(
+            units.iter().any(|b| b.completes_through.as_str() != "b2"),
+            "at least one unit ends before commit b2 completes"
+        );
+    }
+
+    #[test]
+    fn bounded_units_share_files_across_commits_without_exceeding_edges() {
+        // Two commits sharing paths weld into ONE component; the
+        // combined edge count still respects the ceiling.
+        let commits = vec![commit("c1", &["a", "b", "c"]), commit("c2", &["a", "d"])];
+        let units = map_history_bounded("repo", &commits, "w", 256, 64);
+        assert_eq!(units.len(), 1, "small commits pack together");
+        assert_eq!(units[0].unit.relationships.len(), 5);
+        assert_eq!(units[0].completes_through, "c2");
+        assert_eq!(
+            units[0].unit.memories.len(),
+            6,
+            "2 commits + 4 distinct files"
+        );
     }
 }

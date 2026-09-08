@@ -1,0 +1,266 @@
+# Round 12 — the prepare-branch `--main` pass over v0.4.0..HEAD
+
+**Scope:** the full Wave-5 range `v0.4.0..63ac93c` (23 commits, 76
+files) — D19 (SaaS adapters + api-client), LP1 (study pack), CLI1-3,
+D4/D5/D8/D9/D10/D11 legs, and rounds 10-11's fixes. Engine: the
+deep-pr-review pipeline (nine lenses: Correctness, Security, Tests,
+Migrations→wire/schema evolution, Performance, Architecture/Packaging,
+Product/AC, Cleanup, Hazard-class enumeration with all three triggers
+fired) plus one Codex adversarial pass. 54 candidate findings, 34
+unverified questions; every actionable finding verified against the
+code before fixing. **25 verified findings fixed in one commit; 1 new
+deferral recorded; 6 unverified questions carried.**
+
+## Blockers fixed
+
+**R12-1 — the next release would have failed mid-run.** Published
+`exocortex-client` depended on `publish = false` `exocortex-api-client`
+(crates/exocortex-client/Cargo.toml:33 vs api-client's manifest) — the
+registry can never resolve that dependency, and `scripts/publish.sh`
+would have discovered it after earlier crates already shipped. Found
+independently by two lenses. Fix: api-client is publishable with an
+ORDER entry before client; a new publish.sh guard refuses an ORDER
+crate whose regular deps name a workspace member not published earlier
+(with a disposable fixture scenario); the two SaaS adapter binaries are
+now explicitly `publish = false` leaves (the D19 row's own words);
+PUBLISHING.md records all of it.
+
+**R12-2 — the SDK silently lost rows a window could not split.**
+`split_unit` packed by bytes only; the server rejects a batch over 64
+edges / 256 memories with `ResourceLimitExceeded` — a PERMANENT
+rejection, so the window settled and the cursor advanced past the lost
+rows (exit 2, rows unrecoverable). A git merge commit with 65+ files,
+a Linear chunk with 65+ same-project issues, or four full-closing-ref
+PRs in one window each hit it. Fix: the split enforces both count
+ceilings during packing and refuses a single over-ceiling component
+BEFORE the wire (`Unsplittable` now names the bound); the testing mock
+enforces the same ceilings so the gap can't go dark again. Tests:
+`batches_respect_the_per_batch_count_ceilings`,
+`a_component_over_an_edge_ceiling_is_unsplittable_before_the_wire`.
+
+**R12-3 — a fetch-bounded GitHub run stranded un-fetched rows
+forever.** The dual-stream shared cursor advanced past rows a walk
+never fetched: issues truncated at the bound excluded every un-fetched
+NEWER issue from all later runs' `since` filter; pulls truncated
+before the backlog stranded the un-walked middle behind the new cursor
+— both exiting 0 with "re-run to continue", which was false. Confirmed
+independently by a lens and the Codex pass. Fix: per-stream truncation
+tracking plus `safe_cursor_ceiling` (issues hold at the fetched
+frontier; an un-backlogged pulls walk holds at the resume point; the
+written cursor is clamped and the log says why and names the remedy).
+Tests: `truncated_runs_hold_the_cursor_below_unfetched_rows`.
+
+**R12-4 — reindex overwrote concurrent writes and could resurrect
+retired rows.** `reindex_chunk` wrote the whole scanned row back with
+no version precondition (Codex P1): a row updated between scan and
+commit was reverted to the scan's content; a retired row was
+resurrected. Fix: optimistic concurrency — each changed row is
+re-read before commit and skipped when its LSN moved (or the row is
+gone), reported as the new `superseded` count through
+`ReindexReport`/`ReindexStats`/`ReindexEmbeddingsOutput` (goldens
+regenerated). Test: `reindex_skips_rows_superseded_after_the_scan`
+(a mutating embedder lands a newer assertion mid-chunk; the stale scan
+never wins).
+
+**R12-5 — a cross-repo closing reference overwrote local identity.**
+`closingIssuesReferences` can name issues in OTHER repositories, but
+closing rows were keyed `issue:{number}` under the TARGET repo's table
+uuid — a foreign repo's #10 collided with (and overwrote/deduped
+against) local #10, attaching the closing edge to the wrong row (Codex
+P1). Fix: the query fetches `repository { nameWithOwner }`, foreign
+refs carry composite identity (`issue:{owner/name}#{number}`), the
+chunker dedupes on (repo, number), and same-repo refs fold onto the
+local identity. Tests:
+`foreign_closing_references_keep_their_own_identity`,
+`normalize_closing_repos_folds_same_repo_refs`.
+
+**R12-6 — every Dreams cycle rewrote its committed abstraction rows,
+and rollback deleted them.** The idempotency guard consulted the
+region-typed working set, which can never contain the General-carried
+abstraction row — so the guard never fired in a typed region: the full
+creation path re-ran each cycle (fresh stamps, perpetual churn,
+metric inflation), and the journaled `create_memory` over a
+preimage-holding row made any later failure in the cycle physically
+DELETE the prior cycle's committed abstraction. Fix: idempotency
+consults storage (`get_memory` by the deterministic id). Test: the
+existing idempotency test now pins that cycle 2 does not restamp the
+committed row (it could not detect the rewrite before).
+
+## Advisories fixed
+
+**R12-7 — cross-domain discovery was non-deterministic and cloned the
+region.** The cap took the first 64 of a HashMap iteration (a random
+per-process subset — different proposals every cycle, contradicting
+the documented determinism and disagreeing with the sorted standalone
+path), after deep-cloning the whole working set to use 64 rows; the
+pairing pass also lacked the computed-row filter `select_anchors`
+applies, so abstraction rows (which inherit member entities) could
+pair into CrossDomain proposals. Fix: borrow, sort by id, filter
+`Provenance::Computed`, then cap. Tests:
+`cross_domain_proposals_skip_computed_rows`; determinism follows from
+the ordering (same input ⇒ same subset, both paths).
+
+**R12-8 — the git adapter livelocked on wide commits and buffered
+unbounded history.** No `--max-window ≥ 2` parse guard (R10-4's class,
+fixed for the SaaS siblings only); the window builder never flushed an
+oversize single commit, so a 300-file merge died at
+`ProjectionBoundExceeded` on every run; `git log` output (whole
+history) was buffered with no bound; the `--range` regression test
+could not fail (its range end equaled the value the sequential run had
+already written); the exit-2 contract had no test. Fix:
+`map_history_bounded` bounds units by rows AND the 64-edge ceiling,
+slicing wide commits across units (each slice repeats the commit row
+with full content; the frontier advances only past complete commits);
+`--max-commits` bounds the read (oldest first; loud continuation);
+tests: `bounded_units_respect_the_edge_ceiling`,
+`bounded_frontier_advances_only_past_complete_commits`, the corrected
+range test (`HEAD~2..HEAD~1`), `the_operator_cursor_is_the_newest_settled_sha`,
+`permanent_rejections_exit_nonzero`, `max_window_below_two_is_rejected_at_parse`.
+
+**R12-9 — api-client: untimed bodies, per-request TLS, silent
+plaintext, token echo.** The 60s timeout ended at the headers (a
+trickling-body endpoint hung the adapter forever, contradicting the
+documented "connect + headers + body"); every request built a new
+client AND loaded the platform trust store; a non-local `http://`
+endpoint sent the bearer cleartext with no warning; error summaries
+embedded 500 chars of raw response body with the request token
+unredacted. Fix: one deadline over request+body; the client (and its
+bounded-retry trust-store load) is built once; non-local plaintext
+draws a loud warning; `summarize` redacts the token. Test:
+`summaries_redact_the_bearer_token`. (A live body-stall test is not
+practical under the constant 60s timeout; the deadline structure is
+the fix and the redaction is pinned.)
+
+**R12-10 — SimilarTo hints leaked scoped titles across producers.**
+The hint path returned `existing_title` with an org/model/dims filter
+only, while the ring stored exactly the visibility needed to gate —
+and the sibling D5 seeding path gates by endpoint visibility. A
+Private row's title reached a different producer's ack. Fix:
+`hint_visible` mirrors `memory_visible`'s scope rules (Private → same
+author, scoped Project/Team → same scope, Org+ → anyone; scope-less
+Project/Team rows keep the D10c advisory contract; an authorless
+Private row hints nobody). Test: `hints_respect_row_visibility_scope`.
+
+**R12-11 — similarity seeding held the ring mutex across
+O(rows×ring×dims) cosines**, serializing concurrent submits behind one
+opt-in loop. Fix: snapshot the ring under the lock, compute outside.
+
+**R12-12 — `chunk_windows` rebuilt the per-window dedupe set per
+group** (O(window²) inserts; pathological at operator-raised
+`--max-window`). Fix: maintained incrementally (now keyed by
+(repo, number) for R12-5).
+
+**R12-13 — adapters buffered full raw bodies pre-chunking** (bounded
+only by the 16 MiB page cap). Fix: `bound_4000` applies at parse time
+(map time never needed more).
+
+**R12-14 — the exhaustive kernel↔wire ProducerKind pin was gone**
+(round 10 deleted the kernel-crate test; only arms 6/7 were pinned; a
+renumber of arms 0-5 passed every gate). Fix: an exhaustive ingest test
+over all 8 values plus fail-closed 8+; the server policy-table loop now
+pins all 7 shipped kinds (its comment claimed "every shipped kind"
+while pinning two).
+
+**R12-15 — the rule-9 ledger was stale**: `exocortex-dreams →
+exocortex-wire` (D8's canonical digest) and cluster's `prost`
+dev-dependency (D10) were unrecorded. Fixed in PUBLISHING.md.
+
+**R12-16 — the kind-7 downgrade blast radius was undocumented**: a
+binary rollback across a producer-kind addition fails the whole source
+registry read (all ingest down, not just SaaS) because `ProducerKind`
+is a serde enum without unknown-variant fallback. The wire path's
+fail-closed behavior was blessed; the serde path's posture now is too:
+forward-only, stated in PUBLISHING.md.
+
+**R12-17 — cross-pack kind-NAME collisions were silent**: kind ids are
+pack-namespaced so the by-id duplicate check cannot fire, and name
+resolution (`kind_id`) picks whichever the HashMap yields first. Fix:
+the kernel rejects a duplicate kind display name at composition
+(`DuplicateKindName`), mapped to a rejection in ingest.
+
+**R12-18 / R12-19 — round-11's operator-doc claims were half-delivered**:
+README still enumerated kinds 1-6 (the R11-8 half that never landed);
+three operator-facing bail strings still carried rewrap artifacts
+(R11V-7's exact class). Both fixed.
+
+**R12-20 — D5's "opt-in" had no operator surface**: the seeding flag
+had exactly one caller (its test) — no shipped binary could enable it.
+Fix: `EXOCORTEX_INGEST_SIMILARITY_SEEDING=1|true|on|yes` on the backend
+node (default off, the recorded lean).
+
+**R12-21 — the three-node fan-out test never touched nodes b/c**: the
+name and the D10 row claimed cluster fan-out; only node-a's ring was
+exercised. Fix: the publisher's retained window is delivered into both
+peers and every node's log is asserted (frontier + LSN order).
+
+**R12-22 — playbook prose contradicted its own generated block** ("The
+8 buckets (48 kinds)" beside "72 kinds are declared") and the gen
+marker still said "regenerated from exocortex-pack-dev-v1". Fixed in
+the artifact AND the generator.
+
+**R12-23 — the CLI rendered the wrong output shapes**: `chain` printed
+`? [?]` for every step (GetChainOutput is hex ids, not objects);
+`related` probed shapes the registry never emits. Fixed; the smoke
+draft fixture no longer races on a shared temp path.
+
+**R12-24 — small correctness-of-record cleanups**: dead
+`reindex_embeddings` arm in http_parity's input closure; the stale
+`unreachable!("chunks() honors the bound")` (the bound it named was
+not the one enforced); the study pack's crate header named the
+pre-rename path; the chaos-fixture comment omitted study-v1 from the
+composed set; linear's `by_id` map values were never read.
+
+**R12-25 — live-leg skips were invisible in CI**: libtest captures a
+passing test's stderr, so the adapters' "UNEXECUTED" lines never
+reached the canonical log. Fix: verify-release.sh echoes the GitHub/
+Linear leg status at shell level, exactly like the Postgres leg.
+
+## Confirmed deferrals (not re-litigated)
+
+- Adapter-runner extraction with identity-pinning test (R10-18/R11).
+- Binary-level cursor tests for the linear/github adapters (R11).
+- CLI export passthrough + stats op (CLI3 reconciliation).
+- Live legs: FALKOR/REDIS/POSTGRES URLs unset throughout this round;
+  the GitHub live leg executed in D19; Linear awaits the owner-minted
+  key.
+
+## New deferral (recorded in the plan's v2 table)
+
+- **R12-D1 — stale-abstraction retirement.** The R12-6 fix stops the
+  rewrite and the rollback deletion, but nothing retires an abstraction
+  whose member set has changed: PRUNE iterates the region-typed
+  working set (General-carried rows are invisible there), and
+  abstraction rows never receive `valid_until`. Retiring superseded
+  abstractions needs a design (PRUNE over the carrier type, or
+  valid_until stamping when a class re-abstracts) — v2, with this
+  round as its evidence.
+
+## Unverified questions (carried, not findings)
+
+- GitHub's `filterBy: {since}` boundary inclusivity is the resume
+  design's own premise but has never been confirmed by a live leg
+  (R12-3's fix holds the cursor conservatively regardless).
+- [unverified] Can Linear's cursor pagination re-emit the same issue
+  id within one walk? If yes, the chunker's per-window id dedupe
+  (added for github in R11V-1) would matter there too.
+- [unverified] Does FalkorDB `stream_all_memories` snapshot before
+  streaming? R12-4's LSN recheck makes reindex safe against concurrent
+  writes on any backend, but the live scan's revisit behavior under
+  mid-scan commits remains unexamined without `FALKOR_URL`.
+- The wire_fanout floor assert (5,000/s) is a wall-clock check without
+  the bench gate's SLO-multiplier relief — flake risk on loaded
+  shared runners is accepted, not verified.
+- hyper-rustls sits outside the no-llm outbound-client allowlist (it
+  cannot originate requests without hyper); naming it in the allowlist
+  is a possible hardening, deliberately not taken this round.
+- rust-analyzer reports E0308 at drain.rs:248; the full matrix (clippy
+  + workspace tests) adjudicates — if green, it is an LSP
+  generic-inference artifact.
+
+## Verify-clauses
+
+Every fix above carries a test or gate that fails without it, named in
+its entry; the commit carrying this document is the closing evidence.
+The loop is NOT yet at a verified-clean exit: this pass found and
+fixed 25, so the iteration-6 full pass is the next gate (the round-11
+precedent: keep passing until a pass returns zero).
