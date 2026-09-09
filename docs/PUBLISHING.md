@@ -13,7 +13,13 @@ exocortex-adapter-sdk joined with A1).
 `prost-types` deps (RFC3339 -> protobuf Timestamp; both pre-existing
 workspace deps, recorded here per rule 9).
 
-**Unreleased (round-12)** — three rule-9 records: `exocortex-dreams`
+**Unreleased (round-12)** — the compatibility fingerprint moves once
+more, `9f92957f… → a427b3ad…`: D8's `Summarizes` kind moved from
+mid-list to the END of dev-v1's declarations (kind local ids are
+declaration-sequential; the mid-list insert renumbered every later
+kind against v0.4.0 — only an append is a superset for stored
+RelKindIds). Golden, study literal, AGENTS/CLAUDE, and the plan
+updated in-commit. Three rule-9 records: `exocortex-dreams`
 depends on `exocortex-wire` (D8: the deterministic abstraction row id
 goes through the ONE canonical `signing::content_digest`, mirroring the
 storage→wire precedent below); `exocortex-cluster` gains a `prost`

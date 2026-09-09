@@ -224,7 +224,7 @@ Linear leg status at shell level, exactly like the Postgres leg.
   the GitHub live leg executed in D19; Linear awaits the owner-minted
   key.
 
-## New deferral (recorded in the plan's v2 table)
+## New deferral (recorded as Backlog rows R12-D1/R12-D2 in the plan)
 
 - **R12-D1 — stale-abstraction retirement.** The R12-6 fix stops the
   rewrite and the rollback deletion, but nothing retires an abstraction
