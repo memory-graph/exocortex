@@ -54,6 +54,25 @@ ORDER entries; the standing adapter-crate policy below) — carry the
 SaaS transcription path. Direct API credentials (LINEAR_API_KEY /
 GITHUB_TOKEN) live in `.env.local`, never in manifests.
 
+**0.4.1 (2026-09-09)** — the agent-pilot release: the SaaS adapter
+family, the study pack, and the round 10-12 hardening. New publishable
+crates: `exocortex-api-client` (ORDER entry before `exocortex-client`)
+and `exocortex-pack-study-v1` (ORDER entry after `exocortex-pack-dev-v1`).
+New `publish = false` leaf members: `exocortex-adapter-linear`,
+`exocortex-adapter-github`. Additive wire change: producer-kind enum
+value 7 (`SAAS_ADAPTER`). `exocortex-client` additionally ships the
+`exocortex-cli` binary (reads over the HTTP ops, writes over the agents'
+signed path). The composed ontology compatibility fingerprint moved
+from v0.4.0's `2c3ec388…5c23` to `a427b3ad…ed9d` through three
+authorized superset moves (D8's `Summarizes` kind, LP1's study pack,
+round 12's Summarizes-to-end correction restoring append-only kind ids).
+Rounds 10-12 (~50 verified fixes) harden the adapter family end to
+end — the never-written resume cursor, window/boundary arithmetic,
+per-batch edge ceilings with bounded slicing, fetch-bound truncation
+ceilings, composite foreign closing-ref identity, createdAt-anchored
+valid_from, reindex's optimistic LSN recheck, Dreams abstraction
+idempotency and access-scope partitioning, and the publish guard over
+build-deps.
 **0.4.0 (2026-09-02)** — the data-breadth and surface wave, additive
 throughout: wire gains the `projection` module (the canonical
 declared-projection schema digest every table-flavored adapter and the

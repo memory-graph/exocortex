@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-delta"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1417,7 +1417,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-git"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1432,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-github"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1452,7 +1452,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-iceberg"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-linear"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-parquet"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1517,7 +1517,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-postgres"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-sdk"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "axum",
  "exocortex-wire",
@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-table"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-api-client"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "hyper 0.14.32",
  "hyper-rustls 0.24.2",
@@ -1581,7 +1581,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-cache"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -1606,7 +1606,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-client"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1654,7 +1654,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-cluster"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1681,7 +1681,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-dreams"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1705,7 +1705,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-entity-resolution"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-ingest"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-kernel"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bincode",
  "blake3",
@@ -1774,7 +1774,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-ops"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-pack-dev-v1"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "exocortex-kernel",
  "inventory",
@@ -1816,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-pack-mortgage-v1"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-pack-study-v1"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
@@ -1837,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-reasoning"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "crepe",
@@ -1858,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-server"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-storage"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1935,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-wire"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "bytes",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-worker"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -6245,7 +6245,7 @@ checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
 
 [[package]]
 name = "xtask"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
