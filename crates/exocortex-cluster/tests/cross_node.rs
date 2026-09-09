@@ -46,6 +46,7 @@ fn mem(title: &str, n: u8) -> Memory {
         title: title.into(),
         content: "c".into(),
         summary: None,
+        rights: None,
         tags: Default::default(),
         visibility: Visibility::Org,
         provenance: Provenance::Asserted {

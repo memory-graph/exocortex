@@ -89,8 +89,13 @@ async fn live_postgres_logical_replication_delivers_mapped_rows() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     let stream_slot = slot.clone();
     let stream_table = mapping.table.clone();
+    // The spawned stream task owns its own DSN copy so the outer scope
+    // keeps `dsn` for the cleanup connect (slot hygiene) below.
+    let stream_dsn = dsn.clone();
     let stream = tokio::spawn(async move {
-        let session = ReplicationSession::connect(&dsn).await.expect("reconnect");
+        let session = ReplicationSession::connect(&stream_dsn)
+            .await
+            .expect("reconnect");
         session
             .stream_changes(&stream_slot, 0, &[stream_table], |event| {
                 if let StreamEvent::Change { payload, .. } = event {

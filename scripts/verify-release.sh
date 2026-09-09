@@ -21,6 +21,15 @@ cargo xtask metrics-hygiene
 cargo xtask wire-standalone
 cargo xtask bench
 cargo xtask storage-conformance
+# Compile every integration-gated live suite even when its backend or
+# token is absent: a gated suite that no longer compiles must fail the
+# matrix HERE, not at the first release run that happens to carry the
+# token (REL1 — four suites had rotted invisibly behind their gates).
+cargo test -p exocortex-adapter-github -p exocortex-adapter-linear \
+  -p exocortex-adapter-postgres -p exocortex-storage \
+  -p exocortex-dreams -p exocortex-cluster \
+  --features exocortex-adapter-github/integration,exocortex-adapter-linear/integration,exocortex-adapter-postgres/integration,exocortex-storage/integration,exocortex-dreams/integration,exocortex-cluster/integration \
+  --no-run
 if [ -n "${POSTGRES_URL:-}" ]; then
   cargo test -p exocortex-adapter-postgres --features integration --test cdc_live -- --nocapture
 else

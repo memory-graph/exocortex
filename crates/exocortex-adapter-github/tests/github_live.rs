@@ -57,8 +57,19 @@ async fn one_live_page_parses_and_maps() -> anyhow::Result<()> {
     );
     eprintln!("live pulls page: {} pulls", pulls.len());
     if !issues.is_empty() || !pulls.is_empty() {
-        let unit =
-            exocortex_adapter_github::map_window(&owner, &repo, &issues, &pulls, "live-page");
+        // The binary's default visibility (org) through the same parser
+        // the CLI rides — the live leg proves the mapper's real inputs,
+        // not a hand-picked discriminant.
+        let visibility = exocortex_adapter_github::parse_visibility("org")
+            .expect("the CLI default visibility word is known");
+        let unit = exocortex_adapter_github::map_window(
+            &owner,
+            &repo,
+            &issues,
+            &pulls,
+            "live-page",
+            visibility,
+        );
         assert!(unit.snapshot.is_some());
     }
     Ok(())
