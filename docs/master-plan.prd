@@ -1,5 +1,28 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-09, V0.4.1 CUT — the owner called the release, which
+decides PLT1's prerequisite in favor of fresh binaries):** bump `6cce949`
+(all crates + xtask; goldens re-stamped via gen-schemas --write; the
+PUBLISHING.md 0.4.1 entry records the new ORDER members
+exocortex-api-client and exocortex-pack-study-v1 and the fingerprint
+chain 2c3ec388… → a427b3ad… through three authorized superset moves).
+The cut found and fixed **REL1** (`097f2d8`): exporting GITHUB_TOKEN
+made verify-release compile `github_live` for the first time since
+round 12 and four integration-gated live suites had rotted invisibly
+(see its Backlog row); verify-release now --no-run compiles all six
+integration features unconditionally. **The FULL gate matrix passed on
+the final tree: verify-release.sh exit 0, 204 suite-oks** (SLO gates
+PASS: search p50 31.9µs / p99 712.8µs over 100k rows); the GitHub live
+leg EXECUTED (the Keychain -36 flake was caught by the bounded
+trust-store retry; the default live repo memory-graph/exocortex carries
+zero issues/PRs — work lives in this plan — so the mapper was proven
+against real rows via the GITHUB_LIVE_OWNER/REPO override, 5 issues +
+5 PRs clean); live FALKOR/REDIS/POSTGRES/Linear legs UNEXECUTED (URLs/
+key unset), to be stated plainly in the release note. REL2 recorded
+(Proposed): the matrix's wall-time budget. Next: push main, tag
+`v0.4.1` → release run, `PUBLISH_VERSION=0.4.1 scripts/publish.sh`,
+install locally for PLT1; closing evidence follows in the next entry.
+
 **Status (2026-09-08, ROUND 12 SECOND WAVE — the loop's iteration 6
 found 14 more, all fixed; the authorized fingerprint move
 `9f92957f… → a427b3ad…` is Summarizes moving to the END of dev-v1's
