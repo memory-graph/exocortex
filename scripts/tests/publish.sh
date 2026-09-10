@@ -153,4 +153,34 @@ if bash scripts/publish.sh >"$fixture/builddep.out" 2>&1; then
   exit 1
 fi
 grep -q 'not published earlier in ORDER' "$fixture/builddep.out"
+
+# A DEV-dependence on a member published LATER in ORDER is the same
+# mid-release failure class (registry resolution during publish
+# verification), unless the crate is in needs_strip — the 0.4.1 cut
+# failed exactly here on exocortex-pack-study-v1 -> mortgage-v1.
+# First: the real production shape must PASS the guard because study-v1
+# is stripped (the fixture's study crate gains the real dev-deps).
+printf '[dev-dependencies]\nexocortex-pack-dev-v1 = "0.2.2"\nexocortex-pack-mortgage-v1 = "0.2.2"\n' \
+  >> crates/exocortex-pack-study-v1/Cargo.toml
+# Second: an unstripped crate with a forward dev-dep is refused before
+# any publish command runs. Reset client first — the build-dep scenario
+# above left a regular-guard refusal in its manifest that would fire
+# before the dev-dep guard and mask it.
+printf '[package]\nname = "exocortex-client"\nversion = "0.2.2"\n' \
+  > crates/exocortex-client/Cargo.toml
+printf '[dev-dependencies]\nexocortex-worker = "0.2.2"\n' \
+  >> crates/exocortex-cache/Cargo.toml
+git add Cargo.toml Cargo.lock crates
+git commit -qm forward-devdep-fixture
+rm -f "$PUBLISH_TEST_LOG"
+if bash scripts/publish.sh >"$fixture/devdep.out" 2>&1; then
+  echo 'expected forward-dev-dep refusal' >&2
+  cat "$fixture/devdep.out" >&2
+  exit 1
+fi
+grep -q 'exocortex-cache dev-depends on workspace member exocortex-worker' "$fixture/devdep.out"
+grep -q 'add the crate to needs_strip' "$fixture/devdep.out"
+# Only the metadata probe ran — no verification, no publish command.
+[ "$(wc -l < "$PUBLISH_TEST_LOG" | tr -d ' ')" = 1 ]
+grep -q '^metadata --format-version 1 --no-deps$' "$PUBLISH_TEST_LOG"
 echo 'publish fixture ok: fail-closed, verified, byte-preserving'

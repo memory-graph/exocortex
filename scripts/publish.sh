@@ -69,6 +69,37 @@ for i, name in enumerate(order):
   exit 1
 fi
 
+# Same rule for DEV-dependencies, which cargo also resolves against the
+# registry during publish verification: a dev-dep naming a member that is
+# not yet published resolves to the older registry version or fails
+# outright (exocortex-pack-study-v1 dev-depends on exocortex-pack-mortgage-v1,
+# which ORDER publishes after it — the 0.4.1 cut failed exactly there,
+# mid-release, after kernel and dev-v1 had already shipped). A crate in
+# needs_strip gets those dev-deps removed for the publish window instead.
+if ! python3 -c '
+import json, sys
+meta = json.load(sys.stdin)
+order = sys.argv[1:]
+members = {p["name"] for p in meta["packages"]}
+deps_by_pkg = {p["name"]: p.get("dependencies", []) for p in meta["packages"]}
+strip = set("exocortex-cluster exocortex-ingest exocortex-server exocortex-pack-study-v1".split())
+for i, name in enumerate(order):
+    if name in strip:
+        continue
+    for dep in deps_by_pkg.get(name, []):
+        # A dev-dep on the package itself resolves to the crate being
+        # published (dreams declares one for its benches); it is not a
+        # forward reference.
+        if dep.get("kind") == "dev" and dep["name"] != name and dep["name"] in members and dep["name"] not in order[:i]:
+            raise SystemExit(
+                "publish refused: " + name + " dev-depends on workspace member "
+                + dep["name"] + ", which is not published earlier in ORDER "
+                + "(add the crate to needs_strip, or publish the dep first)"
+            )
+' "${ORDER[@]}" <<<"$metadata"; then
+  exit 1
+fi
+
 # No mutation or publication occurs until every mandatory release check passes.
 if ! bash scripts/verify-release.sh; then
   echo "publish refused: mandatory correctness prerequisite failed" >&2
@@ -91,7 +122,7 @@ trap cleanup EXIT INT TERM
 
 needs_strip() {
   case "$1" in
-    exocortex-cluster|exocortex-ingest|exocortex-server) return 0 ;;
+    exocortex-cluster|exocortex-ingest|exocortex-server|exocortex-pack-study-v1) return 0 ;;
     *) return 1 ;;
   esac
 }
