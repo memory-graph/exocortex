@@ -1,5 +1,25 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-10, V0.4.1 CLOSED — the crates.io half re-run after
+the mid-release REL3 failure and a power outage):** the first publish
+died at exocortex-pack-study-v1 (forward dev-dep on mortgage-v1 — REL3,
+fixed in `9360726`) with kernel + dev-v1 already shipped, and the resume
+was cut off by a power outage. Today's re-run on the REL3 tree: the FULL
+gate matrix passed again (verify-release.sh exit 0, 204 suite-oks — the
+same count as the cut run; SLO gates PASS, search p50 29.25µs / p99
+738.6µs over 100k rows; the live GitHub leg EXECUTED — the Keychain -36
+flake recovered by the bounded trust-store retry, against the default
+live repo which carries zero rows, so the cut run's override proof
+against real rows stands; live FALKOR/REDIS/POSTGRES/Linear legs
+UNEXECUTED, as the release note states plainly). Publish: kernel +
+dev-v1 skipped as already published, the remaining fifteen published in
+ORDER — ALL 17 crates now sit at 0.4.1 on crates.io, none yanked
+(verified against the registry API). The tag half was already done
+pre-outage: tag `v0.4.1` at `d0a5e2b` with CI and the Release workflow
+green, the GitHub release published with install.sh and the platform
+tarballs. Local 0.4.1 binaries (exocortex-mcp-client, exocortex-node,
+exocortex-worker, exocortex) are installed for PLT1. v0.4.1 is closed.
+
 **Status (2026-09-09, V0.4.1 CUT — the owner called the release, which
 decides PLT1's prerequisite in favor of fresh binaries):** bump `6cce949`
 (all crates + xtask; goldens re-stamped via gen-schemas --write; the
