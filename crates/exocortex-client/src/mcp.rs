@@ -27,6 +27,11 @@ pub struct ExocortexMcp {
     org: smol_str::SmolStr,
     cache: Arc<LocalCache>,
     vc: VisibilityContext,
+    /// D31: projects this process has written to (offline batches) or
+    /// was seeded with at boot — joined into every read. Standalone is
+    /// a one-user org, so the caller must stay able to find their own
+    /// project-visibility rows.
+    session_projects: Arc<std::sync::Mutex<Vec<smol_str::SmolStr>>>,
     /// The gRPC-backed end_session tool; `None` when no `--backend` is
     /// configured (offline mode falls through to the WAL path).
     end_session: Option<Arc<EndSessionTool>>,
@@ -58,6 +63,7 @@ impl ExocortexMcp {
             org,
             cache,
             vc,
+            session_projects: Arc::new(std::sync::Mutex::new(Vec::new())),
             end_session: None,
             wal: None,
             ontology,
@@ -89,6 +95,33 @@ impl ExocortexMcp {
     pub fn in_flight_calls(&self) -> Arc<InFlightCalls> {
         Arc::clone(&self.in_flight)
     }
+
+    /// D31: the read-side context — the fixed session vc plus every
+    /// project granted this process (offline writes grant their
+    /// batch's project; `main` boot-seeds the WAL's projects).
+    fn effective_vc(&self) -> VisibilityContext {
+        let mut vc = self.vc.clone();
+        let granted = self.session_projects.lock().expect("session projects");
+        for id in granted.iter() {
+            if !vc.project_ids.iter().any(|p| p == id) {
+                vc.project_ids.push(id.clone());
+            }
+        }
+        vc
+    }
+
+    /// D31: join `project` into this session's read scope (idempotent;
+    /// empty is a no-op).
+    fn grant_project(&self, project: &str) {
+        if project.is_empty() {
+            return;
+        }
+        let mut granted = self.session_projects.lock().expect("session projects");
+        let id = smol_str::SmolStr::from(project);
+        if !granted.contains(&id) {
+            granted.push(id);
+        }
+    }
 }
 
 /// Input for `exocortex.search_memories`.
@@ -111,7 +144,7 @@ impl ExocortexMcp {
     /// the no-backend shim: interactive reads are cache-served.
     fn registry_ctx(&self) -> std::sync::Arc<exocortex_ops::OpContext> {
         std::sync::Arc::new(exocortex_ops::OpContext {
-            visibility_ctx: self.vc.clone(),
+            visibility_ctx: self.effective_vc(),
             audit_admin: true,
             storage: std::sync::Arc::new(crate::no_backend::NoBackendStorage),
             cache: self.cache.clone(),
@@ -313,7 +346,9 @@ impl ExocortexMcp {
             // cannot succeed or fail based on which transport carried it.
             let context = exocortex_kernel::MemoryContext {
                 timestamp: now,
-                project_id: Some(args.project_id.clone().into()),
+                // D31: empty normalizes to None, matching team_id below
+                // — an unscoped row must not claim a phantom project.
+                project_id: (!args.project_id.is_empty()).then(|| args.project_id.clone().into()),
                 project_path: None,
                 team_id: args
                     .team_id
@@ -427,6 +462,12 @@ impl ExocortexMcp {
                 tags,
             )
             .map_err(|e| json_error("wal-error", e.to_string()))?;
+        // D31: the batch's project joins this session's read scope
+        // BEFORE the publish below — cross-batch edge targets in the
+        // same project resolve, and project-visibility rows become
+        // searchable the moment the ack returns.
+        self.grant_project(&args.project_id);
+        let vc = self.effective_vc();
         // SR-PRD F2: read-your-writes — publish the materialized batch
         // into the served snapshot (ONE copy-on-write swap that also
         // stamps the R-M7 local LSN). Read back through the SAME
@@ -442,7 +483,7 @@ impl ExocortexMcp {
                     &entry,
                     &|id| {
                         self.cache
-                            .get_memory(&self.org, id, &self.vc)
+                            .get_memory(&self.org, id, &vc)
                             .map(|m| (m.memory_type, m.visibility))
                     },
                 );
@@ -487,7 +528,7 @@ impl ExocortexMcp {
     ) -> Result<String, String> {
         let cache = self.cache.clone();
         let org = self.org.to_string();
-        let vc = self.vc.clone();
+        let vc = self.effective_vc();
         let result = crate::preflight::validate_batch(&self.ontology, &memories, &edges, |id| {
             let id = exocortex_kernel::MemoryId::parse_hex(id)?;
             cache.get_memory(&org, &id, &vc).map(|m| m.memory_type)

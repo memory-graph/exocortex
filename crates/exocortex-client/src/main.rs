@@ -254,6 +254,11 @@ fn main() -> anyhow::Result<()> {
     let (cache, writer_rx) = LocalCache::new(2 * 1024 * 1024 * 1024);
     let cache = Arc::new(cache);
 
+    // D31: the projects the standalone WAL holds — the session context
+    // joins them all (one-user org: the caller owns what they wrote) so
+    // project-visibility rows stay searchable across restarts.
+    let mut wal_projects: Vec<smol_str::SmolStr> = Vec::new();
+
     // WAL: offline write buffer + (standalone) the embedded store.
     let wal = Arc::new(wal::Wal::open(&data_dir.join("wal"))?);
     if wal.near_full()? {
@@ -270,6 +275,13 @@ fn main() -> anyhow::Result<()> {
                 tracing::warn!(?rows.dropped_edges, "standalone seed dropped edges");
             }
             cache.seed_local(&args.org, &rows.memories, &rows.edges, last_lsn);
+            for memory in &rows.memories {
+                if let Some(project) = memory.context.project_id.as_ref() {
+                    if !project.is_empty() && !wal_projects.contains(project) {
+                        wal_projects.push(project.clone());
+                    }
+                }
+            }
             tracing::info!(
                 memories = rows.memories.len(),
                 batches = entries.len(),
@@ -283,13 +295,15 @@ fn main() -> anyhow::Result<()> {
         Some(_) => cache.seed_local(&args.org, &[], &[], 0),
     }
 
-    let server = mcp::ExocortexMcp::new(
-        args.org.clone().into(),
-        cache.clone(),
-        org_visibility(&args.org, &args.user),
-        ontology.clone(),
-    )
-    .with_offline_wal(wal.clone());
+    let mut vc = org_visibility(&args.org, &args.user);
+    for project in wal_projects {
+        if !vc.project_ids.iter().any(|p| p == &project) {
+            vc.project_ids.push(project);
+        }
+    }
+    let server =
+        mcp::ExocortexMcp::new(args.org.clone().into(), cache.clone(), vc, ontology.clone())
+            .with_offline_wal(wal.clone());
 
     // The acceptance probe deliberately runs after the selected topology has
     // opened its WAL, materialized its cache, and assembled the MCP operation

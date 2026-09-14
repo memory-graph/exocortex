@@ -5,6 +5,8 @@
 //! AC1 in-session read-back; AC2 cross-restart; AC3 edges + grouping;
 //! AC4 honest-empty; AC6 all-states seeding; AC7 dangling edges.
 //! (AC5 — backend mode unchanged — is `e2e_chain` + the CL5 stdio test.)
+//! D31 adds the project-visibility round-trip (the instruction block's
+//! default) on both legs of AC1/AC2.
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -236,6 +238,55 @@ fn cross_restart_read_back_with_stable_ids() {
         hits[0]["id"].as_str().unwrap(),
         id,
         "WAL-stored id byte-stable across restart"
+    );
+}
+
+/// D31: the instruction block's DEFAULT visibility ("project") must
+/// round-trip — in-session immediately and across restart. Before the
+/// fix the write acked (LSN advanced) but search returned zero hits
+/// forever: the session read context carried an empty `project_ids`
+/// while the write scoped the row to the batch's project.
+#[test]
+fn project_visibility_write_is_searchable_in_session_and_across_restart() {
+    let dir = tempdir();
+    {
+        let mut first = Client::spawn(&dir);
+        let mut msgs = Client::init_msgs();
+        msgs.push(Client::end_session(
+            serde_json::json!([
+                {
+                    "draft_key": "p",
+                    "memory_type": "Problem",
+                    "title": "Quokka parser panic on empty fixture",
+                    "content": "parser panics instead of rejecting",
+                    "visibility": "project",
+                    "tags": ["parser"]
+                }
+            ]),
+            serde_json::json!([]),
+        ));
+        msgs.push(Client::search("Quokka"));
+        first.send_all(&msgs);
+        let _init = first.read_line();
+        let ack = first.read_line();
+        assert!(ack.get("result").is_some(), "end_session ok: {ack}");
+        let hits = search_hits(&first.read_line());
+        assert_eq!(
+            hits.len(),
+            1,
+            "project-visibility row searchable in-session: {hits:?}"
+        );
+    }
+    let mut second = Client::spawn(&dir);
+    let mut msgs = Client::init_msgs();
+    msgs.push(Client::search("Quokka"));
+    second.send_all(&msgs);
+    let _init = second.read_line();
+    let hits = search_hits(&second.read_line());
+    assert_eq!(
+        hits.len(),
+        1,
+        "project-visibility row searchable after restart (boot-seeded project scope): {hits:?}"
     );
 }
 
