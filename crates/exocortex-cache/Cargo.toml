@@ -28,7 +28,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
-stats_alloc = "0.1"  # §8.5 step 1: no-allocation assertion on the read hot path
 
 [[bench]]
 name = "search"
