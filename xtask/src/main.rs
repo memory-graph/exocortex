@@ -427,8 +427,13 @@ fn integration_declaring_crates() -> Result<Vec<String>> {
         {
             let name = text
                 .lines()
-                .find_map(|line| line.trim().strip_prefix("name = "))
-                .map(|name| name.trim_matches('"').to_string())
+                .find_map(|line| {
+                    let trimmed = line.trim();
+                    let value = trimmed.strip_prefix("name")?;
+                    let value = value.trim_start().strip_prefix('=')?;
+                    Some(value.trim().trim_matches('"').to_string())
+                })
+                .filter(|name| !name.is_empty())
                 .ok_or_else(|| {
                     anyhow::anyhow!("{} declares no package name", manifest.display())
                 })?;
