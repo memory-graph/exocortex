@@ -367,3 +367,121 @@ deferral. Carried unverified: GitHub `since` inclusivity (live);
 Linear same-id re-emission; Falkor stream snapshot semantics;
 wire_fanout wall-clock floor flake posture; hyper-rustls allowlist
 naming; drain.rs:248 rust-analyzer report (matrix green = artifact).
+
+## Iteration 7 — the third wave (2026-09-19)
+
+**Scope:** the release range `12c8825..2d90018` (15 commits, 18 files)
+— the 0.4.1 bump, REL1's compile sweep + four rotted suites, REL3's
+publish guard, D30's thread-scoped allocator, D31's standalone project
+grant, and D32's rustls bump; the loop's first pass over the work that
+shipped v0.4.1. Engine: the deep-pr-review pipeline with EIGHT lenses +
+one Codex adversarial pass (clean: "no actionable regressions"); no
+hazard-class triggers fired (the D31 grant is an idempotent one-path
+set-insert, no new data kind or destination moved, the boot WAL scan is
+one-shot local). 22 candidate findings consolidated to 12 actionable
+(all advisory-grade; the AC table for all six range items came back
+Met), 2 retired by design, 5 observations recorded; every fix carries
+its evidence below.
+
+**Fixed:**
+
+**R12-40 — the publish guard's strip set was a second hand-synced
+literal.** `publish.sh` carried `needs_strip()`'s membership twice (the
+python exemption set and the shell case); a crate added to one but not
+the other re-opened exactly the REL3 mid-release failure the guard
+exists to stop (fail-open direction). One `STRIP_CRATES` array now
+feeds both, and the two python guard blocks merged into one (the
+duplicated prologue goes with it). `bash scripts/tests/publish.sh`
+green; the fixture's existing gregs pin both refusal strings.
+
+**R12-41 — REL1's six-feature sweep was unpinned against drift.** A
+seventh crate declaring `integration` would rott invisibly behind its
+gate again — the exact REL1 class. `cargo xtask deployment-acceptance`
+now derives the feature-declaring crates from the workspace manifests
+and refuses unless verify-release.sh compiles each one under
+`--no-run`; `integration_sweep_pins_every_declaring_crate` fails
+against a doctored sweep (missing crate, dropped --no-run).
+
+**R12-42 — the alloc gate had no positive control.** Both window tests
+assert deltas of zero; a broken hook (increment dropped, allocator
+unhooked) left the gate permanently green while measuring nothing.
+`same_thread_allocations_do_count_in_the_window` pins 64 same-thread
+allocations land in the window exactly.
+
+**R12-43 — alloc.rs prose was wrong and bloated.** The struct doc said
+`dealloc` "needs no arm" beside its required-trait arm; the module doc
+restated the D30 row. Both cut to accurate 2-3 line forms; the
+PRD-naming divergence (stats_alloc/dhat vs the hand-rolled allocator)
+is now deviation 22 in MILESTONE_REPORT (rule 8's ledger, not a PRD
+edit).
+
+**R12-44 — the online end_session path never granted the batch's
+project** (the D31 bug class, backend half): the server acked, the
+reseed delivered, and the client's own read filter dropped the row
+forever. The ack now grants the batch's project into the session scope
+(mirrors the offline fix; only widens the LOCAL filter for rows the
+server already delivered). Fail-without-it:
+`backend_project_grant.rs::backend_project_visibility_write_is_searchable_after_ack`
+(in-process backend node, principal carrying the project so delivery
+is proven, poll to the served hit; red with the grant stashed, green
+fixed). The SERVER half — principal project membership for SSE
+delivery — stays PLT1's recorded concern, now noted on its row.
+
+**R12-45 — preflight_wrapup ignored its project_id.** A proposed
+batch's cross-batch edge targets in the batch's own project did not
+resolve (the lookup scope excluded it — the very widening end_session's
+self-preflight applies). The batch's project now joins the lookup scope
+only.
+
+**R12-46 — dead dedup + O(M×P) boot scan in main.rs.** The boot join's
+`.any()` guard was provably dead (the base vc is empty two lines up)
+and the accumulating dedupe was a Vec::contains scan; the wal project
+set is a HashSet assigned once.
+
+**R12-47 — PUBLISHING.md contradicted itself about 0.4.1.** Four
+"Unreleased" blocks described crates the same file recorded as shipped;
+the publish-script contract paragraph omitted the new dev-dep refusal
+(and needs_strip); the supported-entry-point example still said
+`PUBLISH_VERSION=0.4.0` against a 0.4.1 workspace. All reconciled; the
+four 0.4.1 records relabelled "Shipped in 0.4.1".
+
+**R12-48 — D32's lockfile bump carried unexplained collateral.** The
+`cargo update --precise` re-resolution also re-pointed tempfile's
+getrandom edge 0.4.3 → 0.3.4 (its requirement admits both; deny
+advisories stay green; no bounded restore exists — `cargo update -p
+tempfile` changes nothing). Recorded here and on the D32 row rather
+than hand-edited into the lock.
+
+**R12-49 — the D32 row misstated the rustls topology and lacked its
+matrix evidence.** Per the lock, `exocortex-client` and
+`exocortex-api-client` ride rustls **0.21.12** (hyper-rustls 0.24
+stack), not 0.23.45 — the 0.23 line belongs to the server path — and
+the rerun's green is CI run 34947142714 (2026-09-15). Row corrected;
+the EOL 0.21 line itself is new Backlog row D33.
+
+**R12-50 — four D1 adapter manifests could publish by mistake.**
+parquet/iceberg/delta/postgres were documented never-ship but left
+publishable (linear/github carry `publish = false`); all four now do,
+with the PUBLISHING record.
+
+**R12-51 — github_live's mapper leg skipped silently on an empty
+window** (a green run that never mapped). The skip is loud and names
+the remedy, matching the repo's loud-skip discipline.
+
+**Retired (not defects):** a standalone "foreign project stays hidden"
+wiring test is unfulfillable by design — standalone grants every WAL
+project (single-principal contract, main.rs) and the cache layer
+already pins `memory_visible`'s exclusion; target-specific dev-deps DO
+carry `kind: "dev"` in cargo metadata (verified empirically), so the
+REL3 guard sees them; CI publishes only through the fixture-tested
+scripts (no workspace publish surface).
+
+**Recorded observations:** per-read `effective_vc` cost is O(P) in
+granted projects (P is the harness's stable project ids in practice;
+PLT1 produces the real shape); boot seeding grants all WAL projects
+regardless of author (the local-file trust boundary is unchanged — a
+WAL writer could always plant readable org rows); cdc_live passes the
+DSN in psql argv (pre-existing, gated). Carried unverified from the
+second wave, unchanged: GitHub `since` inclusivity; Linear same-id
+re-emission; Falkor stream snapshot semantics; wire_fanout wall-clock
+posture; hyper-rustls allowlist naming; drain.rs:248 analyzer report.
