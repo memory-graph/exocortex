@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "Parquet-directory adapter (D1): a directory of Parquet files as a bounded, declared-projection import through the signed Ingestion Protocol. No network beyond the backend, no LLM — schema-faithful transcription only."
 
 [[bin]]

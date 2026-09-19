@@ -9,11 +9,11 @@ planned for `ghcr.io`).
 All 14 crate names were verified available (2026-08-25;
 exocortex-adapter-sdk joined with A1).
 
-**Unreleased (round-10)** — the SaaS adapters gain direct `chrono` +
+**Shipped in 0.4.1 (round-10)** — the SaaS adapters gain direct `chrono` +
 `prost-types` deps (RFC3339 -> protobuf Timestamp; both pre-existing
 workspace deps, recorded here per rule 9).
 
-**Unreleased (round-12)** — the compatibility fingerprint moves once
+**Shipped in 0.4.1 (round-12)** — the compatibility fingerprint moves once
 more, `9f92957f… → a427b3ad…`: D8's `Summarizes` kind moved from
 mid-list to the END of dev-v1's declarations (kind local ids are
 declaration-sequential; the mid-list insert renumbered every later
@@ -35,13 +35,13 @@ value fails closed at the persisted registry (every producer's Submit
 rejected) rather than mislabeling provenance — roll forward, never
 back, across a producer-kind addition.
 
-**Unreleased (LP1, the study pack)** — `exocortex-pack-study-v1`
+**Shipped in 0.4.1 (LP1, the study pack)** — `exocortex-pack-study-v1`
 joins the composed set in every binary: 7 memory types, 3 entity
 types, 11 relationship kinds, rules L1-L3, no pack verbs in v1. The
 compatibility fingerprint moves deliberately (4615018b… → 9f92957f…).
 New ORDER entry after `exocortex-pack-dev-v1`.
 
-**Unreleased (D19, SaaS adapters)** — additive: the wire producer-kind
+**Shipped in 0.4.1 (D19, SaaS adapters)** — additive: the wire producer-kind
 enum gains `SAAS_ADAPTER` (value 7 — older servers reject it
 fail-closed, the correct rolling-upgrade behavior; no ontology
 fingerprint move). New workspace members — `exocortex-api-client`
@@ -53,6 +53,12 @@ workspace deps; published from round-12 because the published
 ORDER entries; the standing adapter-crate policy below) — carry the
 SaaS transcription path. Direct API credentials (LINEAR_API_KEY /
 GITHUB_TOKEN) live in `.env.local`, never in manifests.
+
+**Unreleased (round 12, iteration 7)** — the four D1 adapter leaf
+binaries (`exocortex-adapter-parquet` / `-iceberg` / `-delta` /
+`-postgres`) become explicitly `publish = false`, aligning their
+manifests with the standing adapter-crate policy that always excluded
+them from ORDER (their manifests could previously publish by mistake).
 
 **0.4.1 (2026-09-09)** — the agent-pilot release: the SaaS adapter
 family, the study pack, and the round 10-12 hardening. New publishable
@@ -92,7 +98,8 @@ The ontology compatibility fingerprint is unchanged. New workspace
 members since 0.3.0 — `exocortex-adapter-table`, the
 parquet/iceberg/delta/postgres adapter crates, and
 `exocortex-entity-resolution` (`publish = false`) — are leaf tool
-crates, not ORDER entries (the standing adapter-crate policy below).
+crates, not ORDER entries (the standing adapter-crate policy below:
+they are `publish = false` leaf members).
 **0.3.0 (2026-08-31)** — the adapter-contract wave, additive throughout:
 wire gains the `Preflight` and `GetValidationManifest` RPCs and the
 validation-manifest module (+`serde_json`, recorded below); the SDK
@@ -107,15 +114,17 @@ must publish in dependency order. The supported entry point is the fail-closed
 repository script:
 
 ```sh
-PUBLISH_VERSION=0.4.0 scripts/publish.sh
+PUBLISH_VERSION=0.4.1 scripts/publish.sh
 ```
 
 It refuses dirty manifests/lockfiles, mixed package versions, and an
-ORDER crate whose regular dependencies name a workspace member that is
-not published earlier (a `publish = false` member can never satisfy a
-published dependent); it runs the full mandatory correctness
-prerequisite before changing a manifest or contacting crates.io,
-publishes without `--no-verify`, and restores temporary
+ORDER crate whose regular, build, OR dev dependencies name a workspace
+member that is not published earlier (a `publish = false` member can
+never satisfy a published dependent; forward DEV-deps are refused with
+the remedy named — `STRIP_CRATES` members get their member dev-deps
+stripped for the publish window instead); it runs the full mandatory
+correctness prerequisite before changing a manifest or contacting
+crates.io, publishes without `--no-verify`, and restores temporary
 dev-dependency edits byte-for-byte. Unrelated worktree changes are
 neither rejected nor touched. Its disposable regression is
 `bash scripts/tests/publish.sh`.
@@ -189,7 +198,8 @@ serde-visible enum addition — roll forward.
   `exocortex-adapter-parquet` — a leaf binary crate like the git
   adapter, never in the kernel (R-I4/CR-26) or the SDK; it is a
   workspace member but not an entry of `scripts/publish.sh` ORDER
-  (adapter crates are not crates.io release items).
+  (adapter crates are not crates.io release items — every adapter
+  crate is `publish = false`).
 - **D1 iceberg-flavor dependency record (2026-09-02, before the
   dependency landed):** the iceberg adapter reads the format DIRECTLY
   — `metadata.json` via serde_json, manifests via `apache-avro`

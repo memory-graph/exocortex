@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "Iceberg-table adapter (D1, iceberg flavor): a local Iceberg table's current snapshot as a bounded, declared-projection import through the signed Ingestion Protocol. Reads the Iceberg format directly (metadata.json + Avro manifests + Parquet data) — no catalog, no engine, no LLM, no network beyond the backend."
 
 [[bin]]

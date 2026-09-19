@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "Delta-table adapter (D1, delta flavor): a local Delta table's current state as a bounded, declared-projection import through the signed Ingestion Protocol. Replays the _delta_log transaction log directly (JSON commits + parquet checkpoints) — no engine, no catalog, no LLM, no network beyond the backend."
 
 [[bin]]

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "Postgres-CDC adapter (D20): logical-replication changes (wal2json) as bounded, declared-projection windows through the signed Ingestion Protocol. A first-party minimal replication client on postgres-protocol (the codecs tokio-postgres itself uses) — no engine, no LLM, no network beyond the backend."
 
 [[bin]]

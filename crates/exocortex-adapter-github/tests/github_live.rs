@@ -56,22 +56,27 @@ async fn one_live_page_parses_and_maps() -> anyhow::Result<()> {
         "the live schema must parse cleanly or the mapping is stale"
     );
     eprintln!("live pulls page: {} pulls", pulls.len());
-    if !issues.is_empty() || !pulls.is_empty() {
-        // The binary's default visibility (org) through the same parser
-        // the CLI rides — the live leg proves the mapper's real inputs,
-        // not a hand-picked discriminant.
-        let visibility = exocortex_adapter_github::parse_visibility("org")
-            .expect("the CLI default visibility word is known");
-        let unit = exocortex_adapter_github::map_window(
-            &owner,
-            &repo,
-            &issues,
-            &pulls,
-            "live-page",
-            visibility,
+    if issues.is_empty() && pulls.is_empty() {
+        eprintln!(
+            "live GitHub mapper leg UNEXECUTED (both pages empty for {owner}/{repo} — \
+             point GITHUB_LIVE_OWNER/GITHUB_LIVE_REPO at a repo with rows)"
         );
-        assert!(unit.snapshot.is_some());
+        return Ok(());
     }
+    // The binary's default visibility (org) through the same parser
+    // the CLI rides — the live leg proves the mapper's real inputs,
+    // not a hand-picked discriminant.
+    let visibility = exocortex_adapter_github::parse_visibility("org")
+        .expect("the CLI default visibility word is known");
+    let unit = exocortex_adapter_github::map_window(
+        &owner,
+        &repo,
+        &issues,
+        &pulls,
+        "live-page",
+        visibility,
+    );
+    assert!(unit.snapshot.is_some());
     Ok(())
 }
 

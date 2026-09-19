@@ -206,6 +206,20 @@ cross-cutting gates (§3). Commits: one per milestone, `M<n>: <what and why>`.
     release validation's Linux container), so the wrapper duplicates its
     own stdin to fd 3 in the foreground first.
 
+### Round 12 (2026-09-19)
+22. **The no-allocation read-path assertion uses a thread-scoped
+    hand-rolled counting allocator, not the PRD-named `dhat-heap` /
+    `stats_alloc` tooling**: the process-wide `stats_alloc` global
+    counter counted every allocation in the test binary, so a one-off
+    background-thread allocation flaked the R-Lat3 gate red in CI
+    (D30). The replacement increments a `thread_local` counter from
+    `GlobalAlloc::alloc` — same-thread counting unchanged, foreign
+    threads excluded — and the `stats_alloc` dev-dependency is removed
+    (D30's plan row carries the evidence). The PRD's tooling names are
+    illustrative; the SLO itself (zero allocations on the read hot
+    path) is still asserted, now with both a negative and a positive
+    control.
+
 ## Post-review round 1 (2026-08-24)
 
 The deep review of the M0–M8 implementation found two correctness bugs and
