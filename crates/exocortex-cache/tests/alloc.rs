@@ -1,9 +1,6 @@
-//! The no-allocation read-path assertion runs in its own test binary, and
-//! its counting allocator is thread-scoped (D30): the `stats_alloc`
-//! process-wide counter this replaced let a background thread's one-off
-//! allocation land inside the measurement window and flake the gate red
-//! in CI (run 34565870901). Only allocations made by the calling thread
-//! are counted, so the gate measures the read path alone.
+//! The no-allocation read-path assertion runs in its own test binary with
+//! a CALLING-THREAD-scoped counting allocator (D30): the process-wide
+//! counter it replaced let a background thread's allocation flake the gate.
 
 use exocortex_cache::{GraphSnapshot, LocalCache};
 use exocortex_kernel::{Memory, MemoryContext, MemoryId, Provenance, Visibility, LSN};
@@ -16,10 +13,9 @@ thread_local! {
     static THREAD_ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Counts allocations made by the CALLING thread only. `dealloc`,
-/// `realloc`, and `alloc_zeroed` need no arms of their own: the default
-/// `GlobalAlloc` impls route through `alloc`, which is the only number
-/// the gate reads.
+/// Counts allocations made by the calling thread only; all counting lives
+/// in `alloc` (`realloc`/`alloc_zeroed` default impls route through it,
+/// `dealloc` passes through uncounted).
 struct ThreadCountingAlloc;
 
 unsafe impl GlobalAlloc for ThreadCountingAlloc {
@@ -122,12 +118,9 @@ fn read_hot_path_snapshot_load_is_allocation_free() {
 
 #[test]
 fn foreign_thread_allocations_do_not_count_in_the_window() {
-    // D30 regression: the process-wide counter flaked this gate red in CI
-    // when a background thread allocated inside the window. Sixty-four
-    // foreign allocations are placed deterministically between the two
-    // reads — signaled by plain atomics, because a channel send from the
-    // measuring thread would itself allocate inside the window — and none
-    // of them may move the calling thread's count.
+    // D30 regression: 64 foreign allocations sit deterministically between
+    // the two reads (handshake via plain atomics — a channel send from the
+    // measuring thread would itself allocate inside the window).
     let go = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let go_foreign = Arc::clone(&go);
@@ -155,5 +148,24 @@ fn foreign_thread_allocations_do_not_count_in_the_window() {
         after - before,
         0,
         "foreign-thread allocations must stay outside the R-Lat3 window (D30)"
+    );
+}
+
+#[test]
+fn same_thread_allocations_do_count_in_the_window() {
+    // Positive control: the two window tests above can only detect
+    // over-counting; this one fails if the counter stops counting at all
+    // (hook dropped, allocator unhooked), which would turn the gate
+    // permanently green while measuring nothing.
+    let before = thread_allocations();
+    for _ in 0..64 {
+        let v = vec![0u8; 4096];
+        std::hint::black_box(&v);
+    }
+    let after = thread_allocations();
+    assert_eq!(
+        after - before,
+        64,
+        "calling-thread allocations must land in the window (one per vec)"
     );
 }
