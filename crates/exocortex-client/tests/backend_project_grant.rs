@@ -121,7 +121,10 @@ fn spawn_client(backend: std::net::SocketAddr, data_dir: &std::path::Path) -> Cl
         .expect("spawn exocortex-mcp-client");
     let stderr = child.stderr.take().unwrap();
     std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
             eprintln!("[client] {line}");
         }
     });
