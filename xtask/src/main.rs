@@ -242,6 +242,8 @@ fn deployment_acceptance() -> Result<()> {
         &standalone_live,
     )?;
     validate_fastembed_dependency_contract(&workspace_manifest, &ingest_manifest)?;
+    let integration_crates = integration_declaring_crates()?;
+    validate_integration_sweep(&verify_release, &integration_crates)?;
     validate_chaos_compose(&compose)?;
     validate_chaos_script(&chaos_script)?;
     run(
@@ -412,6 +414,44 @@ fn validate_release_hardening(
     validate_dockerfile(dockerfile)?;
     validate_protoc_installer(protoc_installer)?;
     validate_compose_files(compose_files)
+}
+
+fn integration_declaring_crates() -> Result<Vec<String>> {
+    let mut crates = Vec::new();
+    for entry in std::fs::read_dir("crates")? {
+        let manifest = entry?.path().join("Cargo.toml");
+        let text = std::fs::read_to_string(&manifest)?;
+        if text
+            .lines()
+            .any(|line| line.trim().starts_with("integration = ["))
+        {
+            let name = text
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("name = "))
+                .map(|name| name.trim_matches('"').to_string())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{} declares no package name", manifest.display())
+                })?;
+            crates.push(name);
+        }
+    }
+    crates.sort();
+    Ok(crates)
+}
+
+fn validate_integration_sweep(verify_release: &str, integration_crates: &[String]) -> Result<()> {
+    anyhow::ensure!(
+        verify_release.contains("--no-run"),
+        "the integration-gated compile sweep must use --no-run so it compiles every gated suite even when its backend or token is absent"
+    );
+    for crate_name in integration_crates {
+        anyhow::ensure!(
+            verify_release.contains(&format!("-p {crate_name} "))
+                && verify_release.contains(&format!("{crate_name}/integration")),
+            "scripts/verify-release.sh must compile {crate_name}'s integration-gated suites (REL1: a crate declaring an `integration` feature that the sweep misses rots invisibly behind its gate)"
+        );
+    }
+    Ok(())
 }
 
 fn validate_fastembed_release(
@@ -1980,7 +2020,8 @@ mod metrics_hygiene_tests {
 mod release_hardening_tests {
     use super::{
         validate_chaos_compose, validate_chaos_script, validate_fastembed_dependency_contract,
-        validate_fastembed_release, validate_release_hardening, validate_standalone_release,
+        validate_fastembed_release, validate_integration_sweep, validate_release_hardening,
+        validate_standalone_release,
     };
 
     const SHA: &str = "11d5960a326750d5838078e36cf38b85af677262";
@@ -2296,6 +2337,31 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
             server_main,
         )
         .is_err());
+    }
+
+    #[test]
+    fn integration_sweep_pins_every_declaring_crate() {
+        let verify = include_str!("../../scripts/verify-release.sh");
+        let crates: Vec<String> = [
+            "exocortex-adapter-github",
+            "exocortex-adapter-linear",
+            "exocortex-adapter-postgres",
+            "exocortex-cluster",
+            "exocortex-dreams",
+            "exocortex-storage",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+        assert!(validate_integration_sweep(verify, &crates).is_ok());
+        // A crate that declares the feature but the sweep forgot fails the gate.
+        let mut missing = crates.clone();
+        missing.push("exocortex-adapter-iceberg".to_string());
+        assert!(validate_integration_sweep(verify, &missing).is_err());
+        // Dropping --no-run would make the sweep execute the suites instead
+        // of compiling them; backend-less runs would skip, not fail.
+        let no_dry_run = verify.replace("--no-run", "--nocapture");
+        assert!(validate_integration_sweep(&no_dry_run, &crates).is_err());
     }
 
     #[test]

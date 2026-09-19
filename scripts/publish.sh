@@ -9,6 +9,14 @@ ORDER=(
   exocortex-ops exocortex-server exocortex-client exocortex-worker
 )
 
+# Members whose workspace-member DEV-dependencies are stripped for the
+# publish window (strip_dev_deps below). The dev-dep guard reads this
+# same list — one source of truth, so the guard's exemption set and the
+# stripping set cannot drift apart.
+STRIP_CRATES=(
+  exocortex-cluster exocortex-ingest exocortex-server exocortex-pack-study-v1
+)
+
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 manifests=(Cargo.toml Cargo.lock)
@@ -44,57 +52,41 @@ if [ -n "${PUBLISH_VERSION:-}" ] && [ "$PUBLISH_VERSION" != "$release_version" ]
 fi
 echo "release version: $release_version"
 
-# A published crate's regular dependencies on workspace MEMBERS must be
-# published earlier in ORDER (PUBLISHING.md: "a crate must exist on
-# crates.io before its dependents verify") — a `publish = false` member
-# can never satisfy a published dependent, and the failure would
-# otherwise surface mid-release, after earlier crates already shipped.
-if ! python3 -c '
-import json, sys
+# A published crate's dependencies on workspace MEMBERS must be published
+# earlier in ORDER (PUBLISHING.md: "a crate must exist on crates.io before
+# its dependents verify") — regular, build, AND dev deps, because cargo
+# resolves all three against the registry during publish verification. A
+# forward member reference otherwise surfaces mid-release, after earlier
+# crates already shipped; STRIP_CRATES members carry their member dev-deps
+# stripped for the publish window, so the guard exempts them there.
+if ! STRIP_CRATES="${STRIP_CRATES[*]}" python3 -c '
+import json, os, sys
 meta = json.load(sys.stdin)
 order = sys.argv[1:]
+strip = set(os.environ["STRIP_CRATES"].split())
 members = {p["name"] for p in meta["packages"]}
 deps_by_pkg = {p["name"]: p.get("dependencies", []) for p in meta["packages"]}
 for i, name in enumerate(order):
     if name not in members:
         raise SystemExit(f"publish refused: {name} is not a workspace member")
     for dep in deps_by_pkg.get(name, []):
-        if (dep.get("kind") in (None, "build")) and dep["name"] in members and dep["name"] not in order[:i]:
-            raise SystemExit(
-                "publish refused: " + name + " depends on workspace member "
-                + dep["name"] + ", which is not published earlier in ORDER "
-                + "(a publish = false member can never satisfy a published dependent)"
+        kind = dep.get("kind")
+        if kind == "dev":
+            # A dev-dep on the package itself resolves to the crate being
+            # published (dreams declares one for its benches), and a
+            # STRIP_CRATES member has its member dev-deps stripped.
+            if name in strip or dep["name"] == name:
+                continue
+        if kind in (None, "build", "dev") and dep["name"] in members and dep["name"] not in order[:i]:
+            remedy = (
+                "(add the crate to needs_strip, or publish the dep first)"
+                if kind == "dev"
+                else "(a publish = false member can never satisfy a published dependent)"
             )
-' "${ORDER[@]}" <<<"$metadata"; then
-  exit 1
-fi
-
-# Same rule for DEV-dependencies, which cargo also resolves against the
-# registry during publish verification: a dev-dep naming a member that is
-# not yet published resolves to the older registry version or fails
-# outright (exocortex-pack-study-v1 dev-depends on exocortex-pack-mortgage-v1,
-# which ORDER publishes after it — the 0.4.1 cut failed exactly there,
-# mid-release, after kernel and dev-v1 had already shipped). A crate in
-# needs_strip gets those dev-deps removed for the publish window instead.
-if ! python3 -c '
-import json, sys
-meta = json.load(sys.stdin)
-order = sys.argv[1:]
-members = {p["name"] for p in meta["packages"]}
-deps_by_pkg = {p["name"]: p.get("dependencies", []) for p in meta["packages"]}
-strip = set("exocortex-cluster exocortex-ingest exocortex-server exocortex-pack-study-v1".split())
-for i, name in enumerate(order):
-    if name in strip:
-        continue
-    for dep in deps_by_pkg.get(name, []):
-        # A dev-dep on the package itself resolves to the crate being
-        # published (dreams declares one for its benches); it is not a
-        # forward reference.
-        if dep.get("kind") == "dev" and dep["name"] != name and dep["name"] in members and dep["name"] not in order[:i]:
             raise SystemExit(
-                "publish refused: " + name + " dev-depends on workspace member "
-                + dep["name"] + ", which is not published earlier in ORDER "
-                + "(add the crate to needs_strip, or publish the dep first)"
+                "publish refused: " + name + (" dev-depends" if kind == "dev" else " depends")
+                + " on workspace member " + dep["name"]
+                + ", which is not published earlier in ORDER " + remedy
             )
 ' "${ORDER[@]}" <<<"$metadata"; then
   exit 1
@@ -121,10 +113,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 needs_strip() {
-  case "$1" in
-    exocortex-cluster|exocortex-ingest|exocortex-server|exocortex-pack-study-v1) return 0 ;;
-    *) return 1 ;;
-  esac
+  local crate
+  for crate in "${STRIP_CRATES[@]}"; do
+    [ "$1" = "$crate" ] && return 0
+  done
+  return 1
 }
 
 strip_dev_deps() {
