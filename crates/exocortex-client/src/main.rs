@@ -8,6 +8,7 @@
 
 use exocortex_client::{mcp, wal};
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -257,7 +258,7 @@ fn main() -> anyhow::Result<()> {
     // D31: the projects the standalone WAL holds — the session context
     // joins them all (one-user org: the caller owns what they wrote) so
     // project-visibility rows stay searchable across restarts.
-    let mut wal_projects: Vec<smol_str::SmolStr> = Vec::new();
+    let mut wal_projects: HashSet<smol_str::SmolStr> = HashSet::new();
 
     // WAL: offline write buffer + (standalone) the embedded store.
     let wal = Arc::new(wal::Wal::open(&data_dir.join("wal"))?);
@@ -277,8 +278,8 @@ fn main() -> anyhow::Result<()> {
             cache.seed_local(&args.org, &rows.memories, &rows.edges, last_lsn);
             for memory in &rows.memories {
                 if let Some(project) = memory.context.project_id.as_ref() {
-                    if !project.is_empty() && !wal_projects.contains(project) {
-                        wal_projects.push(project.clone());
+                    if !project.is_empty() {
+                        wal_projects.insert(project.clone());
                     }
                 }
             }
@@ -296,11 +297,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut vc = org_visibility(&args.org, &args.user);
-    for project in wal_projects {
-        if !vc.project_ids.iter().any(|p| p == &project) {
-            vc.project_ids.push(project);
-        }
-    }
+    vc.project_ids = wal_projects.into_iter().collect();
     let server =
         mcp::ExocortexMcp::new(args.org.clone().into(), cache.clone(), vc, ontology.clone())
             .with_offline_wal(wal.clone());

@@ -277,13 +277,20 @@ impl ExocortexMcp {
             // process-minted conversation id groups every batch of this
             // client process into one backend group.
             session_id: Some(session_id.unwrap_or_else(|| self.process_session_id.clone())),
-            project_id,
+            project_id: project_id.clone(),
             team_id,
             memories,
             edges,
         };
         if let Some(tool) = &self.end_session {
             let ack = tool.handle(args).await.map_err(|e| e.to_string())?;
+            // The server accepted the batch: join its project into this
+            // session's read scope (the D31 grant, online half) so the
+            // rows the reseed delivers are not filtered out of local
+            // reads. Server-side project membership stays with the
+            // principal (PLT1); this only widens the local filter for
+            // rows the server already delivered.
+            self.grant_project(&project_id);
             return serde_json::to_string(&ack).map_err(|e| e.to_string());
         }
         if let Some(wal) = &self.wal {
@@ -522,13 +529,19 @@ impl ExocortexMcp {
     )]
     pub async fn preflight_wrapup(
         &self,
-        #[tool(param)] _project_id: String,
+        #[tool(param)] project_id: String,
         #[tool(param)] memories: Vec<MemoryDraftInput>,
         #[tool(param)] edges: Vec<EdgeHintInput>,
     ) -> Result<String, String> {
         let cache = self.cache.clone();
         let org = self.org.to_string();
-        let vc = self.effective_vc();
+        // The proposed batch's project joins the LOOKUP scope only — the
+        // same widening end_session's self-preflight applies — so a
+        // cross-batch edge target in the batch's own project resolves.
+        let mut vc = self.effective_vc();
+        if !project_id.is_empty() && !vc.project_ids.iter().any(|p| p.as_str() == project_id) {
+            vc.project_ids.push(project_id.clone().into());
+        }
         let result = crate::preflight::validate_batch(&self.ontology, &memories, &edges, |id| {
             let id = exocortex_kernel::MemoryId::parse_hex(id)?;
             cache.get_memory(&org, &id, &vc).map(|m| m.memory_type)
