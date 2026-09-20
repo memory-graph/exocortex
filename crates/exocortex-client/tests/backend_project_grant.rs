@@ -244,15 +244,47 @@ async fn a_rejected_batch_does_not_grant_its_project() {
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    // The reader boots AFTER the write, so its initial hydration (which
-    // completes before initialize is answered) already carries the
-    // other-project row into its cache. A REJECTED batch in that project
-    // must not widen the reader's read scope: without the accepted>0
-    // guard the grant fires on the rejected ack and the row turns
-    // searchable out of nowhere.
     let mut reader = spawn_client(node_addr, &data_dir("reader"));
     let mut reader_input = reader.child.stdin.take().expect("reader stdin");
     initialize(&mut reader, &mut reader_input);
+    // Positive control first: the reader's own valid write in grant-proj
+    // must become searchable, proving its search, cache, and filter
+    // machinery are live (so the other-proj absence below is the grant's,
+    // not a broken harness).
+    say(
+        &mut reader_input,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"exocortex.end_session","arguments":{"session_id":"grant-probe","project_id":"grant-proj","team_id":null,"memories":[{"draft_key":"r1","memory_type":"Fix","title":"reader control row","content":"granted and searchable","visibility":"project","tags":[]}],"edges":[]}}}"#,
+    );
+    let control = reader.reader.read_json_id(4, Duration::from_secs(20));
+    assert!(
+        tool_text(&control).contains(r#""accepted":1"#),
+        "reader control submit committed: {}",
+        tool_text(&control)
+    );
+    for attempt in 0..40 {
+        let id = 400 + attempt;
+        say(
+            &mut reader_input,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"exocortex.search_memories","arguments":{{"query":"reader control row"}}}}}}"#
+            ),
+        );
+        let response = reader.reader.read_json_id(id, Duration::from_secs(10));
+        if tool_text(&response).contains("reader control row") {
+            break;
+        }
+        assert!(
+            attempt < 39,
+            "reader never saw its own control row — the e2e premise is broken"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // The reader booted AFTER the other-project write, so its initial
+    // hydration (which completes before initialize is answered) already
+    // carries that row into its cache. A REJECTED batch in that project
+    // must not widen the reader's read scope: without the accepted>0
+    // guard the grant fires on the rejected ack and the row turns
+    // searchable out of nowhere.
     say(
         &mut reader_input,
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"exocortex.end_session","arguments":{"session_id":"grant-probe","project_id":"other-proj","team_id":null,"memories":[{"draft_key":"bad1","memory_type":"NoSuchType","title":"rejected draft","content":"invalid","visibility":"project","tags":[]}],"edges":[]}}}"#,

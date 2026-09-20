@@ -3,9 +3,8 @@ use std::process::{Child, ChildStdout};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-/// Compiled once per including test binary; each binary uses a subset,
-/// so per-binary dead-code is allowed on the shared items.
-#[allow(dead_code)]
+// Compiled once per including test binary; each binary uses a subset,
+// so per-binary dead-code is allowed on the shared items.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_BYTES: usize = exocortex_wire::limits::MAX_MCP_REQUEST_BYTES;
 
@@ -46,7 +45,6 @@ impl BoundedLineReader {
         Self { lines }
     }
 
-    /// Compiled once per including test binary; each binary uses a subset.
     #[allow(dead_code)]
     pub fn read_json(&self, child: &mut Child) -> serde_json::Value {
         self.read_json_with_timeout(child, RESPONSE_TIMEOUT)
@@ -118,6 +116,23 @@ mod tests {
             child.try_wait().unwrap().is_some(),
             "silent child was reaped"
         );
+    }
+
+    #[test]
+    fn read_json_id_skips_unrelated_lines() {
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "printf '%s\n%s\n' '{\"id\":7,\"note\":\"unrelated\"}' '{\"id\":3,\"result\":\"wanted\"}'; sleep 30",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let reader = BoundedLineReader::new(child.stdout.take().unwrap());
+        let value = reader.read_json_id(3, Duration::from_secs(5));
+        assert_eq!(value["result"], "wanted");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 

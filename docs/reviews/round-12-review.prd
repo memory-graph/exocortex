@@ -552,3 +552,57 @@ commit-hash and CI-run questions (confirmed by the run log).
 same-id re-emission; Falkor stream snapshot semantics; wire_fanout
 wall-clock posture; hyper-rustls allowlist naming; drain.rs:248
 analyzer report; the server-side principal-membership question (PLT1).
+
+## Iteration 9 — the convergence pass over iteration 8 (2026-09-19)
+
+**Scope:** the iteration-8 fix commit `6a69a23..7b56a09` (4 code files).
+Engine: eight lenses + one Codex pass (clean, the third consecutive).
+**Zero Blocking findings** — Security and Performance clean outright;
+the actionable set is advisory polish, all fixed in the same commit as
+this record:
+
+**R12-56 — `declares_integration` was section-blind** (Correctness,
+Wire/schema, Tests): an `integration = ["…"]` array under any other
+table (e.g. `[package.metadata]`) would falsely mark a crate a
+declarer. The detector now scopes to the `[features]` table; the
+"array opener on the next line" variant raised alongside it is invalid
+TOML (values must open on the key's line) and needs no arm — stated in
+the doc comment. Negative case pinned.
+
+**R12-57 — the sweep anchor could mis-blame** (Correctness,
+Wire/schema): `find("--no-run")` captured the FIRST flag occurrence;
+a comment naming the flag before the sweep would anchor on the comment
+and fail with a misleading message (fail-closed, diagnostic-only).
+`sweep_command` now skips `--no-run` occurrences whose command carries
+no `/integration` feature — a decoy comment before the workspace test
+is pinned to stay green.
+
+**R12-58 — the rejected-batch test could pass vacuously under double
+drift** (Correctness): nothing proved the reader's search machinery was
+live before asserting the other-project row stays hidden. The reader
+now writes its own valid grant-proj control row first and must see it
+before the negative phase. Mutation re-proven on the hardened test
+(weakened guard → red, restored → green).
+
+**R12-59 — `read_json_id`'s skip branch was unpinned** (Tests) and
+comment volume (Cleanup): a unit test feeds an unrelated-id line then
+the wanted one and asserts the right one returns; the sweep_command doc
+and test glosses cut; the thrice-pasted per-binary-allow rationale is
+one module-level note.
+
+**Recorded, not fixed:** `read_json_id` is the module's first
+single-consumer pub item (defensible as `read_json`'s id-matched
+sibling; note in the record); the three poll loops' shared spine judged
+load-bearing (their exit contracts differ); iteration 9's lenses
+re-verified the accepted>0 semantics against every server ack path
+(whole-batch atomic, replay returns the settled count — no
+partial-commit-with-zero case exists).
+
+**Retired:** the rust-analyzer E0107 reports (stale index — the tree
+compiles and tests green); the server partial-acceptance question
+(traced: whole-batch atomic at `service.rs:1607`, replay carries the
+settled count at `:2051`); my own prompt's publish=false premise
+(corrected by a lens: three of the six sweep targets are publish=false,
+and the bijection is publish-agnostic by design). **Carried unverified,
+unchanged:** the six live-gated/analyzer questions plus the PLT1
+principal-membership question.

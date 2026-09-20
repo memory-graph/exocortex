@@ -32,7 +32,7 @@ checks could be satisfied by the token-gated live legs), the online
 grant fires only on `accepted > 0` (a rejected batch must not widen
 the read scope — fail-without-it `a_rejected_batch_does_not_grant_its_project`),
 the manifest walker skips non-crate entries instead of aborting, and
-the e2e harness reads through the shared bounded line reader. Loop
+the grant e2e harness reads through the shared bounded line reader. Loop
 status: iteration 9 required for a verified-clean exit.
 
 **Status (2026-09-10, V0.4.1 CLOSED — the crates.io half re-run after

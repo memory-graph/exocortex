@@ -416,15 +416,27 @@ fn validate_release_hardening(
     validate_compose_files(compose_files)
 }
 
+/// True when the manifest's `[features]` table declares an
+/// `integration` key (any spacing around the `=`; TOML requires the
+/// value to open on the key's line, so `starts_with('[')` is exact).
 fn declares_integration(manifest: &str) -> bool {
-    manifest
-        .lines()
-        .any(|line| match line.trim().split_once('=') {
-            Some((key, value)) => {
-                key.trim() == "integration" && value.trim_start().starts_with('[')
+    let mut in_features = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_features = trimmed == "[features]";
+            continue;
+        }
+        if !in_features {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if key.trim() == "integration" && value.trim_start().starts_with('[') {
+                return true;
             }
-            None => false,
-        })
+        }
+    }
+    false
 }
 
 fn integration_declaring_crates() -> Result<Vec<String>> {
@@ -458,14 +470,22 @@ fn integration_declaring_crates() -> Result<Vec<String>> {
     Ok(crates)
 }
 
-/// The `--no-run` sweep command itself (from its `cargo test` to the
-/// `--no-run`), so coverage is judged against THAT invocation — not
-/// against unrelated lines elsewhere in the script (the token-gated
-/// live legs carry the same `-p` names).
+/// The `--no-run` compile-sweep command, judged as ONE invocation
+/// (skipping any earlier `--no-run` mention whose command carries no
+/// `/integration` feature, e.g. a comment).
 fn sweep_command(verify_release: &str) -> Option<&str> {
-    let dry_end = verify_release.find("--no-run")? + "--no-run".len();
-    let start = verify_release[..dry_end].rfind("cargo test")?;
-    Some(&verify_release[start..dry_end])
+    let mut search_from = 0;
+    loop {
+        let offset = verify_release[search_from..].find("--no-run")?;
+        let dry_end = search_from + offset + "--no-run".len();
+        let candidate = verify_release[..dry_end]
+            .rfind("cargo test")
+            .map(|start| &verify_release[start..dry_end]);
+        if candidate.is_some_and(|command| command.contains("/integration")) {
+            return candidate;
+        }
+        search_from = dry_end;
+    }
 }
 
 fn validate_integration_sweep(verify_release: &str, integration_crates: &[String]) -> Result<()> {
@@ -2410,22 +2430,28 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
         let mut missing = crates.clone();
         missing.push("exocortex-adapter-iceberg".to_string());
         assert!(validate_integration_sweep(verify, &missing).is_err());
-        // Dropping a crate from the SWEEP must fail even though the
+        // Dropping a crate from the sweep must fail even though the
         // token-gated live legs still carry its -p name elsewhere.
         let gutted = verify.replace("-p exocortex-dreams ", "");
         assert!(validate_integration_sweep(&gutted, &crates).is_err());
-        // A stale sweep entry (a -p target that declares no integration
-        // feature) fails the reverse direction — all six real entries
-        // stay present so only the added kernel can be the offender.
+        // A stale sweep entry fails the reverse direction (all six real
+        // entries stay present, so only the added kernel can offend).
         let stale = verify.replace(
             "-p exocortex-cluster \\",
             "-p exocortex-cluster -p exocortex-kernel \\",
         );
         assert!(validate_integration_sweep(&stale, &crates).is_err());
-        // The sweep must stay a compile check; running instead of
-        // compiling skips every backend-less environment.
+        // Running instead of compiling skips every backend-less
+        // environment.
         let no_dry_run = verify.replace("--no-run", "--nocapture");
         assert!(validate_integration_sweep(&no_dry_run, &crates).is_err());
+        // A decoy --no-run before the real sweep must not capture the
+        // anchor (the workspace test carries no /integration feature).
+        let decoy = verify.replace(
+            "cargo test --workspace",
+            "# a comment naming --no-run\ncargo test --workspace",
+        );
+        assert!(validate_integration_sweep(&decoy, &crates).is_ok());
     }
 
     #[test]
@@ -2439,6 +2465,9 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
             "[features]\nintegration_tests = []\n"
         ));
         assert!(!declares_integration("# integration = []\n"));
+        assert!(!declares_integration(
+            "[package.metadata]\nintegration = [\"x\"]\n"
+        ));
     }
 
     #[test]
