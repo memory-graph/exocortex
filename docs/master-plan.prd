@@ -32,8 +32,15 @@ checks could be satisfied by the token-gated live legs), the online
 grant fires only on `accepted > 0` (a rejected batch must not widen
 the read scope — fail-without-it `a_rejected_batch_does_not_grant_its_project`),
 the manifest walker skips non-crate entries instead of aborting, and
-the grant e2e harness reads through the shared bounded line reader. Loop
-status: iteration 9 required for a verified-clean exit.
+the grant e2e harness reads through the shared bounded line reader. **Iterations 9
+and 10 (2026-09-19/20) ran the loop over those fixes:** 9 hardened the
+sweep anchor (decoy-proof, [features]-scoped detection) and pinned
+read_json_id plus the rejected-batch double-drift control; 10 found
+only low advisories (two cargo-legal TOML forms, a rule-of-three poll
+extraction, comment trims, this header's own staleness) — five lenses
+clean outright — all fixed. Loop status: iteration 11 is the
+zero-finding candidate; the product surface has been stable across two
+consecutive passes.
 
 **Status (2026-09-10, V0.4.1 CLOSED — the crates.io half re-run after
 the mid-release REL3 failure and a power outage):** the first publish

@@ -606,3 +606,42 @@ settled count at `:2051`); my own prompt's publish=false premise
 and the bijection is publish-agnostic by design). **Carried unverified,
 unchanged:** the six live-gated/analyzer questions plus the PLT1
 principal-membership question.
+
+## Iteration 10 — the second convergence pass (2026-09-20)
+
+**Scope:** the iteration-9 fix commit `7b56a09..40bcb9d` (3 code files,
+220 diff lines). Engine: eight lenses + one Codex pass. **Security,
+Tests, Wire/schema, Performance, and Architecture returned clean
+outright**; the actionable set is four low advisories, all fixed with
+this record (Codex independently converged on the first):
+
+**R12-60 — two cargo-legal TOML forms escaped the detector**
+(Correctness + Codex): a quoted key (`"integration" = []`) or a
+`[features]` header with a trailing comment left the section-scoped
+matcher false-negative. Both verified absent from every manifest in
+the workspace (complete enumeration, Wire lens) and single-drift stays
+fail-closed (the reverse sweep direction fires) — fixed anyway: the
+header now splits at `#`, the key unquotes; both forms pinned.
+
+**R12-61 — the file's third isomorphic poll loop crossed the rule of
+three** (Cleanup): the three positive search-poll loops collapsed into
+`poll_until_found` (the return-vs-break distinction was not
+load-bearing); the negative loop keeps its distinct shape.
+
+**R12-62 — two derivable comment lines** on the reader control cut to
+the WHY.
+
+**R12-63 — the plan header's loop-status line went stale the moment
+iteration 9 landed** (Product/AC): the header said "iteration 9
+required" after iteration 9 had already run. Corrected with this
+pass's record (the header now carries the living loop state).
+
+**Roster note (honesty):** iteration 10 initially dispatched only three
+of the eight mandatory lenses; the remaining five were dispatched and
+returned before consolidation — the pass below is reported as a full
+eight-lens pass, and the shortfall existed only mid-run.
+
+**Retired:** the search-echoes-query question (results-only output);
+rmcp out-of-order responses (strictly sequential request/response in
+the harness). **Carried unverified, unchanged:** the six live-gated/
+analyzer questions plus the PLT1 principal-membership question.

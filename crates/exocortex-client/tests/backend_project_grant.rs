@@ -163,6 +163,31 @@ fn tool_text(response: &serde_json::Value) -> &str {
         .unwrap_or_default()
 }
 
+/// Poll search_memories until the needle is served (the SSE reseed is
+/// asynchronous); false when the budget expires.
+fn poll_until_found(
+    input: &mut std::process::ChildStdin,
+    reader: &support::BoundedLineReader,
+    id_base: i64,
+    needle: &str,
+) -> bool {
+    for attempt in 0..40 {
+        let id = id_base + attempt;
+        say(
+            input,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"exocortex.search_memories","arguments":{{"query":"{needle}"}}}}}}"#
+            ),
+        );
+        let response = reader.read_json_id(id, Duration::from_secs(10));
+        if tool_text(&response).contains(needle) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    false
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn backend_project_visibility_write_is_searchable_after_ack() {
     // The node's serving tasks are abort-on-drop; `_node` holds the
@@ -183,24 +208,10 @@ async fn backend_project_visibility_write_is_searchable_after_ack() {
         tool_text(&ack)
     );
 
-    // The SSE reseed is asynchronous; poll search until the row is served
-    // or the budget expires. Without the post-ack grant the row sits in a
-    // cache the session filter cannot read and this NEVER hits.
-    for attempt in 0..40 {
-        let id = 100 + attempt;
-        say(
-            &mut input,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"exocortex.search_memories","arguments":{{"query":"backend grant probe row"}}}}}}"#
-            ),
-        );
-        let response = client.reader.read_json_id(id, Duration::from_secs(10));
-        if tool_text(&response).contains("backend grant probe row") {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    panic!(
+    // Without the post-ack grant the row sits in a cache the session
+    // filter cannot read and the poll NEVER hits.
+    assert!(
+        poll_until_found(&mut input, &client.reader, 100, "backend grant probe row"),
         "project-visibility write over --backend never became searchable: \
          the session read scope never joined the batch's project"
     );
@@ -225,32 +236,17 @@ async fn a_rejected_batch_does_not_grant_its_project() {
         "writer submit committed: {}",
         tool_text(&ack)
     );
-    for attempt in 0..40 {
-        let id = 200 + attempt;
-        say(
-            &mut writer_input,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"exocortex.search_memories","arguments":{{"query":"other project row"}}}}}}"#
-            ),
-        );
-        let response = writer.reader.read_json_id(id, Duration::from_secs(10));
-        if tool_text(&response).contains("other project row") {
-            break;
-        }
-        assert!(
-            attempt < 39,
-            "writer never saw its own row — the e2e premise is broken"
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    assert!(
+        poll_until_found(&mut writer_input, &writer.reader, 200, "other project row"),
+        "writer never saw its own row — the e2e premise is broken"
+    );
 
     let mut reader = spawn_client(node_addr, &data_dir("reader"));
     let mut reader_input = reader.child.stdin.take().expect("reader stdin");
     initialize(&mut reader, &mut reader_input);
-    // Positive control first: the reader's own valid write in grant-proj
-    // must become searchable, proving its search, cache, and filter
-    // machinery are live (so the other-proj absence below is the grant's,
-    // not a broken harness).
+    // Positive control: the reader's own grant-proj write must become
+    // searchable, so the other-proj absence below is the grant's, not a
+    // broken harness.
     say(
         &mut reader_input,
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"exocortex.end_session","arguments":{"session_id":"grant-probe","project_id":"grant-proj","team_id":null,"memories":[{"draft_key":"r1","memory_type":"Fix","title":"reader control row","content":"granted and searchable","visibility":"project","tags":[]}],"edges":[]}}}"#,
@@ -261,24 +257,10 @@ async fn a_rejected_batch_does_not_grant_its_project() {
         "reader control submit committed: {}",
         tool_text(&control)
     );
-    for attempt in 0..40 {
-        let id = 400 + attempt;
-        say(
-            &mut reader_input,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"exocortex.search_memories","arguments":{{"query":"reader control row"}}}}}}"#
-            ),
-        );
-        let response = reader.reader.read_json_id(id, Duration::from_secs(10));
-        if tool_text(&response).contains("reader control row") {
-            break;
-        }
-        assert!(
-            attempt < 39,
-            "reader never saw its own control row — the e2e premise is broken"
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    assert!(
+        poll_until_found(&mut reader_input, &reader.reader, 400, "reader control row"),
+        "reader never saw its own control row — the e2e premise is broken"
+    );
     // The reader booted AFTER the other-project write, so its initial
     // hydration (which completes before initialize is answered) already
     // carries that row into its cache. A REJECTED batch in that project

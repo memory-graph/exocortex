@@ -424,14 +424,18 @@ fn declares_integration(manifest: &str) -> bool {
     for line in manifest.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_features = trimmed == "[features]";
+            in_features = trimmed
+                .split('#')
+                .next()
+                .is_some_and(|header| header.trim() == "[features]");
             continue;
         }
         if !in_features {
             continue;
         }
         if let Some((key, value)) = trimmed.split_once('=') {
-            if key.trim() == "integration" && value.trim_start().starts_with('[') {
+            if key.trim().trim_matches('"') == "integration" && value.trim_start().starts_with('[')
+            {
                 return true;
             }
         }
@@ -2468,6 +2472,10 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
         assert!(!declares_integration(
             "[package.metadata]\nintegration = [\"x\"]\n"
         ));
+        assert!(declares_integration(
+            "[features] # live backend tests\nintegration = []\n"
+        ));
+        assert!(declares_integration("[features]\n\"integration\" = []\n"));
     }
 
     #[test]
