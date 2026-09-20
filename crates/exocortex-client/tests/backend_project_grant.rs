@@ -1,13 +1,11 @@
-//! D31 follow-up (round 12, iteration 7): the online half of the session
-//! project grant. In `--backend` mode `end_session` acked fine, but the
-//! batch's project never joined the client session's read scope, so the
-//! project-visibility rows the server delivered over SSE were filtered
-//! out of every local read — the same blindness D31 fixed for standalone.
-//!
-//! The in-process backend node registers its principal WITH the project in
-//! scope (server-side project membership is PLT1's concern; this test
-//! isolates the client half), so the row IS delivered — and without the
-//! post-ack grant it is delivered into a cache the session cannot read.
+//! The online half of the D31 project grant: over `--backend`,
+//! end_session acked but the batch's project never joined the client's
+//! read scope, so server-delivered project-visibility rows were
+//! filtered out of every local read. The node's principal carries the
+//! projects in scope (server-side membership is PLT1's concern), so the
+//! rows ARE delivered — the client's own filter is what's under test.
+
+mod support;
 
 use std::io::{BufRead as _, Write as _};
 use std::process::{Child, Command, Stdio};
@@ -21,6 +19,7 @@ const CLUSTER_KEY: [u8; 32] = [21u8; 32];
 const PRODUCER_KEY: [u8; 32] = [22u8; 32];
 const TOKEN: &str = "test-only-grant-bearer-token-0000000000";
 const PROJECT: &str = "grant-proj";
+const OTHER_PROJECT: &str = "other-proj";
 
 fn hex(bytes: &[u8; 32]) -> String {
     use std::fmt::Write as _;
@@ -44,11 +43,9 @@ async fn boot_node() -> (
         .expect("composed pack set assembles"),
     );
     let storage = Arc::new(InMemoryStorage::new(ontology.clone()));
-    // The principal carries the project in scope so the server DELIVERS
-    // project-visibility rows over SSE; the blindness under test is the
-    // client's own read filter.
     let mut principal = exocortex_ops::operations::ops_vc("org", "grantu", Visibility::Org);
     principal.project_ids.push(PROJECT.into());
+    principal.project_ids.push(OTHER_PROJECT.into());
     let node = exocortex_server::backend::run_backend_node(
         storage,
         ontology,
@@ -88,7 +85,7 @@ async fn boot_node() -> (
 
 struct ClientProcess {
     child: Child,
-    lines: std::sync::mpsc::Receiver<Result<String, String>>,
+    reader: support::BoundedLineReader,
 }
 
 impl Drop for ClientProcess {
@@ -128,39 +125,42 @@ fn spawn_client(backend: std::net::SocketAddr, data_dir: &std::path::Path) -> Cl
             eprintln!("[client] {line}");
         }
     });
-    let stdout = child.stdout.take().unwrap();
-    let (tx, lines) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stdout).lines() {
-            let line = line.map_err(|e| e.to_string());
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    ClientProcess { child, lines }
+    let reader = support::BoundedLineReader::new(child.stdout.take().unwrap());
+    ClientProcess { child, reader }
 }
 
-/// Next stdout line that is a JSON-RPC response with the given id.
-fn response_for(client: &ClientProcess, id: i64, timeout: Duration) -> serde_json::Value {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out waiting for response id {id}"
-        );
-        let line = client
-            .lines
-            .recv_timeout(remaining)
-            .unwrap_or_else(|_| panic!("stdout closed waiting for response id {id}"))
-            .expect("stdout UTF-8");
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-            if value.get("id") == Some(&serde_json::json!(id)) {
-                return value;
-            }
-        }
-    }
+fn data_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "exo-grant-{tag}-{}-{}",
+        std::process::id(),
+        uuid::Uuid::now_v7().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn initialize(client: &mut ClientProcess, input: &mut std::process::ChildStdin) {
+    say(
+        input,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"grant-probe","version":"1"}}}"#,
+    );
+    let init = client.reader.read_json_id(1, Duration::from_secs(20));
+    assert!(init["result"].is_object(), "initialize ok: {init}");
+    say(
+        input,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
+    );
+}
+
+fn say(input: &mut std::process::ChildStdin, msg: &str) {
+    writeln!(input, "{msg}").unwrap();
+    input.flush().unwrap();
+}
+
+fn tool_text(response: &serde_json::Value) -> &str {
+    response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -168,42 +168,19 @@ async fn backend_project_visibility_write_is_searchable_after_ack() {
     // The node's serving tasks are abort-on-drop; `_node` holds the
     // listener open for the whole test.
     let (_node, node_addr) = boot_node().await;
-    let data_dir = std::env::temp_dir().join(format!(
-        "exo-grant-{}-{}",
-        std::process::id(),
-        uuid::Uuid::now_v7().simple()
-    ));
-    std::fs::create_dir_all(&data_dir).unwrap();
-    let mut client = spawn_client(node_addr, &data_dir);
-
+    let mut client = spawn_client(node_addr, &data_dir("ack"));
     let mut input = client.child.stdin.take().expect("client stdin");
-    let say = |input: &mut std::process::ChildStdin, msg: &str| {
-        writeln!(input, "{msg}").unwrap();
-        input.flush().unwrap();
-    };
-
-    say(
-        &mut input,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"grant-probe","version":"1"}}}"#,
-    );
-    let init = response_for(&client, 1, Duration::from_secs(20));
-    assert!(init["result"].is_object(), "initialize ok: {init}");
-    say(
-        &mut input,
-        r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
-    );
+    initialize(&mut client, &mut input);
 
     say(
         &mut input,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exocortex.end_session","arguments":{"session_id":"grant-probe","project_id":"grant-proj","team_id":null,"memories":[{"draft_key":"m1","memory_type":"Fix","title":"backend grant probe row","content":"project-visibility row written over the online path","visibility":"project","tags":[]}],"edges":[]}}}"#,
     );
-    let ack = response_for(&client, 2, Duration::from_secs(20));
-    let text = ack["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
+    let ack = client.reader.read_json_id(2, Duration::from_secs(20));
     assert!(
-        text.contains(r#""accepted":1"#),
-        "the submit committed: {text}"
+        tool_text(&ack).contains(r#""accepted":1"#),
+        "the submit committed: {}",
+        tool_text(&ack)
     );
 
     // The SSE reseed is asynchronous; poll search until the row is served
@@ -217,11 +194,8 @@ async fn backend_project_visibility_write_is_searchable_after_ack() {
                 r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"exocortex.search_memories","arguments":{{"query":"backend grant probe row"}}}}}}"#
             ),
         );
-        let response = response_for(&client, id, Duration::from_secs(10));
-        let text = response["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or_default();
-        if text.contains("backend grant probe row") {
+        let response = client.reader.read_json_id(id, Duration::from_secs(10));
+        if tool_text(&response).contains("backend grant probe row") {
             return;
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -230,4 +204,78 @@ async fn backend_project_visibility_write_is_searchable_after_ack() {
         "project-visibility write over --backend never became searchable: \
          the session read scope never joined the batch's project"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_batch_does_not_grant_its_project() {
+    let (_node, node_addr) = boot_node().await;
+
+    // A second client writes a row in OTHER_PROJECT; its own grant makes
+    // the row searchable from the writer, proving it is server-side.
+    let mut writer = spawn_client(node_addr, &data_dir("writer"));
+    let mut writer_input = writer.child.stdin.take().expect("writer stdin");
+    initialize(&mut writer, &mut writer_input);
+    say(
+        &mut writer_input,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exocortex.end_session","arguments":{"session_id":"grant-probe","project_id":"other-proj","team_id":null,"memories":[{"draft_key":"w1","memory_type":"Fix","title":"other project row","content":"written by the writer client","visibility":"project","tags":[]}],"edges":[]}}}"#,
+    );
+    let ack = writer.reader.read_json_id(2, Duration::from_secs(20));
+    assert!(
+        tool_text(&ack).contains(r#""accepted":1"#),
+        "writer submit committed: {}",
+        tool_text(&ack)
+    );
+    for attempt in 0..40 {
+        let id = 200 + attempt;
+        say(
+            &mut writer_input,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"exocortex.search_memories","arguments":{{"query":"other project row"}}}}}}"#
+            ),
+        );
+        let response = writer.reader.read_json_id(id, Duration::from_secs(10));
+        if tool_text(&response).contains("other project row") {
+            break;
+        }
+        assert!(
+            attempt < 39,
+            "writer never saw its own row — the e2e premise is broken"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // The reader boots AFTER the write, so its initial hydration (which
+    // completes before initialize is answered) already carries the
+    // other-project row into its cache. A REJECTED batch in that project
+    // must not widen the reader's read scope: without the accepted>0
+    // guard the grant fires on the rejected ack and the row turns
+    // searchable out of nowhere.
+    let mut reader = spawn_client(node_addr, &data_dir("reader"));
+    let mut reader_input = reader.child.stdin.take().expect("reader stdin");
+    initialize(&mut reader, &mut reader_input);
+    say(
+        &mut reader_input,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"exocortex.end_session","arguments":{"session_id":"grant-probe","project_id":"other-proj","team_id":null,"memories":[{"draft_key":"bad1","memory_type":"NoSuchType","title":"rejected draft","content":"invalid","visibility":"project","tags":[]}],"edges":[]}}}"#,
+    );
+    let ack = reader.reader.read_json_id(3, Duration::from_secs(20));
+    assert!(
+        tool_text(&ack).contains(r#""accepted":0"#),
+        "the batch must be rejected client-side: {}",
+        tool_text(&ack)
+    );
+    for attempt in 0..12 {
+        let id = 300 + attempt;
+        say(
+            &mut reader_input,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"exocortex.search_memories","arguments":{{"query":"other project row"}}}}}}"#
+            ),
+        );
+        let response = reader.reader.read_json_id(id, Duration::from_secs(10));
+        assert!(
+            !tool_text(&response).contains("other project row"),
+            "a rejected batch granted its project: the row became searchable"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }

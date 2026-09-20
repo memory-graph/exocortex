@@ -3,6 +3,9 @@ use std::process::{Child, ChildStdout};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
+/// Compiled once per including test binary; each binary uses a subset,
+/// so per-binary dead-code is allowed on the shared items.
+#[allow(dead_code)]
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_BYTES: usize = exocortex_wire::limits::MAX_MCP_REQUEST_BYTES;
 
@@ -43,9 +46,35 @@ impl BoundedLineReader {
         Self { lines }
     }
 
+    /// Compiled once per including test binary; each binary uses a subset.
+    #[allow(dead_code)]
     pub fn read_json(&self, child: &mut Child) -> serde_json::Value {
         self.read_json_with_timeout(child, RESPONSE_TIMEOUT)
             .unwrap_or_else(|error| panic!("MCP child response failed: {error}"))
+    }
+
+    /// Next JSON-RPC response carrying the given id, skipping unrelated
+    /// lines, bounded by `timeout` overall.
+    #[allow(dead_code)]
+    pub fn read_json_id(&self, id: i64, timeout: Duration) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for a response with id {id}"
+            );
+            let line = match self.lines.recv_timeout(remaining) {
+                Ok(Ok(line)) => line,
+                Ok(Err(error)) => panic!("MCP child response failed: {error}"),
+                Err(error) => panic!("no answer while waiting for id {id}: {error}"),
+            };
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                if value.get("id") == Some(&serde_json::json!(id)) {
+                    return value;
+                }
+            }
+        }
     }
 
     fn read_json_with_timeout(

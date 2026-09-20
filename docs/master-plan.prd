@@ -21,8 +21,19 @@ and D32's row is corrected (client/api-client ride rustls 0.21.12 not
 benign getrandom collateral re-pointing — R12-48). New Proposed row
 D33 (retire the EOL rustls 0.21 line under api-client's hyper 0.14
 stack). Deviation 22 records D30's tooling divergence from the PRD's
-stats_alloc/dhat naming. Loop status: iteration 8 required for a
-verified-clean exit (the pass covers its own fixes next).
+stats_alloc/dhat naming. Fixes landed as `ea34623` (publish strip set +
+sweep pin), `714f8af` (alloc controls), `09b8164` (online grant,
+preflight join, HashSet boot), `55f8d69` (loud skip, manifests, docs),
+`2996903`/`6a69a23` (fmt, manifest-name parsing). **Iteration 8 (same
+day) ran the loop over those fixes** and hardened its own output: the
+sweep pin now anchors to the actual `--no-run` command with a two-way
+crate bijection and spacing-tolerant feature detection (substring
+checks could be satisfied by the token-gated live legs), the online
+grant fires only on `accepted > 0` (a rejected batch must not widen
+the read scope — fail-without-it `a_rejected_batch_does_not_grant_its_project`),
+the manifest walker skips non-crate entries instead of aborting, and
+the e2e harness reads through the shared bounded line reader. Loop
+status: iteration 9 required for a verified-clean exit.
 
 **Status (2026-09-10, V0.4.1 CLOSED — the crates.io half re-run after
 the mid-release REL3 failure and a power outage):** the first publish

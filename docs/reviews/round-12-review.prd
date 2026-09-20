@@ -485,3 +485,70 @@ DSN in psql argv (pre-existing, gated). Carried unverified from the
 second wave, unchanged: GitHub `since` inclusivity; Linear same-id
 re-emission; Falkor stream snapshot semantics; wire_fanout wall-clock
 posture; hyper-rustls allowlist naming; drain.rs:248 analyzer report.
+
+## Iteration 8 — the loop over iteration 7's fixes (2026-09-19)
+
+**Scope:** the iteration-7 fix commits `2d90018..6a69a23` (11 code
+files). Engine: eight lenses + one Codex pass (clean again); no hazard
+triggers. 20 candidates consolidated to 4 actionable (one found
+independently by five lenses), several verified-clean notes, and the
+carried unverified list unchanged.
+
+**Fixed:**
+
+**R12-52 — the sweep pin was weaker than its purpose** (Correctness,
+Tests, Wire/schema, Architecture, Cleanup — independent). The
+substring-anywhere checks could be satisfied from the token-gated LIVE
+legs (`-p exocortex-adapter-github` appears there too), the `--no-run`
+check was disjoint from the per-crate check, and the feature detector
+matched one canonical spelling (`integration=[]` would escape —
+fail-open). `validate_integration_sweep` now anchors to the actual
+`--no-run` command (from its `cargo test` to the flag), parses its
+`-p` and `--features` tokens, and enforces a TWO-WAY bijection with
+the manifest-derived declaring set (a stale sweep entry also refuses);
+`declares_integration` accepts any TOML spacing. Tests pin each
+direction: gutted sweep, stale entry, dropped `--no-run`, spacing
+variants.
+
+**R12-53 — the online grant fired on a rejected ack** (Correctness +
+Security). `tool.handle` returns `Ok` with `accepted: 0` when local
+preflight rejects every draft, so a failed batch still widened the
+session read scope for the process lifetime. The grant now fires only
+on `accepted > 0`. Fail-without-it:
+`a_rejected_batch_does_not_grant_its_project` — a second client writes
+an other-project row, the reader (hydrated with it at boot) submits an
+invalid batch in that project and must NOT see the row (red with the
+guard weakened to `if true`, green fixed).
+
+**R12-54 — the manifest walker aborted the gate on non-crate
+entries** (Correctness + Wire/schema). Any stray file or manifest-less
+directory under `crates/` killed deployment-acceptance with an opaque
+io error; such entries now skip (they carry no gated suites).
+
+**R12-55 — harness and prose hardening** (Cleanup + Tests). The e2e
+reads through the shared `support::BoundedLineReader` (byte-bounded;
+`read_json_id` added) instead of a hand-rolled unbounded channel pump —
+also fixing the timeout-misread-as-stdout-closed diagnostic; the grant
+comment and the test module doc cut to their WHY.
+
+**Recorded, not fixed:** the merged publish guard reports whichever
+violation comes first in ORDER when a crate has both kinds (cosmetic;
+both refuse pre-mutation — the fixture's own reset comment
+acknowledges the interleave); the ~100-line backend-harness duplication
+across the two e2e files is the repo's established per-file idiom
+(extract at the third backend harness, per the standalone_readback /
+backup_restore precedent); performance re-examined `effective_vc` and
+confirmed the diff only POPULATES the recorded O(P) shape in backend
+mode (G ≤ distinct written projects, SmallVec-bounded) and improves
+boot to O(M). The fixture's study strip-then-publish leg remains
+unexecuted by construction (the refusal aborts before publish_one) —
+covered instead by the single-sourced STRIP_CRATES, cluster's
+strip/restore leg, and the guard-exemption scenario. Retired: the
+test-vs-gate split for the sweep (the literal six in the unit test
+cannot go stale into a false pass — the gate derives from manifests);
+commit-hash and CI-run questions (confirmed by the run log).
+
+**Carried unverified, unchanged:** GitHub `since` inclusivity; Linear
+same-id re-emission; Falkor stream snapshot semantics; wire_fanout
+wall-clock posture; hyper-rustls allowlist naming; drain.rs:248
+analyzer report; the server-side principal-membership question (PLT1).

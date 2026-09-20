@@ -416,15 +416,29 @@ fn validate_release_hardening(
     validate_compose_files(compose_files)
 }
 
+fn declares_integration(manifest: &str) -> bool {
+    manifest
+        .lines()
+        .any(|line| match line.trim().split_once('=') {
+            Some((key, value)) => {
+                key.trim() == "integration" && value.trim_start().starts_with('[')
+            }
+            None => false,
+        })
+}
+
 fn integration_declaring_crates() -> Result<Vec<String>> {
     let mut crates = Vec::new();
     for entry in std::fs::read_dir("crates")? {
         let manifest = entry?.path().join("Cargo.toml");
+        // Non-crate entries under crates/ (a stray file, a scratch dir)
+        // carry no manifest and no gated suites; skip them rather than
+        // aborting the gate on an unrelated io error.
+        if !manifest.is_file() {
+            continue;
+        }
         let text = std::fs::read_to_string(&manifest)?;
-        if text
-            .lines()
-            .any(|line| line.trim().starts_with("integration = ["))
-        {
+        if declares_integration(&text) {
             let name = text
                 .lines()
                 .find_map(|line| {
@@ -444,16 +458,49 @@ fn integration_declaring_crates() -> Result<Vec<String>> {
     Ok(crates)
 }
 
+/// The `--no-run` sweep command itself (from its `cargo test` to the
+/// `--no-run`), so coverage is judged against THAT invocation — not
+/// against unrelated lines elsewhere in the script (the token-gated
+/// live legs carry the same `-p` names).
+fn sweep_command(verify_release: &str) -> Option<&str> {
+    let dry_end = verify_release.find("--no-run")? + "--no-run".len();
+    let start = verify_release[..dry_end].rfind("cargo test")?;
+    Some(&verify_release[start..dry_end])
+}
+
 fn validate_integration_sweep(verify_release: &str, integration_crates: &[String]) -> Result<()> {
-    anyhow::ensure!(
-        verify_release.contains("--no-run"),
-        "the integration-gated compile sweep must use --no-run so it compiles every gated suite even when its backend or token is absent"
-    );
+    let command =
+        sweep_command(verify_release).ok_or_else(|| anyhow::anyhow!("scripts/verify-release.sh must carry an integration-gated compile sweep that uses --no-run so every gated suite compiles even when its backend or token is absent (REL1)"))?;
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut packages: Vec<&str> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if *token == "-p" {
+            if let Some(name) = tokens.get(index + 1) {
+                packages.push(name);
+            }
+        }
+    }
+    let features: Vec<&str> = tokens
+        .iter()
+        .position(|token| *token == "--features")
+        .and_then(|index| tokens.get(index + 1))
+        .map(|value| value.split(',').collect())
+        .unwrap_or_default();
+    let declaring: std::collections::HashSet<&str> = integration_crates
+        .iter()
+        .map(|name| name.as_str())
+        .collect();
     for crate_name in integration_crates {
         anyhow::ensure!(
-            verify_release.contains(&format!("-p {crate_name} "))
-                && verify_release.contains(&format!("{crate_name}/integration")),
-            "scripts/verify-release.sh must compile {crate_name}'s integration-gated suites (REL1: a crate declaring an `integration` feature that the sweep misses rots invisibly behind its gate)"
+            packages.contains(&crate_name.as_str())
+                && features.contains(&format!("{crate_name}/integration").as_str()),
+            "the --no-run sweep must compile {crate_name} under its integration feature (REL1: a crate declaring an `integration` feature that the sweep misses rots invisibly behind its gate)"
+        );
+    }
+    for package in packages {
+        anyhow::ensure!(
+            declaring.contains(package),
+            "the --no-run sweep compiles {package}, which declares no integration feature — a stale sweep entry (the manifest walk and the sweep must agree)"
         );
     }
     Ok(())
@@ -2024,9 +2071,9 @@ mod metrics_hygiene_tests {
 #[cfg(test)]
 mod release_hardening_tests {
     use super::{
-        validate_chaos_compose, validate_chaos_script, validate_fastembed_dependency_contract,
-        validate_fastembed_release, validate_integration_sweep, validate_release_hardening,
-        validate_standalone_release,
+        declares_integration, validate_chaos_compose, validate_chaos_script,
+        validate_fastembed_dependency_contract, validate_fastembed_release,
+        validate_integration_sweep, validate_release_hardening, validate_standalone_release,
     };
 
     const SHA: &str = "11d5960a326750d5838078e36cf38b85af677262";
@@ -2363,10 +2410,35 @@ readonly expected_sha256=3333333333333333333333333333333333333333333333333333333
         let mut missing = crates.clone();
         missing.push("exocortex-adapter-iceberg".to_string());
         assert!(validate_integration_sweep(verify, &missing).is_err());
-        // Dropping --no-run would make the sweep execute the suites instead
-        // of compiling them; backend-less runs would skip, not fail.
+        // Dropping a crate from the SWEEP must fail even though the
+        // token-gated live legs still carry its -p name elsewhere.
+        let gutted = verify.replace("-p exocortex-dreams ", "");
+        assert!(validate_integration_sweep(&gutted, &crates).is_err());
+        // A stale sweep entry (a -p target that declares no integration
+        // feature) fails the reverse direction — all six real entries
+        // stay present so only the added kernel can be the offender.
+        let stale = verify.replace(
+            "-p exocortex-cluster \\",
+            "-p exocortex-cluster -p exocortex-kernel \\",
+        );
+        assert!(validate_integration_sweep(&stale, &crates).is_err());
+        // The sweep must stay a compile check; running instead of
+        // compiling skips every backend-less environment.
         let no_dry_run = verify.replace("--no-run", "--nocapture");
         assert!(validate_integration_sweep(&no_dry_run, &crates).is_err());
+    }
+
+    #[test]
+    fn integration_detection_tolerates_manifest_spacing() {
+        assert!(declares_integration("[features]\nintegration = []\n"));
+        assert!(declares_integration("[features]\nintegration=[]\n"));
+        assert!(declares_integration(
+            "[features]\nintegration = [\n  \"live\",\n]\n"
+        ));
+        assert!(!declares_integration(
+            "[features]\nintegration_tests = []\n"
+        ));
+        assert!(!declares_integration("# integration = []\n"));
     }
 
     #[test]

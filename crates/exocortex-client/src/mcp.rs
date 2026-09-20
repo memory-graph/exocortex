@@ -284,13 +284,12 @@ impl ExocortexMcp {
         };
         if let Some(tool) = &self.end_session {
             let ack = tool.handle(args).await.map_err(|e| e.to_string())?;
-            // The server accepted the batch: join its project into this
-            // session's read scope (the D31 grant, online half) so the
-            // rows the reseed delivers are not filtered out of local
-            // reads. Server-side project membership stays with the
-            // principal (PLT1); this only widens the local filter for
-            // rows the server already delivered.
-            self.grant_project(&project_id);
+            // Only a batch the server accepted widens the local read
+            // filter (the D31 grant, online half); server-side project
+            // membership stays with the principal (PLT1).
+            if ack.accepted > 0 {
+                self.grant_project(&project_id);
+            }
             return serde_json::to_string(&ack).map_err(|e| e.to_string());
         }
         if let Some(wal) = &self.wal {
