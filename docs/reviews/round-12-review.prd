@@ -645,3 +645,23 @@ eight-lens pass, and the shortfall existed only mid-run.
 rmcp out-of-order responses (strictly sequential request/response in
 the harness). **Carried unverified, unchanged:** the six live-gated/
 analyzer questions plus the PLT1 principal-membership question.
+
+## Iteration 11 — the zero-finding candidate (2026-09-20)
+
+**Scope:** the iteration-10 fix commit `40bcb9d..91732bd` (2 code
+files, 170 diff lines). Engine: the full eight-lens roster + one Codex
+pass (clean, the fifth consecutive). **Seven of eight lenses returned
+clean with zero findings** (Correctness, Security, Tests, Wire/schema —
+parity re-confirmed against all 26 manifests — Performance,
+Architecture, Product/AC — all four R12-60..63 claims verified, the
+roster note read as honest). The single actionable finding, from
+Cleanup: the detector's doc comment did not name its two new
+tolerances — fixed as the one-line commit carrying this record
+(R12-64). Two informational observations recorded without action: the
+literal-string-key TOML form (`'integration'`) remains undetected
+(absent from every manifest, same fail-closed drift direction), and a
+full-line comment inside `[features]` has no dedicated negative case
+(behavior traced correct, pinned indirectly by the pre-section case).
+
+Carried unverified, unchanged: the six live-gated/analyzer questions
+plus the PLT1 principal-membership question.

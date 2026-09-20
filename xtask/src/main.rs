@@ -417,8 +417,9 @@ fn validate_release_hardening(
 }
 
 /// True when the manifest's `[features]` table declares an
-/// `integration` key (any spacing around the `=`; TOML requires the
-/// value to open on the key's line, so `starts_with('[')` is exact).
+/// `integration` key — any spacing around the `=`, a trailing comment
+/// on the header, or a quoted key all match; TOML requires the value
+/// to open on the key's line, so `starts_with('[')` is exact.
 fn declares_integration(manifest: &str) -> bool {
     let mut in_features = false;
     for line in manifest.lines() {
