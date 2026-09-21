@@ -38,9 +38,16 @@ sweep anchor (decoy-proof, [features]-scoped detection) and pinned
 read_json_id plus the rejected-batch double-drift control; 10 found
 only low advisories (two cargo-legal TOML forms, a rule-of-three poll
 extraction, comment trims, this header's own staleness) — five lenses
-clean outright — all fixed. Loop status: iteration 11 is the
-zero-finding candidate; the product surface has been stable across two
-consecutive passes.
+clean outright — all fixed. Iterations 11 and 12 closed the loop
+(11: full roster, one doc-line nit; 12: zero findings) — **ROUND 12
+EXITS VERIFIED-CLEAN** (round-12-review.prd's closure section carries
+the evidence: 8 iterations, 64 verified findings fixed, matrix green
+on the exact closing tree `8d3af2f`, live legs unexecuted as ever).
+The plan's open work resumes where the 2026-09-05 Next list parked it:
+D19 waits on LINEAR_API_KEY (owner), PLT1 is the next owner-requested
+row (prerequisite met; the server-side membership half is named on its
+row), Wave 5 D3/D15 remain the next locally-satisfiable rows, REL2 and
+D33 sit Proposed.
 
 **Status (2026-09-10, V0.4.1 CLOSED — the crates.io half re-run after
 the mid-release REL3 failure and a power outage):** the first publish

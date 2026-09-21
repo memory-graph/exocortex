@@ -665,3 +665,32 @@ full-line comment inside `[features]` has no dedicated negative case
 
 Carried unverified, unchanged: the six live-gated/analyzer questions
 plus the PLT1 principal-membership question.
+
+## Iteration 12 — the clean-exit confirmation (2026-09-20)
+
+**Scope:** the iteration-11 fix commit `91732bd..8d3af2f` — one doc
+comment (the detector naming its own tolerances) plus the records.
+Engine, disclosed honestly: a composite confirmation pass — three
+agents covering all eight lens subjects over the 16-line code diff
+(doc accuracy cross-checked line by line against the function; record
+accuracy including the header's candidate-not-assertion wording and
+both informational observations; residual surfaces: correctness of the
+quoted-table-name edge, security surface, test-needs-none, packaging,
+performance, proportionality) + one Codex pass (clean, the sixth
+consecutive). **Zero findings, zero unverified of substance.** The
+pass's base is iteration 11's full-roster run (eight lenses, seven
+clean, the one nit fixed as this pass's subject).
+
+## Loop closure — round 12 exits verified-clean
+
+Exit evidence, per the loop's own conditions: the final pass ran
+against HEAD `8d3af2f` after the last fix, with zero Actionable
+findings and nothing reclassified to reach it; the full gate matrix
+passed on that exact tree (verify-release.sh exit 0, 204 suite-oks;
+live FALKOR/REDIS/POSTGRES/GitHub/Linear legs UNEXECUTED, URLs/tokens
+unset, as ever stated plainly). Eight iterations total: 1 (the wave
+pass, 25 findings), 6 (14), 7 (12, the release range), 8 (4), 9 (4),
+10 (4), 11 (1), 12 (0) — 64 verified findings fixed across the round,
+every one with fail-without-it evidence or a failing check, two new
+deferrals recorded (R12-D1, R12-D2), and the standing carried
+questions enumerated in each iteration's record. Round 12 is CLOSED.
