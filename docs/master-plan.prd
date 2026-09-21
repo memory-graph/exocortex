@@ -1,5 +1,23 @@
 # Exocortex — Master Plan
 
+**Status (2026-09-21, ROUND 12 CLOSED — the review loop exited
+verified-clean; main green at `75a427e`, CI run 35560051450):** the
+loop ran iterations 7-12 across 2026-09-19/20 over the v0.4.1 release
+range and each pass's own fixes (12+4+4+4+1+0 findings, every fix with
+fail-without-it evidence; Codex clean six consecutive passes) — 64
+verified findings fixed across the round's eight iterations. The full
+gate matrix passed on every pushed tree (204 suite-oks, exit 0; live
+FALKOR/REDIS/POSTGRES/GitHub/Linear legs UNEXECUTED throughout, URLs/
+tokens unset, stated plainly). The detail lives in the 2026-09-19
+entry below and `docs/reviews/round-12-review.prd`'s closure section.
+**Next, in order:** D19 parks on the owner minting LINEAR_API_KEY;
+PLT1 is the next owner-requested row (prerequisite met — fresh 0.4.1
+binaries installed; its row names the remaining server-side half,
+principal project membership for SSE delivery); Wave 5's D3/D15 are
+the next locally-satisfiable rows (each starts with its design
+decision per the open-row gates); REL2 (matrix wall-time) and D33
+(retire the EOL rustls 0.21 line) sit Proposed.
+
 **Status (2026-09-19, ROUND 12 THIRD WAVE — the loop's iteration 7 over
 the v0.4.1 release range, `12c8825..2d90018`; 12 actionable findings
 fixed, all advisory-grade, all six range items' ACs Met):** eight lenses
@@ -1188,7 +1206,7 @@ A PRD that is not listed here is not accepted work.
 | `docs/bug-prd-standalone-readback.md` | Zero-setup mode's write→read loop | Closed (SR-PRD) |
 | `docs/bug-prd-external-key-identity.md` | `ExternalKey` identity stability | Closed |
 | `docs/prd/adapter-contract-prd.md` | Projection bounds, adapter-side validation, source-schema evolution — the contract every table/CDC/API adapter needs | **Shipped** (Wave 2, D21 a-e complete; D1/D19/D20 unblocked) |
-| `docs/reviews/round-<n>-review.prd` | Findings against completed work; rounds 1, 2, 3, 6, 7, 8, and 9 are closed | Round 9 closed — Wave 4 boundary, three findings landed with fixes; every round follows the same lifecycle as 6 |
+| `docs/reviews/round-<n>-review.prd` | Findings against completed work; rounds 1, 2, 3, 6, 7, 8, 9, 10, 11, and 12 are closed | Round 12 closed 2026-09-20 at the loop's verified-clean exit (eight iterations, 64 verified findings, zero on the closing pass); rounds 10-11 were its middle waves |
 
 Bug PRDs keep their `docs/` paths because source comments cite them; feature
 PRDs live in `docs/prd/`.
@@ -1336,23 +1354,19 @@ idea:
 
 ## In progress
 
-**D19 is in progress** (owner supplied credentials this run; design
-decisions recorded in its Sequenced row; Linear first, GitHub second).
-Otherwise as below: the v0.4.0 release SHIPPED this run (bump
-`28266f9`; matrix exit 0 / 179 oks on the bumped tree; tag `v0.4.0` →
-release run 33811497061 green in every job; all 15 ORDER crates on
--crates.io; live FALKOR/REDIS/POSTGRES matrix legs unexecuted, stated
-in the release note — though the compose chaos leg itself RAN for
-D11, its first local execution). **Wave 4 is COMPLETE**: D4 (`700f932`),
-D5 (`cdeeda4`), D8 (`c18079e`, the authorized fingerprint move
-`2c3ec388…→4615018b…96c4`), D9 (`cc871ab`), D10 (`ee028ac`), D11
-(`1b60eb5`) — each closed with evidence in its Sequenced row, and the
-boundary review round 9 (`725523a`) landed with all three findings
-fixed. The table below carries the CLOSED detail ledgers (Rounds 6-9;
-every row Done, evidence inline; the summary rows live in the Done
-section). The next locally satisfiable work is Wave 5 (D3/D15) per
-the open-row gates. D19 parks on owner credentials; D14/D16/D26 +
-the training-corpus direction park on owner decisions. A new item
+**D19 is in progress** (owner supplied GitHub credentials 2026-09-03;
+design decisions recorded in its Sequenced row). Its remaining legs —
+the Linear live leg and one full backend-submit run per adapter — park
+on the owner minting a LINEAR_API_KEY (external gate; recorded in the
+row). **Round 12 closed 2026-09-20** at a verified-clean exit (eight
+iterations, 64 verified findings — the 2026-09-21 header and the
+round doc carry the evidence); v0.4.1 shipped and closed before that
+(all 17 crates on crates.io, tag + release assets green). The table
+below carries the CLOSED detail ledgers (Rounds 6-9; every row Done,
+evidence inline; the summary rows live in the Done section). The next
+locally satisfiable work is Wave 5 (D3/D15) per the open-row gates;
+PLT1 waits on the owner's go; D14/D16/D26 + the training-corpus
+direction park on owner decisions; REL2/D33 sit Proposed. A new item
 enters here only when work actually starts.
 
 | ID | Item | Owner | Notes |
