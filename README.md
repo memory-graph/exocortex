@@ -180,8 +180,8 @@ are marked with their successors.
 
 | Tool | Kind | What it does |
 |---|---|---|
-| `exocortex.search_memories` | Function | Ranked free-text search over titles/tags of your org's graph. Superseded memories are marked with `superseded_by` and rank below their successors. |
-| `exocortex.get_memory` | Function | Fetch one memory by hex id (carries `superseded_by` when superseded). |
+| `exocortex.search_memories` | Function | Ranked free-text search over titles/tags of your org's graph; each hit carries the memory's full `content` and its type label. Superseded memories are marked with `superseded_by` and rank below their successors. |
+| `exocortex.get_memory` | Function | Fetch one memory by hex id — full `content`, type label, and `superseded_by` when superseded. |
 | `exocortex.find_related` | Function | Bounded k-hop neighborhood of a memory. |
 | `exocortex.end_session` | Action | Submit the wrapup (1-5 memory drafts, edges by `draft_key` or `to_memory_id`). Self-preflights locally with correction hints; the ack carries advisory `similar_to` near-duplicate suggestions. Offline, it buffers to a local WAL and syncs later. |
 | `exocortex.preflight_wrapup` | Function | Validate a proposed batch without writing — same rules `end_session` and the backend enforce, with an `unverified` list of server-only checks. |

@@ -78,6 +78,16 @@ impl Client {
         })
     }
 
+    fn get(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 91, "method": "tools/call",
+            "params": {
+                "name": "exocortex.get_memory",
+                "arguments": { "id": id }
+            }
+        })
+    }
+
     fn end_session(memories: serde_json::Value, edges: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "jsonrpc": "2.0", "id": 80, "method": "tools/call",
@@ -171,6 +181,53 @@ fn in_session_read_back_after_offline_write() {
         local_lsn.is_some_and(|n| n >= acked_lsn),
         "R-M7 stamp reflects the offline write (got {local_lsn:?}, acked {acked_lsn})"
     );
+}
+
+/// D35 (GitHub issue #1): the write→read loop is closed — what
+/// `end_session` writes, `search_memories` finds AND `get_memory`
+/// returns in full, with the type label the write side accepted (the
+/// pack-order u8 alone is not readable by an agent).
+#[test]
+fn end_session_get_memory_round_trips_content() {
+    const BODY: &str = "Publish the ArcSwap snapshot before advancing the WAL cursor.";
+    let dir = tempdir();
+    let mut c = Client::spawn(&dir);
+    let mut msgs = Client::init_msgs();
+    msgs.push(Client::end_session(
+        serde_json::json!([
+            { "draft_key": "k-d35", "memory_type": "Fix",
+              "title": "Xenopsylla roundtrip witness",
+              "content": BODY, "visibility": "org" }
+        ]),
+        serde_json::json!([]),
+    ));
+    msgs.push(Client::search("Xenopsylla"));
+    c.send_all(&msgs);
+    let _init = c.read_line();
+    let ack = c.read_line();
+    assert!(ack.get("result").is_some(), "end_session ok: {ack}");
+
+    let hits = search_hits(&c.read_line());
+    assert_eq!(hits.len(), 1, "one hit: {hits:?}");
+    assert_eq!(
+        hits[0]["content"].as_str(),
+        Some(BODY),
+        "search hits carry the content: {hits:?}"
+    );
+    assert_eq!(hits[0]["memory_type_label"].as_str(), Some("Fix"));
+
+    let id = hits[0]["id"].as_str().expect("hex id").to_string();
+    c.send_all(&[Client::get(&id)]);
+    let got = c.read_line();
+    let text = got["result"]["content"][0]["text"].as_str().unwrap();
+    let inner: serde_json::Value = serde_json::from_str(text).unwrap();
+    let memory = &inner["memory"];
+    assert_eq!(
+        memory["content"].as_str(),
+        Some(BODY),
+        "get_memory returns the content in full: {memory}"
+    );
+    assert_eq!(memory["memory_type_label"].as_str(), Some("Fix"));
 }
 
 #[test]

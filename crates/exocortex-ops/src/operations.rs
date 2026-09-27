@@ -45,6 +45,15 @@ pub struct MemoryJson {
     pub title: String,
     /// Memory type id.
     pub memory_type: u8,
+    /// Memory type label from the context's ontology (e.g. "Fix").
+    /// Absent when no ontology is attached — never a wrong label
+    /// (the D10b degradation pattern).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_type_label: Option<String>,
+    /// Full content — the single free-text payload (§7.5) the reader
+    /// is read for. D35: never excerpted; a bounded-excerpt param is
+    /// deferred until size pressure is demonstrated.
+    pub content: String,
     /// Visibility label.
     pub visibility: String,
     /// D10b (§4.10a): the hex id of this memory's SUCCESSOR, when a live
@@ -63,11 +72,21 @@ fn hex32(bytes: &[u8; 16]) -> String {
     MemoryId(*bytes).to_hex()
 }
 
-fn mem_json(m: &Memory) -> MemoryJson {
+/// D35: the projection carries the content itself and a human-readable
+/// type label — a title-only row is a headline, not agent context. The
+/// label resolves through the context's ontology when one is attached
+/// (both surfaces attach it); without one it degrades to absent.
+fn mem_json(ctx: &OpContext, m: &Memory) -> MemoryJson {
     MemoryJson {
         id: hex32(&m.id.0),
         title: m.title.to_string(),
         memory_type: m.memory_type,
+        memory_type_label: ctx.ontology.as_ref().and_then(|o| {
+            o.memory_type_names
+                .get(m.memory_type as usize)
+                .map(|n| n.to_string())
+        }),
+        content: m.content.clone(),
         visibility: format!("{:?}", m.visibility),
         superseded_by: None,
     }
@@ -123,7 +142,7 @@ impl Operation for FindRelated {
             .cache
             .traverse(&org, &anchor, &spec)
             .iter()
-            .map(mem_json)
+            .map(|m| mem_json(ctx, m))
             .collect();
         Ok(FindRelatedOutput { memories })
     }
@@ -187,7 +206,7 @@ impl Operation for GetMemory {
             return Ok(GetMemoryOutput {
                 memory: Some(MemoryJson {
                     superseded_by: superseded_by(ctx, &org, &id),
-                    ..mem_json(&m)
+                    ..mem_json(ctx, &m)
                 }),
             });
         }
@@ -197,7 +216,7 @@ impl Operation for GetMemory {
                 Ok(GetMemoryOutput {
                     memory: Some(MemoryJson {
                         superseded_by: superseded_by(ctx, &org, &id),
-                        ..mem_json(&m)
+                        ..mem_json(ctx, &m)
                     }),
                 })
             }
@@ -282,7 +301,7 @@ impl Operation for SearchMemoriesOp {
             annotated.push((
                 MemoryJson {
                     superseded_by: sup,
-                    ..mem_json(&m)
+                    ..mem_json(ctx, &m)
                 },
                 rank,
             ));

@@ -941,6 +941,75 @@ async fn superseded_state_is_visible_on_reads() {
     );
 }
 
+/// D35 (GitHub issue #1): every read projection carries the memory's
+/// content and a human-readable type label — a title-only row is a
+/// headline, not agent context.
+#[tokio::test]
+async fn read_results_carry_content_and_type_label() {
+    let onto = ontology();
+    let (cache, _rx) = LocalCache::new(16 * 1024 * 1024);
+    let mut m = mem("Snapshot flush order matters");
+    m.id = MemoryId([7; 16]);
+    m.content = "Publish the ArcSwap snapshot before advancing the WAL cursor.".into();
+    let mut snap = GraphSnapshot::empty();
+    snap.push_test_memory(m.clone());
+    cache.publish("org", Arc::new(snap));
+    let ctx = OpContext {
+        visibility_ctx: ops_vc("org", "alice", Visibility::Org),
+        audit_admin: false,
+        storage: Arc::new(InMemoryStorage::new(onto.clone())),
+        cache: Arc::new(cache),
+        deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
+        ontology: Some(onto),
+        ingest_preflight: None,
+        embedding_reindex: None,
+    };
+
+    // get_memory: the point read carries the payload and the label.
+    let entry = exocortex_ops::entries()
+        .into_iter()
+        .find(|e| e.mcp_tool_name == "exocortex.get_memory")
+        .unwrap();
+    let out = (entry.handler)(
+        entry,
+        &ctx,
+        serde_json::to_value(GetMemoryInput { id: hex(&m.id) }).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out["memory"]["content"].as_str(),
+        Some(m.content.as_str()),
+        "get_memory returns the content: {out}"
+    );
+    assert_eq!(
+        out["memory"]["memory_type_label"].as_str(),
+        Some("Solution"),
+        "the numeric type id carries its pack label: {out}"
+    );
+
+    // search_memories: ranked hits carry both too.
+    let entry = exocortex_ops::entries()
+        .into_iter()
+        .find(|e| e.mcp_tool_name == "exocortex.search_memories")
+        .unwrap();
+    let out = (entry.handler)(
+        entry,
+        &ctx,
+        serde_json::to_value(exocortex_ops::operations::SearchInput {
+            query: "Snapshot flush".into(),
+            limit: 10,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let hits = out["memories"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "one hit: {out}");
+    assert_eq!(hits[0]["content"].as_str(), Some(m.content.as_str()));
+    assert_eq!(hits[0]["memory_type_label"].as_str(), Some("Solution"));
+}
+
 // ---- PX6: kernel catalogue <-> operation registry bijection, and the
 // three newly registered operations.
 

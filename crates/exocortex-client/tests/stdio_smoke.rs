@@ -721,8 +721,12 @@ async fn mcp_get_memory_shape_matches_registry() {
     };
     let _ = std::hint::black_box(exocortex_pack_dev_v1::pack_def().name.clone());
     let ontology = std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs().unwrap());
-    let server =
-        exocortex_client::mcp::ExocortexMcp::new("org".into(), cache.clone(), vc.clone(), ontology);
+    let server = exocortex_client::mcp::ExocortexMcp::new(
+        "org".into(),
+        cache.clone(),
+        vc.clone(),
+        ontology.clone(),
+    );
 
     // MCP tool call (the binary's surface).
     let mcp_out = server
@@ -731,8 +735,12 @@ async fn mcp_get_memory_shape_matches_registry() {
         .expect("mcp get_memory");
 
     // The registry handler directly (the HTTP surface's implementation).
+    // D35: attach the ontology exactly as the backend's HTTP bind does
+    // when it builds its OpContext — the read projection resolves
+    // `memory_type_label` through it, so a bare ctx here would diverge
+    // from both production surfaces.
     let ctx = Arc::new(exocortex_ops::OpContext {
-        ontology: None,
+        ontology: Some(ontology),
         visibility_ctx: vc,
         audit_admin: true,
         storage: Arc::new(exocortex_client::no_backend::NoBackendStorage),
