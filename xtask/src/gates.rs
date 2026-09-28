@@ -1071,7 +1071,9 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
         // §23 carries numeric ids 1..=30; the OC-PRD success criteria
         // ride the same matrix under the `oc` namespace (S1-S6); PX2's
         // pack-verb criteria ride it under the `px` namespace (px1..=px8,
-        // palantir-expansion PRD §3.2 acceptance).
+        // palantir-expansion PRD §3.2 acceptance); the agent-instructions
+        // PRD's mechanically-checkable criteria ride it under `ai` (S8
+        // ↔ ai1, the D37 read-payload contract).
         let is_core = matches!(columns[0].parse::<u8>(), Ok(n) if (1..=30).contains(&n));
         let is_oc = matches!(
             columns[0].as_bytes(),
@@ -1085,9 +1087,10 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
             columns[0].as_bytes(),
             [b'a', b'c', n] if (b'1'..=b'5').contains(n)
         );
+        let is_ai = matches!(columns[0].as_bytes(), [b'a', b'i', b'1']);
         anyhow::ensure!(
-            is_core || is_oc || is_px || is_ac,
-            "criterion {} is outside §23 (1..=30), the OC/PX2/AC rows",
+            is_core || is_oc || is_px || is_ac || is_ai,
+            "criterion {} is outside §23 (1..=30), the OC/PX2/AC/AI rows",
             columns[0]
         );
         let criterion = columns[0].to_string();
@@ -1162,10 +1165,18 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
         }
     }
     // §23's own 30 criteria plus the OC-PRD S-rows (oc namespace) plus
-    // the PX2 pack-verb rows (px namespace).
+    // the PX2 pack-verb rows (px namespace) plus the agent-instructions
+    // read-payload row (ai namespace). The ai count is EXACT (not a
+    // range): a dropped ai row must fail the gate, not pass silently
+    // inside a tolerated range (the D38 review's tightening direction).
     let core = seen
         .iter()
-        .filter(|c| !c.starts_with("oc") && !c.starts_with("px") && !c.starts_with("ac"))
+        .filter(|c| {
+            !c.starts_with("oc")
+                && !c.starts_with("px")
+                && !c.starts_with("ac")
+                && !c.starts_with("ai")
+        })
         .count();
     anyhow::ensure!(
         core == 30,
@@ -1189,6 +1200,12 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
         (1..=5).contains(&ac),
         "acceptance matrix covers {} of the 5 adapter-contract rows",
         ac
+    );
+    let ai = seen.iter().filter(|c| c.starts_with("ai")).count();
+    anyhow::ensure!(
+        ai == 1,
+        "acceptance matrix covers {} of the 1 agent-instructions read-payload row (S8/ai1)",
+        ai
     );
     Ok(())
 }
@@ -3127,8 +3144,21 @@ fn unclaimed() {}
 "
             ));
         }
+        // D37: the ai row rides the good fixture from the start, and its
+        // count is exact — dropping it must fail the gate, not pass
+        // silently inside a tolerated range.
+        let ai_row =
+            "ai1\tverified\trequirement ai1\ttests/direct.rs::direct_case\tcargo test direct_case\t-\n";
+        rows.push_str(ai_row);
         write(&root, "docs/acceptance/section-23.tsv", &rows);
         assert!(validate_acceptance_matrix(&root).is_ok());
+        let no_ai = rows.replacen(ai_row, "", 1);
+        write(&root, "docs/acceptance/section-23.tsv", &no_ai);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "a dropped ai row fails the matrix (exact count, not a range)"
+        );
+        write(&root, "docs/acceptance/section-23.tsv", &rows);
 
         write(
             &root,
