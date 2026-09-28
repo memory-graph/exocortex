@@ -366,6 +366,18 @@ pub fn free_port() -> anyhow::Result<u16> {
 mod tests {
     use super::*;
 
+    /// D36: `resolve_paths_canonicalizes_relative_runtime_paths`
+    /// mutates the PROCESS cwd (`std::env::set_current_dir` is global
+    /// to every test thread). A child spawned by a sibling test while
+    /// the cwd is mid-swap stalls before exec in uninterruptible wait
+    /// — observed live: the D29 diagnose stub's stderr sink stays
+    /// empty and its `/bin/sh` sits in state U past `wait_ping`'s 10s
+    /// deadline, so the exit-naming assertion fails (≈1 run in 3
+    /// multi-threaded; 10/10 green `--test-threads=1`; 12/12 green
+    /// with the chdir test ignored). Tests that mutate the cwd and
+    /// tests that spawn-and-wait a child serialize on this lock.
+    static PROCESS_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// CS5 (audit): the restart loop is PRODUCTION code now — a child
     /// that keeps crashing is restarted within the budget, then the
     /// supervisor gives up (the old test called no production function).
@@ -465,6 +477,9 @@ mod tests {
     fn resolve_paths_canonicalizes_relative_runtime_paths() {
         #[cfg(unix)]
         {
+            // D36: the chdir below is a process-global side effect —
+            // hold the lock so no sibling spawns a child mid-swap.
+            let _cwd_guard = PROCESS_CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             use std::os::unix::fs::PermissionsExt as _;
             let dir = std::env::temp_dir().join(format!(
                 "exocortex-supervisor-resolve-{}",
@@ -545,6 +560,9 @@ mod tests {
     fn startup_failure_names_the_cause() {
         #[cfg(unix)]
         {
+            // D36: serialize against the cwd-mutating sibling (the lock's
+            // doc comment names the failure mode this prevents).
+            let _cwd_guard = PROCESS_CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             use std::os::unix::fs::PermissionsExt as _;
             let dir = std::env::temp_dir().join(format!(
                 "exocortex-supervisor-diagnose-{}",
