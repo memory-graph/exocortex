@@ -1185,19 +1185,19 @@ pub(crate) fn validate_acceptance_matrix(root: &Path) -> Result<()> {
     );
     let oc = seen.iter().filter(|c| c.starts_with("oc")).count();
     anyhow::ensure!(
-        (1..=6).contains(&oc),
+        oc == 6,
         "acceptance matrix covers {} of the 6 OC-PRD S-rows",
         oc
     );
     let px = seen.iter().filter(|c| c.starts_with("px")).count();
     anyhow::ensure!(
-        (1..=8).contains(&px),
+        px == 8,
         "acceptance matrix covers {} of the 8 PX2 pack-verb rows",
         px
     );
     let ac = seen.iter().filter(|c| c.starts_with("ac")).count();
     anyhow::ensure!(
-        (1..=5).contains(&ac),
+        ac == 5,
         "acceptance matrix covers {} of the 5 adapter-contract rows",
         ac
     );
@@ -3157,6 +3157,18 @@ fn unclaimed() {}
         assert!(
             validate_acceptance_matrix(&root).is_err(),
             "a dropped ai row fails the matrix (exact count, not a range)"
+        );
+        // R13-7: the oc/px/ac namespaces are exact too — dropping an oc
+        // row must fail (the pre-fix range check (1..=6) passed it).
+        let no_oc6 = rows.replacen(
+            "oc6\tverified\trequirement oc6\ttests/direct.rs::direct_case\tcargo test direct_case\t-\n",
+            "",
+            1,
+        );
+        write(&root, "docs/acceptance/section-23.tsv", &no_oc6);
+        assert!(
+            validate_acceptance_matrix(&root).is_err(),
+            "a dropped oc row fails the matrix (exact count, not a range)"
         );
         write(&root, "docs/acceptance/section-23.tsv", &rows);
 

@@ -110,7 +110,7 @@ fn search_msg(id: i64, query: &str) -> serde_json::Value {
     })
 }
 
-fn hits_of(payload: &serde_json::Value) -> Vec<(String, String)> {
+fn hits_of(payload: &serde_json::Value) -> Vec<(String, String, String)> {
     let text = payload["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or("");
@@ -124,6 +124,10 @@ fn hits_of(payload: &serde_json::Value) -> Vec<(String, String)> {
             (
                 m["id"].as_str().unwrap_or("").to_string(),
                 m["title"].as_str().unwrap_or("").to_string(),
+                // R13-5: the restore verdict must see the CONTENT, not
+                // just (id, title) — the D35 class survives an
+                // (id,title)-projected assertion.
+                m["content"].as_str().unwrap_or("").to_string(),
             )
         })
         .collect()
@@ -188,7 +192,8 @@ fn round_trip_preserves_ids_and_reads() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Phase 3: same ids, same reads, on the restored WAL.
+    // Phase 3: same ids, same reads — content byte-equal too (R13-5) —
+    // on the restored WAL.
     let mut c = Client::spawn_serving(&dir);
     let mut msgs = init_msgs();
     msgs.push(search_msg(90, "yak"));
@@ -201,6 +206,11 @@ fn round_trip_preserves_ids_and_reads() {
     assert_eq!(h2.len(), 1, "toolchain write restored: {h2:?}");
     assert_eq!(h1[0].0, ids[0], "id byte-identical across wipe+restore");
     assert_eq!(h2[0].0, ids[1], "id byte-identical across wipe+restore");
+    assert_eq!(
+        h1[0].2, "release script shaves yaks",
+        "content survives wipe+restore: {h1:?}"
+    );
+    assert_eq!(h2[0].2, "pin rust-toolchain", "content survives: {h2:?}");
 }
 
 /// AC2: importing the same backup twice is a no-op on the served graph.

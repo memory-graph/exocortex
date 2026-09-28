@@ -1,0 +1,165 @@
+# Round 13 — the memory lifecycle's consumer adequacy + the testing approach
+
+**Scope:** two questions the D35 postmortem opened (GitHub issue #1:
+every read surface dropped `Memory.content` with the whole gate matrix
+green). (a) The memory lifecycle end-to-end — write, read, maintain,
+consolidate, export/restore — audited for CONSUMER adequacy: for every
+stage, who consumes the output, and is the consumer's need pinned by an
+executable test or acceptance criterion, not merely by cross-surface
+consistency. (b) The testing approach itself — where the suite proves
+consistency but not adequacy, where additive-safe subset assertions
+dominate, and which agent-facing payloads still lack a consumer
+contract. Engine: two read-only scout passes over
+`exocortex-client`/`exocortex-ops`/`exocortex-server`/`exocortex-dreams`
+/`exocortex-ingest`/`xtask` (every claim below carries its file:line),
+cross-checked against the playbook, the README tool table, the
+agent-instructions PRD §11 block, and `docs/acceptance/section-23.tsv`.
+Not in scope: the adapters (round-12 covered), live-backend legs
+(FALKOR/REDIS/POSTGRES/GitHub/Linear URLs unset throughout — stated
+plainly).
+
+**Verdict: 8 findings — 3 verified-and-actionable (2 fixed in this
+round's commits, 1 → D39), 3 recorded decisions (1 → D40), 2 clean.
+D37 (ai1/S8 + consumer-contract tests) landed as this round's
+companion before the review wrote this file, so the read surface it
+audits was already pinned.**
+
+## Part A — the lifecycle, stage by stage
+
+### Write (`end_session`)
+
+The ONLINE ack (`EndSessionAck`: accepted/rejected/rejections[
+{draft_key, code, detail, correction}]/local_validation_failed/
+unverified[]/similar_to[{draft_key, existing_memory_id,
+existing_title, suggestion}]) is fully specified
+(client/src/tools/end_session.rs:56-104) and pinned at the wire and
+registry layers — ingest grouping tests assert `detail` content and
+`suggestion` values (ingest/tests/grouping.rs:597-607), ops and HTTP
+preflight assert code+detail+correction (ops/tests/parity.rs:1511-1516,
+server/tests/http_parity.rs:725-727). **R13-1:** none of that is pinned
+through the `exocortex.end_session` TOOL itself — the only stdio-level
+rejection assertion checks a substring of the rendered JSON
+(client/tests/backend_project_grant.rs:275-279, `"accepted":0`), and
+the playbook's core promise "Rejections: read the `code` and `detail`,
+fix, resubmit same turn" (playbook v1_0_0.md:47-48, 148-149) is
+therefore unpinned on the surface agents actually call. The OFFLINE
+ack is now pinned by ai1 (local_lsns, sync_pending, refusal naming the
+offender). Disposition: **D39** — extend the consumer-contract harness
+to the `--backend` path (the backend_project_grant in-process backend
+node is the vehicle), pinning rejections code+detail+correction,
+`local_validation_failed`, `unverified[]`, and the `similar_to` shape
+through the real tool. Sub-finding: the `distinct` suggestion value is
+promised (PRD §4.10b) and pinned NOWHERE (wire pins `duplicate` and
+`contradicts` only) — D39 covers it.
+
+### Read (`search_memories` / `get_memory` / `find_related`)
+
+Content + label + citable ids + supersession-through-the-tool are now
+pinned end-to-end (D35 + ai1). **R13-2 (recorded decision):**
+`MemoryJson` deliberately does not expose `tags`, `summary`,
+timestamps, or the usage-context block; nothing promises them (the
+README's "titles/tags" describes the search INDEX, not the payload),
+and search matching over tags is separately pinned. Decision: not
+exposed in v1; revisit on demonstrated consumer demand (a Pickle-Rick
+lesson-injection need for tags would be that demand). **R13-3:** the
+`unverified[]` list is promised to agents ("Both tools name those in
+an `unverified` list", v1_0_0.md:204) and pinned by no test anywhere —
+it rides D39's online contract.
+
+### Maintain (promote/resolve/retract/accept)
+
+All four backend-HTTP ops return outputs whose consumer-relevant
+fields are pinned with VALUE assertions (not shape): audit_lsn > 0 and
+echoed resolution/superseded/edge ids through both ops and HTTP
+(ops/tests/parity.rs:211, 329-330, 1141, 1701-1703;
+server/tests/http_parity.rs:536-595). The full discovery consumer
+chain (list → issue → accept) is value-pinned end-to-end
+(parity.rs:413-510). **No findings.**
+
+### Consolidate (Dreams)
+
+Discovery proposals are value-pinned to their consumer (quality 0.6/
+0.9, via_types sentinels, visibility — parity.rs:451-470,
+dreams/tests/tenancy_regions.rs:234-237). **R13-4:** abstraction rows
+(carrier `General`, title "Abstraction of N <Type>", content = first
+eight member titles) reach the READ path as ordinary rows, and no test
+pins that an abstraction is retrievable through `search_memories` or
+`find_related` — only internal id/timestamp pins exist
+(dreams/tests/abstractions.rs:198, 220-243). Disposition: **D40**
+(Proposed; needs a Dreams cycle and a read through the served snapshot
+in one test — the dreams `testing` feature is the vehicle).
+
+### Export / restore
+
+The server-side org backup is byte-faithful modulo LSN
+(org_backup.rs:240-244) — content survival pinned. **R13-5:** the
+CLIENT WAL restore path verifies survival through an (id, title)
+projection only (client/tests/backup_restore.rs:113-130) — content
+survival through the tool a CLI user actually runs was unpinned.
+Disposition: fixed in this round — `hits_of` now carries content and
+the round-trip asserts the body byte-equal after wipe+restore.
+
+## Part B — the testing approach
+
+**R13-6 (the structural finding, verified):** every parity/identity
+leg in the workspace compares a surface against ITSELF. The stdio IN10
+leg's "registry side" calls the identical fn-pointer the MCP tool
+dispatches (client/src/mcp.rs:218; test at stdio_smoke.rs:732-768);
+http_parity's "typed handler" leg is the same `entry.handler` the
+route closure runs (server/src/http_bind.rs:320; http_parity.rs:349,
+463-464, 597-602); ops' both-surfaces leg compares the generated
+wrapper with the op it wraps (ops/src/lib.rs:265-270; parity.rs:144-
+165); artifact-equivalence's console claim "MCP result == registry
+result" re-runs the same-handler stdio leg. These pin transport
+wrapping (their purpose — CR-9 remains real) and CANNOT catch a
+shared-projection omission: D35 shipped exactly that way. The only
+genuine two-implementation payload comparison in the client/ops/server
+suites is the grouping-node builder pair
+(standalone_readback.rs:478-512). Disposition: adequacy moves to
+consumer contracts (the ai1 pattern — real binary, documented
+promises); parity legs keep their transport role. D39 extends the
+pattern to the online surface.
+
+**R13-7 (verified, fixed this round):** the acceptance matrix is ~14%
+consumer-fidelity (7 of 49 rows classify FIDELITY; 14 CONSISTENCY, 15
+SHAPE, 5 METRIC, 5 GATE-MECHANICS, 2 deferred, 1 mixed), and the
+oc/px/ac namespace counts were RANGE checks — a dropped row inside the
+range passed silently (only core==30 was exact; gates.rs:1175-1192).
+D37 made ai exact-count from birth; this round's fix commit tightens
+oc/px/ac to exact counts and grows the xtask canary with a dropped-oc
+adversarial variant (fails red on the pre-fix range check — the
+variant is the fail-without-it evidence).
+
+**R13-8 (verified, recorded):** no golden anywhere pins a tool RESULT
+payload — openapi.json/mcp-tools.json are request-side, responses
+stubbed "OK" (xtask/src/main.rs:1253-1264). Decision: result payloads
+are pinned by behavior contracts (ai1/D39), not goldens; a golden
+would pin serialization, not consumer adequacy, and the D35 class
+would survive it.
+
+**Hazard sweep (clean):** the D36 process-global-cwd class has exactly
+one site in the workspace (supervisor.rs:495-501, serialized since
+D36); no other `set_current_dir`/`env::set_var`/`env::remove_var` in
+crates/.
+
+## Findings ledger
+
+| ID | Finding | Disposition |
+|----|---------|-------------|
+| R13-1 | end_session ONLINE ack (rejections code+detail+correction, similar_to, unverified, `distinct`) unpinned through the tool | **D39** (Proposed) |
+| R13-2 | tags/summary/timestamps not exposed on reads | Recorded decision: v1 scope, revisit on demand |
+| R13-3 | `unverified[]` promised, pinned nowhere | Rides **D39** |
+| R13-4 | Dreams abstractions unpinned on the read surface | **D40** (Proposed) |
+| R13-5 | client WAL restore verified through (id,title) only | **Fixed this round** (backup_restore carries content) |
+| R13-6 | all parity legs are same-handler comparisons | Recorded: transport role kept; adequacy via ai1/D39 |
+| R13-7 | matrix ~14% fidelity; oc/px/ac range counts tolerate dropped rows | **Fixed this round** (exact counts + canary variant) |
+| R13-8 | no result-payload goldens | Recorded decision: behavior contracts over goldens |
+
+## Closure
+
+Fixed in this round's commits: R13-5, R13-7 (each with fail-without-it
+evidence — the dropped-oc canary variant fails on the pre-fix range
+check; the restore test's content assertion fails on the pre-fix
+(id,title) projection). Opened: D39, D40. Companion work already
+landed: D35 (the defect), D36 (the flake it exposed), D37 (S8/ai1 +
+consumer contracts). Live-backend legs unexecuted (URLs/tokens unset).
