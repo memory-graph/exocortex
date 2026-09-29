@@ -170,6 +170,12 @@ exocortex-mcp-client --dump-block >> CLAUDE.md   # or AGENTS.md / .cursorrules
 exocortex-mcp-client --verify                    # green/red install checklist
 ```
 
+The installer also drops a **config skill** at
+`~/.agents/skills/exocortex-config/` — the wiring, verify, and
+dead-connection triage procedure for any harness (Crush auto-discovers
+it; other harnesses can read it from there). It also ships in the repo
+at `.agents/skills/exocortex-config/SKILL.md`.
+
 On first run the client also installs the full Agent Playbook under the
 OS data home; `exocortex-mcp-client --verify` prints its exact path. It
 is the reference for the 58 assertable edge

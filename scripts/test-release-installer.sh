@@ -33,6 +33,8 @@ for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
   printf '#!/bin/sh\nexit 0\n' > "$payload/$bin"
   chmod +x "$payload/$bin"
 done
+mkdir -p "$payload/skills/exocortex-config"
+printf 'skill fixture\n' > "$payload/skills/exocortex-config/SKILL.md"
 tar -czf "$release/$archive" -C "$tmp/payload" "$(basename "$payload")"
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$release" && sha256sum "$archive" > "$archive.sha256")
@@ -107,10 +109,12 @@ INSTALL_VERSION="$tag" \
 PATH="$tmp/mock-bin:$PATH" \
 MOCK_RELEASE_ROOT="$release" \
 MOCK_CURL_LOG="$mock_log" \
+EXOCORTEX_SKILL_DEST="$tmp/skills/exocortex-config" \
 CARGO_HOME="$tmp/cargo" \
 sh scripts/release-install.sh >/dev/null
 test -x "$tmp/cargo/bin/exocortex-node"
 test "$(cat "$tmp/cargo/share/exocortex/models/$model_dir/model.marker")" = "sidecar fixture"
+test "$(cat "$tmp/skills/exocortex-config/SKILL.md")" = "skill fixture"
 if [ "$runtime_supported" -eq 1 ]; then
   test -x "$tmp/cargo/share/exocortex/standalone/redis-server"
   test "$(cat "$tmp/cargo/share/exocortex/standalone/falkordb.so")" = "module fixture"
@@ -123,9 +127,11 @@ INSTALL_VERSION="$tag" \
 PATH="$tmp/mock-bin:$PATH" \
 MOCK_RELEASE_ROOT="$release" \
 MOCK_CURL_LOG="$mock_log" \
+EXOCORTEX_SKILL_DEST="$tmp/skills/exocortex-config" \
 CARGO_HOME="$tmp/cargo" \
 sh scripts/release-install.sh >/dev/null
 test "$(cat "$tmp/cargo/share/exocortex/models/$model_dir/model.marker")" = "sidecar fixture"
+test "$(cat "$tmp/skills/exocortex-config/SKILL.md")" = "skill fixture"
 test "$(wc -l < "$mock_log" | tr -d ' ')" -eq 4
 
 for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
@@ -162,10 +168,36 @@ if INSTALL_VERSION="$tag" \
    PATH="$tmp/mock-bin:$PATH" \
    MOCK_RELEASE_ROOT="$release" \
    MOCK_CURL_LOG="$mock_log" \
+   EXOCORTEX_SKILL_DEST="$tmp/skills/exocortex-config" \
    CARGO_HOME="$tmp/cargo-tampered" \
    sh scripts/release-install.sh >/dev/null 2>&1; then
   echo "installer accepted a checksum-mismatched archive" >&2
   exit 1
 fi
 test ! -e "$tmp/cargo-tampered/bin/exocortex-node"
-echo "release-installer ok: fixed HTTPS origin, failure-atomic install, and tamper refusal"
+
+# D42: an archive without the config skill is refused (fail-closed,
+# like the model sidecar) and nothing is installed.
+restore_archive="$(mktemp -d)"
+mv "$release/$archive" "$restore_archive/"
+mv "$release/$archive.sha256" "$restore_archive/"
+rm -rf "$tmp/payload/exocortex-${tag#v}-$artifact_target/skills"
+tar -czf "$release/$archive" -C "$tmp/payload" "exocortex-${tag#v}-$artifact_target"
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd "$release" && sha256sum "$archive" > "$archive.sha256")
+else
+  (cd "$release" && shasum -a 256 "$archive" > "$archive.sha256")
+fi
+if INSTALL_VERSION="$tag" \
+   PATH="$tmp/mock-bin:$PATH" \
+   MOCK_RELEASE_ROOT="$release" \
+   MOCK_CURL_LOG="$mock_log" \
+   EXOCORTEX_SKILL_DEST="$tmp/skills-noskill/exocortex-config" \
+   CARGO_HOME="$tmp/cargo-noskill" \
+   sh scripts/release-install.sh >/dev/null 2>&1; then
+  echo "installer accepted an archive with no config skill" >&2
+  exit 1
+fi
+test ! -e "$tmp/cargo-noskill/bin/exocortex-node"
+test ! -e "$tmp/skills-noskill/exocortex-config/SKILL.md"
+echo "release-installer ok: fixed HTTPS origin, failure-atomic install, tamper refusal, and skill fail-closed"

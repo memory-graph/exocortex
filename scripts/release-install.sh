@@ -94,6 +94,7 @@ if [ "$runtime_supported" -eq 1 ]; then
   [ -f "$src/standalone-runtime/falkordb.so" ] || { echo "install refused: archive has no standalone FalkorDB module" >&2; exit 1; }
   [ -f "$src/standalone-runtime/RUNTIME-MANIFEST.txt" ] || { echo "install refused: archive has no standalone runtime manifest" >&2; exit 1; }
 fi
+[ -f "$src/skills/exocortex-config/SKILL.md" ] || { echo "install refused: archive has no config skill" >&2; exit 1; }
 dest="${CARGO_HOME:-$HOME/.cargo}/bin"
 mkdir -p "$dest"
 model_dest="${CARGO_HOME:-$HOME/.cargo}/share/exocortex/models"
@@ -161,14 +162,20 @@ fi
 for bin in exocortex exocortex-mcp-client exocortex-node exocortex-worker; do
   rm -f "$dest/.$bin.old.$$"
 done
+# The config skill rides outside the transactional set: an inert
+# markdown file left behind by a rolled-back install is harmless,
+# unlike a half-swapped binary pair.
+skill_dest="${EXOCORTEX_SKILL_DEST:-$HOME/.agents/skills/exocortex-config}"
+mkdir -p "$skill_dest"
+cp "$src/skills/exocortex-config/SKILL.md" "$skill_dest/SKILL.md"
 case ":$PATH:" in
   *":$dest:"*) ;;
   *) echo "note: add $dest to PATH" ;;
 esac
 if [ "$runtime_supported" -eq 1 ]; then
-  echo "installed: exocortex binaries, verified model sidecar, and standalone Redis/Falkor runtime"
+  echo "installed: exocortex binaries, verified model sidecar, standalone Redis/Falkor runtime, and the config skill"
   echo "next: exocortex --mode mcp-standalone --org my-org --user me"
 else
-  echo "installed: exocortex binaries and verified model sidecar"
+  echo "installed: exocortex binaries, verified model sidecar, and the config skill"
   echo "note: mcp-standalone is unavailable on macOS Intel; use mcp-client or backend-node"
 fi
