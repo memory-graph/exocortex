@@ -130,6 +130,19 @@ The server speaks MCP over stdio. Add it to your agent's MCP config:
 claude mcp add exocortex -- exocortex --mode mcp-standalone --org my-org --user me
 ```
 
+**Crush** — add to `~/.config/crush/crushrc`:
+
+```sh
+mcp add exocortex --type stdio \
+  --command ~/.cargo/bin/exocortex \
+  --args --mode --args mcp-standalone \
+  --args --org --args my-org --args --user --args me
+```
+
+and surface the instruction block in every session with
+`option global-context-path "$HOME/.config/crush/AGENTS.md"`
+(`exocortex-mcp-client --dump-block` writes it).
+
 **Codex / Cursor / any MCP client** — point the stdio server config at
 the binary:
 
