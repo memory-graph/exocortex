@@ -39,3 +39,8 @@ testing = ["exocortex-storage/testing"]
 exocortex-dreams = { path = ".", features = ["testing"] }
 exocortex-pack-dev-v1 = { workspace = true }
 futures = { workspace = true }
+# D40: the abstraction read-surface pin drives the ops registry handlers
+# (search/find_related) over a LocalCache snapshot — dev-only, no cycle
+# (ops does not depend on dreams).
+exocortex-ops = { workspace = true }
+exocortex-cache = { workspace = true }
