@@ -9,6 +9,11 @@ description = "The Exocortex node binary: mcp-standalone and backend-node modes 
 
 [features]
 fastembed = ["exocortex-ingest/fastembed"]
+# D39: end-to-end suites that need the node's near-duplicate hints
+# attach the deterministic FakeEmbedder when the real model is off.
+# Release paths never enable it: fastembed builds take the real model,
+# plain non-testing builds keep NO embedder (fail-closed).
+testing = []
 otlp = [
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",

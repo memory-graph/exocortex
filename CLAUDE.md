@@ -32,13 +32,15 @@ deferrals go to the v2 table with a PRD citation.
 ## Test invocation has a trap
 
 ```sh
-cargo test --workspace --features exocortex-adapter-sdk/testing
+cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing
 ```
 
-The feature is **mandatory**, not optional. Without it the SDK's
-mock-driven suites go dark and the run still reports green — a lib canary
-fails any run that would leave them dark. Never drop the flag to make a
-run faster.
+The features are **mandatory**, not optional. Without
+`exocortex-adapter-sdk/testing` the SDK's mock-driven suites go dark and
+the run still reports green — a lib canary fails any run that would
+leave them dark; without `exocortex-server/testing` the online-ack
+consumer-contract suite compiles to an empty binary and skips silently.
+Never drop the flags to make a run faster.
 
 Live-backend suites are feature-gated and **skip loudly** without
 `FALKOR_URL`/`REDIS_URL`. A green `cargo xtask storage-conformance`

@@ -921,6 +921,12 @@ async fn run_backend_node_inner<S: Storage + 'static>(
         exocortex_ingest::embedding::FastEmbedder::bge_small()
             .map_err(|error| anyhow::anyhow!("initialize bge-small embedder: {error}"))?,
     ));
+    // D39: the `testing` feature swaps in the deterministic double so
+    // end-to-end suites can pin the near-duplicate hint path without
+    // the model sidecar; fastembed wins if both are on, and plain
+    // non-testing builds keep NO embedder (fail-closed, as before).
+    #[cfg(all(not(feature = "fastembed"), feature = "testing"))]
+    let ingest = ingest.with_embedder(Arc::new(exocortex_ingest::FakeEmbedder::default()));
     let post_ingest_effects = {
         let ingest = Arc::new(ingest.clone());
         tokio::spawn(async move { ingest.run_post_ingest_effects().await })
