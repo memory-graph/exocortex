@@ -223,6 +223,8 @@ fn standalone_main(
         port,
         max_restarts: 3,
         auth_token: Some(store_token),
+        supervisor_pid: None,
+        startup_timeout: None,
     };
     let mut supervised = supervisor::spawn_supervised(&cfg)?;
     tracing::info!(port = supervised.port, "embedded FalkorDB ready");

@@ -31,6 +31,8 @@ name = "exocortex-node"
 path = "src/main.rs"
 
 [dependencies]
+# D44: flock(2) + process-group signals for the supervised store.
+libc = { workspace = true }
 # D21-b: the registry preflight handle implements the ops async trait.
 async-trait = { workspace = true }
 exocortex-kernel = { workspace = true }

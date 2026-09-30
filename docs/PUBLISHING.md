@@ -318,6 +318,17 @@ OC-PRD rolling-upgrade acceptance test that drives a real IngestServer;
 both already workspace dependencies, no new external crate).
 
 `exocortex-server` directly depends on `axum-server` with its Rustls feature.
+- **D44 supervisor dependency record (2026-09-30, per rule 9):**
+  `exocortex-server` gains a direct `libc` dependency (workspace
+  `0.2`, already in the lockfile transitively) for exactly two calls:
+  `flock(2)` — the exclusive standalone data-dir lock, whose
+  auto-release-on-process-death is the whole point (a stale lock file
+  after a crash would refuse every future boot) — and `kill(-pgid)` —
+  tearing down the supervised store's process group. No alternative
+  without a new dependency exists in std; rejected: `fs2`/`fd-lock`
+  (new crates for two syscalls), O_EXCL lockfiles (stale-lock handling
+  after kill -9 reintroduces the failure class the lock exists to
+  prevent).
 - **D20 CDC dependency record (2026-09-02, per rule 9):** the
   Postgres CDC adapter uses `postgres-protocol` 0.6 (rust-version
   1.85, the exact floor) plus `fallible-iterator` 0.2 (the version

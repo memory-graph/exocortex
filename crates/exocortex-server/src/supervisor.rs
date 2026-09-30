@@ -31,6 +31,13 @@ pub struct SupervisorConfig {
     /// is shared with every local process; without it any of them owns
     /// the graph (§4.3 data-plane privacy).
     pub auth_token: Option<String>,
+    /// D44: the pid the store's watchdog watches — the store dies when
+    /// THIS process is gone, even if nothing runs Drop (kill -9).
+    /// `None` means this process (production).
+    pub supervisor_pid: Option<u32>,
+    /// D44: startup PING deadline override (tests shrink the 10s
+    /// default so failing spawns return fast).
+    pub startup_timeout: Option<Duration>,
 }
 
 /// Where the supervised server landed.
@@ -45,6 +52,10 @@ pub struct SupervisedServer {
     pub restarts: u32,
     /// The access token the server enforces, if any (shutdown needs it).
     auth_token: Option<String>,
+    /// D44: the exclusive data-dir lock, held for the lifetime of the
+    /// server (flock releases automatically on process death — a
+    /// crashed node never leaves a stale lock behind).
+    _data_dir_lock: Option<std::fs::File>,
 }
 
 impl Drop for SupervisedServer {
@@ -61,9 +72,24 @@ impl Drop for SupervisedServer {
             std::thread::sleep(Duration::from_millis(20));
         }
         let _ = self.child.kill();
+        kill_store_process_group(self.child.id());
         let _ = self.child.wait();
     }
 }
+
+/// D44: the store runs in its own process group (spawn_child), so
+/// teardown signals the GROUP — killing only the watchdog shell would
+/// race its poll loop and could leave the store alive a tick longer,
+/// or forever if the shell itself was SIGKILLed.
+#[cfg(unix)]
+fn kill_store_process_group(child_pid: u32) {
+    unsafe {
+        libc::kill(-(child_pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_store_process_group(_child_pid: u32) {}
 
 impl SupervisedServer {
     /// Check the child once and apply the bounded restart policy. Async
@@ -119,25 +145,17 @@ fn apply_bundled_dyld_path(command: &mut Command, module: &std::path::Path) {
 }
 
 /// Spawn the raw child (CS5: shared by spawn + restart).
+/// D44: the store runs behind a watchdog shell in its own process
+/// group. The shell re-exports the store's exit status (the D29
+/// diagnosis keeps working: `wait $child` reaps an early death
+/// immediately), kills the store when terminated, and — the reason it
+/// exists — a watcher subshell polls the supervisor's pid once a
+/// second and kills the store when the supervisor is gone: a node
+/// that dies without running Drop (kill -9, crash) must never leave
+/// an orphaned redis-server appending to the data dir (GitHub issue
+/// #2's live evidence: two orphans on one AOF).
 fn spawn_child(cfg: &SupervisorConfig) -> anyhow::Result<Child> {
-    let mut command = Command::new(&cfg.redis_server_bin);
-    command
-        .args([
-            "--port",
-            &cfg.port.to_string(),
-            "--bind",
-            "127.0.0.1",
-            "--save",
-            "1 1",
-            "--appendonly",
-            "yes",
-            "--appendfsync",
-            "everysec",
-            "--dir",
-        ])
-        .arg(&cfg.data_dir)
-        .arg("--loadmodule")
-        .arg(&cfg.falkordb_module);
+    let mut command = store_command(cfg);
     #[cfg(target_os = "macos")]
     apply_bundled_dyld_path(&mut command, &cfg.falkordb_module);
     if let Some(token) = &cfg.auth_token {
@@ -169,9 +187,109 @@ fn spawn_child(cfg: &SupervisorConfig) -> anyhow::Result<Child> {
         .map_err(Into::into)
 }
 
+/// Build the store's command line: the watchdog shell in its own
+/// process group, with the store binary and its flags as the shell's
+/// `$0`/`$@` so quoting survives paths with spaces.
+#[cfg(unix)]
+fn store_command(cfg: &SupervisorConfig) -> Command {
+    use std::os::unix::process::CommandExt as _;
+    let supervisor_pid = cfg.supervisor_pid.unwrap_or_else(std::process::id);
+    // Apple-protected interpreters scrub DYLD_* from their own
+    // environment, so the bundled-lib path rides under a neutral name
+    // and the shell exports it for the store (which is not protected).
+    let script = format!(
+        "trap 'kill $child 2>/dev/null; exit 143' TERM INT HUP; \
+[ -n \"$EXOCORTEX_WATCHDOG_DYLD\" ] && export DYLD_LIBRARY_PATH=\"$EXOCORTEX_WATCHDOG_DYLD\"; \
+\"$0\" \"$@\" & child=$!; \
+( while kill -0 {supervisor_pid} 2>/dev/null; do sleep 1; done; kill $child 2>/dev/null ) & watcher=$!; \
+wait $child; status=$?; kill $watcher 2>/dev/null; exit $status"
+    );
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script).arg(&cfg.redis_server_bin);
+    store_args(cfg, &mut command);
+    if let Some(value) = bundled_dyld_value(cfg) {
+        command.env("EXOCORTEX_WATCHDOG_DYLD", value);
+    }
+    command.process_group(0);
+    command
+}
+
+#[cfg(not(unix))]
+fn store_command(cfg: &SupervisorConfig) -> Command {
+    let mut command = Command::new(&cfg.redis_server_bin);
+    store_args(cfg, &mut command);
+    command
+}
+
+fn store_args(cfg: &SupervisorConfig, command: &mut Command) {
+    command
+        .args([
+            "--port",
+            &cfg.port.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--save",
+            "1 1",
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "everysec",
+            "--dir",
+        ])
+        .arg(&cfg.data_dir)
+        .arg("--loadmodule")
+        .arg(&cfg.falkordb_module);
+}
+
+/// The composed DYLD_LIBRARY_PATH the store needs on macOS (the same
+/// value `apply_bundled_dyld_path` sets for the direct-exec form).
+#[cfg(target_os = "macos")]
+fn bundled_dyld_value(cfg: &SupervisorConfig) -> Option<String> {
+    let dir = cfg.falkordb_module.parent()?;
+    let dir = dir.to_string_lossy().into_owned();
+    Some(match std::env::var("DYLD_LIBRARY_PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{dir}:{existing}"),
+        _ => dir,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bundled_dyld_value(_cfg: &SupervisorConfig) -> Option<String> {
+    None
+}
+
+/// D44: exclusively own the data dir for the lifetime of the supervised
+/// store. flock releases on process death by itself, so a crashed node
+/// never leaves a stale lock; a second live instance is refused while
+/// the first owns the directory — two stores appending to one AOF is
+/// the corruption class of GitHub issue #2.
+pub fn acquire_data_dir_lock(data_dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    use std::io::Write as _;
+    std::fs::create_dir_all(data_dir)?;
+    let lock_path = data_dir.join(".supervised.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        anyhow::ensure!(
+            rc == 0,
+            "another supervised store already owns {} — an exocortex standalone              instance is running on this data dir; attach to it or pass a different --data-dir",
+            data_dir.display()
+        );
+    }
+    let mut file = file;
+    let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
+    Ok(file)
+}
+
 /// Wait for PING with the startup deadline; errors if the child exits.
 fn wait_ping(cfg: &SupervisorConfig, child: &mut Child) -> anyhow::Result<bool> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + cfg.startup_timeout.unwrap_or(Duration::from_secs(10));
     loop {
         if let Some(status) = child.try_wait()? {
             anyhow::bail!(
@@ -282,10 +400,18 @@ pub fn resolve_paths(
 /// use.
 pub fn spawn_supervised(cfg: &SupervisorConfig) -> anyhow::Result<SupervisedServer> {
     std::fs::create_dir_all(&cfg.data_dir)?;
+    // D44: exclusive ownership for the whole spawn + serve lifetime.
+    let data_dir_lock = acquire_data_dir_lock(&cfg.data_dir)?;
     let mut child = spawn_child(cfg)?;
     if !wait_ping(cfg, &mut child)? {
         let _ = child.kill();
-        anyhow::bail!("supervised FalkorDB server did not answer PING within 10s");
+        kill_store_process_group(child.id());
+        anyhow::bail!(
+            "supervised FalkorDB server did not answer PING within {}",
+            cfg.startup_timeout
+                .unwrap_or(Duration::from_secs(10))
+                .as_secs()
+        );
     }
     if let Some(path) = &cfg.port_file {
         exocortex_storage::bounded_io::atomic_write_private(
@@ -300,6 +426,7 @@ pub fn spawn_supervised(cfg: &SupervisorConfig) -> anyhow::Result<SupervisedServ
         port: cfg.port,
         restarts: 0,
         auth_token: cfg.auth_token.clone(),
+        _data_dir_lock: Some(data_dir_lock),
     })
 }
 
@@ -393,6 +520,8 @@ mod tests {
             max_restarts: 2,
             port_file: None,
             auth_token: None,
+            supervisor_pid: None,
+            startup_timeout: None,
         };
         let mut server = SupervisedServer {
             child: Command::new("/bin/sleep")
@@ -404,6 +533,7 @@ mod tests {
             port: 0,
             restarts: 0,
             auth_token: None,
+            _data_dir_lock: None,
         };
         // Kill the live child so the loop sees a crash and restarts it.
         server.child.kill().unwrap();
@@ -447,6 +577,7 @@ mod tests {
             port: 0,
             restarts: 0,
             auth_token: None,
+            _data_dir_lock: None,
         };
         drop(server);
         // The child must be gone: kill(pid) fails with ESRCH (or the pid
@@ -550,6 +681,169 @@ mod tests {
         assert_eq!(value.to_string_lossy(), "/rt");
     }
 
+    /// D44: the data-dir lock is exclusive while held and releases on
+    /// drop — a second live store on one directory is refused, and the
+    /// refusal names the directory.
+    #[test]
+    fn data_dir_lock_is_exclusive_and_released() {
+        let dir = std::env::temp_dir().join(format!(
+            "exocortex-supervisor-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = acquire_data_dir_lock(&dir).expect("first owner locks");
+        let message = match acquire_data_dir_lock(&dir) {
+            Ok(_) => panic!("a second live store was allowed onto one data dir"),
+            Err(error) => format!("{error}"),
+        };
+        assert!(
+            message.contains("another supervised store already owns"),
+            "the refusal names the condition: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(first);
+        assert!(
+            acquire_data_dir_lock(&dir).is_ok(),
+            "the lock releases with its owner"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D44 (GitHub issue #2's orphan evidence): the store must die with
+    /// its SUPERVISOR, even when nothing runs Drop. Drives spawn_child
+    /// DIRECTLY — a spawn that fails startup tears the group down by
+    /// itself, which would satisfy this test without the watchdog
+    /// existing at all. The stub here serves no PING and no error path
+    /// runs: only the watchdog's watcher subshell can reap it after the
+    /// supervisor is kill -9ed. Without the watchdog this test times
+    /// out red.
+    #[test]
+    #[cfg(unix)]
+    fn store_child_dies_with_its_supervisor() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "exocortex-supervisor-watchdog-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("store-stub");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho $$ > {}/stub.pid\nexec sleep 60\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut supervisor = Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let cfg = SupervisorConfig {
+            redis_server_bin: stub,
+            falkordb_module: "unused".into(),
+            data_dir: dir.clone(),
+            port: free_port().unwrap(),
+            max_restarts: 0,
+            port_file: None,
+            auth_token: None,
+            supervisor_pid: Some(supervisor.id()),
+            startup_timeout: None,
+        };
+        let child = spawn_child(&cfg).expect("watchdog spawns");
+        let _leaked: Child = child;
+        let pid_file = dir.join("stub.pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stub_pid: i32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                break text.trim().parse().expect("stub pid");
+            }
+            assert!(Instant::now() < deadline, "the stub never started");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        supervisor.kill().unwrap();
+        let _ = supervisor.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if unsafe { libc::kill(stub_pid, 0) } != 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the store outlived its supervisor (watchdog failed)"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D44: a spawn that fails startup tears down the whole store
+    /// PROCESS GROUP — the staying stub behind the watchdog shell must
+    /// be gone when spawn_supervised returns its error.
+    #[test]
+    #[cfg(unix)]
+    fn failing_spawn_kills_the_store_group() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "exocortex-supervisor-groupkill-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("store-stub");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho $$ > {}/stub.pid\nexec sleep 60\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = SupervisorConfig {
+            redis_server_bin: stub,
+            falkordb_module: "unused".into(),
+            data_dir: dir.clone(),
+            port: free_port().unwrap(),
+            max_restarts: 0,
+            port_file: None,
+            auth_token: None,
+            supervisor_pid: None,
+            startup_timeout: Some(Duration::from_secs(1)),
+        };
+        assert!(
+            spawn_supervised(&cfg).is_err(),
+            "the stub never answers PING"
+        );
+        let pid_file = dir.join("stub.pid");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let stub_pid: i32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                break text.trim().parse().expect("stub pid");
+            }
+            assert!(Instant::now() < deadline, "the stub never started");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if unsafe { libc::kill(stub_pid, 0) } != 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the store survived the failed spawn's teardown (group kill failed)"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// D29: a store binary that cannot start — here a stub that prints its
     /// reason to stderr and exits 1, the same shape as the release-runner
     /// walls (glibc 2.38 symbols missing on a 2.35 runner; a `minos 15.0`
@@ -584,6 +878,8 @@ mod tests {
                 max_restarts: 0,
                 port_file: None,
                 auth_token: None,
+                supervisor_pid: None,
+                startup_timeout: None,
             };
             let error = spawn_supervised(&cfg).err().expect("the stub cannot start");
             let message = format!("{error:#}");
@@ -635,6 +931,8 @@ mod tests {
             max_restarts: 0,
             port_file: None,
             auth_token: Some("5f4d3c2b1a5f4d3c2b1a5f4d3c2b1a5f4d3c2b1a5f4d3c2b1a".into()),
+            supervisor_pid: None,
+            startup_timeout: None,
         };
         let server = spawn_supervised(&cfg).expect("supervised server with auth starts");
         let refused = {

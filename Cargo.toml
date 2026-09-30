@@ -40,6 +40,9 @@ repository   = "https://github.com/memory-graph/exocortex"
 
 [workspace.dependencies]
 # --- runtime & primitives ---
+# D44: exocortex-server only — flock(2) for the exclusive standalone
+# data-dir lock and group signals for the supervised store's teardown.
+libc          = "0.2"
 tokio          = { version = "1.40", features = ["full"] }
 tokio-stream   = { version = "0.1" }
 futures        = "0.3"
