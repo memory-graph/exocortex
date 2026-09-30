@@ -38,6 +38,11 @@ pub struct SupervisorConfig {
     /// D44: startup PING deadline override (tests shrink the 10s
     /// default so failing spawns return fast).
     pub startup_timeout: Option<Duration>,
+    /// D45: override the snapshot policy (`--save`). `None` keeps the
+    /// production `1 1` (BGSAVE one second after the first dirtying
+    /// change); `Some("")` disables snapshots entirely — the
+    /// discriminator leg of the store-death repro harness.
+    pub save_policy: Option<String>,
 }
 
 /// Where the supervised server landed.
@@ -96,18 +101,25 @@ impl SupervisedServer {
     /// runtimes use this non-blocking step from their own interval loop.
     pub fn poll(&mut self, cfg: &SupervisorConfig) -> anyhow::Result<()> {
         match self.child.try_wait() {
-            Ok(Some(_status)) => {
+            Ok(Some(status)) => {
+                // D45: post-startup deaths carried no diagnosis (only
+                // the startup path ran diagnose_exit) — the store-death
+                // investigation had nothing but a bare WARN. The death
+                // is ERROR-level: under the default ERROR-only filter
+                // a store restart is exactly what must NOT be silent.
+                let why = describe_death(cfg, &status);
                 if self.restarts >= cfg.max_restarts {
                     anyhow::bail!(
-                        "supervised server exited; restart budget ({}) exhausted",
+                        "supervised server exited; restart budget ({}) exhausted; last death: {why}",
                         cfg.max_restarts
                     );
                 }
                 self.restarts += 1;
                 metrics::counter!("exocortex_supervisor_restarts_total").increment(1);
-                tracing::warn!(
+                tracing::error!(
                     restart = self.restarts,
                     port = self.port,
+                    death = %why,
                     "supervised server crashed; restarting"
                 );
                 self.child = spawn_child(cfg)?;
@@ -222,6 +234,7 @@ fn store_command(cfg: &SupervisorConfig) -> Command {
 }
 
 fn store_args(cfg: &SupervisorConfig, command: &mut Command) {
+    let save = cfg.save_policy.as_deref().unwrap_or("1 1");
     command
         .args([
             "--port",
@@ -229,7 +242,7 @@ fn store_args(cfg: &SupervisorConfig, command: &mut Command) {
             "--bind",
             "127.0.0.1",
             "--save",
-            "1 1",
+            save,
             "--appendonly",
             "yes",
             "--appendfsync",
@@ -294,7 +307,7 @@ fn wait_ping(cfg: &SupervisorConfig, child: &mut Child) -> anyhow::Result<bool> 
         if let Some(status) = child.try_wait()? {
             anyhow::bail!(
                 "supervised redis-server exited during startup: {}",
-                diagnose_exit(cfg, &status)
+                describe_death(cfg, &status)
             );
         }
         if ping(cfg.port, cfg.auth_token.as_deref()) {
@@ -313,7 +326,7 @@ fn wait_ping(cfg: &SupervisorConfig, child: &mut Child) -> anyhow::Result<bool> 
 /// load on macOS 14 — were invisible because the log lived in a data dir
 /// the harness deleted, leaving only "exited during startup" to guess
 /// from). Bounded to the last 2 KiB: a diagnosis, not a log ship.
-fn diagnose_exit(cfg: &SupervisorConfig, status: &std::process::ExitStatus) -> String {
+fn describe_death(cfg: &SupervisorConfig, status: &std::process::ExitStatus) -> String {
     let how = match status.code() {
         Some(code) => format!("exit status {code}"),
         None => {
@@ -522,6 +535,7 @@ mod tests {
             auth_token: None,
             supervisor_pid: None,
             startup_timeout: None,
+            save_policy: None,
         };
         let mut server = SupervisedServer {
             child: Command::new("/bin/sleep")
@@ -756,6 +770,7 @@ mod tests {
             auth_token: None,
             supervisor_pid: Some(supervisor.id()),
             startup_timeout: None,
+            save_policy: None,
         };
         let child = spawn_child(&cfg).expect("watchdog spawns");
         let _leaked: Child = child;
@@ -816,6 +831,7 @@ mod tests {
             auth_token: None,
             supervisor_pid: None,
             startup_timeout: Some(Duration::from_secs(1)),
+            save_policy: None,
         };
         assert!(
             spawn_supervised(&cfg).is_err(),
@@ -842,6 +858,276 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D45: post-startup deaths are diagnosable — the exit status AND
+    /// the store's own log tail ride the restart log (and the
+    /// budget-exhausted error), where the bare WARN left the
+    /// store-death investigation with nothing.
+    #[test]
+    fn post_startup_death_carries_the_log_tail() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = std::env::temp_dir()
+                .join(format!("exocortex-death-diagnosis-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let stub = dir.join("store-stub");
+            std::fs::write(&stub, "#!/bin/sh\necho 'stub: dying loud' >&2\nexit 7\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cfg = SupervisorConfig {
+                redis_server_bin: stub,
+                falkordb_module: "unused".into(),
+                data_dir: dir.clone(),
+                port: free_port().unwrap(),
+                max_restarts: 0,
+                port_file: None,
+                auth_token: None,
+                supervisor_pid: None,
+                startup_timeout: None,
+                save_policy: None,
+            };
+            let child = spawn_child(&cfg).expect("watchdog spawns");
+            let output = child.wait_with_output().expect("stub exits");
+            let why = describe_death(&cfg, &output.status);
+            assert!(
+                why.contains("exit status 7"),
+                "the diagnosis names the exit status: {why}"
+            );
+            assert!(
+                why.contains("stub: dying loud"),
+                "the diagnosis carries the store's own stderr tail: {why}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// D45: the store-death repro harness (GitHub issue #3), live and
+    /// env-gated like the auth suite — without EXOCORTEX_REDIS_SERVER
+    /// and EXOCORTEX_FALKORDB_MODULE it skips loudly. Legs:
+    /// (control) an empty-dir store survives its first BGSAVE window;
+    /// (dual-writer) two 5beaf74-era stores serve CONCURRENTLY on one
+    /// data dir — the corruption precondition — then a fresh boot on
+    /// the interleaved dir is observed through its first dirty-save
+    /// window, with and without snapshots (the discriminator).
+    /// Set EXOCORTEX_REPRO_DATA_DIR to observe a COPY of a real data
+    /// dir instead of the synthetic corpus (never the live dir).
+    #[test]
+    fn store_death_repro_harness() {
+        let (Ok(bin), Ok(module)) = (
+            std::env::var("EXOCORTEX_REDIS_SERVER"),
+            std::env::var("EXOCORTEX_FALKORDB_MODULE"),
+        ) else {
+            eprintln!(
+                "SKIP store_death_repro_harness: EXOCORTEX_REDIS_SERVER/\
+                 EXOCORTEX_FALKORDB_MODULE absent; live suite unexecuted"
+            );
+            return;
+        };
+        let base = std::env::temp_dir().join(format!(
+            "exocortex-repro-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+
+        let boot = |dir: &std::path::Path, save: Option<&str>| -> SupervisorConfig {
+            SupervisorConfig {
+                redis_server_bin: bin.clone().into(),
+                falkordb_module: module.clone().into(),
+                data_dir: dir.to_path_buf(),
+                port: free_port().unwrap(),
+                max_restarts: 0,
+                port_file: None,
+                auth_token: None,
+                supervisor_pid: None,
+                startup_timeout: None,
+                save_policy: save.map(str::to_owned),
+            }
+        };
+        // EXOCORTEX_REPRO_SCALE multiplies the write volume (the OOM-
+        // during-fork variant of the hypothesis needs real memory
+        // pressure; the default corpus is small and fast).
+        let scale: usize = std::env::var("EXOCORTEX_REPRO_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        // One connection for the whole dirty phase: a connection per
+        // command exhausts ephemeral ports at EXOCORTEX_REPRO_SCALE.
+        let dirty = |cfg: &SupervisorConfig, batches: usize| {
+            use std::io::{Read, Write};
+            let mut stream =
+                std::net::TcpStream::connect(("127.0.0.1", cfg.port)).expect("dirty session");
+            for i in 0..batches * scale {
+                // 100 nodes per round trip keeps the harness fast at
+                // volume.
+                let nodes: Vec<String> = (0..100)
+                    .map(|j| format!("(:N {{v: '{}.{j}'}})", i))
+                    .collect();
+                let query = format!("CREATE {}", nodes.join(","));
+                let graph = "exocortex-personal";
+                let frame = format!(
+                    "*3\r\n$11\r\nGRAPH.QUERY\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    graph.len(),
+                    graph,
+                    query.len(),
+                    query
+                );
+                stream.write_all(frame.as_bytes()).expect("write");
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).expect("reply");
+                let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
+                assert!(
+                    reply.starts_with('*') || reply.starts_with('+') || reply.starts_with(':'),
+                    "graph write {i} succeeded: {reply}"
+                );
+            }
+        };
+        let alive = |cfg: &SupervisorConfig| -> bool { ping(cfg.port, None) };
+
+        // ---- control: an empty-dir store survives past its first
+        //      dirty BGSAVE (the ~1s `--save 1 1` fork).
+        {
+            let dir = base.join("control");
+            let cfg = boot(&dir, None);
+            let server = spawn_supervised(&cfg).expect("control store starts");
+            dirty(&cfg, 3);
+            std::thread::sleep(Duration::from_secs(4));
+            assert!(
+                alive(&cfg),
+                "control: the store survives its first save fork"
+            );
+            drop(server);
+        }
+
+        // ---- dual-writer precondition: two stores on ONE dir at the
+        //      same time (the 5beaf74 hazard, reproduced deliberately
+        //      via spawn_child — spawn_supervised's flock refuses it).
+        {
+            let dir = base.join("dual");
+            std::fs::create_dir_all(&dir).unwrap();
+            let cfg_a = boot(&dir, None);
+            let mut a = spawn_child(&cfg_a).expect("writer A spawns");
+            assert!(
+                wait_ping(&cfg_a, &mut a).expect("A startup"),
+                "writer A serves"
+            );
+            let cfg_b = SupervisorConfig {
+                port: free_port().unwrap(),
+                ..boot(&dir, None)
+            };
+            let mut b = spawn_child(&cfg_b).expect("writer B spawns");
+            assert!(
+                wait_ping(&cfg_b, &mut b).expect("B startup"),
+                "writer B serves on the SAME data dir — the 5beaf74 hazard"
+            );
+            dirty(&cfg_a, 5);
+            dirty(&cfg_b, 5);
+            // Hard-kill both, no Drop, no shutdown save.
+            kill_store_process_group(a.id());
+            kill_store_process_group(b.id());
+            let _ = a.wait();
+            let _ = b.wait();
+            std::thread::sleep(Duration::from_secs(1));
+
+            // ---- observation: a fresh supervised boot on the
+            //      interleaved dir, through its first dirty-save
+            //      window, WITH and WITHOUT snapshots.
+            for (tag, save, expect_alive) in [
+                ("corrupted-with-saves", None, true),
+                ("corrupted-no-saves", Some(""), true),
+            ] {
+                let cfg = SupervisorConfig {
+                    // A big interleaved corpus replays slowly; the
+                    // observation window must not mistake a slow boot
+                    // for the death.
+                    startup_timeout: Some(Duration::from_secs(60)),
+                    ..boot(&dir, save)
+                };
+                let observed = match spawn_supervised(&cfg) {
+                    Ok(mut server) => {
+                        dirty(&cfg, 2);
+                        std::thread::sleep(Duration::from_secs(4));
+                        let survived = alive(&cfg);
+                        let why = server
+                            .child
+                            .try_wait()
+                            .ok()
+                            .flatten()
+                            .map(|status| describe_death(&cfg, &status))
+                            .unwrap_or_default();
+                        eprintln!(
+                            "repro[{tag}]: survived={survived}{}",
+                            if why.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" death: {why}")
+                            }
+                        );
+                        drop(server);
+                        survived
+                    }
+                    Err(error) => {
+                        eprintln!("repro[{tag}]: boot refused: {error:#}");
+                        false
+                    }
+                };
+                // The harness must never fabricate a verdict: both legs
+                // assert only that the STORE-LEVEL behavior is coherent
+                // (a boot that survives its window answers PING).
+                assert_eq!(observed, expect_alive, "repro[{tag}] coherence");
+            }
+        }
+
+        // ---- real-data mode: EXOCORTEX_REPRO_DATA_DIR=<copy of a real
+        //      dir> observes THAT dir's behavior through the same
+        //      window (the dir is copied first — never the live one).
+        if let Ok(source) = std::env::var("EXOCORTEX_REPRO_DATA_DIR") {
+            let dir = base.join("real-copy");
+            std::fs::create_dir_all(&dir).unwrap();
+            for item in ["appendonlydir", "dump.rdb"] {
+                let from = std::path::Path::new(&source).join(item);
+                if from.exists() {
+                    let status = std::process::Command::new("cp")
+                        .args(["-Rp", &from.to_string_lossy(), &dir.to_string_lossy()])
+                        .status()
+                        .expect("cp");
+                    assert!(status.success(), "copied {item}");
+                }
+            }
+            let cfg = SupervisorConfig {
+                startup_timeout: Some(Duration::from_secs(60)),
+                ..boot(&dir, None)
+            };
+            match spawn_supervised(&cfg) {
+                Ok(mut server) => {
+                    let _ = ping(cfg.port, None); // read-only probe: no dirtying
+                    std::thread::sleep(Duration::from_secs(6));
+                    let survived = alive(&cfg);
+                    let why = server
+                        .child
+                        .try_wait()
+                        .ok()
+                        .flatten()
+                        .map(|status| describe_death(&cfg, &status))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "repro[real-data]: survived={survived}{}",
+                        if why.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" death: {why}")
+                        }
+                    );
+                    drop(server);
+                }
+                Err(error) => eprintln!("repro[real-data]: boot refused: {error:#}"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// D29: a store binary that cannot start — here a stub that prints its
@@ -880,6 +1166,7 @@ mod tests {
                 auth_token: None,
                 supervisor_pid: None,
                 startup_timeout: None,
+                save_policy: None,
             };
             let error = spawn_supervised(&cfg).err().expect("the stub cannot start");
             let message = format!("{error:#}");
@@ -933,6 +1220,7 @@ mod tests {
             auth_token: Some("5f4d3c2b1a5f4d3c2b1a5f4d3c2b1a5f4d3c2b1a5f4d3c2b1a".into()),
             supervisor_pid: None,
             startup_timeout: None,
+            save_policy: None,
         };
         let server = spawn_supervised(&cfg).expect("supervised server with auth starts");
         let refused = {
