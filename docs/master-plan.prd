@@ -1,5 +1,33 @@
 # Exocortex — Master Plan
 
+**Status (2026-10-01, GitHub issues #2–#7 triaged as D44–D49; D44-S1,
+D45-partial, D46 landed):** the standalone multi-instance cascade from
+the owner's dogfood. D44 S1 (a71cf3e): the supervised store runs
+behind a watchdog shell in its own process group — an orphaned store
+reaps itself when its node dies, even under kill -9 — teardown signals
+the group, and `spawn_supervised` takes an exclusive flock on the data
+dir so a second live store is refused naming the remedy; fail-without-it
+tests for all three, one dependency (libc, rule-9 recorded). S2 (attach
+mode + per-session WAL) remains Proposed with the review's five S1
+edges recorded in the row. D45 (9d1137b, d66d641): post-startup store
+deaths now carry exit status + log tail at ERROR level (visible under
+the default filter); the repro harness is landed (env-gated live:
+control leg asserts, dual-writer leg manufactures the #2 hazard,
+save-policy discriminator, real-data mode, scale knob) — synthetic
+corpora to ~3M nodes did NOT reproduce, so the row PARKS ON the owner
+running it over a copy of the real data dir; root cause unconfirmed.
+D46 (4a67f2c, c10b7fc): every redis-plane store consumer now rides a
+ConnectionManager (feature flag on the existing redis dep) — the fire
+drain, discovery delivery, post-ingest effects, and the health probe
+all survive a supervised restart; red/green fail-without-it proven.
+Issue #4 closed; #2, #3, #5, #6, #7 stay open against their rows.
+**Next, in order:** D47 (diagnostics defaults — ERROR-only filter, the
+dropped hydration status, stale-reads surfacing), D48 (Claude Code
+skill path + idempotent dump-block with the word-gate trap recorded),
+D49 (verify's four gaps — the harness row is PRD-promised S6), D44-S2
+(attach mode); the release cut still waits on the owner's version
+call; D45's real-data run is one command recorded in its row.
+
 **Status (2026-09-27, D35–D38 closed — the issue #1 postmortem landed
 as work):** GitHub issue #1 (every read surface dropped
 `Memory.content`) fixed as D35 with stash-verified fail-without-it
