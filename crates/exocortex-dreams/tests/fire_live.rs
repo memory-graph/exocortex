@@ -17,7 +17,7 @@ async fn isolated_queue(org: &str) -> Option<(redis::Client, RedisFireQueue, Str
     };
     let client = redis::Client::open(redis_url).expect("REDIS_URL must be valid");
     let conn = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("connect to live Redis");
     let key = format!("exocortex:test:dreams:queue:{}", uuid::Uuid::new_v4());
@@ -47,7 +47,7 @@ async fn queue_atomically_caps_at_one_thousand_and_drops_newest() {
     );
 
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("second Redis connection");
     let len: u64 = redis::cmd("LLEN")
@@ -87,7 +87,7 @@ async fn organization_queue_rejects_cross_org_regions_before_redis_write() {
     let error = queue.fire(&foreign, "foreign-node").await.unwrap_err();
     assert!(error.to_string().contains("rejects region organization"));
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("second Redis connection");
     let len: u64 = redis::cmd("LLEN")
@@ -131,7 +131,7 @@ async fn quiet_hours_defers_durably_without_requeueing() {
     assert_eq!(result, DrainResult::Deferred);
 
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("second Redis connection");
     let len: u64 = redis::cmd("LLEN")
@@ -286,7 +286,7 @@ async fn shared_counters_coalesce_and_acknowledge_exact_fired_snapshot() {
     ));
 
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("second Redis connection");
     let counter_key = format!(
@@ -365,7 +365,7 @@ async fn ambiguous_success_retry_preserves_post_fire_writes() {
     assert_eq!(follow_up.fired_at.unwrap().memories_since_last_cycle, 1);
 
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("second Redis connection");
     let counter_key = format!(
@@ -427,7 +427,7 @@ async fn engine_settlement_retain_flag_reaches_the_distributed_queue() {
         .unwrap();
 
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("inspection connection");
     let (processed, settled): (u64, u64) = redis::pipe()
@@ -519,7 +519,7 @@ async fn engine_on_write_uses_shared_transport_even_as_follower() {
     assert_eq!(recovered.fire_id, fire_id);
 
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("second Redis connection");
     let counter_key = format!(
@@ -593,7 +593,7 @@ async fn stable_write_event_is_counted_once_after_an_ambiguous_retry() {
     ));
 
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("second Redis connection");
     let counter_key = format!(
@@ -662,7 +662,7 @@ async fn interleaved_effect_retry_is_counted_once() {
     }
 
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("second Redis connection");
     let counter_key = format!(
@@ -766,7 +766,7 @@ async fn high_cardinality_settled_effects_do_not_accumulate_identities() {
         serde_json::to_string(&region).unwrap()
     );
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("second Redis connection");
     let processed: u64 = redis::cmd("SCARD")
@@ -840,7 +840,7 @@ async fn partial_multi_region_cleanup_resumes_after_restart_without_reapplying()
     drop(queue); // crash after cleaning only the first region
 
     let conn = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("reconnect after partial cleanup");
     let mut restarted = RedisFireQueue::new_with_queue_key(
@@ -857,7 +857,7 @@ async fn partial_multi_region_cleanup_resumes_after_restart_without_reapplying()
     }
 
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("inspection connection");
     for region in &regions {
@@ -953,7 +953,7 @@ async fn delayed_stale_generation_cannot_reapply_after_cleanup() {
         serde_json::to_string(&region).unwrap()
     );
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("inspection connection");
     let (memories, settled_generation): (u32, u64) = redis::cmd("HMGET")
@@ -998,7 +998,7 @@ async fn adopted_legacy_cleanup_retains_marker_against_old_lua_replay() {
     let processed_key = format!("{counter_key}:processed-events");
     let event = format!("legacy-effect:{}", uuid::Uuid::new_v4());
     let mut legacy_conn = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("legacy command connection");
     let legacy_script = redis::Script::new(
@@ -1033,7 +1033,7 @@ async fn adopted_legacy_cleanup_retains_marker_against_old_lua_replay() {
     assert_eq!(delayed, 1, "retained marker rejects delayed legacy Lua");
 
     let mut inspect = client
-        .get_multiplexed_async_connection()
+        .get_connection_manager()
         .await
         .expect("inspection connection");
     let (processed, settled): (u64, u64) = redis::pipe()
@@ -1090,7 +1090,7 @@ async fn counters_and_failed_cycle_survive_standalone_queue_restarts() {
     ));
     drop(first_process);
 
-    let second_connection = client.get_multiplexed_async_connection().await.unwrap();
+    let second_connection = client.get_connection_manager().await.unwrap();
     let mut second_process = RedisFireQueue::new_with_queue_key(
         second_connection,
         QuietHours::none(),
@@ -1118,7 +1118,7 @@ async fn counters_and_failed_cycle_survive_standalone_queue_restarts() {
     let fire_id = in_flight.fire_id.clone();
     drop(second_process);
 
-    let third_connection = client.get_multiplexed_async_connection().await.unwrap();
+    let third_connection = client.get_connection_manager().await.unwrap();
     let mut third_process =
         RedisFireQueue::new_with_queue_key(third_connection, QuietHours::none(), &org, key.clone());
     assert_eq!(third_process.recover_inflight().await.unwrap(), 1);
@@ -1136,7 +1136,7 @@ async fn counters_and_failed_cycle_survive_standalone_queue_restarts() {
     ));
     drop(third_process);
 
-    let fourth_connection = client.get_multiplexed_async_connection().await.unwrap();
+    let fourth_connection = client.get_connection_manager().await.unwrap();
     let mut fourth_process = RedisFireQueue::new_with_queue_key(
         fourth_connection,
         QuietHours::none(),
@@ -1156,7 +1156,7 @@ async fn counters_and_failed_cycle_survive_standalone_queue_restarts() {
         AcknowledgeOutcome::Acknowledged(c) if c.memories_since_last_cycle == 0
     ));
 
-    let mut inspect = client.get_multiplexed_async_connection().await.unwrap();
+    let mut inspect = client.get_connection_manager().await.unwrap();
     let counter_key = format!(
         "exocortex:dreams:counters:{}",
         serde_json::to_string(&region).unwrap()
