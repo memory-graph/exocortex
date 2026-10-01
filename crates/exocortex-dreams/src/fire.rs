@@ -378,7 +378,7 @@ impl QuietHours {
 /// (multiplexed); Lua coalesces counters, bounded lists hold ready/in-flight
 /// work, and a sorted set durably holds quiet-hour deferrals.
 pub struct RedisFireQueue {
-    conn: redis::aio::MultiplexedConnection,
+    conn: redis::aio::ConnectionManager,
     org: SmolStr,
     queue_key: SmolStr,
     deferred_key: SmolStr,
@@ -390,7 +390,7 @@ pub struct RedisFireQueue {
 impl RedisFireQueue {
     /// Connect over an existing client.
     pub fn new(
-        conn: redis::aio::MultiplexedConnection,
+        conn: redis::aio::ConnectionManager,
         quiet_hours: QuietHours,
         org: impl Into<SmolStr>,
     ) -> Self {
@@ -403,7 +403,7 @@ impl RedisFireQueue {
     }
 
     fn from_queue_key(
-        conn: redis::aio::MultiplexedConnection,
+        conn: redis::aio::ConnectionManager,
         quiet_hours: QuietHours,
         org: SmolStr,
         queue_key: SmolStr,
@@ -422,7 +422,7 @@ impl RedisFireQueue {
     #[doc(hidden)]
     #[cfg(feature = "testing")]
     pub fn new_with_queue_key(
-        conn: redis::aio::MultiplexedConnection,
+        conn: redis::aio::ConnectionManager,
         quiet_hours: QuietHours,
         org: impl Into<SmolStr>,
         queue_key: impl Into<SmolStr>,

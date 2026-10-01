@@ -902,6 +902,114 @@ mod tests {
         }
     }
 
+    /// D46 (GitHub issue #4): a supervised store restart must not wedge
+    /// the node's store consumers. A FalkorStorage is built against a
+    /// live supervised store; the store is hard-killed (group SIGKILL,
+    /// no Drop) and a NEW store is started on the SAME port and token —
+    /// exactly what poll()'s restart does. The storage handle must
+    /// answer pings again: with a pinned MultiplexedConnection it never
+    /// does (the once-per-second broken pipe, forever); with the
+    /// ConnectionManager it reconnects.
+    #[tokio::test]
+    async fn storage_pings_recover_after_a_store_restart() {
+        let (Ok(bin), Ok(module)) = (
+            std::env::var("EXOCORTEX_REDIS_SERVER"),
+            std::env::var("EXOCORTEX_FALKORDB_MODULE"),
+        ) else {
+            eprintln!(
+                "SKIP storage_pings_recover_after_a_store_restart: EXOCORTEX_REDIS_SERVER/\
+                 EXOCORTEX_FALKORDB_MODULE absent; live suite unexecuted"
+            );
+            return;
+        };
+        let base = std::env::temp_dir().join(format!(
+            "exocortex-reconnect-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let token = "5f4d3c2b1a5f4d3c2b1a5f4d3c2b1a5f4d3c2b1a5f4d3c2b1a";
+        let cfg = SupervisorConfig {
+            redis_server_bin: bin.into(),
+            falkordb_module: module.into(),
+            data_dir: base.join("a"),
+            port: free_port().unwrap(),
+            max_restarts: 0,
+            port_file: None,
+            auth_token: Some(token.into()),
+            supervisor_pid: None,
+            startup_timeout: None,
+            save_policy: None,
+        };
+        let mut server = spawn_supervised(&cfg).expect("store A starts");
+        let (falkor_url, redis_url) = supervised_store_urls(cfg.port, Some(token));
+        let ontology = std::sync::Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let storage = exocortex_storage::FalkorStorage::connect(
+            exocortex_storage::FalkorConfig {
+                falkor_url,
+                redis_url,
+                graph_name: "exocortex-reconnect".into(),
+                org_id: "o".into(),
+                node_id: "reconnect-probe".into(),
+            },
+            ontology,
+        )
+        .await
+        .expect("storage connects to store A");
+        use exocortex_storage::Storage as _;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), storage.ping())
+                .await
+                .expect("ping A")
+                .is_ok(),
+            "the store answers before the restart"
+        );
+
+        // Hard-kill A (group SIGKILL, no Drop), then bring a NEW store
+        // up on the same port and token on a fresh dir — poll()'s
+        // restart, by hand. The old server handle is leaked so its
+        // flock stays on dir A, which the replacement does not need
+        // (spawn_child bypasses the lock).
+        kill_store_process_group(server.child.id());
+        let _ = server.child.wait();
+        let replacement = SupervisorConfig {
+            data_dir: base.join("b"),
+            ..cfg
+        };
+        std::fs::create_dir_all(&replacement.data_dir).unwrap();
+        let mut child_b = spawn_child(&replacement).expect("store B spawns");
+        assert!(
+            wait_ping(&replacement, &mut child_b).expect("B startup"),
+            "store B serves on the same port and token"
+        );
+
+        let mut ok = false;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if tokio::time::timeout(Duration::from_secs(2), storage.ping())
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false)
+            {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        kill_store_process_group(child_b.id());
+        let _ = child_b.wait();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            ok,
+            "the storage handle recovered after the store restart (a pinned connection would ping dead forever)"
+        );
+    }
+
     /// D45: the store-death repro harness (GitHub issue #3), live and
     /// env-gated like the auth suite — without EXOCORTEX_REDIS_SERVER
     /// and EXOCORTEX_FALKORDB_MODULE it skips loudly. Legs:

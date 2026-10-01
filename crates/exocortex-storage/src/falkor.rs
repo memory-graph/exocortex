@@ -48,7 +48,9 @@ pub struct FalkorStorage {
     client: FalkorAsyncClient,
     graph: String,
     redis_client: redis::Client,
-    redis: redis::aio::MultiplexedConnection,
+    /// D46: a reconnecting manager — the supervised store restarts in
+    /// place and every consumer of this connection must follow it.
+    redis: redis::aio::ConnectionManager,
     node_id: SmolStr,
     org_id: SmolStr,
     ontology: Arc<Ontology>,
@@ -463,8 +465,12 @@ impl FalkorStorage {
             .map_err(|e| StorageError::Backend(e.to_string()))?;
         let redis_client = redis::Client::open(cfg.redis_url.as_str())
             .map_err(|e| StorageError::Backend(e.to_string()))?;
+        // D46: ConnectionManager, not MultiplexedConnection — the
+        // supervised store restarts in place (same port, same token),
+        // and a pinned multiplexed conn stays dead forever, taking the
+        // health probe, the fire drain, and discovery delivery with it.
         let redis = redis_client
-            .get_multiplexed_async_connection()
+            .get_connection_manager()
             .await
             .map_err(|e| StorageError::Backend(e.to_string()))?;
         let mut this = Self {

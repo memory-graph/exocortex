@@ -107,7 +107,7 @@ async fn standalone_startup_recovers_the_supervised_redis_processing_list() {
         chrono::Utc::now().timestamp_micros()
     );
     let client = redis::Client::open(redis_url.as_str()).unwrap();
-    let producer = client.get_multiplexed_async_connection().await.unwrap();
+    let producer = client.get_connection_manager().await.unwrap();
     let mut queue = exocortex_dreams::fire::RedisFireQueue::new(
         producer,
         exocortex_dreams::fire::QuietHours::none(),
@@ -142,7 +142,7 @@ async fn standalone_startup_recovers_the_supervised_redis_processing_list() {
     );
     let processing_key = format!("{queue_key}:processing");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    let mut inspect = client.get_multiplexed_async_connection().await.unwrap();
+    let mut inspect = client.get_connection_manager().await.unwrap();
     loop {
         let ready: u64 = redis::cmd("LLEN")
             .arg(&queue_key)

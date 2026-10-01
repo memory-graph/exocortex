@@ -810,8 +810,9 @@ async fn run_backend_node_inner<S: Storage + 'static>(
     // falling back to process-local counters.
     let (distributed_fire, mut fire_drainer) = if let Some(redis_url) = &args.redis_url {
         let client = redis::Client::open(redis_url.as_str())?;
-        let producer = client.get_multiplexed_async_connection().await?;
-        let drainer = client.get_multiplexed_async_connection().await?;
+        // D46: managers — the drain loop must survive a store restart.
+        let producer = client.get_connection_manager().await?;
+        let drainer = client.get_connection_manager().await?;
         (
             Some(Arc::new(tokio::sync::Mutex::new(
                 exocortex_dreams::fire::RedisFireQueue::new(
