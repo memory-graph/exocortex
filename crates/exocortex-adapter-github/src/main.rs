@@ -94,7 +94,11 @@ fn save_cursor_atomic(path: &std::path::Path, value: &str) -> std::io::Result<()
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::WARN.into())
+                .from_env_lossy(),
+        )
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();

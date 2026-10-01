@@ -96,7 +96,11 @@ fn org_visibility(org: &str, user: &str) -> VisibilityContext {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::WARN.into())
+                .from_env_lossy(),
+        )
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
@@ -346,6 +350,11 @@ fn main() -> anyhow::Result<()> {
             sync_config.bearer = Some(bearer.clone());
             sync_config.client_key = Some(sse_key);
             sync_config.org = org.clone().into();
+            // D47: the degradation cell is shared with the MCP read surface
+            // so a failing backend stream stamps reads and backend_status.
+            let sync_health = exocortex_client::sync::StreamErrorCell::default();
+            sync_config.last_stream_error = Some(sync_health.clone());
+            server = server.with_sync_health(sync_health);
             let _sync = exocortex_client::sync::hydrate_and_start_backend_sync(
                 sync_config,
                 cache.clone(),

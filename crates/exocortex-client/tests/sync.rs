@@ -998,13 +998,65 @@ async fn seed_ignorant_server_fails_initial_hydration_promptly() {
     .expect("legacy incompatibility is bounded");
     assert!(matches!(
         result,
-        Err(exocortex_client::sync::SyncError::InitialHydrationTimeout(timeout))
-            if timeout == Duration::from_millis(40)
+        Err(exocortex_client::sync::SyncError::InitialHydrationTimeout {
+            waited,
+            ..
+        }) if waited == Duration::from_millis(40)
     ));
     assert_eq!(
         cache.resident_orgs(),
         0,
         "empty state is never declared ready"
+    );
+    server.abort();
+}
+
+/// D47: the hydration timeout must carry the server's own diagnosis — HTTP
+/// status AND a bounded slice of the body — instead of reporting a bare
+/// timeout while a readiness 503 names the failing probe in its response.
+#[tokio::test(flavor = "multi_thread")]
+async fn hydration_timeout_carries_the_backend_http_status_and_body() {
+    let _harness = NETWORK_HARNESS.lock().await;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+
+    let app = axum::Router::new().route(
+        "/v1/changes",
+        get(|| async {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage unreachable: storage_ok probe failed",
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (cache, writer_rx) = LocalCache::new(1024 * 1024);
+    let cache = Arc::new(cache);
+    let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, [1; 32]);
+    cfg.initial_hydration_timeout = Duration::from_millis(300);
+    cfg.stall_timeout = Duration::from_secs(5);
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(1500),
+        exocortex_client::sync::hydrate_and_start_backend_sync(cfg, cache.clone(), writer_rx),
+    )
+    .await
+    .expect("readiness refusal is bounded");
+    let Err(error) = result else {
+        panic!("a 503-only backend must fail hydration");
+    };
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("503"),
+        "the timeout must name the HTTP status, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("storage_ok probe failed"),
+        "the timeout must carry the server's own diagnosis, got: {rendered}"
     );
     server.abort();
 }

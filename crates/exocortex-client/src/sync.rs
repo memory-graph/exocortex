@@ -153,9 +153,31 @@ pub enum SyncError {
     #[error("envelope rejected: {0}")]
     Rejected(String),
     /// The peer accepted SSE but did not implement the required initial seed
-    /// contract, so exposing an empty backend cache would be unsafe.
-    #[error("backend did not provide an initial graph seed within {0:?}")]
-    InitialHydrationTimeout(Duration),
+    /// contract, so exposing an empty backend cache would be unsafe. The last
+    /// observed SSE failure (HTTP status + bounded body, or the transport
+    /// error) rides along so the operator sees WHY no seed arrived instead of
+    /// only that it did not (D47: the server's 503 body used to be dropped at
+    /// the SSE read and swallowed by the reconnect loop).
+    #[error("backend did not provide an initial graph seed within {waited:?}{last_error}")]
+    InitialHydrationTimeout {
+        waited: Duration,
+        last_error: LastSseFailure,
+    },
+}
+
+/// The last stream failure observed while waiting for a seed; renders as
+/// nothing when the stream never reported one (pure silence is itself a
+/// diagnosis: the peer connected and said nothing).
+#[derive(Debug, Clone, Default)]
+pub struct LastSseFailure(pub Option<String>);
+
+impl std::fmt::Display for LastSseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(error) => write!(f, " (last SSE failure: {error})"),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Configuration for the SSE subscriber.
@@ -193,6 +215,10 @@ pub struct SseSyncConfig {
     pub connection_ready: Option<Arc<tokio::sync::Notify>>,
     /// Signal emitted only after an initial/recovery snapshot is visible.
     pub hydration_ready: Option<Arc<tokio::sync::Notify>>,
+    /// Cell beside `hydration_ready`: the subscriber records its last stream
+    /// failure (HTTP status + bounded body or transport error) here so the
+    /// hydration timeout can surface it. Cleared on every successful frame.
+    pub last_stream_error: Option<Arc<std::sync::Mutex<Option<String>>>>,
     /// Org graph replaced by a full SSE reseed.
     pub org: smol_str::SmolStr,
 }
@@ -213,6 +239,7 @@ impl SseSyncConfig {
             initial_hydration_timeout: Duration::from_secs(15),
             connection_ready: None,
             hydration_ready: None,
+            last_stream_error: None,
             org: "org".into(),
         }
     }
@@ -222,6 +249,12 @@ impl SseSyncConfig {
 /// unrecoverable gap): invoked before a resubscribe so the caller can
 /// reseed the cache from storage.
 pub type ResyncFn = Box<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send>;
+
+/// Shared cell the subscriber uses to publish its last stream failure;
+/// supervisors and the read surface consult it to tell degraded cache
+/// reads from live ones (D47). `Some(error)` = currently failing,
+/// `None` = healthy (or never connected).
+pub type StreamErrorCell = Arc<std::sync::Mutex<Option<String>>>;
 
 /// Start the production backend cache lifecycle and return only after the
 /// authenticated SSE subscriber has atomically installed its first graph
@@ -240,13 +273,24 @@ pub async fn hydrate_and_start_backend_sync(
     });
     let hydrated = Arc::new(tokio::sync::Notify::new());
     cfg.hydration_ready = Some(hydrated.clone());
+    // D47: a caller-provided cell (the MCP read surface shares it) is kept
+    // so degradation stays observable after hydration succeeds.
+    let last_error = cfg
+        .last_stream_error
+        .clone()
+        .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(None)));
+    cfg.last_stream_error = Some(last_error.clone());
     let sync = tokio::spawn(run_sse_sync(cfg, cache, 0, None));
     match tokio::time::timeout(hydration_timeout, hydrated.notified()).await {
         Ok(()) => Ok(sync),
         Err(_) => {
             sync.abort();
             writer.abort();
-            Err(SyncError::InitialHydrationTimeout(hydration_timeout))
+            let last_error = LastSseFailure(last_error.lock().unwrap().clone());
+            Err(SyncError::InitialHydrationTimeout {
+                waited: hydration_timeout,
+                last_error,
+            })
         }
     }
 }
@@ -543,9 +587,20 @@ fn bounded_sse_stream(
             return;
         }
         if !response.status().is_success() {
+            // D47: the status exists here but the body never reached the
+            // operator — read one bounded chunk so the server's own words
+            // (readiness refusals name their probe) ride the error.
+            let status = response.status().as_u16();
+            let mut body = response.into_body();
+            let body_note = match body.data().await {
+                Some(Ok(chunk)) if !chunk.is_empty() => {
+                    let text = String::from_utf8_lossy(&chunk[..chunk.len().min(1024)]);
+                    format!(": {}", text.trim())
+                }
+                _ => String::new(),
+            };
             yield Err(SseReadError::Other(format!(
-                "SSE backend returned HTTP {}",
-                response.status()
+                "SSE backend returned HTTP {status}{body_note}"
             )));
             return;
         }
@@ -659,7 +714,13 @@ pub async fn run_sse_sync(
                 match item {
                     // R-C5: heartbeats/connect anchors prove transport-level
                     // activity; silence still trips `read_timeout` below.
-                    Ok(SseFrame::Activity) => {}
+                    // D47: activity also clears the degradation cell — a
+                    // live transport means reads are current again.
+                    Ok(SseFrame::Activity) => {
+                        if let Some(cell) = &cfg.last_stream_error {
+                            *cell.lock().unwrap() = None;
+                        }
+                    }
                     Ok(SseFrame::Event { event_type, data }) => {
                         if event_type == "inv" {
                             let verify_key = cfg.client_key.unwrap_or(cfg.hmac_key);
@@ -707,6 +768,7 @@ pub async fn run_sse_sync(
                                 }
                                 Err(e) => {
                                     tracing::warn!(%e, "envelope rejected; full reseed required");
+                                    record_stream_error(&cfg, format!("envelope rejected: {e}"));
                                     needs_seed = true;
                                     reconnect_reason = "invalid hydrated envelope";
                                     break;
@@ -722,17 +784,19 @@ pub async fn run_sse_sync(
                         }
                     }
                     Err(SseReadError::ResyncRequired) => {
-                        // R-C6: a 409 means the gap is un-bridgeable from
-                        // the replay buffer, so the client full-reseeds via
-                        // the hook (it never resumes from the advertised
+                        // R-C6: a 409 means the gap is un-bridgeable from the
+                        // replay buffer, so the client full-reseeds via the
+                        // hook (it never resumes from the advertised
                         // floor — that would silently skip the gap).
                         tracing::warn!("409 resync required");
+                        record_stream_error(&cfg, "HTTP 409 resync required".into());
                         needs_seed = true;
                         reconnect_reason = "409 resync";
                         break;
                     }
                     Err(SseReadError::Other(e)) => {
                         tracing::warn!(%e, "sse stream error");
+                        record_stream_error(&cfg, e);
                         needs_seed = true;
                         reconnect_reason = "stream error";
                         break;
@@ -747,6 +811,14 @@ pub async fn run_sse_sync(
         metrics::counter!("exocortex_sync_reconnects_total").increment(1);
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(10));
+    }
+}
+
+/// Record the latest stream failure into the shared cell so supervisors and
+/// the initial-hydration timeout can surface it (D47).
+fn record_stream_error(cfg: &SseSyncConfig, note: String) {
+    if let Some(cell) = &cfg.last_stream_error {
+        *cell.lock().unwrap() = Some(note);
     }
 }
 

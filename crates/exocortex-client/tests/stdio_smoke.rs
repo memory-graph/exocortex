@@ -438,10 +438,15 @@ fn mcp_tool_list_matches_registry() {
             "{read_op} listed on the client surface"
         );
     }
-    // No phantom tools: everything listed is a registry op or end_session.
+    // No phantom tools: everything listed is a registry op or a
+    // client-local session tool (end_session: gRPC/WAL submit;
+    // backend_status: D47 client-side sync diagnostics — the health cell
+    // it reads lives in the client process, not the registry context).
     for name in &listed {
         assert!(
-            registry.contains(name) || name == "exocortex.end_session",
+            registry.contains(name)
+                || name == "exocortex.end_session"
+                || name == "exocortex.backend_status",
             "{name} is not a registry tool"
         );
     }

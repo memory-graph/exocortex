@@ -49,6 +49,11 @@ pub struct ExocortexMcp {
     /// D27: in-flight tool calls; stdin EOF drains these before the
     /// process exits (see `eof_drain`).
     in_flight: Arc<InFlightCalls>,
+    /// D47: the SSE subscriber's degradation cell, shared in backend mode.
+    /// `Some(error)` means the stream is currently failing and reads are
+    /// served from a frozen snapshot — reads then carry a `sync` health
+    /// object so a degraded store is never silent.
+    sync_health: Option<crate::sync::StreamErrorCell>,
 }
 
 impl ExocortexMcp {
@@ -69,6 +74,7 @@ impl ExocortexMcp {
             ontology,
             process_session_id: uuid::Uuid::now_v7().simple().to_string(),
             in_flight: InFlightCalls::new(),
+            sync_health: None,
         }
     }
 
@@ -83,6 +89,22 @@ impl ExocortexMcp {
     pub fn with_offline_wal(mut self, wal: Arc<wal::Wal>) -> Self {
         self.wal = Some(wal);
         self
+    }
+
+    /// D47: attach the backend sync degradation cell (backend mode only).
+    /// Reads consult it on every call; a degraded store surfaces as a
+    /// `sync` health object instead of silently stale rows.
+    pub fn with_sync_health(mut self, cell: crate::sync::StreamErrorCell) -> Self {
+        self.sync_health = Some(cell);
+        self
+    }
+
+    /// D47: the current degradation note, or `None` when the stream is
+    /// healthy / no backend is configured.
+    fn degraded_sync_error(&self) -> Option<String> {
+        self.sync_health
+            .as_ref()
+            .and_then(|cell| cell.lock().unwrap().clone())
     }
 
     /// §4.8: the process-minted conversation id (test surface).
@@ -199,6 +221,9 @@ impl ExocortexMcp {
                 }),
             );
         }
+        // D47: a degraded backend must never read as live — stamp the last
+        // SSE failure beside the (frozen) snapshot version.
+        self.attach_sync_health(&mut v);
         serde_json::to_string(&v).map_err(|e| e.to_string())
     }
 
@@ -223,7 +248,9 @@ impl ExocortexMcp {
         )
         .await
         .map_err(|e| e.to_string())?;
-        serde_json::to_string(&out).map_err(|e| e.to_string())
+        let mut v = serde_json::to_value(&out).map_err(|e| e.to_string())?;
+        self.attach_sync_health(&mut v);
+        serde_json::to_string(&v).map_err(|e| e.to_string())
     }
 
     /// `exocortex.find_related` (registry op, client-side over the cache).
@@ -253,7 +280,9 @@ impl ExocortexMcp {
         )
         .await
         .map_err(|e| e.to_string())?;
-        serde_json::to_string(&out).map_err(|e| e.to_string())
+        let mut v = serde_json::to_value(&out).map_err(|e| e.to_string())?;
+        self.attach_sync_health(&mut v);
+        serde_json::to_string(&v).map_err(|e| e.to_string())
     }
 
     /// `exocortex.end_session` (§13.6): wrapup batch submit. Online: gRPC
@@ -548,6 +577,18 @@ impl ExocortexMcp {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
+    /// D47: stamp `sync: {degraded, last_error}` onto a read result when
+    /// the backend stream is failing. Absent when healthy — the
+    /// healthy-path bytes stay identical to the registry shape.
+    fn attach_sync_health(&self, value: &mut serde_json::Value) {
+        if let (Some(error), serde_json::Value::Object(map)) = (self.degraded_sync_error(), value) {
+            map.insert(
+                "sync".into(),
+                serde_json::json!({ "degraded": true, "last_error": error }),
+            );
+        }
+    }
+
     /// `exocortex.playbook_version` (D3, §3.3): the compiled playbook
     /// version plus content hashes — one version string governs the
     /// playbook and the instruction block.
@@ -566,6 +607,44 @@ impl ExocortexMcp {
             version: crate::playbook::PLAYBOOK_VERSION.into(),
             playbook_hash: crate::playbook::playbook_hash(),
             block_hash: crate::playbook::block_hash(),
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    /// `exocortex.backend_status` (D47): the client's own connectivity and
+    /// freshness diagnosis — mode, the snapshot version in hand, and the
+    /// last SSE failure when reads are served from a frozen graph. The
+    /// tool a session calls when reads look stale or empty.
+    #[tool(
+        name = "exocortex.backend_status",
+        description = "Report client memory-store health: mode (standalone/backend), the snapshot version in hand, and the last sync failure when reads are served from a frozen graph."
+    )]
+    pub async fn backend_status(&self) -> Result<String, String> {
+        #[derive(Serialize)]
+        struct StatusReport {
+            mode: &'static str,
+            snapshot_version: serde_json::Value,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sync: Option<serde_json::Value>,
+        }
+        let version = self.cache.version(&self.org);
+        let snapshot = serde_json::json!({
+            "local_lsn": version.map(|x| x.local_lsn).unwrap_or(0),
+            "backend_lsn": version.map(|x| x.backend_lsn).unwrap_or(0),
+        });
+        let sync = match self.degraded_sync_error() {
+            Some(error) => Some(serde_json::json!({ "degraded": true, "last_error": error })),
+            None if self.sync_health.is_some() => Some(serde_json::json!({ "degraded": false })),
+            None => None,
+        };
+        serde_json::to_string(&StatusReport {
+            mode: if self.sync_health.is_some() {
+                "backend"
+            } else {
+                "standalone"
+            },
+            snapshot_version: snapshot,
+            sync,
         })
         .map_err(|e| e.to_string())
     }
@@ -678,6 +757,7 @@ impl ServerHandler for ExocortexMcp {
             Self::end_session_tool_attr(),
             Self::preflight_wrapup_tool_attr(),
             Self::playbook_version_tool_attr(),
+            Self::backend_status_tool_attr(),
         ];
         for entry in exocortex_ops::entries() {
             let dispatchable = matches!(
@@ -715,6 +795,7 @@ impl ServerHandler for ExocortexMcp {
             "exocortex.end_session" => Self::end_session_tool_call(tcc).await,
             "exocortex.preflight_wrapup" => Self::preflight_wrapup_tool_call(tcc).await,
             "exocortex.playbook_version" => Self::playbook_version_tool_call(tcc).await,
+            "exocortex.backend_status" => Self::backend_status_tool_call(tcc).await,
             _other => Err(rmcp::Error::invalid_params(
                 "method not found (backend-only operations are served over HTTP)",
                 None,

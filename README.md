@@ -205,6 +205,7 @@ are marked with their successors.
 | `exocortex.end_session` | Action | Submit the wrapup (1-5 memory drafts, edges by `draft_key` or `to_memory_id`). Self-preflights locally with correction hints; the ack carries advisory `similar_to` near-duplicate suggestions. Offline, it buffers to a local WAL and syncs later. |
 | `exocortex.preflight_wrapup` | Function | Validate a proposed batch without writing — same rules `end_session` and the backend enforce, with an `unverified` list of server-only checks. |
 | `exocortex.playbook_version` | Function | The compiled playbook version + content hashes. |
+| `exocortex.backend_status` | Function | Client store health: mode (standalone/backend), the snapshot version in hand, and the last sync failure when reads are served from a frozen graph. While the backend stream is failing, every read also carries a `sync: {degraded: true, last_error}` object. |
 
 The backend registry adds governance operations over authenticated
 HTTP — `exocortex.accept_discovery`, `exocortex.promote_visibility`,
