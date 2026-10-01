@@ -961,28 +961,24 @@ mod tests {
             let mut stream =
                 std::net::TcpStream::connect(("127.0.0.1", cfg.port)).expect("dirty session");
             for i in 0..batches * scale {
-                // 100 nodes per round trip keeps the harness fast at
-                // volume.
-                let nodes: Vec<String> = (0..100)
-                    .map(|j| format!("(:N {{v: '{}.{j}'}})", i))
-                    .collect();
-                let query = format!("CREATE {}", nodes.join(","));
-                let graph = "exocortex-personal";
+                // Plain SETs dirty the DB (the `--save 1 1` fork fires
+                // on any write) without embedding Cypher outside
+                // exocortex-storage (CR-10) — the real-data mode is
+                // what carries actual graph keys through the module.
+                let key = format!("repro:{i}");
+                let value = "v".repeat(256);
                 let frame = format!(
-                    "*3\r\n$11\r\nGRAPH.QUERY\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    graph.len(),
-                    graph,
-                    query.len(),
-                    query
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    key.len(),
+                    key,
+                    value.len(),
+                    value
                 );
                 stream.write_all(frame.as_bytes()).expect("write");
-                let mut buf = [0u8; 4096];
+                let mut buf = [0u8; 64];
                 let n = stream.read(&mut buf).expect("reply");
                 let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
-                assert!(
-                    reply.starts_with('*') || reply.starts_with('+') || reply.starts_with(':'),
-                    "graph write {i} succeeded: {reply}"
-                );
+                assert!(reply.starts_with('+'), "write {i} succeeded: {reply}");
             }
         };
         let alive = |cfg: &SupervisorConfig| -> bool { ping(cfg.port, None) };
