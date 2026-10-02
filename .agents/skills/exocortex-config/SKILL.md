@@ -39,9 +39,10 @@ Wiring snippets:
 
 ## 2. The instruction block
 
-`exocortex-mcp-client --dump-block` prints it; append to the harness's
-always-loaded context (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`). For
-Crush, keep it in the file named by
+`exocortex-mcp-client --install-block <file>` installs it into the
+harness's always-loaded context (`CLAUDE.md`, `AGENTS.md`,
+`.cursorrules`) — idempotent, version-marked, reruns replace in place.
+For Crush, keep it in the file named by
 `option global-context-path "$HOME/.config/crush/AGENTS.md"`. The block
 is the contract: write checklist, read patterns, rejection loop, and
 the absent-tools clause — if `exocortex.*` tools are missing, the

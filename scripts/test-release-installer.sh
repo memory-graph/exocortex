@@ -3,6 +3,9 @@ set -eu
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
+# D48: sandbox the Claude Code skill path for every leg — a bare default
+# (nonexistent dir) keeps the installer out of the runner's real ~/.claude.
+export EXOCORTEX_CLAUDE_HOME="$tmp/claude-home-default"
 tag="v9.9.9"
 target="$(uname -s)-$(uname -m)"
 case "$target" in
@@ -110,11 +113,36 @@ PATH="$tmp/mock-bin:$PATH" \
 MOCK_RELEASE_ROOT="$release" \
 MOCK_CURL_LOG="$mock_log" \
 EXOCORTEX_SKILL_DEST="$tmp/skills/exocortex-config" \
+EXOCORTEX_CLAUDE_HOME="$tmp/home-with-claude/.claude" \
 CARGO_HOME="$tmp/cargo" \
 sh scripts/release-install.sh >/dev/null
 test -x "$tmp/cargo/bin/exocortex-node"
 test "$(cat "$tmp/cargo/share/exocortex/models/$model_dir/model.marker")" = "sidecar fixture"
 test "$(cat "$tmp/skills/exocortex-config/SKILL.md")" = "skill fixture"
+# D48: Claude Code's skill dir is seeded via symlink when ~/.claude
+# exists, and never created when it does not. (Separate curl log so the
+# fetch-count assertions below keep their meaning.)
+mock_log_d48="$tmp/curl-d48.log"
+mkdir -p "$tmp/home-with-claude/.claude"
+EXOCORTEX_SKILL_DEST="$tmp/skills-again/exocortex-config" \
+EXOCORTEX_CLAUDE_HOME="$tmp/home-with-claude/.claude" \
+CARGO_HOME="$tmp/cargo" \
+MOCK_RELEASE_ROOT="$release" \
+MOCK_CURL_LOG="$mock_log_d48" \
+PATH="$tmp/mock-bin:$PATH" \
+INSTALL_VERSION="$tag" \
+sh scripts/release-install.sh >/dev/null
+test -L "$tmp/home-with-claude/.claude/skills/exocortex-config/SKILL.md"
+test "$(cat "$tmp/home-with-claude/.claude/skills/exocortex-config/SKILL.md")" = "skill fixture"
+EXOCORTEX_CLAUDE_HOME="$tmp/home-bare/.claude" \
+EXOCORTEX_SKILL_DEST="$tmp/skills-bare/exocortex-config" \
+CARGO_HOME="$tmp/cargo" \
+MOCK_RELEASE_ROOT="$release" \
+MOCK_CURL_LOG="$mock_log_d48" \
+PATH="$tmp/mock-bin:$PATH" \
+INSTALL_VERSION="$tag" \
+sh scripts/release-install.sh >/dev/null
+test ! -e "$tmp/home-bare"
 if [ "$runtime_supported" -eq 1 ]; then
   test -x "$tmp/cargo/share/exocortex/standalone/redis-server"
   test "$(cat "$tmp/cargo/share/exocortex/standalone/falkordb.so")" = "module fixture"

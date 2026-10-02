@@ -90,6 +90,79 @@ pub fn block_word_count() -> usize {
     BLOCK.split_whitespace().count()
 }
 
+/// D48: the begin marker carrying the block version. `--dump-block`
+/// emits the block between these markers so `--install-block` can find
+/// and replace exactly one region on every rerun.
+pub fn block_begin_marker() -> String {
+    format!("<!-- exocortex-block v{PLAYBOOK_VERSION} -->")
+}
+
+/// D48: the end marker (see `block_begin_marker`).
+pub fn block_end_marker() -> &'static str {
+    "<!-- /exocortex-block -->"
+}
+
+/// D48: the emitted form — the block wrapped in its versioned markers.
+pub fn marked_block() -> String {
+    format!(
+        "{}\n\n{}\n{}\n",
+        block_begin_marker(),
+        BLOCK.trim_end(),
+        block_end_marker()
+    )
+}
+
+/// D48: install the marked block into a harness instruction file
+/// (`CLAUDE.md`/`AGENTS.md`) idempotently. Every existing marked region
+/// — matched by the version-agnostic `<!-- exocortex-block ` prefix, so
+/// an upgrade replaces an OLDER version's region too — is removed
+/// (healing a marker-era double append), then one fresh region lands
+/// where the first one was — or at the end of a file that has never
+/// carried the block. Content outside the markers is never touched.
+pub fn install_block_into(existing: &str) -> String {
+    const BEGIN_PREFIX: &str = "<!-- exocortex-block ";
+    let end = block_end_marker();
+    let marked = marked_block();
+    let mut rest = existing.to_string();
+    let mut first_insert = None;
+    loop {
+        let Some(start) = rest.find(BEGIN_PREFIX) else {
+            break;
+        };
+        let Some(marker_line) = rest[start..].find('\n') else {
+            break;
+        };
+        let after_line = start + marker_line + 1;
+        let Some(end_rel) = rest[after_line..].find(end) else {
+            break;
+        };
+        // Consume the newline following the end marker so reruns do not
+        // accumulate blank lines.
+        let mut stop = after_line + end_rel + end.len();
+        if rest[stop..].starts_with('\n') {
+            stop += 1;
+        }
+        if first_insert.is_none() {
+            first_insert = Some(start);
+        }
+        rest.replace_range(start..stop, "");
+    }
+    match first_insert {
+        Some(at) => format!("{}{}{}", &rest[..at], marked, &rest[at..]),
+        None => {
+            let mut out = existing.to_string();
+            if !out.is_empty() {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+            out.push_str(&marked);
+            out
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +210,62 @@ mod tests {
             .join(format!("playbook-v{PLAYBOOK_VERSION}.md"))
             .exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D48: the emitted (marked) form is what rides in the harness
+    /// context — markers included — so the 300-word budget must hold for
+    /// `marked_block`, not just the bare file.
+    #[test]
+    fn marked_block_within_word_bound() {
+        let words = marked_block().split_whitespace().count();
+        assert!(
+            words <= BLOCK_WORD_LIMIT,
+            "emitted instruction block is {words} words with markers; bound is {BLOCK_WORD_LIMIT}"
+        );
+    }
+
+    /// D48: `--install-block` is idempotent — running it twice leaves
+    /// exactly one copy (GitHub issue #7: `--dump-block >> CLAUDE.md`
+    /// appended a second copy on every rerun).
+    #[test]
+    fn install_block_is_idempotent() {
+        let once = install_block_into("project instructions\n");
+        let twice = install_block_into(&once);
+        assert_eq!(once, twice, "second run changes nothing");
+        assert_eq!(
+            once.matches(block_end_marker()).count(),
+            1,
+            "exactly one block region"
+        );
+        assert!(
+            once.starts_with("project instructions\n"),
+            "surrounding content is preserved"
+        );
+    }
+
+    /// D48: a rerun REPLACES the stale marked region in place — the file
+    /// never grows a second copy, and content after the region survives.
+    #[test]
+    fn install_block_replaces_the_marked_region() {
+        let stale =
+            "# my repo\n\n<!-- exocortex-block v0.0.1 -->\n\nold block\n<!-- /exocortex-block -->\n\ntrailing notes\n";
+        let updated = install_block_into(stale);
+        assert_eq!(updated.matches(block_end_marker()).count(), 1);
+        assert!(!updated.contains("old block"), "stale region replaced");
+        assert!(!updated.contains("v0.0.1"));
+        assert!(updated.contains("trailing notes"));
+        assert!(updated.contains(BLOCK.trim_end()));
+    }
+
+    /// D48: a marker-era double append heals back to one region.
+    #[test]
+    fn install_block_heals_double_regions() {
+        let doubled = format!("{}{}", marked_block(), marked_block());
+        let healed = install_block_into(&doubled);
+        assert_eq!(
+            healed.matches(block_end_marker()).count(),
+            1,
+            "one region after healing"
+        );
     }
 }

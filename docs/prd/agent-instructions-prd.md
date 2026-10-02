@@ -706,7 +706,7 @@ edge is listed there, expect that one to be checked server-side.
 
 This block is the load-bearing artifact of the whole PRD. It's what lives in the user's repo, in the agent's context, on every turn. The full playbook at `~/.exocortex/playbook.md` is the reference for corner cases — but this block is what shapes behavior because it's always visible.
 
-**Length target:** ≤300 words — **[r4]** enforced by the drift gate, which regenerates the block and fails the build past 300 words. Prescriptive, not aspirational. If a rule can't fit here, it belongs in the full playbook, not the block. **[r4]** Rev 3's block embedded the full 48-kind catalogue inline (~350 words, over its own bound with nothing enforcing it) — violating the block's thesis that only what rides in context on every turn shapes behavior. Rev 4 keeps in-context only what shapes every write: the trigger, the fallback kind, the prohibition, the pointer. The catalogue is reference material and lives in the playbook; the gate cross-checks the block's `RelatedTo`/`SimilarTo` claims against the pack. **[r5]** The block gained two behaviors (the problem trigger item, the supersession paragraph) and paid for them by compression, not by breaching the bound — the full supersession procedure lives in the playbook (§10); the block carries only the two clauses that must fire on every affected turn. **[2026-09-28, D41]** The block gained the absent-tools clause — a session ran a full day on a dead MCP connection with every memory instruction silently skipped — and again paid by compression (297/300): absent tools must be surfaced immediately, never skipped.
+**Length target:** ≤300 words — **[r4]** enforced by the drift gate, which regenerates the block and fails the build past 300 words. Prescriptive, not aspirational. If a rule can't fit here, it belongs in the full playbook, not the block. **[r4]** Rev 3's block embedded the full 48-kind catalogue inline (~350 words, over its own bound with nothing enforcing it) — violating the block's thesis that only what rides in context on every turn shapes behavior. Rev 4 keeps in-context only what shapes every write: the trigger, the fallback kind, the prohibition, the pointer. The catalogue is reference material and lives in the playbook; the gate cross-checks the block's `RelatedTo`/`SimilarTo` claims against the pack. **[r5]** The block gained two behaviors (the problem trigger item, the supersession paragraph) and paid for them by compression, not by breaching the bound — the full supersession procedure lives in the playbook (§10); the block carries only the two clauses that must fire on every affected turn. **[2026-09-28, D41]** The block gained the absent-tools clause — a session ran a full day on a dead MCP connection with every memory instruction silently skipped — and again paid by compression (297/300): absent tools must be surfaced immediately, never skipped. **[2026-10-01, D48]** The block gained versioned emit markers (idempotent `--install-block`) and paid for the 7 marker tokens by compression (292 bare / 299 emitted of 300); the bound now gates the EMITTED form, markers included.
 
 ```markdown
 ## Exocortex — writing to memory
@@ -763,18 +763,27 @@ reference: `~/.exocortex/playbook.md`.
 
 ### 11.1 Delivery
 
-- The block is emitted verbatim by `exocortex-mcp-client --dump-block`
-  (D5). Users pipe it into their `CLAUDE.md`:
+- **[2026-10-01, D48]** The block is emitted between versioned HTML
+  markers (`<!-- exocortex-block v… -->` … `<!-- /exocortex-block -->`)
+  by `exocortex-mcp-client --dump-block`, and the idempotent installer
+  replaces exactly that region in place:
   ```sh
-  exocortex-mcp-client --dump-block >> CLAUDE.md
+  exocortex-mcp-client --install-block CLAUDE.md
   ```
+  Reruns never duplicate (the pre-D48 `>> CLAUDE.md` append did). The
+  bare `>>` redirect still works for a first install; the markers make
+  every later one replaceable. The marker tokens count against the
+  ≤300-word bound: the emitted form is gated, not just the file
+  (`marked_block_within_word_bound`).
+- The block is emitted by `exocortex-mcp-client --dump-block` (D5);
+  the append-to-file form is superseded by `--install-block` (D48).
 - **[r2]** The block is versioned identically to the playbook — one version string, one artifact, two renderings. `playbook_version` reports `{ version, playbook_hash, block_hash }`; there is no separate block version.
 - The block is treated as a stable API surface: changes bump the
   version, and the changelog for `exocortex-client` calls out any
   edits so users know when to re-paste. Removing a memory type from
   the list is a breaking change; adding one is not.
 - The three harness appendices (D4) each say, verbatim: "Run
-  `exocortex-mcp-client --dump-block >> CLAUDE.md` (or `AGENTS.md`,
+  `exocortex-mcp-client --install-block CLAUDE.md` (or `AGENTS.md`,
   or your harness's equivalent instruction file). Then verify with
   `exocortex-mcp-client --verify`."
 

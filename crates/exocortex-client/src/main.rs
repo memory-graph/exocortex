@@ -48,9 +48,15 @@ struct Args {
     #[arg(long)]
     dump_playbook: bool,
     /// D5: print just the `CLAUDE.md`/`AGENTS.md` instruction block to
-    /// stdout and exit (`exocortex-mcp-client --dump-block >> CLAUDE.md`).
+    /// stdout and exit, wrapped in versioned markers so a rerun can
+    /// replace it (`exocortex-mcp-client --install-block CLAUDE.md`).
     #[arg(long)]
     dump_block: bool,
+    /// D48: install the instruction block into `<file>` in place —
+    /// replaces the marked region (or appends one), idempotently; never
+    /// duplicates on rerun.
+    #[arg(long)]
+    install_block: Option<std::path::PathBuf>,
     /// PX2: print every registered operation — kernel ops AND
     /// pack-registered verbs — with its pack identity, surfaces, and
     /// typed input schema, one JSON line each, then exit.
@@ -116,7 +122,17 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if args.dump_block {
-        print!("{}", exocortex_client::playbook::BLOCK);
+        print!("{}", exocortex_client::playbook::marked_block());
+        return Ok(());
+    }
+    if let Some(path) = &args.install_block {
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        let updated = exocortex_client::playbook::install_block_into(&existing);
+        std::fs::write(path, updated)?;
+        eprintln!(
+            "instruction block installed (v{}) — markers make reruns idempotent",
+            exocortex_client::playbook::PLAYBOOK_VERSION
+        );
         return Ok(());
     }
     // PX2 one-shot modes (registry + fingerprint surfaces).

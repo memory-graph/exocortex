@@ -141,7 +141,7 @@ mcp add exocortex --type stdio \
 
 and surface the instruction block in every session with
 `option global-context-path "$HOME/.config/crush/AGENTS.md"`
-(`exocortex-mcp-client --dump-block` writes it).
+(`exocortex-mcp-client --install-block` writes it, idempotently).
 
 **Codex / Cursor / any MCP client** — point the stdio server config at
 the binary:
@@ -166,7 +166,7 @@ The client ships the instruction block — the load-bearing artifact
 that rides in your agent's context on every turn:
 
 ```sh
-exocortex-mcp-client --dump-block >> CLAUDE.md   # or AGENTS.md / .cursorrules
+exocortex-mcp-client --install-block CLAUDE.md   # or AGENTS.md / .cursorrules — idempotent
 exocortex-mcp-client --verify                    # green/red install checklist
 ```
 
@@ -222,7 +222,8 @@ commit), `exocortex.list_audit_records`.
 | `--backend` | none | Client-only backend URL for shared-org mode (see below). Omitted on the raw client: writes buffer in the offline WAL until a backend is available. The installed personal entrypoint supplies its supervised loopback backend automatically. |
 | `--data-dir` | OS data home | Where the client offline WAL and playbook live. In `mcp-standalone`, `--standalone-data-dir` owns the durable Falkor graph across restarts. |
 | `--dump-playbook` | — | Print the compiled playbook and exit. |
-| `--dump-block` | — | Print the CLAUDE.md/AGENTS.md instruction block and exit. |
+| `--dump-block` | — | Print the CLAUDE.md/AGENTS.md instruction block (version-marked) and exit. |
+| `--install-block <file>` | — | Install the instruction block into `<file>` in place — replaces the marked region, never duplicates on rerun. |
 | `--verify` | — | Green/red checklist of every client-checkable write precondition; exit code = red count. |
 | `--tail-audit [--last N]` | 5 | Print the N most recent local writes (WAL), newest first. |
 | `--export <file>` | — | One-shot backup: dump every WAL entry (all states, LSN order) to a versioned, fingerprint-stamped JSON file. |

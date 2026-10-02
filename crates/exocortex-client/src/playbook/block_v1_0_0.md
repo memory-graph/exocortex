@@ -24,7 +24,7 @@ fire, write nothing.
 
 **Edges:** typed; `exocortex-mcp-client --verify` locates the 48-kind
 catalogue. Link within the batch by `draft_key`, or
-to an existing memory by `to_memory_id` (32-hex id from reads).
+by `to_memory_id` (32-hex id from reads).
 When in doubt, use `RelatedTo`. Never assert `SimilarTo`
 (computed-only).
 
@@ -48,4 +48,4 @@ search every turn.
 turn. Never drop one silently; surface unfixable rejections.
 
 Session ids are client-stamped. Full reference:
-the playbook path `exocortex-mcp-client --verify` prints.
+the playbook path `--verify` prints.

@@ -168,6 +168,15 @@ done
 skill_dest="${EXOCORTEX_SKILL_DEST:-$HOME/.agents/skills/exocortex-config}"
 mkdir -p "$skill_dest"
 cp "$src/skills/exocortex-config/SKILL.md" "$skill_dest/SKILL.md"
+# D48 (GitHub issue #7): Claude Code loads skills from ~/.claude/skills
+# and never sees ~/.agents. When the user has Claude Code, the skill
+# lands there too — as a symlink, so one source of truth survives
+# reinstalls and refreshes both surfaces together.
+claude_home="${EXOCORTEX_CLAUDE_HOME:-$HOME/.claude}"
+if [ -d "$claude_home" ]; then
+  mkdir -p "$claude_home/skills/exocortex-config"
+  ln -sfn "$skill_dest/SKILL.md" "$claude_home/skills/exocortex-config/SKILL.md"
+fi
 case ":$PATH:" in
   *":$dest:"*) ;;
   *) echo "note: add $dest to PATH" ;;
