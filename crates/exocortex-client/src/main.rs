@@ -689,8 +689,159 @@ fn verify(
             "  {}  wal: {pending} pending entries (drained at startup when a backend is configured)",
             if pending == 0 { "ok" } else { "RED" }
         );
+
+        // D49 (d): the WAL's own partition ledger vs the configured pair.
+        // A wrong --org/--user silently starts an empty graph next door
+        // (issue #6: README says my-org/me, defaults say personal/dev,
+        // the live data said personal/gregory).
+        let partitions = wal.partitions()?;
+        if partitions.is_empty() {
+            println!("  ok    partition: no stamped writes yet (first write stamps this pair)");
+        } else if partitions
+            .iter()
+            .any(|(o, u)| o == &args.org && u == &args.user)
+        {
+            println!(
+                "  ok    partition: --org {} --user {} has writes in the local ledger",
+                args.org, args.user
+            );
+        } else {
+            red += 1;
+            let held = partitions
+                .iter()
+                .map(|(o, u)| format!("{o}/{u}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  RED   partition: --org {} --user {} has NO writes in the local ledger, which holds: {held} — wiring the wrong pair starts an empty graph next door",
+                args.org, args.user
+            );
+        }
     } else {
         println!("  ok    wal: no local WAL yet (nothing buffered)");
+    }
+
+    // D49 (c): harness wiring — PRD S6 promises this row; absence was the
+    // bug. RED unless a known harness config names a binary from THIS
+    // install directory.
+    {
+        use exocortex_client::verify_checks::{harness_check, harness_config_paths};
+        let install_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        match install_dir {
+            Some(dir) => {
+                let configs = harness_config_paths();
+                let inputs: Vec<(&str, Option<String>)> = configs
+                    .iter()
+                    .map(|(name, path)| (*name, std::fs::read_to_string(path).ok()))
+                    .collect();
+                match harness_check(&dir, &inputs) {
+                    exocortex_client::verify_checks::HarnessCheck::Wired(name, exe) => {
+                        println!("  ok    harness: {name} wires this install ({exe})");
+                    }
+                    exocortex_client::verify_checks::HarnessCheck::NotWired(names) => {
+                        red += 1;
+                        println!(
+                            "  RED   harness: no harness config points at this install ({} present but unwired; EXOCORTEX_VERIFY_HARNESS_CONFIG names a custom one)",
+                            names.join(", ")
+                        );
+                    }
+                    exocortex_client::verify_checks::HarnessCheck::NoConfigFound => {
+                        red += 1;
+                        println!(
+                            "  RED   harness: no harness config found (expected one of: crush, claude-code; EXOCORTEX_VERIFY_HARNESS_CONFIG names a custom one)"
+                        );
+                    }
+                }
+            }
+            None => {
+                red += 1;
+                println!("  RED   harness: cannot determine this binary's directory");
+            }
+        }
+    }
+
+    // D49 (a)+(b): store-artifact checks on the data dir the standalone
+    // node shares with this client by default — orphaned/foreign store
+    // processes and a stale `port` artifact.
+    {
+        use exocortex_client::verify_checks::{lock_holder_pid, pid_alive, redis_answers};
+        use std::time::Duration;
+        if cfg!(unix) {
+            let ps = std::process::Command::new("ps")
+                .arg("-axo")
+                .arg("pid=,command=")
+                .output();
+            let pids = ps
+                .ok()
+                .map(|out| {
+                    exocortex_client::verify_checks::store_pids_on_dir(
+                        &String::from_utf8_lossy(&out.stdout),
+                        data_dir,
+                    )
+                })
+                .unwrap_or_default();
+            match pids.len() {
+                0 => println!(
+                    "  ok    store: no store process on {} (and none required here)",
+                    data_dir.display()
+                ),
+                1 => {
+                    let holder = lock_holder_pid(data_dir);
+                    let supervised = holder.map(pid_alive).unwrap_or(false);
+                    if supervised {
+                        println!(
+                            "  ok    store: one supervised store (pid {}) owns {}",
+                            pids[0],
+                            data_dir.display()
+                        );
+                    } else {
+                        red += 1;
+                        println!(
+                            "  RED   store: pid {} serves {} with NO live supervisor (lock holder {:?}) — an orphaned store corrupts the AOF; kill it or re-attach",
+                            pids[0],
+                            data_dir.display(),
+                            holder
+                        );
+                    }
+                }
+                n => {
+                    red += 1;
+                    println!(
+                        "  RED   store: {} store processes ({}) share {} — concurrent writers on one data dir corrupt the append-only file",
+                        n,
+                        pids.iter()
+                            .map(|p| p.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        data_dir.display()
+                    );
+                }
+            }
+        }
+        // (b) the port artifact: PING it — any Redis reply is live, a
+        // silent port is stale (the file carries no token, so liveness is
+        // all a client can prove). Kept (not deleted): D44-S2 attach mode
+        // consumes it.
+        let port_file = data_dir.join("port");
+        if let Ok(raw) = std::fs::read_to_string(&port_file) {
+            match raw.trim().parse::<u16>() {
+                Ok(port) if redis_answers(port, Duration::from_millis(500)) => {
+                    println!("  ok    store: port file answers PING ({port} live)");
+                }
+                Ok(port) => {
+                    red += 1;
+                    println!(
+                        "  RED   store: stale port file — nothing answers on {port} (left by an earlier boot; D44-S2 attach will consume it)"
+                    );
+                }
+                Err(_) => {
+                    red += 1;
+                    println!("  RED   store: port file is malformed ({})", raw.trim());
+                }
+            }
+        }
     }
 
     println!(

@@ -487,6 +487,10 @@ impl ExocortexMcp {
             });
         }
         let memory_ids: Vec<MemoryId> = ids.into_iter().map(|(_, id)| id).collect();
+        // D49: stamp the org/user partition so --verify can enumerate
+        // the WAL's partitions and catch a mis-wired --org/--user pair.
+        let org = self.org.to_string();
+        let user = self.vc.user_id.to_string();
         let local_lsn = wal
             .append_batch_full_idempotent(
                 &session_id,
@@ -495,6 +499,8 @@ impl ExocortexMcp {
                 batch_id,
                 draft_keys,
                 tags,
+                &org,
+                &user,
             )
             .map_err(|e| json_error("wal-error", e.to_string()))?;
         // D31: the batch's project joins this session's read scope

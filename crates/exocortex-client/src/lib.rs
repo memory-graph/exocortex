@@ -12,4 +12,5 @@ pub mod playbook;
 pub mod preflight;
 pub mod sync;
 pub mod tools;
+pub mod verify_checks;
 pub mod wal;

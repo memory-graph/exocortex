@@ -50,6 +50,15 @@ pub struct WalEntry {
     /// references on drain).
     #[serde(default)]
     pub draft_keys: Vec<String>,
+    /// D49: the org/user partition this batch was written under. Stamped
+    /// at append time so `--verify` can enumerate the WAL's partitions
+    /// and catch a wrong `--org/--user` pair before it silently starts
+    /// an empty graph next door. Empty on legacy entries (pre-D49).
+    #[serde(default)]
+    pub org: String,
+    /// D49: see `org`.
+    #[serde(default)]
+    pub user: String,
     /// Tags parallel to `memories` (CL1: the offline path must not
     /// silently drop the harness-supplied tags before they are durable).
     #[serde(default)]
@@ -146,11 +155,14 @@ impl Wal {
             String::new(),
             Vec::new(),
             Vec::new(),
+            "",
+            "",
         )
     }
 
     /// Append with the stable batch id and the rebuild inputs the drain
     /// needs (draft keys + tags; W1/IN7/CL1).
+    #[allow(clippy::too_many_arguments)] // grew one at a time; each is a distinct rebuild input
     pub fn append_batch_full(
         &self,
         session_id: &str,
@@ -159,6 +171,8 @@ impl Wal {
         batch_id: String,
         draft_keys: Vec<String>,
         tags: Vec<Vec<String>>,
+        org: &str,
+        user: &str,
     ) -> Result<u64, WalError> {
         let entry = WalEntry {
             local_lsn: 0,
@@ -169,6 +183,8 @@ impl Wal {
             batch_id,
             draft_keys,
             tags,
+            org: org.to_string(),
+            user: user.to_string(),
         };
         self.insert_entry(entry)
     }
@@ -177,6 +193,7 @@ impl Wal {
     /// batch id, or append it once. This is the offline equivalent of the
     /// backend's durable ingest claim: response loss and concurrent retries
     /// cannot mint a second WAL row.
+    #[allow(clippy::too_many_arguments)] // mirrors append_batch_full
     pub fn append_batch_full_idempotent(
         &self,
         session_id: &str,
@@ -185,6 +202,8 @@ impl Wal {
         batch_id: String,
         draft_keys: Vec<String>,
         tags: Vec<Vec<String>>,
+        org: &str,
+        user: &str,
     ) -> Result<u64, WalError> {
         let entry = WalEntry {
             local_lsn: 0,
@@ -195,6 +214,8 @@ impl Wal {
             batch_id,
             draft_keys,
             tags,
+            org: org.to_string(),
+            user: user.to_string(),
         };
         let _append = self
             .append_gate
@@ -344,6 +365,25 @@ impl Wal {
     /// these rows server-side (`Pending`, `Synced`, and `Failed` alike).
     pub fn entries(&self) -> Result<Vec<WalEntry>, WalError> {
         self.decoded_entries()
+    }
+
+    /// D49: distinct non-empty org/user partitions this WAL holds, in
+    /// first-write order. Legacy (pre-D49) entries carry no stamp and are
+    /// skipped; `--verify` compares the configured pair against this list
+    /// so a mis-wired `--org/--user` cannot silently start an empty graph
+    /// next door to the live data.
+    pub fn partitions(&self) -> Result<Vec<(String, String)>, WalError> {
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for entry in self.decoded_entries()? {
+            if entry.org.is_empty() {
+                continue;
+            }
+            let pair = (entry.org, entry.user);
+            if !seen.contains(&pair) {
+                seen.push(pair);
+            }
+        }
+        Ok(seen)
     }
 
     fn decoded_entries(&self) -> Result<Vec<WalEntry>, WalError> {
@@ -626,6 +666,8 @@ mod tests {
             batch_id: "framing".into(),
             draft_keys: vec!["k".into()],
             tags: vec![vec![]],
+            org: String::new(),
+            user: String::new(),
         };
         let encoded = encode_entry(&entry).unwrap();
         let actual = u32::try_from(encoded.len() - 5).unwrap();
@@ -654,6 +696,8 @@ mod tests {
             batch_id: "batch".into(),
             draft_keys: vec!["k".into()],
             tags: vec![vec![]],
+            org: String::new(),
+            user: String::new(),
         };
         assert!(matches!(
             wal.append_imported_batch(vec![entry.clone(), entry]),
@@ -687,6 +731,8 @@ mod tests {
             batch_id: "batch".into(),
             draft_keys: vec!["k".into()],
             tags: vec![vec![]],
+            org: String::new(),
+            user: String::new(),
         }];
         let error = wal
             .append_imported_batch_with(&mut imported, || {

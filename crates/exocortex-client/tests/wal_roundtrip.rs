@@ -11,6 +11,8 @@ fn wal_entry_bincode_roundtrip() {
         batch_id: "b".into(),
         draft_keys: vec![],
         tags: vec![],
+        org: String::new(),
+        user: String::new(),
     };
     let bytes = bincode::serialize(&e).unwrap();
     let back: WalEntry = bincode::deserialize(&bytes).unwrap();
@@ -91,6 +93,8 @@ async fn wal_drain_settles_pending_entries() {
         "batch-one".into(),
         vec!["k1".into()],
         vec![vec!["ci".into()]],
+        "org",
+        "user",
     )
     .unwrap();
     let ids2 = vec![exocortex_kernel::MemoryId::new_v7()];
@@ -101,6 +105,8 @@ async fn wal_drain_settles_pending_entries() {
         "batch-two".into(),
         vec!["k1".into()],
         vec![vec![]],
+        "org",
+        "user",
     )
     .unwrap();
     assert_eq!(wal.pending_count().unwrap(), 2);

@@ -473,6 +473,8 @@ mod tests {
             batch_id: "b".into(),
             draft_keys: Vec::new(),
             tags: Vec::new(),
+            org: String::new(),
+            user: String::new(),
         }
     }
 

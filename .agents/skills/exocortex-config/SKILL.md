@@ -56,14 +56,24 @@ exocortex-mcp-client --verify
 
 Row meanings:
 
-- `harness config points at this binary` — the MCP spawn command must
-  name the installed entrypoint (§1).
+- `harness` (RED when unwired or no config found) — no known harness
+  config (crushrc, ~/.claude.json, ~/.claude/settings.json) names this
+  install's binaries; wire per §1, or point at a custom config with
+  `EXOCORTEX_VERIFY_HARNESS_CONFIG=<file>`.
 - `ontology` / `playbook` rows — fingerprints must match the goldens
   in the repo's AGENTS.md; a mismatch means binary and state come from
   different versions.
 - `wal: N pending entries` (RED, offline mode) — writes are buffering
   with no backend. This is the signature of raw-client wiring; migrate
   to the entrypoint and the entries drain at next startup.
+- `partition` (RED on a pair mismatch) — the local WAL holds writes
+  stamped under other org/user pairs than the configured `--org/--user`;
+  running with the wrong pair starts an empty graph next door to the
+  live data. Re-run with the pair the row names.
+- `store` rows (RED) — either store processes on the data dir with no
+  live supervisor (orphaned/foreign writers: kill them, one AOF must
+  have one writer), or a stale `port` file whose port answers nothing
+  (left by an earlier boot; safe to ignore until attach mode ships).
 - Drain-time `InvalidTypeTriple` terminal rejections in stderr are
   old offline-accepted entries the server rejects at sync — expected,
   audit-marked `Failed`, not data loss of the valid rows.
