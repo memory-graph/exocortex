@@ -766,23 +766,22 @@ fn verify(
     // node shares with this client by default — orphaned/foreign store
     // processes and a stale `port` artifact.
     {
-        use exocortex_client::verify_checks::{lock_holder_pid, pid_alive, redis_answers};
+        use exocortex_client::verify_checks::{
+            lock_holder_pid, pid_alive, redis_answers, store_ports_on_dir,
+        };
         use std::time::Duration;
         if cfg!(unix) {
             let ps = std::process::Command::new("ps")
                 .arg("-axo")
                 .arg("pid=,command=")
                 .output();
-            let pids = ps
+            // Redis rewrites its process title and the watchdog shells
+            // embed the store's argv — count DISTINCT PORTS, not pids.
+            let ports = ps
                 .ok()
-                .map(|out| {
-                    exocortex_client::verify_checks::store_pids_on_dir(
-                        &String::from_utf8_lossy(&out.stdout),
-                        data_dir,
-                    )
-                })
+                .map(|out| store_ports_on_dir(&String::from_utf8_lossy(&out.stdout), data_dir))
                 .unwrap_or_default();
-            match pids.len() {
+            match ports.len() {
                 0 => println!(
                     "  ok    store: no store process on {} (and none required here)",
                     data_dir.display()
@@ -792,15 +791,15 @@ fn verify(
                     let supervised = holder.map(pid_alive).unwrap_or(false);
                     if supervised {
                         println!(
-                            "  ok    store: one supervised store (pid {}) owns {}",
-                            pids[0],
+                            "  ok    store: one supervised store (port {}) owns {}",
+                            ports[0],
                             data_dir.display()
                         );
                     } else {
                         red += 1;
                         println!(
-                            "  RED   store: pid {} serves {} with NO live supervisor (lock holder {:?}) — an orphaned store corrupts the AOF; kill it or re-attach",
-                            pids[0],
+                            "  RED   store: a store on port {} serves {} with NO live supervisor (lock holder {:?}) — an orphaned store corrupts the AOF; kill it or re-attach",
+                            ports[0],
                             data_dir.display(),
                             holder
                         );
@@ -809,9 +808,10 @@ fn verify(
                 n => {
                     red += 1;
                     println!(
-                        "  RED   store: {} store processes ({}) share {} — concurrent writers on one data dir corrupt the append-only file",
+                        "  RED   store: {} store processes (ports {}) share {} — concurrent writers on one data dir corrupt the append-only file",
                         n,
-                        pids.iter()
+                        ports
+                            .iter()
                             .map(|p| p.to_string())
                             .collect::<Vec<_>>()
                             .join(", "),

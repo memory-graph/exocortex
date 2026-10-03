@@ -210,6 +210,9 @@ fn standalone_main(
 ) -> anyhow::Result<()> {
     let (bin, module) =
         supervisor::resolve_paths(args.redis_server_bin.clone(), args.falkordb_module.clone())?;
+    // The data home is resolved FIRST: the attach decision (D44-S2) needs
+    // to know where a live owner would have published its record.
+    let data_home = args.standalone_data_dir.clone().unwrap_or(data_home()?);
     let cluster_secret =
         resolve_cluster_secret(std::env::var("EXOCORTEX_CLUSTER_SECRET").ok().as_deref())?;
     // §4.3 data-plane privacy: the store token is derived before spawning
@@ -218,12 +221,11 @@ fn standalone_main(
         &exocortex_wire::signing::derive_supervised_store_token(&cluster_secret),
     );
     let port = supervisor::free_port()?;
-    let data_home = args.standalone_data_dir.clone().unwrap_or(data_home()?);
     let cfg = supervisor::SupervisorConfig {
         redis_server_bin: bin,
         falkordb_module: module,
         port_file: Some(data_home.join("port")),
-        data_dir: data_home,
+        data_dir: data_home.clone(),
         port,
         max_restarts: 3,
         auth_token: Some(store_token),
@@ -231,7 +233,18 @@ fn standalone_main(
         startup_timeout: None,
         save_policy: None,
     };
-    let mut supervised = supervisor::spawn_supervised(&cfg)?;
+    let mut supervised = match supervisor::spawn_supervised(&cfg) {
+        Ok(supervised) => supervised,
+        Err(error) => {
+            // D44-S2: another live instance owns this data dir — ATTACH to
+            // it in client mode instead of failing (or corrupting) — but
+            // only once the owner's endpoint verifiably answers.
+            if error.downcast_ref::<supervisor::DataDirOwned>().is_some() {
+                return attach_to_live_node(&args, &ontology, &data_home);
+            }
+            return Err(error);
+        }
+    };
     tracing::info!(port = supervised.port, "embedded FalkorDB ready");
     if args.verify_rules {
         return verify_deployed_rules(&ontology, "mcp-standalone");
@@ -320,6 +333,17 @@ fn standalone_main(
                 contents.as_bytes(),
                 "standalone runtime",
             )?;
+            // D44-S2: publish the attach record so a concurrent session
+            // can ATTACH (client mode against this node) instead of
+            // failing on the data-dir lock. 0600 beside the graph; the
+            // data home is single-user in standalone mode.
+            supervisor::AttachInfo {
+                backend: format!("http://{}", node.local_addr),
+                auth_token: bearer.clone(),
+                hmac_key: std::env::var("EXOCORTEX_HMAC_KEY")?,
+                sse_key: sse_key_hex,
+            }
+            .write(&data_home)?;
         }
         tracing::info!(addr = %node.local_addr, "exocortex-node mcp-standalone ready");
         loop {
@@ -331,6 +355,83 @@ fn standalone_main(
             }
         }
     })
+}
+
+/// D44-S2: another live instance owns the data dir — attach to it. Reads
+/// the owner's attach record, verifies the owner's node actually answers
+/// with a matching ontology fingerprint (retrying while the owner is
+/// still binding), publishes the wrapper's runtime env with the OWNER's
+/// credentials, and exits 0: the wrapper then runs its MCP client
+/// against the existing backend with a per-session WAL slot instead of
+/// starting a second store. Fails closed if the owner never answers —
+/// never starts a second store on one data dir.
+fn attach_to_live_node(
+    args: &Args,
+    ontology: &std::sync::Arc<exocortex_kernel::Ontology>,
+    data_home: &std::path::Path,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let attempt = supervisor::AttachInfo::read(data_home)
+            .map_err(|e| e.to_string())
+            .and_then(|info| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                rt.block_on(async {
+                    let mut client =
+                        exocortex_wire::ingest::v1::ingest_service_client::IngestServiceClient::connect(
+                            info.backend.clone(),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let mut req =
+                        tonic::Request::new(exocortex_wire::ingest::v1::FingerprintRequest {});
+                    if let Ok(value) = format!("Bearer {}", info.auth_token).parse() {
+                        req.metadata_mut().insert("authorization", value);
+                    }
+                    let fp = client
+                        .fingerprint(req)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .into_inner();
+                    if fp.fingerprint != ontology.fingerprint.0.to_vec() {
+                        return Err(format!(
+                            "attach refused: owner ontology fingerprint mismatch (owner {} bytes)",
+                            fp.fingerprint.len()
+                        ));
+                    }
+                    Ok(info)
+                })
+            });
+        match attempt {
+            Ok(info) => {
+                if let Some(path) = args.standalone_runtime_file.as_deref() {
+                    exocortex_storage::bounded_io::atomic_write_private(
+                        path,
+                        info.runtime_env_lines().as_bytes(),
+                        "standalone attach runtime",
+                    )?;
+                }
+                tracing::warn!(
+                    backend = %info.backend,
+                    "attached to the live standalone node on this data dir (client mode; no second store)"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "cannot attach to the live instance on {}: {error} (the owner never answered within 20s)",
+                        data_home.display()
+                    );
+                }
+                tracing::debug!(%error, "attach attempt failed; retrying");
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
 }
 
 fn verify_production_embedder() -> anyhow::Result<()> {

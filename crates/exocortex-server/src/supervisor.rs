@@ -271,6 +271,97 @@ fn bundled_dyld_value(_cfg: &SupervisorConfig) -> Option<String> {
     None
 }
 
+/// D44-S2: the typed refusal a second boot gets when another live
+/// instance owns the data dir — the signal to ATTACH instead of failing.
+#[derive(Debug)]
+pub struct DataDirOwned(pub std::path::PathBuf);
+
+impl std::fmt::Display for DataDirOwned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another supervised store already owns {} — attach to it or pass a different --data-dir",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for DataDirOwned {}
+
+/// D44-S2: the attach record the owning node publishes beside its graph
+/// — the endpoint and secrets a second concurrent session reuses in
+/// client mode instead of starting a second store. Mode 0600; the data
+/// home is single-user by construction in standalone mode.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct AttachInfo {
+    /// The owner node's loopback HTTP/gRPC base URL.
+    pub backend: String,
+    /// The owner's bearer (EXOCORTEX_AUTH_TOKEN).
+    pub auth_token: String,
+    /// The owner's producer key (EXOCORTEX_HMAC_KEY, 64 hex).
+    pub hmac_key: String,
+    /// The owner's SSE client key (64 hex).
+    pub sse_key: String,
+}
+
+impl AttachInfo {
+    /// Every field must be present and well-shaped; a malformed record
+    /// fails closed (an attacher must never guess at credentials).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.backend.starts_with("http://127.0.0.1:")
+                || self.backend.starts_with("http://[::1]:"),
+            "attach record backend must be loopback, got {}",
+            self.backend
+        );
+        for (name, value) in [
+            ("auth_token", &self.auth_token),
+            ("hmac_key", &self.hmac_key),
+            ("sse_key", &self.sse_key),
+        ] {
+            anyhow::ensure!(
+                value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()),
+                "attach record {name} must be 64 hex chars"
+            );
+        }
+        Ok(())
+    }
+
+    /// Render the runtime-env lines a wrapper sources: the backend + SSE
+    /// key every session gets, plus the owner's credentials (an attacher
+    /// must present the owner's identity — standalone serves ONE
+    /// principal) and the attach marker the wrapper keys its per-session
+    /// WAL slot on.
+    pub fn runtime_env_lines(&self) -> String {
+        format!(
+            "EXOCORTEX_BACKEND='{}'\nEXOCORTEX_SSE_KEY='{}'\nEXOCORTEX_AUTH_TOKEN='{}'\nEXOCORTEX_HMAC_KEY='{}'\nEXOCORTEX_ATTACHED='1'\n",
+            self.backend, self.sse_key, self.auth_token, self.hmac_key
+        )
+    }
+
+    /// Read + validate the attach record from `<data_dir>/attach.json`.
+    pub fn read(data_dir: &std::path::Path) -> anyhow::Result<Self> {
+        let path = data_dir.join("attach.json");
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("no attach record at {}: {e}", path.display()))?;
+        let info: AttachInfo = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("malformed attach record: {e}"))?;
+        info.validate()?;
+        Ok(info)
+    }
+
+    /// Publish (0600, atomic) as the owning node.
+    pub fn write(&self, data_dir: &std::path::Path) -> anyhow::Result<()> {
+        let raw = serde_json::to_string(self)?;
+        exocortex_storage::bounded_io::atomic_write_private(
+            &data_dir.join("attach.json"),
+            raw.as_bytes(),
+            "attach record",
+        )?;
+        Ok(())
+    }
+}
+
 /// D44: exclusively own the data dir for the lifetime of the supervised
 /// store. flock releases on process death by itself, so a crashed node
 /// never leaves a stale lock; a second live instance is refused while
@@ -289,11 +380,10 @@ pub fn acquire_data_dir_lock(data_dir: &std::path::Path) -> anyhow::Result<std::
     {
         use std::os::fd::AsRawFd as _;
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        anyhow::ensure!(
-            rc == 0,
-            "another supervised store already owns {} — an exocortex standalone              instance is running on this data dir; attach to it or pass a different --data-dir",
-            data_dir.display()
-        );
+        if rc != 0 {
+            // D44-S2: typed so the caller can attach instead of failing.
+            return Err(anyhow::Error::new(DataDirOwned(data_dir.to_path_buf())));
+        }
     }
     let mut file = file;
     let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
@@ -505,6 +595,70 @@ pub fn free_port() -> anyhow::Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_record_round_trips_and_fails_closed_on_malformation() {
+        let dir = std::env::temp_dir().join(format!("exo-attach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hex64 = "a".repeat(64);
+        let info = AttachInfo {
+            backend: "http://127.0.0.1:41234".into(),
+            auth_token: hex64.clone(),
+            hmac_key: hex64.clone(),
+            sse_key: hex64.clone(),
+        };
+        info.write(&dir).unwrap();
+        assert_eq!(AttachInfo::read(&dir).unwrap().backend, info.backend);
+        // Mode 0600: the record carries the owner's credentials.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.join("attach.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // The runtime env a wrapper sources carries ALL of it + the marker.
+        let lines = info.runtime_env_lines();
+        assert!(lines.contains("EXOCORTEX_ATTACHED='1'"));
+        assert!(lines.contains(&format!("EXOCORTEX_AUTH_TOKEN='{hex64}'")));
+        assert!(lines.contains("EXOCORTEX_HMAC_KEY='"));
+        // Malformed records never authorize an attach.
+        std::fs::write(
+            dir.join("attach.json"),
+            "{\"backend\":\"http://10.0.0.1:1\"}",
+        )
+        .unwrap();
+        assert!(
+            AttachInfo::read(&dir).is_err(),
+            "non-loopback must fail closed"
+        );
+        let mut evil = serde_json::to_string(&info).unwrap();
+        evil = evil.replace(&hex64, "short"); // not 64 hex
+        std::fs::write(dir.join("attach.json"), evil).unwrap();
+        assert!(
+            AttachInfo::read(&dir).is_err(),
+            "short credentials must fail closed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_dir_conflict_is_the_typed_attach_signal() {
+        let dir = std::env::temp_dir().join(format!("exo-owned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = acquire_data_dir_lock(&dir).unwrap();
+        let error = acquire_data_dir_lock(&dir).unwrap_err();
+        assert!(
+            error.downcast_ref::<DataDirOwned>().is_some(),
+            "the second lock attempt must carry the typed signal, got: {error}"
+        );
+        drop(first);
+        assert!(acquire_data_dir_lock(&dir).is_ok(), "released on drop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// D36: `resolve_paths_canonicalizes_relative_runtime_paths`
     /// mutates the PROCESS cwd (`std::env::set_current_dir` is global

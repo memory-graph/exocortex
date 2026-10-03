@@ -103,6 +103,334 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
 
 #[test]
 #[cfg(unix)]
+fn attached_session_reuses_owner_credentials_and_gets_its_own_wal_slot() {
+    let dir = std::env::temp_dir().join(format!(
+        "exocortex-standalone-attach-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let client_args = dir.join("client-args");
+    let client_env = dir.join("client-env");
+    let fake_node = dir.join("exocortex-node");
+    let fake_client = dir.join("exocortex-mcp-client");
+    // The node simulates D44-S2 attach mode: it owns nothing, publishes
+    // the OWNER's endpoint + credentials + the attach marker, and exits.
+    let owner_token = "f".repeat(64);
+    std::fs::write(
+        &fake_node,
+        format!(
+            "#!/bin/sh\nruntime=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --standalone-runtime-file ]; then runtime=$2; shift 2; else shift; fi\ndone\nprintf \"EXOCORTEX_BACKEND='http://127.0.0.1:43119'\\nEXOCORTEX_SSE_KEY='0000000000000000000000000000000000000000000000000000000000000000'\\nEXOCORTEX_AUTH_TOKEN='{owner_token}'\\nEXOCORTEX_HMAC_KEY='{owner_token}'\\nEXOCORTEX_ATTACHED='1'\\n\" > \"$runtime\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &fake_client,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf '%s\\n' \"$EXOCORTEX_AUTH_TOKEN\" > '{}'\nIFS= read -r request\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'\n",
+            client_args.display(),
+            client_env.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&fake_client, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let wrapper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/exocortex");
+    let mut child = Command::new(wrapper)
+        .args([
+            "--mode",
+            "mcp-standalone",
+            "--org",
+            "attach-org",
+            "--user",
+            "attacher",
+            // A user data-dir that must NOT be the attached client's WAL
+            // home (it belongs to the owner session).
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ])
+        .env("EXOCORTEX_BIN_DIR", &dir)
+        .env("EXOCORTEX_STANDALONE_NODE_BIN", &fake_node)
+        .env("EXOCORTEX_STANDALONE_CLIENT_BIN", &fake_client)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let responses = support::BoundedLineReader::new(child.stdout.take().unwrap());
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": { "name": "attach-test", "version": "0" }
+            }
+        })
+    )
+    .unwrap();
+    child.stdin.as_mut().unwrap().flush().unwrap();
+    let response = responses.read_json(&mut child);
+    assert!(response.get("result").is_some(), "{response}");
+    assert!(child.wait().unwrap().success());
+
+    // The wrapper exported the OWNER's credentials to the client.
+    assert_eq!(
+        std::fs::read_to_string(&client_env).unwrap().trim(),
+        owner_token
+    );
+    // The client's LAST --data-dir is the per-session slot under the
+    // wrapper's temp runtime dir, not the shared user data dir.
+    let args = std::fs::read_to_string(client_args).unwrap();
+    let last_data_dir = args
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|w| w[0] == "--data-dir")
+        .last()
+        .expect("a --data-dir must be forwarded")[1]
+        .to_string();
+    assert!(
+        last_data_dir.contains("exocortex-standalone."),
+        "attached client must use a per-session slot, got: {args}"
+    );
+    assert_ne!(last_data_dir, dir.to_str().unwrap());
+    assert!(
+        args.contains("--backend http://127.0.0.1:43119"),
+        "attached client rides the owner's backend: {args}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// D44-S2 live leg (env-gated on the bundled runtime, the supervisor
+/// suite's pattern): two CONCURRENT wrapper sessions on one data dir must
+/// share ONE store — the second ATTACHES (client mode, owner's
+/// credentials, per-session WAL slot) instead of failing on the data-dir
+/// lock, and a write through session 1 is searchable through session 2.
+/// Fail-without-it: pre-S2 the second wrapper's node exited with the
+/// data-dir-owned refusal and the session never served MCP.
+#[test]
+#[cfg(unix)]
+fn two_concurrent_sessions_share_one_store_via_attach() {
+    let (Some(redis), Some(module)) = (
+        std::env::var("EXOCORTEX_REDIS_SERVER").ok(),
+        std::env::var("EXOCORTEX_FALKORDB_MODULE").ok(),
+    ) else {
+        eprintln!(
+            "live attach suite UNEXECUTED: set EXOCORTEX_REDIS_SERVER and \
+             EXOCORTEX_FALKORDB_MODULE to the bundled runtime to run it"
+        );
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "exocortex-standalone-attach-live-{}",
+        std::process::id()
+    ));
+    let dir_marker = dir.to_str().unwrap().to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Panic-proof cleanup: everything this test spawns references the
+    // unique dir in its argv, so a sweep by marker reaps the whole tree
+    // (an early run leaked a node + store for hours when an assert
+    // panicked before the explicit kills).
+    let cleanup = |marker: &str| {
+        let _ = Command::new("pkill").args(["-f", marker]).status();
+    };
+    cleanup(&dir_marker);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        attach_live_body(&dir, &redis, &module);
+    }));
+    cleanup(&dir_marker);
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn attach_live_body(dir: &std::path::Path, redis: &str, module: &str) {
+    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_exocortex-mcp-client"))
+        .parent()
+        .unwrap();
+    let _ = (redis, module);
+    let wrapper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/exocortex");
+    let common_args = [
+        "--mode".to_string(),
+        "mcp-standalone".to_string(),
+        "--org".to_string(),
+        "attach-live".to_string(),
+        "--user".to_string(),
+        "tester".to_string(),
+        "--data-dir".to_string(),
+        dir.to_str().unwrap().to_string(),
+    ];
+
+    let spawn_session = || {
+        let mut child = Command::new(&wrapper)
+            .args(&common_args)
+            .env("EXOCORTEX_BIN_DIR", bin_dir)
+            .env(
+                "EXOCORTEX_STANDALONE_NODE_BIN",
+                bin_dir.join("exocortex-node"),
+            )
+            .env(
+                "EXOCORTEX_STANDALONE_CLIENT_BIN",
+                bin_dir.join("exocortex-mcp-client"),
+            )
+            .env("EXOCORTEX_REDIS_SERVER", &redis)
+            .env("EXOCORTEX_FALKORDB_MODULE", &module)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let responses = support::BoundedLineReader::new(child.stdout.take().unwrap());
+        writeln!(
+            child.stdin.as_mut().unwrap(),
+            "{}",
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": { "name": "attach-live", "version": "0" }
+                }
+            })
+        )
+        .unwrap();
+        child.stdin.as_mut().unwrap().flush().unwrap();
+        (child, responses)
+    };
+
+    let (mut first, mut first_responses) = spawn_session();
+    let response = first_responses.read_json(&mut first);
+    assert!(
+        response.get("result").is_some(),
+        "session 1 must serve: {response}"
+    );
+    writeln!(
+        first.stdin.as_mut().unwrap(),
+        "{}",
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} })
+    )
+    .unwrap();
+    first.stdin.as_mut().unwrap().flush().unwrap();
+
+    let (mut second, mut second_responses) = spawn_session();
+    let response = second_responses.read_json(&mut second);
+    assert!(
+        response.get("result").is_some(),
+        "session 2 must ATTACH and serve, not fail on the data-dir lock: {response}"
+    );
+    writeln!(
+        second.stdin.as_mut().unwrap(),
+        "{}",
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} })
+    )
+    .unwrap();
+    second.stdin.as_mut().unwrap().flush().unwrap();
+
+    // Exactly ONE store process serves the data dir — counted by DISTINCT
+    // PORT (redis rewrites its title; the watchdog shells duplicate the
+    // store's argv), the same measure `--verify` uses.
+    let ps = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .unwrap();
+    let ports: Vec<String> = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|line| line.contains("redis-server") && line.contains(dir.to_str().unwrap()))
+        .filter_map(|line| {
+            let mut tokens = line.split_whitespace();
+            let mut port = None;
+            while let Some(token) = tokens.next() {
+                if token == "--port" {
+                    port = tokens.next().map(|v| v.to_string());
+                    break;
+                }
+            }
+            port
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        ports.len(),
+        1,
+        "one store must serve both sessions: {ports:?}"
+    );
+
+    // Cross-session visibility: write through session 1, read through 2.
+    let call = |child: &mut std::process::Child,
+                reader: &mut support::BoundedLineReader,
+                id: i64,
+                method: &str,
+                params: serde_json::Value| {
+        writeln!(
+            child.stdin.as_mut().unwrap(),
+            "{}",
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": method, "params": params
+            })
+        )
+        .unwrap();
+        child.stdin.as_mut().unwrap().flush().unwrap();
+        let out = reader.read_json(child);
+        assert!(out.get("result").is_some(), "call {method} failed: {out}");
+        out
+    };
+    let ack = call(
+        &mut first,
+        &mut first_responses,
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "exocortex.end_session",
+            "arguments": {
+                "project_id": "attach-live",
+                "edges": [],
+                "memories": [{
+                    "draft_key": "d1",
+                    "memory_type": "Fix",
+                    "title": "attach live shared row",
+                    "content": "written by session one",
+                    "visibility": "org"
+                }]
+            }
+        }),
+    );
+    let ack_text = ack["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        ack_text.contains("\"accepted\":1"),
+        "write acked: {ack_text}"
+    );
+
+    // Give session 2's SSE a moment, then search through it.
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    let hit = call(
+        &mut second,
+        &mut second_responses,
+        3,
+        "tools/call",
+        serde_json::json!({
+            "name": "exocortex.search_memories",
+            "arguments": { "query": "attach live shared row", "limit": 5 }
+        }),
+    );
+    let hit_text = hit["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        hit_text.contains("written by session one"),
+        "session 2 must read session 1's write through the shared store: {hit_text}"
+    );
+
+    let _ = first.kill();
+    let _ = first.wait();
+    let _ = second.kill();
+    let _ = second.wait();
+}
+
+#[test]
+#[cfg(unix)]
 fn installed_wrapper_rule_probe_enters_standalone_topology() {
     let dir = std::env::temp_dir().join(format!(
         "exocortex-standalone-rule-probe-{}",

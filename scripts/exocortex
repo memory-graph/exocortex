@@ -134,6 +134,39 @@ case "$mode" in
       exit 1
     }
     export EXOCORTEX_SSE_KEY
+    # D44-S2: an attached session reuses the OWNER's credentials (the
+    # standalone node serves one principal) and must not share the
+    # default client WAL dir — sled locks it exclusively.
+    client_data_args=""
+    if [ -n "${EXOCORTEX_ATTACHED:-}" ]; then
+      [ "$EXOCORTEX_ATTACHED" = 1 ] || {
+        echo "standalone runtime published a bad attach marker" >&2; exit 1;
+      }
+      for credential in EXOCORTEX_AUTH_TOKEN EXOCORTEX_HMAC_KEY; do
+        eval value=\$$credential
+        case "$value" in
+          ''|*[!0-9a-f]*)
+            echo "attach runtime published an invalid $credential" >&2; exit 1 ;;
+        esac
+        [ "${#value}" -eq 64 ] || {
+          echo "attach runtime published a wrong-width $credential" >&2; exit 1;
+        }
+      done
+      export EXOCORTEX_AUTH_TOKEN EXOCORTEX_HMAC_KEY
+      mkdir -p "$runtime_dir/client"
+      client_data_args="--data-dir $runtime_dir/client"
+      # Strip any user --data-dir from the forwarded args: the client
+      # rejects the flag twice, and the attached session's WAL home is
+      # the per-session slot, not the owner's shared dir.
+      remaining=$#
+      while [ "$remaining" -gt 0 ]; do
+        case "$1" in
+          --data-dir) shift 2; remaining=$((remaining - 2)) ;;
+          --data-dir=*) shift; remaining=$((remaining - 1)) ;;
+          *) set -- "$@" "$1"; shift; remaining=$((remaining - 1)) ;;
+        esac
+      done
+    fi
     # The foreground MCP runtime uses the supervised Falkor-backed node for
     # both writes and authenticated cache hydration.
     # A non-interactive shell may hand a BACKGROUND job /dev/null stdin
@@ -141,7 +174,8 @@ case "$mode" in
     # validation's linux container where the client read instant EOF).
     # Duplicate the wrapper's stdin in the FOREGROUND, then pass the copy.
     exec 3<&0
-    "$client_bin" --backend "$EXOCORTEX_BACKEND" "$@" <&3 &
+    # shellcheck disable=SC2086 -- client_data_args is wrapper-built, word-split safe
+    "$client_bin" --backend "$EXOCORTEX_BACKEND" "$@" $client_data_args <&3 &
     client_pid=$!
     set +e
     wait "$client_pid"

@@ -236,6 +236,10 @@ in-process coordinator—no gossip or cluster election. Dreams counters and fire
 retries use the same supervised local Redis so acknowledged writes survive a
 process restart; this is durable local transport, not an inter-node service.
 The client WAL is a bounded offline buffer, not the standalone database.
+A second concurrent session on the same data dir ATTACHES to the live
+node (client mode, the owner's published endpoint, its own per-session
+WAL slot) instead of starting a second store — concurrent harness
+sessions share one graph safely.
 
 ## The ontology
 

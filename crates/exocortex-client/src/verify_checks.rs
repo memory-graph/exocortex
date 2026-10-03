@@ -9,31 +9,47 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::time::Duration;
 
-/// Parse `ps -axo pid=,command=` output: pids of processes whose argv
-/// references `data_dir` AND look like a store (redis-server or the
-/// falkordb module). A supervised store legitimately matches ONE pid; a
-/// dead supervisor's store or a second foreign writer is the hazard.
-pub fn store_pids_on_dir(ps_output: &str, data_dir: &Path) -> Vec<u32> {
+/// Parse `ps -axo pid=,command=` output: DISTINCT `--port` values of
+/// store processes whose argv references `data_dir`. Redis rewrites its
+/// process title after startup, so a pid/name scan misses the real
+/// store and double-counts the watchdog shells that embed its argv —
+/// the PORT SET is the honest measure (two stores on one dir ⇔ two
+/// distinct ports mentioning that dir).
+pub fn store_ports_on_dir(ps_output: &str, data_dir: &Path) -> Vec<u16> {
     let dir = data_dir.to_string_lossy();
-    let mut pids = Vec::new();
+    let mut ports: Vec<u16> = Vec::new();
     for line in ps_output.lines() {
-        let line = line.trim_start();
-        let Some((pid, command)) = line.split_once(char::is_whitespace) else {
+        if !line.contains(dir.as_ref()) {
             continue;
-        };
-        let Ok(pid) = pid.parse::<u32>() else {
+        }
+        let is_store_plane = line.contains("redis-server")
+            || line.contains("falkordb.so")
+            || (line.contains("redis") && line.contains("--dir"));
+        if !is_store_plane {
             continue;
-        };
-        let command = command.trim();
-        let is_store = command.contains("redis-server")
-            || command.contains("falkordb.so")
-            || (command.contains("redis") && command.contains("--dir"));
-        if is_store && command.contains(dir.as_ref()) {
-            pids.push(pid);
+        }
+        if let Some(port) = port_of(line) {
+            if !ports.contains(&port) {
+                ports.push(port);
+            }
         }
     }
-    pids.sort_unstable();
-    pids
+    ports.sort_unstable();
+    ports
+}
+
+/// The `--port N` value of a command line, if present.
+fn port_of(line: &str) -> Option<u16> {
+    let mut tokens = line.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "--port" {
+            return tokens.next().and_then(|v| v.parse().ok());
+        }
+        if let Some(value) = token.strip_prefix("--port=") {
+            return value.parse().ok();
+        }
+    }
+    None
 }
 
 /// Is a pid live? (`ps -p <pid>` — dep-free, Unix.)
@@ -148,13 +164,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn store_pids_find_redis_on_the_dir_only() {
+    fn store_ports_find_distinct_stores_on_the_dir() {
+        // Redis rewrites its title after start; the watchdog shells embed
+        // the same argv — three lines, ONE store, must collapse to one
+        // port. A second foreign store shows a second port.
         let ps = "  10 /usr/bin/sleep 5\n \
-                   20 /usr/local/bin/redis-server 127.0.0.1:6379 --dir /data/exo *:0\n \
-                   21 /usr/local/bin/redis-server *:6399 --dir /data/exo\n \
-                   22 /usr/local/bin/redis-server *:6399 --dir /other/dir\n";
-        let pids = store_pids_on_dir(ps, Path::new("/data/exo"));
-        assert_eq!(pids, vec![20, 21], "foreign store processes on the dir");
+                   20 sh -c trap x; redis-server --port 6400 --dir /data/exo\n \
+                   21 sh -c trap x; redis-server --port 6400 --dir /data/exo\n \
+                   22 redis-server 127.0.0.1:6400\n \
+                   23 sh -c trap x; redis-server --port 6410 --dir /data/exo\n \
+                   24 sh -c trap x; redis-server --port 6410 --dir /other\n";
+        let ports = store_ports_on_dir(ps, Path::new("/data/exo"));
+        assert_eq!(ports, vec![6400, 6410], "distinct stores by port");
+        let one = store_ports_on_dir(
+            &ps.lines().take(4).collect::<Vec<_>>().join("\n"),
+            Path::new("/data/exo"),
+        );
+        assert_eq!(one, vec![6400], "title-rewritten store + shells collapse");
     }
 
     #[test]
