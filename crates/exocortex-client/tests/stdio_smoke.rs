@@ -456,6 +456,50 @@ fn mcp_tool_list_matches_registry() {
     assert!(!listed.iter().any(|t| t.contains("explain_edge")));
 }
 
+/// R14 (T8): `exocortex.backend_status` is listed AND dispatchable over
+/// stdio — the phantom-tool exception in `mcp_tool_list_matches_registry`
+/// admitted the name; this proves the dispatch arm exists.
+#[test]
+fn backend_status_is_dispatchable_over_stdio() {
+    let dir = std::env::temp_dir().join(format!("exo-mcp-backend-status-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut client = Client::spawn_with(|cmd| {
+        cmd.args(["--org", "status", "--user", "tester"])
+            .arg("--data-dir")
+            .arg(&dir);
+    });
+    client.send_all(&[
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "t", "version": "0" }
+            }
+        }),
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "exocortex.backend_status", "arguments": {} }
+        }),
+    ]);
+    let _init = client.read_line();
+    let response = client.read_line();
+    assert!(
+        response.get("result").is_some(),
+        "tools/call failed: {response}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains("\"mode\":\"standalone\""),
+        "standalone status expected, got: {text}"
+    );
+    assert!(text.contains("snapshot_version"), "got: {text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// D28: harnesses may drop a tool schema's JSON-Schema `definitions` map
 /// while passing `$ref`s through unresolved — the Crush dogfood then
 /// guessed draft fields and the server rejected the calls (`missing

@@ -180,6 +180,12 @@ impl std::fmt::Display for LastSseFailure {
     }
 }
 
+/// Shared cell the subscriber uses to publish its last stream failure;
+/// supervisors and the read surface consult it to tell degraded cache
+/// reads from live ones (D47). `Some(error)` = currently failing,
+/// `None` = healthy (or never connected).
+pub type StreamErrorCell = Arc<std::sync::Mutex<Option<String>>>;
+
 /// Configuration for the SSE subscriber.
 #[derive(Clone)]
 pub struct SseSyncConfig {
@@ -218,7 +224,7 @@ pub struct SseSyncConfig {
     /// Cell beside `hydration_ready`: the subscriber records its last stream
     /// failure (HTTP status + bounded body or transport error) here so the
     /// hydration timeout can surface it. Cleared on every successful frame.
-    pub last_stream_error: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    pub last_stream_error: Option<StreamErrorCell>,
     /// Org graph replaced by a full SSE reseed.
     pub org: smol_str::SmolStr,
 }
@@ -249,12 +255,6 @@ impl SseSyncConfig {
 /// unrecoverable gap): invoked before a resubscribe so the caller can
 /// reseed the cache from storage.
 pub type ResyncFn = Box<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send>;
-
-/// Shared cell the subscriber uses to publish its last stream failure;
-/// supervisors and the read surface consult it to tell degraded cache
-/// reads from live ones (D47). `Some(error)` = currently failing,
-/// `None` = healthy (or never connected).
-pub type StreamErrorCell = Arc<std::sync::Mutex<Option<String>>>;
 
 /// Start the production backend cache lifecycle and return only after the
 /// authenticated SSE subscriber has atomically installed its first graph
@@ -590,15 +590,27 @@ fn bounded_sse_stream(
             // D47: the status exists here but the body never reached the
             // operator — read one bounded chunk so the server's own words
             // (readiness refusals name their probe) ride the error.
+            // R14-B5: the read is bounded in TIME too (the live-body loop
+            // below wraps the identical call) — a wedged proxy must not
+            // park the generator, or no reconnect fires and the
+            // degradation cell never populates. R14: control characters
+            // are stripped — a hostile backend must not forge log lines
+            // or inject into agent-facing error text.
             let status = response.status().as_u16();
             let mut body = response.into_body();
-            let body_note = match body.data().await {
-                Some(Ok(chunk)) if !chunk.is_empty() => {
-                    let text = String::from_utf8_lossy(&chunk[..chunk.len().min(1024)]);
-                    format!(": {}", text.trim())
-                }
-                _ => String::new(),
-            };
+            let body_note =
+                match tokio::time::timeout(stall_timeout, body.data()).await {
+                    Ok(Some(Ok(chunk))) if !chunk.is_empty() => {
+                        let text = String::from_utf8_lossy(&chunk[..chunk.len().min(1024)]);
+                        let flat = sanitize_single_line(&text);
+                        if flat.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {flat}")
+                        }
+                    }
+                    _ => String::new(),
+                };
             yield Err(SseReadError::Other(format!(
                 "SSE backend returned HTTP {status}{body_note}"
             )));
@@ -820,6 +832,23 @@ fn record_stream_error(cfg: &SseSyncConfig, note: String) {
     if let Some(cell) = &cfg.last_stream_error {
         *cell.lock().unwrap() = Some(note);
     }
+}
+
+/// R14 (review round 14): flatten a backend-provided body slice to one
+/// printable line — control characters (newlines, CR, ESC/ANSI, other C0)
+/// become spaces, so a hostile or proxied backend cannot forge log lines,
+///colorize operator terminals, or inject line structure into agent-facing
+/// error text. Returns the trimmed result (empty when nothing printable).
+pub fn sanitize_single_line(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_control() {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
 }
 
 fn subscription_url(backend: &str, since: u64, seed: bool) -> String {

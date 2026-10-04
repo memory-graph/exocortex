@@ -93,12 +93,12 @@ pub fn block_word_count() -> usize {
 /// D48: the begin marker carrying the block version. `--dump-block`
 /// emits the block between these markers so `--install-block` can find
 /// and replace exactly one region on every rerun.
-pub fn block_begin_marker() -> String {
+fn block_begin_marker() -> String {
     format!("<!-- exocortex-block v{PLAYBOOK_VERSION} -->")
 }
 
 /// D48: the end marker (see `block_begin_marker`).
-pub fn block_end_marker() -> &'static str {
+fn block_end_marker() -> &'static str {
     "<!-- /exocortex-block -->"
 }
 
@@ -125,27 +125,40 @@ pub fn install_block_into(existing: &str) -> String {
     let marked = marked_block();
     let mut rest = existing.to_string();
     let mut first_insert = None;
+    let mut cursor = 0usize;
     loop {
-        let Some(start) = rest.find(BEGIN_PREFIX) else {
+        // R14: search from a cursor, not from byte 0 — k regions must
+        // cost one pass, not k rescans.
+        let Some(rel) = rest[cursor..].find(BEGIN_PREFIX) else {
             break;
         };
-        let Some(marker_line) = rest[start..].find('\n') else {
-            break;
+        let start = cursor + rel;
+        let region_end = match rest[start..].find('\n') {
+            // R14-B4: a begin marker with no end marker is an unterminated
+            // region — it runs to EOF and is REPLACED, never appended
+            // beside (the append arm duplicated the block on run 1).
+            None => rest.len(),
+            Some(marker_line) => {
+                let after_line = start + marker_line + 1;
+                match rest[after_line..].find(end) {
+                    None => rest.len(),
+                    Some(end_rel) => {
+                        // Consume the newline following the end marker so
+                        // reruns do not accumulate blank lines.
+                        let mut stop = after_line + end_rel + end.len();
+                        if rest[stop..].starts_with('\n') {
+                            stop += 1;
+                        }
+                        stop
+                    }
+                }
+            }
         };
-        let after_line = start + marker_line + 1;
-        let Some(end_rel) = rest[after_line..].find(end) else {
-            break;
-        };
-        // Consume the newline following the end marker so reruns do not
-        // accumulate blank lines.
-        let mut stop = after_line + end_rel + end.len();
-        if rest[stop..].starts_with('\n') {
-            stop += 1;
-        }
         if first_insert.is_none() {
             first_insert = Some(start);
         }
-        rest.replace_range(start..stop, "");
+        rest.replace_range(start..region_end, "");
+        cursor = start;
     }
     match first_insert {
         Some(at) => format!("{}{}{}", &rest[..at], marked, &rest[at..]),
@@ -267,5 +280,28 @@ mod tests {
             1,
             "one region after healing"
         );
+    }
+
+    /// R14-B4: an unterminated begin marker is a region running to EOF —
+    /// replaced in place, never duplicated beside (the pre-fix append arm
+    /// kept the old body AND added a fresh block on run 1).
+    #[test]
+    fn install_block_replaces_an_unterminated_region() {
+        let stale = "project notes\n\n<!-- exocortex-block v1.0.0 -->\n\norphaned old body without end marker";
+        let once = install_block_into(stale);
+        assert!(
+            !once.contains("orphaned old body"),
+            "the unterminated region is replaced, got: {once}"
+        );
+        assert_eq!(once.matches(block_end_marker()).count(), 1);
+        let twice = install_block_into(&once);
+        assert_eq!(once, twice, "second run changes nothing");
+    }
+
+    /// R14: the block body must never quote its own markers — healing
+    /// parses them structurally, so self-reference would mis-parse.
+    #[test]
+    fn block_body_never_contains_its_own_markers() {
+        assert!(!BLOCK.contains("exocortex-block"));
     }
 }

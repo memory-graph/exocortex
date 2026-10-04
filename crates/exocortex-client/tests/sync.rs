@@ -1061,6 +1061,183 @@ async fn hydration_timeout_carries_the_backend_http_status_and_body() {
     server.abort();
 }
 
+/// R14-B5: a backend that sends non-success headers and then never writes
+/// a body must still fail within the stall timeout — the pre-fix read was
+/// size-bounded but time-unbounded, parking the subscriber (no reconnect,
+/// no degradation cell) behind a wedged proxy.
+#[tokio::test(flavor = "multi_thread")]
+async fn wedged_error_body_still_fails_within_the_stall_timeout() {
+    let _harness = NETWORK_HARNESS.lock().await;
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+    use axum::routing::get;
+
+    let app = axum::Router::new().route(
+        "/v1/changes",
+        get(|| async {
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::from_stream(futures::stream::pending::<
+                    Result<axum::body::Bytes, std::io::Error>,
+                >()))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (cache, writer_rx) = LocalCache::new(1024 * 1024);
+    let cache = Arc::new(cache);
+    let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, [1; 32]);
+    cfg.initial_hydration_timeout = Duration::from_millis(300);
+    cfg.stall_timeout = Duration::from_millis(250);
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(1500),
+        exocortex_client::sync::hydrate_and_start_backend_sync(cfg, cache.clone(), writer_rx),
+    )
+    .await
+    .expect("a wedged body is bounded by the stall timeout");
+    let Err(error) = result else {
+        panic!("a wedged 503 must fail hydration");
+    };
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("503"),
+        "the status must still be named without a body, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains('\n'),
+        "the error must be a single line, got: {rendered}"
+    );
+    server.abort();
+}
+
+/// R14: the degradation cell is wired through the REAL subscriber loop —
+/// a 503 records the failure, and transport recovery clears it (the D47
+/// production couplings, previously tested only with hand-set cells).
+#[tokio::test(flavor = "multi_thread")]
+async fn subscriber_records_and_clears_the_degradation_cell() {
+    let _harness = NETWORK_HARNESS.lock().await;
+    use axum::http::StatusCode;
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::get;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let phase = Arc::new(AtomicU32::new(0));
+    let seen = phase.clone();
+    let app = axum::Router::new().route(
+        "/v1/changes",
+        get(move || {
+            let seen = seen.clone();
+            async move {
+                use axum::response::IntoResponse as _;
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (StatusCode::SERVICE_UNAVAILABLE, "storage unreachable probe").into_response()
+                } else {
+                    let stream = async_stream::stream! {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            yield Ok::<Event, Infallible>(Event::default().comment("heartbeat"));
+                        }
+                    };
+                    Sse::new(stream).into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (cache, _writer_rx) = LocalCache::new(1024 * 1024);
+    let cell = exocortex_client::sync::StreamErrorCell::default();
+    let cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, [1; 32]);
+    let sync = tokio::spawn(exocortex_client::sync::run_sse_sync(
+        SseSyncConfig {
+            last_stream_error: Some(cell.clone()),
+            backoff: Duration::from_millis(50),
+            stall_timeout: Duration::from_secs(5),
+            ..cfg
+        },
+        Arc::new(cache),
+        0,
+        None,
+    ));
+    // 503 recorded, then cleared by heartbeat activity.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while cell.lock().unwrap().is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        cell.lock().unwrap().is_some(),
+        "the 503 must be recorded through the real loop"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while cell.lock().unwrap().is_some() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        cell.lock().unwrap().is_none(),
+        "transport recovery must clear the cell"
+    );
+    sync.abort();
+}
+
+/// R14: a backend body full of control characters cannot forge log lines
+/// or inject line structure — the carried note is one printable line.
+#[tokio::test(flavor = "multi_thread")]
+async fn hostile_error_body_is_flattened_to_one_line() {
+    let _harness = NETWORK_HARNESS.lock().await;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+
+    let app = axum::Router::new().route(
+        "/v1/changes",
+        get(|| async {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "real error\n2026-10-02 INFO exocortex: forged line\x1b[31m red",
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (cache, writer_rx) = LocalCache::new(1024 * 1024);
+    let cache = Arc::new(cache);
+    let mut cfg = SseSyncConfig::new(format!("http://{addr}"), HMAC_KEY, [1; 32]);
+    cfg.initial_hydration_timeout = Duration::from_millis(300);
+    cfg.stall_timeout = Duration::from_secs(2);
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(1500),
+        exocortex_client::sync::hydrate_and_start_backend_sync(cfg, cache.clone(), writer_rx),
+    )
+    .await
+    .expect("hostile body is bounded");
+    let Err(error) = result else {
+        panic!("a 503 must fail hydration");
+    };
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains('\n') && !rendered.contains('\x1b'),
+        "control characters must be flattened, got: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("forged line"),
+        "printable content survives, got: {rendered}"
+    );
+    server.abort();
+}
+
 /// R6-B06: exercise the exact production lifecycle helper. It must not return
 /// before an authenticated full image is visible, and its retained writer/SSE
 /// tasks must continue applying later commits.

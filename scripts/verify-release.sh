@@ -49,6 +49,19 @@ if [ -n "${LINEAR_API_KEY:-}" ]; then
 else
   echo "live Linear adapter suite UNEXECUTED (LINEAR_API_KEY unset)"
 fi
+# R14 (T6): the D44-S2 live attach suite (two concurrent wrappers, one
+# store) runs whenever the bundled runtime is resolvable — it was env-
+# gated with NO gate ever exporting the env, so attach could regress
+# behind a green matrix. Loud skip otherwise, the storage-conformance
+# pattern.
+RUNTIME_DIR="${EXOCORTEX_STANDALONE_RUNTIME:-"${CARGO_HOME:-$HOME/.cargo}/share/exocortex/standalone"}"
+if [ -x "$RUNTIME_DIR/redis-server" ] && [ -f "$RUNTIME_DIR/falkordb.so" ]; then
+  EXOCORTEX_REDIS_SERVER="$RUNTIME_DIR/redis-server" \
+  EXOCORTEX_FALKORDB_MODULE="$RUNTIME_DIR/falkordb.so" \
+    cargo test -p exocortex-client --test standalone_wrapper
+else
+  echo "live standalone attach suite UNEXECUTED (no bundled runtime at $RUNTIME_DIR)"
+fi
 cargo xtask write-path-parity
 cargo xtask dead-enforcement
 cargo xtask auth-coverage

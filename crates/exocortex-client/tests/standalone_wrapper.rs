@@ -87,7 +87,14 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
     }
     assert!(marker.exists(), "standalone supervisor was not started");
     assert!(child.wait().unwrap().success());
-    let args = std::fs::read_to_string(client_args).unwrap();
+    // The cleanup probe also invokes the client (--tail-audit); pick the
+    // real session's invocation line.
+    let args = std::fs::read_to_string(client_args)
+        .unwrap()
+        .lines()
+        .find(|line| line.contains("--backend"))
+        .expect("the session client ran")
+        .to_string();
     assert!(args.contains("--backend http://127.0.0.1:43119"), "{args}");
     let resolved_runtime = std::fs::read_to_string(marker.with_extension("runtime")).unwrap();
     assert_eq!(
@@ -127,7 +134,7 @@ fn attached_session_reuses_owner_credentials_and_gets_its_own_wal_slot() {
     std::fs::write(
         &fake_client,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf '%s\\n' \"$EXOCORTEX_AUTH_TOKEN\" > '{}'\nIFS= read -r request\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' \"$EXOCORTEX_AUTH_TOKEN\" > '{}'\nIFS= read -r request\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'\n",
             client_args.display(),
             client_env.display()
         ),
@@ -183,7 +190,14 @@ fn attached_session_reuses_owner_credentials_and_gets_its_own_wal_slot() {
     );
     // The client's LAST --data-dir is the per-session slot under the
     // wrapper's temp runtime dir, not the shared user data dir.
-    let args = std::fs::read_to_string(client_args).unwrap();
+    // The cleanup probe also invokes the client (--tail-audit); pick the
+    // real session's invocation line.
+    let args = std::fs::read_to_string(client_args)
+        .unwrap()
+        .lines()
+        .find(|line| line.contains("--backend"))
+        .expect("the session client ran")
+        .to_string();
     let last_data_dir = args
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -278,8 +292,8 @@ fn attach_live_body(dir: &std::path::Path, redis: &str, module: &str) {
                 "EXOCORTEX_STANDALONE_CLIENT_BIN",
                 bin_dir.join("exocortex-mcp-client"),
             )
-            .env("EXOCORTEX_REDIS_SERVER", &redis)
-            .env("EXOCORTEX_FALKORDB_MODULE", &module)
+            .env("EXOCORTEX_REDIS_SERVER", redis)
+            .env("EXOCORTEX_FALKORDB_MODULE", module)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -337,23 +351,11 @@ fn attach_live_body(dir: &std::path::Path, redis: &str, module: &str) {
         .args(["-axo", "pid=,command="])
         .output()
         .unwrap();
-    let ports: Vec<String> = String::from_utf8_lossy(&ps.stdout)
-        .lines()
-        .filter(|line| line.contains("redis-server") && line.contains(dir.to_str().unwrap()))
-        .filter_map(|line| {
-            let mut tokens = line.split_whitespace();
-            let mut port = None;
-            while let Some(token) = tokens.next() {
-                if token == "--port" {
-                    port = tokens.next().map(|v| v.to_string());
-                    break;
-                }
-            }
-            port
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    // R14 (Cl7): the SAME measure --verify uses, not a re-implementation.
+    let ports = exocortex_client::verify_checks::store_ports_on_dir(
+        &String::from_utf8_lossy(&ps.stdout),
+        dir,
+    );
     assert_eq!(
         ports.len(),
         1,
@@ -427,6 +429,82 @@ fn attach_live_body(dir: &std::path::Path, redis: &str, module: &str) {
     let _ = first.wait();
     let _ = second.kill();
     let _ = second.wait();
+}
+
+/// R14 (T7): the wrapper's attach fail-closed branches — a bad marker,
+/// non-hex credentials, or a wrong-width key must refuse the session
+/// (nonzero exit) WITHOUT ever spawning the MCP client.
+#[test]
+#[cfg(unix)]
+fn attach_runtime_failures_refuse_before_the_client_spawns() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let cases: &[(&str, String)] = &[
+        ("bad marker", format!(
+            "EXOCORTEX_BACKEND='http://127.0.0.1:43119'\nEXOCORTEX_SSE_KEY='{zeros}'\nEXOCORTEX_AUTH_TOKEN='{zeros}'\nEXOCORTEX_HMAC_KEY='{zeros}'\nEXOCORTEX_ATTACHED='2'\n",
+            zeros = "0".repeat(64),
+        )),
+        ("non-hex token", format!(
+            "EXOCORTEX_BACKEND='http://127.0.0.1:43119'\nEXOCORTEX_SSE_KEY='{zeros}'\nEXOCORTEX_AUTH_TOKEN='{bad}'\nEXOCORTEX_HMAC_KEY='{zeros}'\nEXOCORTEX_ATTACHED='1'\n",
+            zeros = "0".repeat(64),
+            bad = "z".repeat(64),
+        )),
+        ("short key", format!(
+            "EXOCORTEX_BACKEND='http://127.0.0.1:43119'\nEXOCORTEX_SSE_KEY='{zeros}'\nEXOCORTEX_AUTH_TOKEN='{zeros}'\nEXOCORTEX_HMAC_KEY='short'\nEXOCORTEX_ATTACHED='1'\n",
+            zeros = "0".repeat(64),
+        )),
+    ];
+    for (label, runtime_env) in cases {
+        let dir =
+            std::env::temp_dir().join(format!("exo-attach-refuse-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let client_marker = dir.join("client-ran");
+        let fake_node = dir.join("exocortex-node");
+        let fake_client = dir.join("exocortex-mcp-client");
+        // A quoted heredoc: the env payload carries single quotes that
+        // would break a printf-with-quotes stub (an earlier draft did
+        // exactly that and the test passed for the WRONG reason — an
+        // empty runtime file, a 10s readiness timeout, not a refusal).
+        std::fs::write(
+            &fake_node,
+            format!(
+                "#!/bin/sh\nruntime=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --standalone-runtime-file ]; then runtime=$2; shift 2; else shift; fi\ndone\ncat > \"$runtime\" <<'EXO_ENV'\n{env}EXO_ENV\n",
+                env = runtime_env,
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &fake_client,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nIFS= read -r request\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'\n",
+                client_marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&fake_client, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let wrapper =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/exocortex");
+        let mut child = Command::new(wrapper)
+            .args(["--mode", "mcp-standalone", "--org", "refuse", "--user", "t"])
+            .env("EXOCORTEX_BIN_DIR", &dir)
+            .env("EXOCORTEX_STANDALONE_NODE_BIN", &fake_node)
+            .env("EXOCORTEX_STANDALONE_CLIENT_BIN", &fake_client)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take();
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "{label}: the wrapper must refuse");
+        assert!(
+            !client_marker.exists(),
+            "{label}: the client must never spawn"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]

@@ -73,7 +73,8 @@ Row meanings:
 - `store` rows (RED) — either store processes on the data dir with no
   live supervisor (orphaned/foreign writers: kill them, one AOF must
   have one writer), or a stale `port` file whose port answers nothing
-  (left by an earlier boot; safe to ignore until attach mode ships).
+  (left by an earlier boot; delete it or re-run standalone — nothing
+  consumes it today).
 - Drain-time `InvalidTypeTriple` terminal rejections in stderr are
   old offline-accepted entries the server rejects at sync — expected,
   audit-marked `Failed`, not data loss of the valid rows.

@@ -307,22 +307,47 @@ pub struct AttachInfo {
 impl AttachInfo {
     /// Every field must be present and well-shaped; a malformed record
     /// fails closed (an attacher must never guess at credentials).
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// R14-B6: the backend is pinned to a literal loopback HOST by
+    /// parsing it (a string prefix admits userinfo —
+    /// `http://127.0.0.1:1@evil.example/` passes the prefix and dials
+    /// evil), with scheme http and no `@` in the authority; the secrets
+    /// ride the ONE hex validator (`signing::decode_hex32` — the CL3
+    /// one-impl rule; hex also cannot carry shell-significant bytes into
+    /// the file the wrapper `source`s).
+    fn validate(&self) -> anyhow::Result<()> {
+        let uri: http::Uri = self
+            .backend
+            .parse()
+            .map_err(|e| anyhow::anyhow!("attach record backend is not a URI: {e}"))?;
         anyhow::ensure!(
-            self.backend.starts_with("http://127.0.0.1:")
-                || self.backend.starts_with("http://[::1]:"),
-            "attach record backend must be loopback, got {}",
+            uri.scheme_str() == Some("http"),
+            "attach record backend must be plain http, got {}",
             self.backend
+        );
+        let authority = uri
+            .authority()
+            .ok_or_else(|| anyhow::anyhow!("attach record backend has no authority"))?;
+        anyhow::ensure!(
+            !authority.as_str().contains('@'),
+            "attach record backend carries userinfo: {}",
+            self.backend
+        );
+        let host = uri.host().unwrap_or_default();
+        anyhow::ensure!(
+            host == "127.0.0.1" || host == "::1" || host == "localhost",
+            "attach record backend must be loopback, got {host}"
+        );
+        anyhow::ensure!(
+            uri.port_u16().is_some(),
+            "attach record backend must carry an explicit port"
         );
         for (name, value) in [
             ("auth_token", &self.auth_token),
             ("hmac_key", &self.hmac_key),
             ("sse_key", &self.sse_key),
         ] {
-            anyhow::ensure!(
-                value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()),
-                "attach record {name} must be 64 hex chars"
-            );
+            exocortex_wire::signing::decode_hex32(value)
+                .map_err(|e| anyhow::anyhow!("attach record {name}: {e}"))?;
         }
         Ok(())
     }
@@ -601,15 +626,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("exo-attach-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let hex64 = "a".repeat(64);
+        // R14: DISTINCT values per field — a permutation in the format
+        // string or the JSON keys must fail the read-back, not pass it.
+        let token = "1".repeat(64);
+        let hmac = "2".repeat(64);
+        let sse = "3".repeat(64);
         let info = AttachInfo {
             backend: "http://127.0.0.1:41234".into(),
-            auth_token: hex64.clone(),
-            hmac_key: hex64.clone(),
-            sse_key: hex64.clone(),
+            auth_token: token.clone(),
+            hmac_key: hmac.clone(),
+            sse_key: sse.clone(),
         };
         info.write(&dir).unwrap();
-        assert_eq!(AttachInfo::read(&dir).unwrap().backend, info.backend);
+        let read_back = AttachInfo::read(&dir).unwrap();
+        assert_eq!(read_back.backend, info.backend);
+        assert_eq!(read_back.auth_token, token);
+        assert_eq!(read_back.hmac_key, hmac);
+        assert_eq!(read_back.sse_key, sse);
         // Mode 0600: the record carries the owner's credentials.
         #[cfg(unix)]
         {
@@ -620,11 +653,13 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        // The runtime env a wrapper sources carries ALL of it + the marker.
+        // The runtime env a wrapper sources carries ALL of it + the
+        // marker, each field under its own key with its own value.
         let lines = info.runtime_env_lines();
         assert!(lines.contains("EXOCORTEX_ATTACHED='1'"));
-        assert!(lines.contains(&format!("EXOCORTEX_AUTH_TOKEN='{hex64}'")));
-        assert!(lines.contains("EXOCORTEX_HMAC_KEY='"));
+        assert!(lines.contains(&format!("EXOCORTEX_AUTH_TOKEN='{token}'")));
+        assert!(lines.contains(&format!("EXOCORTEX_HMAC_KEY='{hmac}'")));
+        assert!(lines.contains(&format!("EXOCORTEX_SSE_KEY='{sse}'")));
         // Malformed records never authorize an attach.
         std::fs::write(
             dir.join("attach.json"),
@@ -635,8 +670,20 @@ mod tests {
             AttachInfo::read(&dir).is_err(),
             "non-loopback must fail closed"
         );
+        // R14-B6: the userinfo shape passes a naive prefix check but must
+        // fail the parsed one.
         let mut evil = serde_json::to_string(&info).unwrap();
-        evil = evil.replace(&hex64, "short"); // not 64 hex
+        evil = evil.replace(
+            "http://127.0.0.1:41234",
+            "http://127.0.0.1:1@evil.example:6379/",
+        );
+        std::fs::write(dir.join("attach.json"), evil).unwrap();
+        assert!(
+            AttachInfo::read(&dir).is_err(),
+            "userinfo-prefixed backend must fail closed"
+        );
+        let mut evil = serde_json::to_string(&info).unwrap();
+        evil = evil.replace(&token, "short"); // not 64 hex
         std::fs::write(dir.join("attach.json"), evil).unwrap();
         assert!(
             AttachInfo::read(&dir).is_err(),

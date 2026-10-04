@@ -64,10 +64,12 @@ pub fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Speak enough RESP to prove a live Redis answers on `port`: any reply
-/// line (`+PONG`, an auth error, anything) means a server; a refused or
-/// silent connection means stale. The port file carries no token, so full
-/// AUTH is impossible client-side — liveness is the question.
+/// Speak enough RESP to prove a live Redis answers on `port`: the first
+/// reply byte must be a RESP type marker (`+ - : $ *`) — `+PONG`, an
+/// auth error, anything Redis-shaped counts; a refused, silent, or
+/// banner-on-connect (SMTP/FTP) connection means stale. The port file
+/// carries no token, so full AUTH is impossible client-side — liveness
+/// is the question (R14: banner bytes must not count as a store).
 pub fn redis_answers(port: u16, timeout: Duration) -> bool {
     let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
         return false;
@@ -78,7 +80,25 @@ pub fn redis_answers(port: u16, timeout: Duration) -> bool {
         return false;
     }
     let mut buf = [0u8; 16];
-    matches!(stream.read(&mut buf), Ok(n) if n > 0)
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => matches!(buf[0], b'+' | b'-' | b':' | b'$' | b'*'),
+        _ => false,
+    }
+}
+
+/// R14-B1: where the standalone node's store artifacts actually live for
+/// a client `--data-dir`. The node's data home is `--standalone-data-dir`
+/// or the OS data home, and the documented wrapper wiring maps a user
+/// `--data-dir D` to `--standalone-data-dir D/falkordb` — so the lock and
+/// port files sit one level below the client's dir in that topology.
+/// First candidate carrying an artifact wins; the bare dir is the
+/// fallback so absent-artifact rows stay honest.
+pub fn store_artifact_dir(data_dir: &Path) -> std::path::PathBuf {
+    let falkordb = data_dir.join("falkordb");
+    if falkordb.join(".supervised.lock").exists() || falkordb.join("port").exists() {
+        return falkordb;
+    }
+    data_dir.to_path_buf()
 }
 
 /// The pid recorded in the supervised store's lock file, if present.
@@ -110,19 +130,24 @@ pub fn harness_check(install_dir: &Path, configs: &[(&str, Option<String>)]) -> 
     for (name, content) in configs {
         let Some(content) = content else { continue };
         existing.push((*name).to_string());
-        if content.contains(dir.as_ref()) && content.contains("exocortex") {
-            // Name the binary the config points at, for the operator.
-            let exe = [
-                "exocortex",
-                "exocortex-mcp-client",
-                "exocortex-node",
-                "exocortex-cli",
-            ]
-            .into_iter()
-            .find(|b| content.contains(&format!("{dir}/{b}")))
-            .unwrap_or("exocortex")
-            .to_string();
-            return HarnessCheck::Wired((*name).to_string(), exe);
+        // R14-B3: the dir and an exocortex binary must appear on the SAME
+        // line — two independent file-wide substrings green-lit a config
+        // that mentioned the install dir for an unrelated tool beside a
+        // stale exocortex wiring elsewhere.
+        for line in content.lines() {
+            if line.contains(dir.as_ref()) && line.contains("exocortex") {
+                let exe = [
+                    "exocortex-mcp-client",
+                    "exocortex-node",
+                    "exocortex-cli",
+                    "exocortex",
+                ]
+                .into_iter()
+                .find(|b| line.contains(b))
+                .unwrap_or("exocortex")
+                .to_string();
+                return HarnessCheck::Wired((*name).to_string(), exe);
+            }
         }
     }
     if existing.is_empty() {
@@ -209,6 +234,74 @@ mod tests {
             harness_check(dir, &[("crush", None)]),
             HarnessCheck::NoConfigFound
         );
+    }
+
+    /// R14: the port liveness answer must be Redis-shaped — a silent
+    /// acceptor or an SMTP-style banner must read as stale.
+    #[test]
+    fn redis_ping_rejects_silent_and_banner_acceptors() {
+        use std::io::{Read, Write};
+        let spawned = |reply: Option<Vec<u8>>| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 8];
+                    let _ = stream.read(&mut buf);
+                    if let Some(bytes) = reply {
+                        let _ = stream.write_all(&bytes);
+                    } else {
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                }
+            });
+            (port, handle)
+        };
+        let (pong_port, pong) = spawned(Some(b"+PONG\r\n".to_vec()));
+        assert!(redis_answers(pong_port, Duration::from_secs(2)));
+        pong.join().unwrap();
+        let (banner_port, banner) = spawned(Some(b"220 mail.example ESMTP\r\n".to_vec()));
+        assert!(
+            !redis_answers(banner_port, Duration::from_secs(2)),
+            "a banner service is not a store"
+        );
+        banner.join().unwrap();
+    }
+
+    /// R14-B3: the install dir mentioned for an UNRELATED tool plus the
+    /// word exocortex elsewhere in the config must NOT wire the row.
+    #[test]
+    fn harness_check_requires_dir_and_binary_on_one_line() {
+        let dir = Path::new("/opt/homebrew/bin");
+        let mixed =
+            "command = /opt/homebrew/bin/rg  # unrelated tool\nalias x = exocortex-old-thing\n";
+        assert_eq!(
+            harness_check(dir, &[("crush", Some(mixed.into()))]),
+            HarnessCheck::NotWired(vec!["crush".into()])
+        );
+        let wired = "mcp add exocortex --command /opt/homebrew/bin/exocortex\n";
+        assert_eq!(
+            harness_check(dir, &[("crush", Some(wired.into()))]),
+            HarnessCheck::Wired("crush".into(), "exocortex".into())
+        );
+    }
+
+    /// R14-B1: the artifact dir resolves into the wrapper's falkordb
+    /// layout when the artifacts live there, and falls back to the bare
+    /// client dir.
+    #[test]
+    fn store_artifact_dir_prefers_the_falkordb_layout() {
+        let base = std::env::temp_dir().join(format!("exo-artifact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("falkordb")).unwrap();
+        assert_eq!(store_artifact_dir(&base), base, "no artifacts yet");
+        std::fs::write(base.join("falkordb/.supervised.lock"), "1\n").unwrap();
+        assert_eq!(
+            store_artifact_dir(&base),
+            base.join("falkordb"),
+            "lock found in the wrapper layout"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

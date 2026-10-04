@@ -56,6 +56,12 @@ case "$mode" in
       esac
     done
     [ -z "$expect" ] || { echo "standalone option requires a value" >&2; exit 2; }
+    # R14 (F2): crash-left runtime trees (SIGKILL skips the trap; an
+    # attached session's file holds the owner's credentials) are NOT
+    # swept here on purpose — a TMPDIR-wide find measured 33s on a real
+    # dev machine, a cost every session would pay for a crash-only leak
+    # that is already 0600-in-0700 (same-uid) and reboot-reclaimed.
+    # Recorded boundary in round 14; revisit only with a bounded reaper.
     runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/exocortex-standalone.XXXXXX")
     runtime_file="$runtime_dir/runtime.env"
     random_hex() {
@@ -101,7 +107,19 @@ case "$mode" in
       kill "$supervisor_pid" 2>/dev/null || true
       wait "$supervisor_pid" 2>/dev/null || true
       rm -f "$runtime_file"
-      rmdir "$runtime_dir" 2>/dev/null || true
+      # R14: the attached client's WAL slot is a sled TREE — rmdir can
+      # never remove it (it silently leaked one credential-bearing dir
+      # per attached session). Remove the whole runtime dir, but KEEP it
+      # (and say where) when it still holds pending offline writes, so a
+      # dead owner can never silently swallow an acked sync_pending batch.
+      if [ -n "${EXOCORTEX_ATTACHED:-}" ] && [ -n "${client_bin:-}" ] \
+         && [ -d "$runtime_dir/client" ] \
+         && "$client_bin" --data-dir "$runtime_dir/client" --tail-audit --last 250 >/dev/null 2>&1 \
+           | grep -q '\[pending\]'; then
+        echo "note: attached session WAL still holds pending entries; kept at $runtime_dir/client (restart a session while the owner is up to drain them)" >&2
+      else
+        rm -rf "$runtime_dir"
+      fi
     }
     trap cleanup EXIT
     trap 'exit 143' HUP INT TERM
@@ -145,7 +163,7 @@ case "$mode" in
       for credential in EXOCORTEX_AUTH_TOKEN EXOCORTEX_HMAC_KEY; do
         eval value=\$$credential
         case "$value" in
-          ''|*[!0-9a-f]*)
+          ''|*[!0-9a-fA-F]*)
             echo "attach runtime published an invalid $credential" >&2; exit 1 ;;
         esac
         [ "${#value}" -eq 64 ] || {

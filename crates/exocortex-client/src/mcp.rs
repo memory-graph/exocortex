@@ -227,6 +227,16 @@ impl ExocortexMcp {
         serde_json::to_string(&v).map_err(|e| e.to_string())
     }
 
+    /// R14 (Cl5): the ONE read-stamping dance — registry output to JSON,
+    /// degraded-sync health attached, string rendered. Every read tool
+    /// rides this so the healthy-path shape is enforced by construction,
+    /// not copy fidelity.
+    fn stamped_read(&self, out: &(impl serde::Serialize + ?Sized)) -> Result<String, String> {
+        let mut value = serde_json::to_value(out).map_err(|e| e.to_string())?;
+        self.attach_sync_health(&mut value);
+        serde_json::to_string(&value).map_err(|e| e.to_string())
+    }
+
     /// `exocortex.get_memory` (registry op, client-side over the cache).
     #[tool(
         name = "exocortex.get_memory",
@@ -248,9 +258,7 @@ impl ExocortexMcp {
         )
         .await
         .map_err(|e| e.to_string())?;
-        let mut v = serde_json::to_value(&out).map_err(|e| e.to_string())?;
-        self.attach_sync_health(&mut v);
-        serde_json::to_string(&v).map_err(|e| e.to_string())
+        self.stamped_read(&out)
     }
 
     /// `exocortex.find_related` (registry op, client-side over the cache).
@@ -280,9 +288,7 @@ impl ExocortexMcp {
         )
         .await
         .map_err(|e| e.to_string())?;
-        let mut v = serde_json::to_value(&out).map_err(|e| e.to_string())?;
-        self.attach_sync_health(&mut v);
-        serde_json::to_string(&v).map_err(|e| e.to_string())
+        self.stamped_read(&out)
     }
 
     /// `exocortex.end_session` (§13.6): wrapup batch submit. Online: gRPC
@@ -588,10 +594,7 @@ impl ExocortexMcp {
     /// healthy-path bytes stay identical to the registry shape.
     fn attach_sync_health(&self, value: &mut serde_json::Value) {
         if let (Some(error), serde_json::Value::Object(map)) = (self.degraded_sync_error(), value) {
-            map.insert(
-                "sync".into(),
-                serde_json::json!({ "degraded": true, "last_error": error }),
-            );
+            map.insert("sync".into(), sync_health_json(&error));
         }
     }
 
@@ -639,7 +642,7 @@ impl ExocortexMcp {
             "backend_lsn": version.map(|x| x.backend_lsn).unwrap_or(0),
         });
         let sync = match self.degraded_sync_error() {
-            Some(error) => Some(serde_json::json!({ "degraded": true, "last_error": error })),
+            Some(error) => Some(sync_health_json(&error)),
             None if self.sync_health.is_some() => Some(serde_json::json!({ "degraded": false })),
             None => None,
         };
@@ -717,6 +720,11 @@ fn inline_schema_refs(
         }
         _ => {}
     }
+}
+
+/// The degraded-sync health object shape (R14: one builder, two sites).
+fn sync_health_json(error: &str) -> serde_json::Value {
+    serde_json::json!({ "degraded": true, "last_error": error })
 }
 
 /// Structured error payload (never a bare string): `{ error, message }`.

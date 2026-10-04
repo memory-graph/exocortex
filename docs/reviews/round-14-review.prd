@@ -1,0 +1,173 @@
+# Round 14 — deep review of the D44–D49 cascade (2026-10-02)
+
+Scope: the five unpushed commits `7cac12d..4fadfad` (D47 diagnostics,
+D48 installer, D49 verify rows, D44-S2 attach mode, plan consolidation).
+Method: the deep-pr-review-lean multi-lens pass over a detached worktree
+(branch mode, chat-only) — ground truth computed once (2,854-line diff,
+32 files, all hand-authored); lenses Correctness/Security/Tests/
+Performance/Product-AC/Cleanup/Hazard-grid dispatched as read-only child
+agents (roster below; tier-named subagents unavailable in this runtime —
+lenses ran at session default, a disclosed cost), verification from
+source by the orchestrator. 40 candidate findings, 15 unverified
+questions; adjudication kept 33 (7 Blocking, 26 Advisory), merged 7
+duplicates, dropped 0 without a named falsifier.
+
+**Verdict: changes-requested — all seven Blocking findings and every
+Actionable Advisory fixed in this round's closing commit; two findings
+resolved as recorded boundaries with measured justification.**
+
+## Blocking findings (all fixed)
+
+- **B1 — verify's store/lock/port rows read the CLIENT dir while the
+  wrapper puts the store at `<dir>/falkordb`** (`--standalone-data-dir
+  D/falkordb`): every healthy `--data-dir` session false-RED as "NO live
+  supervisor" and the stale-port row could never fire. Fixed:
+  `verify_checks::store_artifact_dir` resolves the artifact dir (the
+  falkordb layout when its artifacts exist, the bare dir otherwise);
+  the lock and port reads ride it. Tests:
+  `store_artifact_dir_prefers_the_falkordb_layout`.
+- **B2 — `--install-block` destroyed unreadable instruction files**
+  (`unwrap_or_default()` swallowed non-UTF-8 read errors, then
+  rewrote the file with only the block). Fixed: only NotFound starts
+  empty; every other read error refuses. Evidence: the R14 fix comment
+  in `main.rs`; the failure mode is data loss, pinned by inspection of
+  the two-line change.
+- **B3 — the harness row green-lit on two independent file-wide
+  substrings** (install dir mentioned for an unrelated tool + the word
+  "exocortex" anywhere). Fixed: the dir and an exocortex binary must
+  appear on the SAME line. Test: `harness_check_requires_dir_and_binary_on_one_line`.
+- **B4 — an unterminated begin marker duplicated the block on run 1**
+  (the splice loop broke, the append arm added a fresh block beside the
+  orphaned body). Fixed: an unterminated region runs to EOF and is
+  replaced. Test: `install_block_replaces_an_unterminated_region`.
+- **B5 — the SSE error-body read was size-bounded but TIME-unbounded**
+  (a wedged proxy parked the subscriber: no reconnect, no degradation
+  cell — strictly worse than pre-D47). Fixed: the read rides
+  `timeout(stall_timeout)`, matching the live-body loop beside it.
+  Test: `wedged_error_body_still_fails_within_the_stall_timeout`.
+- **B6 — attach.json admitted a userinfo bypass and shell injection**
+  (`http://127.0.0.1:1@evil.example/` passes the string-prefix loopback
+  check and dials evil — confirmed against `http::Uri` authority
+  parsing; the unvalidated backend was interpolated unescaped into the
+  file the wrapper `source`s). Fixed: the backend is PARSED — plain
+  http, no `@` in the authority, literal loopback host, explicit port —
+  and the secrets ride the one-impl `signing::decode_hex32` (also
+  closing the hand-rolled-hex cleanup finding; hex cannot carry
+  shell-significant bytes). Tests:
+  `attach_record_round_trips_and_fails_closed_on_malformation` (the
+  userinfo shape now asserted refused).
+- **B7 — the attached session's WAL slot leaked and stranded writes**
+  (cleanup's `rmdir` cannot remove a sled tree — one
+  credential-bearing dir per attached session, forever; pending
+  offline writes in it were unreachable by any drain). Fixed: cleanup
+  `rm -rf`s the runtime dir UNLESS `--tail-audit` still reports
+  `[pending]` entries — then the dir is kept and its path printed.
+
+## Advisory findings (fixed in the same commit)
+
+- **S2/U1 — hostile error-body injection**: control characters from a
+  backend body rode into operator logs and agent-facing read stamps.
+  Fixed at the source: `sync::sanitize_single_line` flattens every
+  control char; test `hostile_error_body_is_flattened_to_one_line`.
+- **C7/T2 — banner services green-lit the port PING**: `redis_answers`
+  now requires a RESP type marker as the first reply byte; test
+  `redis_ping_rejects_silent_and_banner_acceptors`.
+- **C6 — uppercase-hex divergence** between Rust validators and the
+  wrapper's shell class: the wrapper accepts `A-F` now.
+- **S3 — attach.json outlived its owner**: the owner removes it on
+  exit (any path) via a Drop guard; attachers never touch it.
+- **P2 — the attach probe could hang past its own 20s promise**: one
+  runtime hoisted above the retry loop, every attempt bounded to 3s;
+  `EXOCORTEX_ATTACH_DEADLINE_MS` tunes the deadline.
+- **T1 — the D47 production couplings were untested**: the cell
+  record/clear is now driven through the REAL subscriber loop
+  (`subscriber_records_and_clears_the_degradation_cell`).
+- **T3 — verify's exit code was pinned only from the red side**:
+  every verify_rows leg asserts exit == red-row count.
+- **T4 — "healthy reads stay registry-identical" proved key-absence**:
+  now byte-compares a cell-carrying server against a cell-free one on
+  all three reads.
+- **T5/A3 — the logging canary self-selected its surface and its name
+  overclaimed**: scans `src/main.rs` AND `src/bin/*.rs`, fails any
+  tracing-emitting binary without the WARN builder, renamed to what it
+  checks.
+- **T6 — the live attach suite ran in NO gate**: `verify-release.sh`
+  now runs it whenever the bundled runtime resolves (loud skip
+  otherwise, the storage-conformance pattern).
+- **T7 — the wrapper's attach fail-closed branches were untested**:
+  `attach_runtime_failures_refuse_before_the_client_spawns` (three
+  shapes; the first draft of this test passed for the WRONG reason —
+  quote-broken stubs left the runtime file empty and the wrapper timed
+  out instead of refusing — caught and fixed with a heredoc stub).
+- **T8 — `backend_status` was listed but never dispatched in test**:
+  `stdio_smoke::backend_status_is_dispatchable_over_stdio`.
+- **T9 — the attach-record fixture used identical secrets**: distinct
+  values, full-struct read-back, per-field env lines, and the userinfo
+  refusal leg.
+- **T10 — nothing pinned the block's marker self-reference
+  invariant**: `block_body_never_contains_its_own_markers`.
+- **T11 — wal_roundtrip stamped empty org/user**: distinct values.
+- **Cl1/Cl3/Cl5/Cl6/Cl7/Cl8** — dead statement, the FALSE "attach
+  consumes the port file" comment (attach consumes attach.json; the
+  comment, the RED message, and SKILL.md now tell the truth), the
+  pasted read-stamp dance (one `stamped_read` + one `sync_health_json`
+  builder), unwarranted `pub` narrowed, the live test now calls the
+  lib's own `store_ports_on_dir`, and `StreamErrorCell` aliases the
+  config field where it is declared.
+- **P3/P4/P5** — verify decodes the WAL once (`pending_and_partitions`),
+  harness-config reads are bounded (8 MiB, unreadable → RED), and the
+  marker splice keeps a cursor (k regions, one pass).
+- **A2 — `attach_to_live_node` had no ungated test**:
+  `attach_tests::attach_publishes_owner_env_and_refuses_mismatched_owners`
+  boots an in-process owner node, asserts the published env verbatim,
+  and asserts a fingerprint-mismatched owner is refused without
+  publishing.
+
+## Resolved as recorded boundaries
+
+- **F2 (crash-path credential retention in the mktemp runtime.env)**:
+  the proposed startup sweep measured **33s** on this machine (a
+  TMPDIR-wide `find`, zero CPU — pure scan latency) — a cost every
+  session would pay against a crash-only leak already protected by
+  0600-in-0700 and reboot reclamation. Reverted; revisit only with a
+  bounded reaper. The finding's other half (slot leak) IS fixed (B7).
+- **C8 (conf-file foreign stores and title-rewritten pre-S1 orphans are
+  invisible to the ps scan)**: with B1's path fix, the lock-holder +
+  recorded-port evidence covers the supervised case; the
+  conf-file-launched foreign writer remains beyond a client-side
+  check's reach — the verify row text states what it counts.
+
+## Unverified questions — dispositions
+
+- userinfo bypass: CONFIRMED against `http::Uri` parsing and fixed (B6).
+- tonic connect/request timeouts: none by default — the P2 fix does not
+  rely on them.
+- mktemp dir mode: 0700 on macOS/GNU — established, leans on F2's
+  boundary note.
+- `~/.claude.json` size: mooted by the bounded read (P4).
+- RUST_LOG override precedence: the documented
+  `with_default_directive`/`from_env_lossy` builder idiom; the canary
+  was renamed to claim only what it checks (A3).
+- slow-owner attach past 20s: the deadline is now tunable and the
+  boundary recorded; D45's real-data run will observe boot times.
+
+## Lens roster and cost
+
+```
+1 Correctness   complex  fired 8 findings        (child agent)
+2 Security      standard fired 3 findings        (child agent)
+3 Tests         complex  fired 11 findings       (child agent)
+4 Migrations    simple   not fired (no migration/SQL paths)
+5 Performance   standard fired 5 findings        (child agent)
+6 Packaging     simple   not fired (no package/CI config)
+7 Product/AC    complex  fired 3 findings        (child agent)
+8 Cleanup       standard fired 8 findings        (child agent)
+9 Hazard-grid   complex  fired (b) 2 findings · grid complete (child agent)
+preflight: comment-ratio 13% · scanners self-gated (LoanLight-only) · 0 hits
+verification: 4a/4b collapsed into an orchestrator source pass (tier scorer
+agents unavailable — disclosed); no finding dropped without a named check
+```
+
+cost: 7 agents (complex 4, standard 3) · lenses fired 7/9 (not fired:
+Migrations, Packaging) · second opinion skipped (fix-loop pass 1; --final
+reserved for the loop's last pass) · pass_type full

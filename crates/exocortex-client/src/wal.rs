@@ -367,6 +367,26 @@ impl Wal {
         self.decoded_entries()
     }
 
+    /// R14 (P3): pending count + partition ledger in ONE decode pass —
+    /// `--verify` called `pending_count()` and `partitions()` back to
+    /// back, decoding the whole WAL twice for a checklist command.
+    pub fn pending_and_partitions(&self) -> Result<(usize, Vec<(String, String)>), WalError> {
+        let mut pending = 0usize;
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for entry in self.decoded_entries()? {
+            if matches!(entry.state, WalState::Pending) {
+                pending += 1;
+            }
+            if !entry.org.is_empty() {
+                let pair = (entry.org, entry.user);
+                if !seen.contains(&pair) {
+                    seen.push(pair);
+                }
+            }
+        }
+        Ok((pending, seen))
+    }
+
     /// D49: distinct non-empty org/user partitions this WAL holds, in
     /// first-write order. Legacy (pre-D49) entries carry no stamp and are
     /// skipped; `--verify` compares the configured pair against this list

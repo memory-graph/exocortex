@@ -48,6 +48,13 @@ fn harness_row_is_red_when_unwired_and_green_when_wired() {
         "unwired harness must be a RED row, got:\n{out}"
     );
     assert!(code.unwrap_or(0) >= 1, "red rows must exit non-zero");
+    // R14: the README contract is exit code == red count — pin both sides.
+    let reds = out.matches("RED   ").count() as i32;
+    assert_eq!(
+        code.unwrap_or(0),
+        reds,
+        "exit code must equal the red-row count"
+    );
 
     // Wire the config at this binary's own install directory.
     let exe = std::env::current_exe().unwrap();
@@ -123,7 +130,13 @@ fn partition_mismatch_is_red_naming_the_live_partitions() {
         out.contains("RED   partition:") && out.contains("personal/gregory"),
         "wrong pair must be RED naming the live partition, got:\n{out}"
     );
-    assert!(code.unwrap_or(0) >= 1);
+    assert_eq!(
+        code.unwrap_or(0),
+        out.lines()
+            .filter(|l| l.trim_start().starts_with("RED"))
+            .count() as i32,
+        "exit code must equal the red-row count"
+    );
 
     let (out, _code) = run_verify(&dir, "personal", "gregory");
     assert!(

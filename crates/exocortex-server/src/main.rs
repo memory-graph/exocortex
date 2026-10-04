@@ -35,7 +35,7 @@ enum Mode {
 }
 
 /// Node options (§4.2).
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(name = "exocortex-node", version)]
 struct Args {
     /// Internal acceptance probe: execute all nine rules in this artifact.
@@ -344,6 +344,16 @@ fn standalone_main(
                 sse_key: sse_key_hex,
             }
             .write(&data_home)?;
+            // R14: the OWNER removes the credential-bearing record when
+            // this node exits (any path) — attachers must never remove
+            // it, and a dead owner's record must not outlive it at rest.
+            struct RemoveAttachOnExit(std::path::PathBuf);
+            impl Drop for RemoveAttachOnExit {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(self.0.join("attach.json"));
+                }
+            }
+            let _attach_guard = RemoveAttachOnExit(data_home.clone());
         }
         tracing::info!(addr = %node.local_addr, "exocortex-node mcp-standalone ready");
         loop {
@@ -370,16 +380,26 @@ fn attach_to_live_node(
     ontology: &std::sync::Arc<exocortex_kernel::Ontology>,
     data_home: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    // Testable and tunable on slow machines (large real-data AOF boots).
+    let deadline_ms: u64 = std::env::var("EXOCORTEX_ATTACH_DEADLINE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20_000);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
+    // R14: one runtime hoisted above the retry loop (a throwaway per
+    // attempt was churn), and every attempt is time-bounded — a hung
+    // owner (accepts, never answers) must not park block_on past the
+    // 20s deadline the bail message promises.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("attach probe runtime: {e}"))?;
     loop {
         let attempt = supervisor::AttachInfo::read(data_home)
             .map_err(|e| e.to_string())
             .and_then(|info| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| e.to_string())?;
-                rt.block_on(async {
+                let info_copy = info.backend.clone();
+                let probe = async {
                     let mut client =
                         exocortex_wire::ingest::v1::ingest_service_client::IngestServiceClient::connect(
                             info.backend.clone(),
@@ -403,7 +423,14 @@ fn attach_to_live_node(
                         ));
                     }
                     Ok(info)
-                })
+                };
+                match rt.block_on(tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    probe,
+                )) {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(format!("owner at {info_copy} did not answer the probe within 3s")),
+                }
             });
         match attempt {
             Ok(info) => {
@@ -423,7 +450,7 @@ fn attach_to_live_node(
             Err(error) => {
                 if std::time::Instant::now() >= deadline {
                     anyhow::bail!(
-                        "cannot attach to the live instance on {}: {error} (the owner never answered within 20s)",
+                        "cannot attach to the live instance on {}: {error} (the owner never answered within {deadline_ms}ms)",
                         data_home.display()
                     );
                 }
@@ -1194,5 +1221,115 @@ mod tests {
             Some("rediss://queue.example:6380")
         );
         assert_eq!(backend_redis_url(None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use super::*;
+
+    fn make_test_args() -> Args {
+        use clap::Parser as _;
+        Args::parse_from(["exocortex-node"])
+    }
+
+    /// R14 (A2): `attach_to_live_node` is covered WITHOUT the bundled
+    /// runtime — an in-process owner node answers the gRPC probe, the
+    /// runtime env is published with the owner's credentials, and a
+    /// fingerprint mismatch fails closed instead of attaching.
+    #[tokio::test]
+    async fn attach_publishes_owner_env_and_refuses_mismatched_owners() {
+        let ontology =
+            std::sync::Arc::new(exocortex_kernel::pack::load_registered_packs().unwrap());
+        let storage =
+            std::sync::Arc::new(exocortex_storage::InMemoryStorage::new(ontology.clone()));
+        let token = "1".repeat(64);
+        let principal = exocortex_storage::VisibilityContext {
+            user_id: "owner".into(),
+            org_id: "attach-org".into(),
+            project_ids: Default::default(),
+            team_ids: Default::default(),
+            max_visibility: exocortex_kernel::Visibility::Org,
+        };
+        let args = backend::BackendNodeArgs {
+            org: "attach-org".into(),
+            bind: "127.0.0.1:0".into(),
+            transport: backend::TransportSecurity::PlaintextLoopback,
+            node_id: "attach-test-owner".into(),
+            cluster_secret: [7u8; 32],
+            principals: std::sync::Arc::new(
+                exocortex_server::principal::PrincipalRegistry::single(token.clone(), principal)
+                    .unwrap(),
+            ),
+            gossip_listen: "127.0.0.1:0".parse().unwrap(),
+            seed_nodes: vec![],
+            redis_url: None,
+            quiet_hours: Default::default(),
+            admin_source_policies: vec![],
+        };
+        let node = backend::run_backend_node(storage, ontology.clone(), args)
+            .await
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("exo-attach-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime_file = dir.join("runtime.env");
+        let client_args = Args {
+            mode: Mode::McpStandalone,
+            standalone_runtime_file: Some(runtime_file.clone()),
+            ..make_test_args()
+        };
+
+        // Matching owner: the attach publishes the owner's env and exits 0.
+        supervisor::AttachInfo {
+            backend: format!("http://{}", node.local_addr),
+            auth_token: token.clone(),
+            hmac_key: "2".repeat(64),
+            sse_key: "3".repeat(64),
+        }
+        .write(&dir)
+        .unwrap();
+        // attach_to_live_node owns a current-thread runtime — production
+        // calls it from sync main; the test must keep it off this async
+        // context (dropping a runtime inside one panics).
+        let attach_args = client_args.clone();
+        let attach_dir = dir.clone();
+        let attach_ontology = ontology.clone();
+        tokio::task::spawn_blocking(move || {
+            attach_to_live_node(&attach_args, &attach_ontology, &attach_dir)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let published = std::fs::read_to_string(&runtime_file).unwrap();
+        assert!(published.contains("EXOCORTEX_ATTACHED='1'"));
+        assert!(published.contains(&format!("EXOCORTEX_AUTH_TOKEN='{token}'")));
+        assert!(published.contains(&format!("EXOCORTEX_BACKEND='http://{}'", node.local_addr)));
+
+        // Mismatched owner (a DIFFERENT ontology): fails closed, publishes
+        // nothing new, never attaches.
+        let other = std::sync::Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![
+                exocortex_pack_dev_v1::pack_def(),
+                exocortex_pack_mortgage_v1::pack_def(),
+            ])
+            .unwrap(),
+        );
+        std::fs::remove_file(&runtime_file).unwrap();
+        std::env::set_var("EXOCORTEX_ATTACH_DEADLINE_MS", "300");
+        let refused_dir = dir.clone();
+        let refused = tokio::task::spawn_blocking(move || {
+            attach_to_live_node(&client_args, &other, &refused_dir)
+        })
+        .await
+        .unwrap();
+        std::env::remove_var("EXOCORTEX_ATTACH_DEADLINE_MS");
+        assert!(refused.is_err(), "a fingerprint mismatch must refuse");
+        assert!(
+            !runtime_file.exists(),
+            "a refused attach must not publish a runtime env"
+        );
+        drop(node); // Drop shuts the node's tasks down.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

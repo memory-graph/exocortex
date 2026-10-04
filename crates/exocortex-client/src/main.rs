@@ -126,7 +126,17 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if let Some(path) = &args.install_block {
-        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        // R14-B2: only a MISSING file starts empty — any other read error
+        // (non-UTF-8 content included) must refuse rather than silently
+        // rewrite the file with only the block (data loss).
+        let existing = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => anyhow::bail!(
+                "--install-block {}: cannot read: {error} — refusing to overwrite",
+                path.display()
+            ),
+        };
         let updated = exocortex_client::playbook::install_block_into(&existing);
         std::fs::write(path, updated)?;
         eprintln!(
@@ -681,7 +691,8 @@ fn verify(
     let wal_dir = data_dir.join("wal");
     if wal_dir.exists() {
         let wal = wal::Wal::open(&wal_dir)?;
-        let pending = wal.pending_count()?;
+        // R14 (P3): one decode pass carries both projections.
+        let (pending, partitions) = wal.pending_and_partitions()?;
         if pending > 0 {
             red += 1;
         }
@@ -694,7 +705,6 @@ fn verify(
         // A wrong --org/--user silently starts an empty graph next door
         // (issue #6: README says my-org/me, defaults say personal/dev,
         // the live data said personal/gregory).
-        let partitions = wal.partitions()?;
         if partitions.is_empty() {
             println!("  ok    partition: no stamped writes yet (first write stamps this pair)");
         } else if partitions
@@ -732,9 +742,22 @@ fn verify(
         match install_dir {
             Some(dir) => {
                 let configs = harness_config_paths();
+                // R14 (P4): bounded reads — ~/.claude.json can be large,
+                // and the workspace's own bounded-io discipline applies
+                // to diagnostic reads too. Unreadable (including
+                // over-limit) counts as existing-but-unconfirmable → RED.
                 let inputs: Vec<(&str, Option<String>)> = configs
                     .iter()
-                    .map(|(name, path)| (*name, std::fs::read_to_string(path).ok()))
+                    .map(|(name, path)| {
+                        let content = exocortex_storage::bounded_io::read_bounded(
+                            path,
+                            8 * 1024 * 1024,
+                            "harness config",
+                        )
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok());
+                        (*name, content)
+                    })
                     .collect();
                 match harness_check(&dir, &inputs) {
                     exocortex_client::verify_checks::HarnessCheck::Wired(name, exe) => {
@@ -767,9 +790,13 @@ fn verify(
     // processes and a stale `port` artifact.
     {
         use exocortex_client::verify_checks::{
-            lock_holder_pid, pid_alive, redis_answers, store_ports_on_dir,
+            lock_holder_pid, pid_alive, redis_answers, store_artifact_dir, store_ports_on_dir,
         };
         use std::time::Duration;
+        // R14-B1: the lock/port artifacts live where the NODE's data home
+        // is — one level below the client dir in the wrapper's
+        // `--data-dir D → D/falkordb` topology.
+        let artifact_dir = store_artifact_dir(data_dir);
         if cfg!(unix) {
             let ps = std::process::Command::new("ps")
                 .arg("-axo")
@@ -777,6 +804,8 @@ fn verify(
                 .output();
             // Redis rewrites its process title and the watchdog shells
             // embed the store's argv — count DISTINCT PORTS, not pids.
+            // The ps match runs against the CLIENT dir (a substring of
+            // the falkordb store dir); the lock read uses the artifact dir.
             let ports = ps
                 .ok()
                 .map(|out| store_ports_on_dir(&String::from_utf8_lossy(&out.stdout), data_dir))
@@ -787,7 +816,7 @@ fn verify(
                     data_dir.display()
                 ),
                 1 => {
-                    let holder = lock_holder_pid(data_dir);
+                    let holder = lock_holder_pid(&artifact_dir);
                     let supervised = holder.map(pid_alive).unwrap_or(false);
                     if supervised {
                         println!(
@@ -820,11 +849,13 @@ fn verify(
                 }
             }
         }
-        // (b) the port artifact: PING it — any Redis reply is live, a
-        // silent port is stale (the file carries no token, so liveness is
-        // all a client can prove). Kept (not deleted): D44-S2 attach mode
-        // consumes it.
-        let port_file = data_dir.join("port");
+        // (b) the port artifact: PING it — a Redis-shaped reply is live,
+        // a silent or banner port is stale (the file carries no token, so
+        // liveness is all a client can prove). R14-Cl3: the record is
+        // honest now — nothing consumes the port file today; it stays
+        // because a future owner may, and because deleting an artifact a
+        // running store still rewrites would flap.
+        let port_file = artifact_dir.join("port");
         if let Ok(raw) = std::fs::read_to_string(&port_file) {
             match raw.trim().parse::<u16>() {
                 Ok(port) if redis_answers(port, Duration::from_millis(500)) => {
@@ -833,7 +864,7 @@ fn verify(
                 Ok(port) => {
                     red += 1;
                     println!(
-                        "  RED   store: stale port file — nothing answers on {port} (left by an earlier boot; D44-S2 attach will consume it)"
+                        "  RED   store: stale port file — nothing answers on {port} (left by an earlier boot; delete it or re-run standalone)"
                     );
                 }
                 Err(_) => {
