@@ -317,7 +317,18 @@ fn standalone_main(
         let mut node =
             backend::run_standalone_backend_node(storage, ontology, node_args, producer_key)
                 .await?;
-        if let Some(path) = args.standalone_runtime_file.as_deref() {
+        // R14-final (SO-1): the publish and its removal guard are
+        // declared at SERVE-LOOP scope — an earlier cut scoped the guard
+        // inside the publish block, dropping it at startup and deleting
+        // attach.json milliseconds after writing it (attach could never
+        // succeed; only the final adversarial pass caught it).
+        struct RemoveAttachOnExit(std::path::PathBuf);
+        impl Drop for RemoveAttachOnExit {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0.join("attach.json"));
+            }
+        }
+        let _attach_guard = if let Some(path) = args.standalone_runtime_file.as_deref() {
             let sse_key = exocortex_wire::signing::derive_sse_client_key(&cluster_secret, &bearer);
             use std::fmt::Write as _;
             let mut sse_key_hex = String::with_capacity(64);
@@ -336,25 +347,21 @@ fn standalone_main(
             // D44-S2: publish the attach record so a concurrent session
             // can ATTACH (client mode against this node) instead of
             // failing on the data-dir lock. 0600 beside the graph; the
-            // data home is single-user in standalone mode.
+            // data home is single-user in standalone mode. The org rides
+            // the record (R14-final): an attacher running a different
+            // --org must refuse, not hydrate the owner's graph.
             supervisor::AttachInfo {
                 backend: format!("http://{}", node.local_addr),
+                org: args.org.clone(),
                 auth_token: bearer.clone(),
                 hmac_key: std::env::var("EXOCORTEX_HMAC_KEY")?,
                 sse_key: sse_key_hex,
             }
             .write(&data_home)?;
-            // R14: the OWNER removes the credential-bearing record when
-            // this node exits (any path) — attachers must never remove
-            // it, and a dead owner's record must not outlive it at rest.
-            struct RemoveAttachOnExit(std::path::PathBuf);
-            impl Drop for RemoveAttachOnExit {
-                fn drop(&mut self) {
-                    let _ = std::fs::remove_file(self.0.join("attach.json"));
-                }
-            }
-            let _attach_guard = RemoveAttachOnExit(data_home.clone());
-        }
+            Some(RemoveAttachOnExit(data_home.clone()))
+        } else {
+            None
+        };
         tracing::info!(addr = %node.local_addr, "exocortex-node mcp-standalone ready");
         loop {
             tokio::select! {
@@ -424,16 +431,28 @@ fn attach_to_live_node(
                     }
                     Ok(info)
                 };
-                match rt.block_on(tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    probe,
-                )) {
+                // The timeout future must be CONSTRUCTED inside the
+                // runtime (its Sleep needs a reactor at creation).
+                match rt.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(3), probe).await
+                }) {
                     Ok(outcome) => outcome,
                     Err(_) => Err(format!("owner at {info_copy} did not answer the probe within 3s")),
                 }
             });
         match attempt {
             Ok(info) => {
+                // R14-final (UQ4): the record names the owner's org — a
+                // different --org must refuse, not attach into the
+                // owner's graph under a phantom partition.
+                if info.org != args.org {
+                    anyhow::bail!(
+                        "attach refused: the live instance on {} serves org {:?}, not {:?}",
+                        data_home.display(),
+                        info.org,
+                        args.org
+                    );
+                }
                 if let Some(path) = args.standalone_runtime_file.as_deref() {
                     exocortex_storage::bounded_io::atomic_write_private(
                         path,
@@ -1230,7 +1249,7 @@ mod attach_tests {
 
     fn make_test_args() -> Args {
         use clap::Parser as _;
-        Args::parse_from(["exocortex-node"])
+        Args::parse_from(["exocortex-node", "--org", "attach-org"])
     }
 
     /// R14 (A2): `attach_to_live_node` is covered WITHOUT the bundled
@@ -1283,6 +1302,7 @@ mod attach_tests {
         // Matching owner: the attach publishes the owner's env and exits 0.
         supervisor::AttachInfo {
             backend: format!("http://{}", node.local_addr),
+            org: "attach-org".into(),
             auth_token: token.clone(),
             hmac_key: "2".repeat(64),
             sse_key: "3".repeat(64),

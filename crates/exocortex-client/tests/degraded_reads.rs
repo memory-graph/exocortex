@@ -77,16 +77,38 @@ async fn degraded_reads_carry_the_sync_health_object() {
 
 #[tokio::test]
 async fn healthy_reads_stay_registry_identical() {
-    let server = server(Some(StreamErrorCell::default()));
-    let out = server
-        .search_memories("anything".into(), None)
-        .await
-        .unwrap();
-    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert!(
-        value.get("sync").is_none(),
-        "a healthy stream must not stamp reads, got: {out}"
-    );
+    // R14-final (SO-4): byte-identity against a cell-FREE server on all
+    // three reads — key-absence on one tool proved nothing about shape.
+    let with_cell = server(Some(StreamErrorCell::default()));
+    let without_cell = server(None);
+    for (a, b) in [
+        (
+            with_cell.search_memories("anything".into(), None).await,
+            without_cell.search_memories("anything".into(), None).await,
+        ),
+        (
+            with_cell
+                .get_memory("deadbeefdeadbeefdeadbeefdeadbeef".into())
+                .await,
+            without_cell
+                .get_memory("deadbeefdeadbeefdeadbeefdeadbeef".into())
+                .await,
+        ),
+        (
+            with_cell
+                .find_related("deadbeefdeadbeefdeadbeefdeadbeef".into(), None)
+                .await,
+            without_cell
+                .find_related("deadbeefdeadbeefdeadbeefdeadbeef".into(), None)
+                .await,
+        ),
+    ] {
+        assert_eq!(
+            a.unwrap(),
+            b.unwrap(),
+            "a healthy cell must not alter read bytes"
+        );
+    }
 }
 
 #[tokio::test]

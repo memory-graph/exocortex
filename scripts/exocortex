@@ -114,7 +114,7 @@ case "$mode" in
       # dead owner can never silently swallow an acked sync_pending batch.
       if [ -n "${EXOCORTEX_ATTACHED:-}" ] && [ -n "${client_bin:-}" ] \
          && [ -d "$runtime_dir/client" ] \
-         && "$client_bin" --data-dir "$runtime_dir/client" --tail-audit --last 250 >/dev/null 2>&1 \
+         && "$client_bin" --data-dir "$runtime_dir/client" --tail-audit --last 10000 2>/dev/null \
            | grep -q '\[pending\]'; then
         echo "note: attached session WAL still holds pending entries; kept at $runtime_dir/client (restart a session while the owner is up to drain them)" >&2
       else
@@ -131,8 +131,11 @@ case "$mode" in
         exit 1
       fi
       attempts=$((attempts + 1))
-      [ "$attempts" -lt 200 ] || {
-        echo "standalone node did not become ready within 10 seconds" >&2
+      # R14-final (SO-8): 25s covers the node-side attach retry deadline
+      # (20s default) — an attaching session behind a slow-booting owner
+      # previously raced a 10s kill here.
+      [ "$attempts" -lt 500 ] || {
+        echo "standalone node did not become ready within 25 seconds" >&2
         exit 1
       }
       sleep 0.05
@@ -145,7 +148,7 @@ case "$mode" in
       *) echo "standalone node published a non-loopback backend" >&2; exit 1 ;;
     esac
     case "${EXOCORTEX_SSE_KEY:-}" in
-      *[!0-9a-f]*|'') echo "standalone node published an invalid SSE key" >&2; exit 1 ;;
+      *[!0-9a-fA-F]*|'') echo "standalone node published an invalid SSE key" >&2; exit 1 ;;
     esac
     [ "${#EXOCORTEX_SSE_KEY}" -eq 64 ] || {
       echo "standalone node published a wrong-width SSE key" >&2

@@ -164,7 +164,15 @@ pub fn harness_config_paths() -> Vec<(&'static str, std::path::PathBuf)> {
     if let Ok(custom) = std::env::var("EXOCORTEX_VERIFY_HARNESS_CONFIG") {
         return vec![("custom", std::path::PathBuf::from(custom))];
     }
-    let home = std::env::var("HOME").unwrap_or_default();
+    // R14-final (SO-11): with no HOME there is no user config dir — an
+    // empty string would build CWD-relative paths and probe whatever
+    // .claude.json happens to sit in the working directory.
+    let Ok(home) = std::env::var("HOME") else {
+        return Vec::new();
+    };
+    if home.is_empty() {
+        return Vec::new();
+    }
     vec![
         ("crush (~/.config/crush/crushrc)", {
             let mut p = std::path::PathBuf::from(&home);

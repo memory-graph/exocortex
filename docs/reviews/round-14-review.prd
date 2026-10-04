@@ -171,3 +171,45 @@ agents unavailable — disclosed); no finding dropped without a named check
 cost: 7 agents (complex 4, standard 3) · lenses fired 7/9 (not fired:
 Migrations, Packaging) · second opinion skipped (fix-loop pass 1; --final
 reserved for the loop's last pass) · pass_type full
+
+## Final pass addendum (2026-10-02, the fix loop's --final second opinion)
+
+An independent adversarial pass over the post-fix tree (never shown the
+round's findings) returned 11 candidates; adjudication kept 9, dropped
+1 with a named check, and confirmed the loop was NOT converged:
+
+- **SO-1 (Blocking) — the S3 fix broke attach entirely**: the
+  `RemoveAttachOnExit` guard was scoped inside the publish `if let`,
+  dropping at the closing brace and deleting `attach.json` at owner
+  STARTUP — concurrent sessions could never attach. Fixed: the guard
+  lives at serve-loop scope. The ungated tests missed it (they write
+  their own records) and the live suite had not run post-fix — the
+  final pass is what caught it. Re-verified green live.
+- **SO-2 (Blocking) — the B7 keep-guard was inert**: `>/dev/null` sat
+  BEFORE the pipe, so grep always read EOF and `rm -rf` always ran —
+  pending writes were still deletable. Fixed: stderr-only redirect,
+  10k-entry window.
+- **SO-3 (Blocking) — the B6 injection surface was half-closed**: a
+  quote-bearing URI PATH passes the parsed host checks into the sourced
+  env file. Fixed: the record's backend must carry no path and no query.
+- **SO-4 (Blocking per the closure rule) — the T4 remedy was recorded
+  but never landed** (a batched edit aborted before writing it): the
+  byte-identity test now actually exists.
+- **SO-8/SO-9/SO-10/SO-11 (Advisory) — fixed**: the wrapper readiness
+  window now covers the attach deadline (25s), the owner-path SSE-key
+  check accepts uppercase hex like every other validator,
+  `--install-block` writes atomically (mode-preserving temp+rename),
+  and an empty `HOME` no longer probes CWD-relative harness configs.
+- **UQ4 → fixed**: the attach record carries the owner's `org` and the
+  attacher refuses a different `--org` (the cross-org variant of the
+  empty-graph-next-door hazard).
+- **SO-5 dropped** — `cargo fmt --all -- --check` exits 0 on the exact
+  tree; the quoted worker indentation is rustfmt-legal.
+- **SO-6/SO-7 (docs) — fixed**: the plan rows' stale citations (the
+  pre-rename canary name, the false port-file rationale, pids→ports).
+- **Boundaries recorded**: the owner-death-vs-attacher race (UQ3 — a
+  session attached moments before the owner dies serves a frozen
+  snapshot until its own reconnect; D47 surfaces the degradation);
+  the attacher-vs-wrapper deadline interplay is now aligned (25s > 20s).
+
+cost: 1 agent (complex) · second opinion ran (--final) · pass_type full

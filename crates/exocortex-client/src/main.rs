@@ -100,6 +100,29 @@ fn org_visibility(org: &str, user: &str) -> VisibilityContext {
     }
 }
 
+/// R14-final: mode-preserving atomic file replace (temp sibling + rename)
+/// so an interrupted --install-block never leaves a truncated file.
+fn atomic_replace(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!(
+        "exo-install-block-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&tmp, bytes)?;
+    if let Ok(mode) = std::fs::metadata(path).map(|m| m.permissions()) {
+        std::fs::set_permissions(&tmp, mode)?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("--install-block {}: {e}", path.display())
+    })?;
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -138,7 +161,10 @@ fn main() -> anyhow::Result<()> {
             ),
         };
         let updated = exocortex_client::playbook::install_block_into(&existing);
-        std::fs::write(path, updated)?;
+        // R14-final (SO-10): atomic replace — a mid-write crash or ENOSPC
+        // on a bare fs::write truncates the user's instruction file, the
+        // same data loss the read refusal above exists to prevent.
+        atomic_replace(path, updated.as_bytes())?;
         eprintln!(
             "instruction block installed (v{}) — markers make reruns idempotent",
             exocortex_client::playbook::PLAYBOOK_VERSION

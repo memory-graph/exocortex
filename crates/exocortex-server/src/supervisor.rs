@@ -296,6 +296,9 @@ impl std::error::Error for DataDirOwned {}
 pub struct AttachInfo {
     /// The owner node's loopback HTTP/gRPC base URL.
     pub backend: String,
+    /// The org the owner serves (R14-final): attachers refuse a
+    /// different `--org` instead of hydrating a foreign partition.
+    pub org: String,
     /// The owner's bearer (EXOCORTEX_AUTH_TOKEN).
     pub auth_token: String,
     /// The owner's producer key (EXOCORTEX_HMAC_KEY, 64 hex).
@@ -340,6 +343,19 @@ impl AttachInfo {
         anyhow::ensure!(
             uri.port_u16().is_some(),
             "attach record backend must carry an explicit port"
+        );
+        // R14-final (SO-3): nothing may follow the authority — a path or
+        // query can carry quote bytes that escape the single-quoted env
+        // file the wrapper sources. The owner always renders a bare
+        // authority; anything else is not our record.
+        anyhow::ensure!(
+            uri.path().is_empty() || uri.path() == "/",
+            "attach record backend must carry no path, got {}",
+            self.backend
+        );
+        anyhow::ensure!(
+            uri.query().is_none(),
+            "attach record backend must carry no query"
         );
         for (name, value) in [
             ("auth_token", &self.auth_token),
@@ -633,6 +649,7 @@ mod tests {
         let sse = "3".repeat(64);
         let info = AttachInfo {
             backend: "http://127.0.0.1:41234".into(),
+            org: "attach-org".into(),
             auth_token: token.clone(),
             hmac_key: hmac.clone(),
             sse_key: sse.clone(),
@@ -640,6 +657,7 @@ mod tests {
         info.write(&dir).unwrap();
         let read_back = AttachInfo::read(&dir).unwrap();
         assert_eq!(read_back.backend, info.backend);
+        assert_eq!(read_back.org, "attach-org");
         assert_eq!(read_back.auth_token, token);
         assert_eq!(read_back.hmac_key, hmac);
         assert_eq!(read_back.sse_key, sse);
