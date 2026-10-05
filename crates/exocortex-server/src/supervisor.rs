@@ -166,6 +166,20 @@ fn apply_bundled_dyld_path(command: &mut Command, module: &std::path::Path) {
 /// that dies without running Drop (kill -9, crash) must never leave
 /// an orphaned redis-server appending to the data dir (GitHub issue
 /// #2's live evidence: two orphans on one AOF).
+/// D45 (root-caused 2026-10-05 on the owner's real graph): a BGSAVE
+/// fork over the loaded FalkorDB graph kills the PARENT with SIGILL
+/// ~1s after the first dirtying write (the fork child saves
+/// successfully; the parent dies — isolated by the discriminator:
+/// identical data with `--save ""` survives the full read/write
+/// workload indefinitely, reproduced live on the real 1,644-node
+/// graph). Durability rides the AOF (everysec); the RDB snapshot was
+/// redundant belt-and-suspenders, so the supervised default DISABLES
+/// it. An explicit `save_policy` still overrides (the D45 repro
+/// harness keeps its knob).
+fn store_save_policy(cfg: &SupervisorConfig) -> String {
+    cfg.save_policy.clone().unwrap_or_default()
+}
+
 fn spawn_child(cfg: &SupervisorConfig) -> anyhow::Result<Child> {
     let mut command = store_command(cfg);
     #[cfg(target_os = "macos")]
@@ -234,7 +248,8 @@ fn store_command(cfg: &SupervisorConfig) -> Command {
 }
 
 fn store_args(cfg: &SupervisorConfig, command: &mut Command) {
-    let save = cfg.save_policy.as_deref().unwrap_or("1 1");
+    let save = store_save_policy(cfg);
+    let save = save.as_str();
     command
         .args([
             "--port",
@@ -636,6 +651,28 @@ pub fn free_port() -> anyhow::Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D45: the supervised default must DISABLE the RDB snapshot — the
+    /// BGSAVE fork SIGILLs the parent over a real loaded graph. An
+    /// explicit harness policy still passes through.
+    #[test]
+    fn supervised_default_disables_the_bgsave_snapshot() {
+        let mut cfg = SupervisorConfig {
+            redis_server_bin: "/bin/sleep".into(),
+            falkordb_module: "unused".into(),
+            data_dir: std::env::temp_dir(),
+            port: 0,
+            max_restarts: 0,
+            port_file: None,
+            auth_token: None,
+            supervisor_pid: None,
+            startup_timeout: None,
+            save_policy: None,
+        };
+        assert_eq!(store_save_policy(&cfg), "", "default: no RDB snapshot");
+        cfg.save_policy = Some("1 1".into());
+        assert_eq!(store_save_policy(&cfg), "1 1", "harness override rides");
+    }
 
     #[test]
     fn attach_record_round_trips_and_fails_closed_on_malformation() {
