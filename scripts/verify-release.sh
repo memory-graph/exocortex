@@ -2,30 +2,51 @@
 # Canonical local/CI prerequisite for any publish or tagged release.
 set -euo pipefail
 
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo check -p exocortex-server --all-targets --features fastembed
-cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --no-fail-fast
-cargo deny check
-cargo xtask kernel-purity
-cargo xtask fingerprint
-cargo xtask gen-schemas
-cargo xtask gen-playbook
-cargo xtask no-llm
-cargo xtask proto-sync
-cargo xtask signing-hygiene
-cargo xtask compatibility-policy
-cargo xtask seam-inventory
-cargo xtask adapter-contract
-cargo xtask metrics-hygiene
-cargo xtask wire-standalone
-cargo xtask bench
-cargo xtask storage-conformance
+# REL2: per-phase wall-time instrumentation. Verdicts are untouched —
+# each phase runs exactly as before; the timer only wraps it. Summary
+# lands at exit (and in the log) so the budget is measurable, not
+# guessed.
+_MATRIX_START=${SECONDS:-0}
+_matrix_total_before=$_MATRIX_START
+phase() {
+  local name="$1"; shift
+  local t0=${SECONDS:-0}
+  "$@"
+  local rc=$?
+  printf '[matrix] %4ds  %s\n' "$(( ${SECONDS:-0} - t0 ))" "$name" >&2
+  return $rc
+}
+# set -e kills the function on failure, so also record failures via EXIT.
+_matrix_summary() {
+  printf '[matrix] %4ds  TOTAL (phases instrumented from second %s)\n' \
+    "$(( ${SECONDS:-0} - _MATRIX_START ))" "$_MATRIX_START" >&2
+}
+trap _matrix_summary EXIT
+
+phase "fmt" cargo fmt --all -- --check
+phase "clippy" cargo clippy --workspace --all-targets -- -D warnings
+phase "check-fastembed" cargo check -p exocortex-server --all-targets --features fastembed
+phase "test-workspace" cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --no-fail-fast
+phase "deny" cargo deny check
+phase "xtask:kernel-purity" cargo xtask kernel-purity
+phase "xtask:fingerprint" cargo xtask fingerprint
+phase "xtask:gen-schemas" cargo xtask gen-schemas
+phase "xtask:gen-playbook" cargo xtask gen-playbook
+phase "xtask:no-llm" cargo xtask no-llm
+phase "xtask:proto-sync" cargo xtask proto-sync
+phase "xtask:signing-hygiene" cargo xtask signing-hygiene
+phase "xtask:compatibility-policy" cargo xtask compatibility-policy
+phase "xtask:seam-inventory" cargo xtask seam-inventory
+phase "xtask:adapter-contract" cargo xtask adapter-contract
+phase "xtask:metrics-hygiene" cargo xtask metrics-hygiene
+phase "xtask:wire-standalone" cargo xtask wire-standalone
+phase "xtask:bench" cargo xtask bench
+phase "xtask:storage-conformance" cargo xtask storage-conformance
 # Compile every integration-gated live suite even when its backend or
 # token is absent: a gated suite that no longer compiles must fail the
 # matrix HERE, not at the first release run that happens to carry the
 # token (REL1 — four suites had rotted invisibly behind their gates).
-cargo test -p exocortex-adapter-github -p exocortex-adapter-linear \
+phase "rel1-compile-sweep" cargo test -p exocortex-adapter-github -p exocortex-adapter-linear \
   -p exocortex-adapter-postgres -p exocortex-storage \
   -p exocortex-dreams -p exocortex-cluster \
   --features exocortex-adapter-github/integration,exocortex-adapter-linear/integration,exocortex-adapter-postgres/integration,exocortex-storage/integration,exocortex-dreams/integration,exocortex-cluster/integration \
@@ -62,10 +83,10 @@ if [ -x "$RUNTIME_DIR/redis-server" ] && [ -f "$RUNTIME_DIR/falkordb.so" ]; then
 else
   echo "live standalone attach suite UNEXECUTED (no bundled runtime at $RUNTIME_DIR)"
 fi
-cargo xtask write-path-parity
-cargo xtask dead-enforcement
-cargo xtask auth-coverage
-cargo xtask artifact-equivalence
-cargo xtask acceptance-coverage
-cargo xtask deployment-acceptance
-cargo xtask ontology-surfaces
+phase "xtask:write-path-parity" cargo xtask write-path-parity
+phase "xtask:dead-enforcement" cargo xtask dead-enforcement
+phase "xtask:auth-coverage" cargo xtask auth-coverage
+phase "xtask:artifact-equivalence" cargo xtask artifact-equivalence
+phase "xtask:acceptance-coverage" cargo xtask acceptance-coverage
+phase "xtask:deployment-acceptance" cargo xtask deployment-acceptance
+phase "xtask:ontology-surfaces" cargo xtask ontology-surfaces
