@@ -58,6 +58,8 @@ fn installed_wrapper_starts_supervisor_and_serves_real_mcp_runtime() {
             dir.to_str().unwrap(),
         ])
         .env("EXOCORTEX_BIN_DIR", &dir)
+        .env_remove("EXOCORTEX_REDIS_SERVER")
+        .env_remove("EXOCORTEX_FALKORDB_MODULE")
         .env("EXOCORTEX_STANDALONE_NODE_BIN", &fake_node)
         .env("EXOCORTEX_STANDALONE_CLIENT_BIN", &fake_client)
         .stdin(Stdio::piped())
@@ -158,6 +160,8 @@ fn attached_session_reuses_owner_credentials_and_gets_its_own_wal_slot() {
             dir.to_str().unwrap(),
         ])
         .env("EXOCORTEX_BIN_DIR", &dir)
+        .env_remove("EXOCORTEX_REDIS_SERVER")
+        .env_remove("EXOCORTEX_FALKORDB_MODULE")
         .env("EXOCORTEX_STANDALONE_NODE_BIN", &fake_node)
         .env("EXOCORTEX_STANDALONE_CLIENT_BIN", &fake_client)
         .stdin(Stdio::piped())
@@ -489,6 +493,8 @@ fn attach_runtime_failures_refuse_before_the_client_spawns() {
         let mut child = Command::new(wrapper)
             .args(["--mode", "mcp-standalone", "--org", "refuse", "--user", "t"])
             .env("EXOCORTEX_BIN_DIR", &dir)
+            .env_remove("EXOCORTEX_REDIS_SERVER")
+            .env_remove("EXOCORTEX_FALKORDB_MODULE")
             .env("EXOCORTEX_STANDALONE_NODE_BIN", &fake_node)
             .env("EXOCORTEX_STANDALONE_CLIENT_BIN", &fake_client)
             .stdin(Stdio::piped())
@@ -545,6 +551,8 @@ fn installed_wrapper_rule_probe_enters_standalone_topology() {
             dir.to_str().unwrap(),
         ])
         .env("EXOCORTEX_BIN_DIR", bin_dir)
+        .env_remove("EXOCORTEX_REDIS_SERVER")
+        .env_remove("EXOCORTEX_FALKORDB_MODULE")
         .env("EXOCORTEX_STANDALONE_NODE_BIN", &fake_node)
         .output()
         .unwrap();
