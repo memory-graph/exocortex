@@ -724,15 +724,14 @@ mod tests {
         // Under full parallel load the kernel's flock release can lag the
         // close by a moment (observed once in the matrix run, green
         // standalone) — retry briefly rather than flaking the gate.
-        let reacquired = std::thread::spawn(|| ()).join().is_ok()
-            && (0..20).any(|_| {
-                if acquire_data_dir_lock(&dir).is_ok() {
-                    true
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    false
-                }
-            });
+        let reacquired = (0..20).any(|_| {
+            if acquire_data_dir_lock(&dir).is_ok() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        });
         assert!(reacquired, "released on drop (within 2s)");
         let _ = std::fs::remove_dir_all(&dir);
     }
