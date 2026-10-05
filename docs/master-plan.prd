@@ -1467,14 +1467,15 @@ of the real data dir (one command, recorded in the row). **Round 14
 (9c22c5f) then deep-reviewed the whole cascade** (the 2026-10-02
 header; `docs/reviews/round-14-review.prd`) and fixed all 7 Blocking
 + 26 Advisory findings — the cascade rows carry [R14] amendment notes
-where the review renamed tests or changed mechanisms. The fast gate
-loop is green on the closing tree (fmt, clippy, the full client and
-server suites, gen-playbook, seam-inventory, no-llm, gen-schemas,
-acceptance-coverage); the FULL verify-release.sh matrix has NOT been
-run since the cascade — it is the precondition before the next push
-(it now also runs the live attach suite when the bundled runtime
-resolves, an R14 gap-closure), and nothing has been pushed past
-7cac12d. The table below carries the
+where the review renamed tests or changed mechanisms. The FULL verify-release.sh matrix
+ran GREEN on 0e2a105 (2026-10-04, exit 0 — including the live attach
+suite over the bundled runtime and, along the way, three real catches:
+one flock release-visibility flake, the attach probe's raw fingerprint
+compare outside the OC-PRD D2 policy table, and the runtime env leaking
+into the wrapper fixtures); everything is PUSHED through 0e2a105.
+Skipped legs for any release note: live Falkor SLO + storage-conformance
+live Falkor/Redis (FALKOR_URL/REDIS_URL unset), Postgres CDC, GitHub/
+Linear adapters (credentials), and the compose chaos harness. The table below carries the
 CLOSED detail ledgers (Rounds 6-9; every row Done, evidence inline;
 the summary rows live in the Done section). The next locally
 satisfiable work is Wave 5 (D3/D15) per the open-row gates; the
