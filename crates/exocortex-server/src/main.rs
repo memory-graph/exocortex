@@ -423,11 +423,15 @@ fn attach_to_live_node(
                         .await
                         .map_err(|e| e.to_string())?
                         .into_inner();
-                    if fp.fingerprint != ontology.fingerprint.0.to_vec() {
-                        return Err(format!(
-                            "attach refused: owner ontology fingerprint mismatch (owner {} bytes)",
-                            fp.fingerprint.len()
-                        ));
+                    // OC-PRD D2: the ONE admission policy (the gate
+                    // rejects raw fingerprint comparisons — and the
+                    // round-14 cleanup flagged this copy diverging from
+                    // verify()'s).
+                    if let Err(error) = exocortex_kernel::admit_peer(
+                        &fp.fingerprint,
+                        &ontology.fingerprint.0,
+                    ) {
+                        return Err(format!("attach refused: owner ontology {error}"));
                     }
                     Ok(info)
                 };
