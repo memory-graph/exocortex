@@ -1105,7 +1105,11 @@ mod tests {
             "the stub never answers PING"
         );
         let pid_file = dir.join("stub.pid");
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // D36 class: under heavy machine contention the stub's spawn can
+        // stall pre-exec for seconds — the bounded wait must outlive a
+        // loaded machine, not 3 spare seconds (publish-matrix flake
+        // 2026-10-06 under 23 parallel jest workers).
+        let deadline = Instant::now() + Duration::from_secs(20);
         let stub_pid: i32 = loop {
             if let Ok(text) = std::fs::read_to_string(&pid_file) {
                 break text.trim().parse().expect("stub pid");
