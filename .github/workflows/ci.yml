@@ -10,10 +10,17 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# REL2: the matrix runs as four PARALLEL shards instead of one
+# 45-minute job. Coverage is identical — every gate runs on the same
+# sha, each exactly once, with the same verdicts; only the wall time
+# changes (the longest shard replaces the sum). Shard membership is
+# documented per job; moving a gate between shards is fine, dropping
+# one is not. Local/verify-release.sh remains the canonical sequential
+# matrix; a shard failing here must reproduce there.
 jobs:
-  gates:
+  lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # The exact pin from rust-toolchain.toml: stable's rustfmt has
@@ -24,17 +31,102 @@ jobs:
           toolchain: "1.85.0"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@d865e9aac326f15b06ac52b57abb58cd0e3330e4 # cargo-deny
+      - name: Lint shard (fmt + clippy + deny)
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo deny check
+
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      # REL2: nextest runs the suites in parallel across test binaries
+      # (doctests stay on cargo test); sccache shares compiled
+      # artifacts across the feature-set flips via the GH cache.
+      EXOCORTEX_TEST_RUNNER: nextest
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.85.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install checksum-verified protoc
         run: |
           bash scripts/install-protoc.sh "$RUNNER_TEMP/protoc"
           echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
-      - uses: taiki-e/install-action@d865e9aac326f15b06ac52b57abb58cd0e3330e4 # cargo-deny
-      - name: Mandatory correctness prerequisite
-        run: bash scripts/verify-release.sh
+      - uses: taiki-e/install-action@d865e9aac326f15b06ac52b57abb58cd0e3330e4 # cargo-nextest, sccache
+        with:
+          tool: cargo-nextest,sccache
+      - name: Test shard (workspace tests + doctests + REL1 compile sweep)
+        run: |
+          cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --no-run
+          cargo nextest run --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --no-fail-fast
+          cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --doc --no-fail-fast
+          cargo test -p exocortex-adapter-github -p exocortex-adapter-linear \
+            -p exocortex-adapter-postgres -p exocortex-storage \
+            -p exocortex-dreams -p exocortex-cluster \
+            --features exocortex-adapter-github/integration,exocortex-adapter-linear/integration,exocortex-adapter-postgres/integration,exocortex-storage/integration,exocortex-dreams/integration,exocortex-cluster/integration \
+            --no-run
+          echo "live legs (Postgres/GitHub/Linear) skip loudly without their credentials, as verify-release reports them"
+
+  xtask-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.85.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install checksum-verified protoc
+        run: |
+          bash scripts/install-protoc.sh "$RUNNER_TEMP/protoc"
+          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+      - name: Gate shard (every xtask correctness gate + bench + conformance)
+        run: |
+          cargo xtask kernel-purity
+          cargo xtask fingerprint
+          cargo xtask gen-schemas
+          cargo xtask gen-playbook
+          cargo xtask no-llm
+          cargo xtask proto-sync
+          cargo xtask signing-hygiene
+          cargo xtask compatibility-policy
+          cargo xtask seam-inventory
+          cargo xtask adapter-contract
+          cargo xtask metrics-hygiene
+          cargo xtask wire-standalone
+          cargo xtask bench
+          cargo xtask storage-conformance
+          cargo xtask write-path-parity
+          cargo xtask dead-enforcement
+          cargo xtask auth-coverage
+          cargo xtask artifact-equivalence
+          cargo xtask acceptance-coverage
+          cargo xtask ontology-surfaces
         env:
           # Shared runners steal CPU. The factor still rejects a 2x regression.
           SLO_MULTIPLIER: "2"
-      - name: Publish-script disposable fixture
-        run: bash scripts/tests/publish.sh
-      - name: Release-asset immutability fixture
-        run: bash scripts/tests/release-assets.sh
+
+  fixtures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.85.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install checksum-verified protoc
+        run: |
+          bash scripts/install-protoc.sh "$RUNNER_TEMP/protoc"
+          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+      - name: Fixture shard (deployment acceptance + publish/release fixtures)
+        run: |
+          cargo xtask deployment-acceptance
+          bash scripts/tests/publish.sh
+          bash scripts/tests/release-assets.sh

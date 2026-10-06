@@ -6,6 +6,12 @@ set -euo pipefail
 # each phase runs exactly as before; the timer only wraps it. Summary
 # lands at exit (and in the log) so the budget is measurable, not
 # guessed.
+# REL2: line-tables-only debuginfo for every matrix build — panic line
+# numbers survive, most debuginfo codegen cost goes away. Verdicts are
+# unaffected (this is a compile-profile knob, not a test knob).
+export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-1}"
+export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-1}"
+
 _MATRIX_START=${SECONDS:-0}
 _matrix_total_before=$_MATRIX_START
 phase() {
@@ -26,7 +32,19 @@ trap _matrix_summary EXIT
 phase "fmt" cargo fmt --all -- --check
 phase "clippy" cargo clippy --workspace --all-targets -- -D warnings
 phase "check-fastembed" cargo check -p exocortex-server --all-targets --features fastembed
-phase "test-workspace" cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --no-fail-fast
+# REL2: compile and run attributed separately — the budget's biggest
+# phase deserves to say which half it spent.
+# REL2: CI runs the suites through nextest (parallel execution across
+# test binaries; doctests stay on cargo test) by exporting
+# EXOCORTEX_TEST_RUNNER=nextest — locally the default stays cargo test
+# so the script never depends on a tool the tree doesn't ship.
+if [ "${EXOCORTEX_TEST_RUNNER:-}" = "nextest" ] && command -v cargo-nextest >/dev/null 2>&1; then
+  phase "test-workspace-compile" cargo nextest run --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --no-fail-fast --profile ci
+  phase "test-workspace-doctests" cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --doc --no-fail-fast
+else
+  phase "test-workspace-compile" cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --no-run
+  phase "test-workspace-run" cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --no-fail-fast
+fi
 phase "deny" cargo deny check
 phase "xtask:kernel-purity" cargo xtask kernel-purity
 phase "xtask:fingerprint" cargo xtask fingerprint

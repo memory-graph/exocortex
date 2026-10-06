@@ -1693,13 +1693,26 @@ fn seam_inventory() -> Result<()> {
     );
     // Every declared seam's suite executes here (the live-feature
     // suites skip loudly without their backends, exactly as
-    // storage-conformance reports them).
+    // storage-conformance reports them). REL2: suites ride the SAME
+    // feature set the matrix's workspace phase compiles with, so this
+    // gate reuses those artifacts instead of building a second variant —
+    // and suites cfg'd behind a testing feature run for real rather
+    // than compiling to an empty, silently-passing binary.
     for (_, package, file, _) in gates::SEAM_INVENTORY {
         if let Some(target) = file
             .strip_prefix("tests/")
             .and_then(|t| t.strip_suffix(".rs"))
         {
-            run(&["test", "-p", package, "--test", target], &[])?;
+            let mut args: Vec<&str> = vec!["test", "-p", package, "--test", target];
+            let features = match *package {
+                "exocortex-server" => Some("exocortex-server/testing,exocortex-server/otlp"),
+                "exocortex-adapter-sdk" => Some("exocortex-adapter-sdk/testing"),
+                _ => None,
+            };
+            if let Some(features) = features {
+                args.extend_from_slice(&["--features", features]);
+            }
+            run(&args, &[])?;
         }
     }
     println!(
