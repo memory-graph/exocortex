@@ -15,6 +15,7 @@ ORDER=(
 # stripping set cannot drift apart.
 STRIP_CRATES=(
   exocortex-cluster exocortex-ingest exocortex-server exocortex-pack-study-v1
+  exocortex-dreams
 )
 
 repo_root=$(git rev-parse --show-toplevel)
