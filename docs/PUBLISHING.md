@@ -60,6 +60,35 @@ binaries (`exocortex-adapter-parquet` / `-iceberg` / `-delta` /
 manifests with the standing adapter-crate policy that always excluded
 them from ORDER (their manifests could previously publish by mistake).
 
+**0.5.0 (2026-10-06)** — the standalone-reliability release: the
+D44–D49 cascade, round 14, and REL2. No ontology fingerprint move
+(`a427b3ad…ed9d` unchanged); no new workspace dependency (the D44-S2
+`libc` record predates this cut). New surfaces: the client-local
+`exocortex.backend_status` MCP tool (degraded backends stamp reads with
+a `sync` health object — a frozen snapshot never reads as live);
+`--install-block <file>` (idempotent, version-marked instruction-block
+install; `--dump-block` emits the markers); `--verify` grows four rows
+(harness wiring RED-when-unwired, WAL org/user partition ledger,
+store-process scan by distinct `--port`, stale port-file PING) and WAL
+entries stamp their org/user partition. Standalone: concurrent sessions
+ATTACH to the live node (`attach.json` endpoint+secrets, parsed-URI
+loopback validation, gRPC liveness+fingerprint probe, owner credentials
++ per-session WAL slot) — one store per data dir by construction; the
+supervised store runs behind a watchdog in its own process group with an
+exclusive data-dir flock, every redis-plane consumer reconnects after a
+supervised restart, and the D45 root cause is fixed (the `--save 1 1`
+BGSAVE fork SIGILLs the parent over a loaded graph — supervised stores
+disable the RDB snapshot; AOF everysec carries durability). All ten
+binaries log WARN by default (RUST_LOG still overrides). Tooling: the
+gate matrix is per-phase instrumented, seam suites reuse the workspace
+feature build, and CI runs as four parallel shards (wall ~17min vs
+~40min). Issues #2/#3/#5/#6/#7 closed. Release-note honesty: the live
+Falkor SLO + storage-conformance Falkor/Redis legs, Postgres CDC, and
+the GitHub/Linear adapter suites were not executed (no FALKOR_URL/
+REDIS_URL/POSTGRES_URL/credentials); the compose chaos harness did not
+run; D45's real-data diagnosis ran on the owner's machine (this cut
+includes its fix).
+
 **0.4.1 (2026-09-09)** — the agent-pilot release: the SaaS adapter
 family, the study pack, and the round 10-12 hardening. New publishable
 crates: `exocortex-api-client` (ORDER entry before `exocortex-client`)
