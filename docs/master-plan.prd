@@ -1,5 +1,24 @@
 # Exocortex — Master Plan
 
+**Status (2026-10-06, v0.5.0 SHIPPED — the standalone-reliability
+release):** version bumped (24 workspace dep reqs + the openapi golden
+regenerated), CI's four shards green on the exact release tree, tag
+v0.5.0 pushed (release.yml: correctness + all three platform builds +
+assets green), and ALL 17 crates published to crates.io at 0.5.0
+(publish exit 0, its own full matrix green inside the run). Two
+release-cut catches, both the guard classes existing for: D40's
+dreams→ops/cache dev-deps tripped the forward-dev-dep guard (dreams
+joined STRIP_CRATES, the REL3 remedy) and one D36-class contention
+flake (stub spawn stalled past a 3s deadline under 23 parallel jest
+workers — deadline stretched to 20s). Release-note honesty, as the
+PUBLISHING entry records: live Falkor/Redis/Postgres/CDC legs and the
+SaaS adapter live suites not executed; compose chaos not run; D45's
+real-data diagnosis ran on the owner's machine and its fix ships.
+REL2 landed first (measured baseline, seam suites reusing the workspace
+feature build, CI sharded to four parallel jobs — wall ~17min vs
+~40min, all green). The queue after the release: PLT1 on the owner's
+go, Wave 5 D3/D15, D19 still parked on LINEAR_API_KEY.
+
 **Status (2026-10-02, ROUND 14 — the cascade's deep review, fixed in
 cycle):** the deep-pr-review-lean pass over the five-commit cascade
 returned changes-requested (7 Blocking, 26 Advisory — verify's store
