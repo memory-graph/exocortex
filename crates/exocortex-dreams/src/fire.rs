@@ -697,6 +697,11 @@ impl RedisFireQueue {
     /// backlog is short; a backlog at or above
     /// [`QUIET_HOURS_BACKLOG_MIN`] runs anyway so cycles never starve.
     pub async fn drain(&mut self, timeout: Duration) -> anyhow::Result<DrainResult> {
+        // D46b: hold through the post-boot index-GC fork window — the
+        // store's periodic fork SIGILLs the parent under darwin
+        // whenever ANY client round-trip is in flight around it, and
+        // this poller pokes the store every few seconds.
+        exocortex_storage::fork_window::await_if_holding().await;
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         let _: u64 = redis::Script::new(PROMOTE_DEFERRED_LUA)
             .key(self.queue_key.as_str())

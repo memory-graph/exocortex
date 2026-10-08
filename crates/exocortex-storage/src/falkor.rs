@@ -1106,6 +1106,8 @@ impl FalkorStorage {
         params: &serde_json::Value,
         read_only: bool,
     ) -> Result<Vec<Vec<FalkorValue>>, StorageError> {
+        // D46b: hold through the post-boot index-GC fork window.
+        crate::fork_window::await_if_holding().await;
         #[cfg(feature = "integration")]
         if matches!(
             template_id,
@@ -1741,6 +1743,8 @@ impl FalkorStorage {
         &self,
         parts: &[(&str, serde_json::Value)],
     ) -> Result<bool, StorageError> {
+        // D46b: hold through the post-boot index-GC fork window.
+        crate::fork_window::await_if_holding().await;
         let max_lsn = parts
             .iter()
             .filter_map(|(_, values)| values.get("lsn").and_then(serde_json::Value::as_u64))
@@ -1915,6 +1919,8 @@ impl FalkorStorage {
         publication_claim_token: Option<&str>,
         audit: Option<&AuditEvent>,
     ) -> Result<Option<FencedBatchCommit>, StorageError> {
+        // D46b: hold through the post-boot index-GC fork window.
+        crate::fork_window::await_if_holding().await;
         // R-T4 inverse companions join the same transaction.
         let all_rels = self.expand_relationships(rs);
 
@@ -4129,6 +4135,8 @@ impl Storage for FalkorStorage {
         id: &MemoryId,
         lease: &OwnerLease,
     ) -> Result<CommitRecord, StorageError> {
+        // D46b: hold through the post-boot index-GC fork window.
+        crate::fork_window::await_if_holding().await;
         let lsn = self.next_lsn().await?;
         let now = Utc::now();
         let props_json = match self.get_memory(id).await? {

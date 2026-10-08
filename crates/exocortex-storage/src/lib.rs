@@ -10,6 +10,9 @@ pub mod bounded_io;
 pub mod cypher;
 /// The FalkorDB adapter (§6.5).
 pub mod falkor;
+/// The post-boot store quiesce window (D46b): the darwin index-GC
+/// fork must meet an idle store.
+pub mod fork_window;
 /// The deterministic in-memory test double (§6.6).
 pub mod in_memory;
 /// The one deliberate seam: the `Storage` trait (§6.1) and `StorageError`.

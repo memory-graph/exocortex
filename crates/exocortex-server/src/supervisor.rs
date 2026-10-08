@@ -126,6 +126,10 @@ impl SupervisedServer {
                 if !wait_ping(cfg, &mut self.child)? {
                     anyhow::bail!("supervised server restart did not answer PING");
                 }
+                // D46: every fresh store boot must re-disarm the fork
+                // and re-arm the D46b quiesce window.
+                disarm_async_delete_fork(cfg)?;
+                exocortex_storage::fork_window::arm();
             }
             Ok(None) => {}
             Err(e) => anyhow::bail!("supervisor try_wait failed: {e}"),
@@ -446,6 +450,71 @@ pub fn acquire_data_dir_lock(data_dir: &std::path::Path) -> anyhow::Result<std::
     Ok(file)
 }
 
+/// D46 (root-caused 2026-10-07 on the owner's real graph): the module's
+/// async-delete worker drains its deletion queue in a `RedisModule_Fork`
+/// child ~30-60s after the first graph delete. On darwin-arm64 that fork
+/// corrupts a parked thread-pool worker's condition variable and macOS
+/// pthread traps the PARENT with SIGILL — the crash reports put the
+/// faulting thread in `__psynch_cvwait` inside the module's `thread_do`.
+/// This is the second D45-class fork trigger (after the BGSAVE fork).
+/// The module rejects `ASYNC_DELETE` as a load argument and rejects
+/// `0`/`false`/`off` at runtime — only the literal `no` is accepted —
+/// so the supervisor flips it over RESP right after the store answers
+/// PING. Deletions then run inline on the query thread: correct, and
+/// cheap at the supervised store's delete volume. A repro harness that
+/// needs the fork back can send `GRAPH.CONFIG SET ASYNC_DELETE yes`.
+fn async_delete_no_resp() -> &'static [u8] {
+    b"*4\r\n$12\r\nGRAPH.CONFIG\r\n$3\r\nSET\r\n$12\r\nASYNC_DELETE\r\n$2\r\nno\r\n"
+}
+
+/// Best-effort `GRAPH.CONFIG SET ASYNC_DELETE no` over RESP, mirroring
+/// `ping`/`request_shutdown` (AUTH first when the store enforces a token).
+fn set_async_delete_no(port: u16, auth_token: Option<&str>) -> bool {
+    use std::io::{Read, Write};
+    let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let mut buf = [0u8; 128];
+    if let Some(token) = auth_token {
+        if s.write_all(format!("AUTH {token}\r\n").as_bytes()).is_err() {
+            return false;
+        }
+        let Ok(n) = s.read(&mut buf) else {
+            return false;
+        };
+        if !buf[..n].starts_with(b"+OK") {
+            return false;
+        }
+    }
+    if s.write_all(async_delete_no_resp()).is_err() {
+        return false;
+    }
+    let Ok(n) = s.read(&mut buf) else {
+        return false;
+    };
+    buf[..n].starts_with(b"+OK")
+}
+
+/// Apply the D46 mitigation after the store is up. On darwin the
+/// async-delete fork is a known parent-killer, so failure is fatal with
+/// a named cause rather than the crash loop it predicts; elsewhere the
+/// fork is benign and the setting is still correct, so a warning rides.
+fn disarm_async_delete_fork(cfg: &SupervisorConfig) -> anyhow::Result<()> {
+    if set_async_delete_no(cfg.port, cfg.auth_token.as_deref()) {
+        return Ok(());
+    }
+    let why = "could not send GRAPH.CONFIG SET ASYNC_DELETE no to the supervised store";
+    #[cfg(target_os = "macos")]
+    {
+        anyhow::bail!("{why}; its async-delete fork can SIGILL the store (D46)");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tracing::warn!("{why}");
+        Ok(())
+    }
+}
+
 /// Wait for PING with the startup deadline; errors if the child exits.
 fn wait_ping(cfg: &SupervisorConfig, child: &mut Child) -> anyhow::Result<bool> {
     let deadline = Instant::now() + cfg.startup_timeout.unwrap_or(Duration::from_secs(10));
@@ -572,6 +641,11 @@ pub fn spawn_supervised(cfg: &SupervisorConfig) -> anyhow::Result<SupervisedServ
                 .as_secs()
         );
     }
+    // D46: disarm the module's async-delete fork before any traffic can
+    // queue a deletion, and arm the D46b quiesce window so the one
+    // index-GC fork per boot meets an idle store.
+    disarm_async_delete_fork(cfg)?;
+    exocortex_storage::fork_window::arm();
     if let Some(path) = &cfg.port_file {
         exocortex_storage::bounded_io::atomic_write_private(
             path,
@@ -672,6 +746,28 @@ mod tests {
         assert_eq!(store_save_policy(&cfg), "", "default: no RDB snapshot");
         cfg.save_policy = Some("1 1".into());
         assert_eq!(store_save_policy(&cfg), "1 1", "harness override rides");
+    }
+
+    /// D46: the supervisor's RESP payload must spell the config exactly
+    /// as the module's parser accepts — a four-element array with the
+    /// literal `no` (0/false/off are rejected, as is a load argument).
+    #[test]
+    fn async_delete_no_resp_spells_the_only_accepted_form() {
+        // ASYNC_DELETE is 12 bytes; a miscounted bulk length is a
+        // protocol error that the server answers by closing the link.
+        let payload = async_delete_no_resp();
+        assert_eq!(
+            payload,
+            &b"*4\r\n$12\r\nGRAPH.CONFIG\r\n$3\r\nSET\r\n$12\r\nASYNC_DELETE\r\n$2\r\nno\r\n"[..]
+        );
+        let body = String::from_utf8_lossy(payload);
+        for token in ["GRAPH.CONFIG", "ASYNC_DELETE", "no"] {
+            let len = token.len();
+            assert!(
+                body.contains(&format!("${len}\r\n{token}\r\n")),
+                "{token} framing"
+            );
+        }
     }
 
     #[test]
