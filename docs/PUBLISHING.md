@@ -60,6 +60,37 @@ binaries (`exocortex-adapter-parquet` / `-iceberg` / `-delta` /
 manifests with the standing adapter-crate policy that always excluded
 them from ORDER (their manifests could previously publish by mistake).
 
+**0.5.1 (2026-10-07)** — the store-crash-tolerance patch release
+(D46/D46b/D46c; no ontology fingerprint move, `a427b3ad…ed9d`
+unchanged; no new workspace dependency). Root cause, from the owner's
+crash reports: the darwin-arm64 falkordblite runtime SIGILLs the
+supervised store's parent whenever a module fork lands under in-flight
+traffic (the fork corrupts a parked thread-do worker's condition
+variable and macOS pthread traps it). D45 had removed the BGSAVE fork;
+0.5.1 removes or rides out the remaining two. The supervisor now sends
+`GRAPH.CONFIG SET ASYNC_DELETE no` over RESP after every store boot
+(the only accepted form — not a load argument, and `0`/`false`/`off`
+are rejected), and arms a 25-75s post-boot quiesce window that the
+storage command paths and the Dreams fire-drain poller hold through,
+so the undisarmable index-GC fork (~39-56s after boot; no load
+argument, no runtime config, no Cypher option disables it) meets an
+idle store instead of racing ambient node traffic. Ingest retries
+transient store-connection failures (idempotent read + batch-key-
+deduplicated commit, six attempts at a 2s gap) so a supervised restart
+no longer fails an accepted end-of-session batch with an opaque
+internal storage error. Verified live on the owner's personal graph:
+end_session commits, LSN advances, backend_status stays
+`degraded=false` across restarts. Release-note honesty: the runtime can
+still SIGILL one-to-two times per boot window (instant-boot deaths plus
+forks under ungated traffic) — the supervisor's bounded restarts and
+the ingest retry ride through it, but the permanent fix is an upstream
+falkordblite darwin-arm64 rebuild (npm ships only 8.2.3-falkordb.4.16.2
+and .3); the live Falkor SLO, storage-conformance, Postgres CDC, and
+GitHub/Linear adapter legs were not executed (no FALKOR_URL/
+REDIS_URL/POSTGRES_URL/credentials), the compose chaos harness did not
+run, and D46's real-graph reproduction and verification ran on the
+owner's machine (this cut includes its fixes).
+
 **0.5.0 (2026-10-06)** — the standalone-reliability release: the
 D44–D49 cascade, round 14, and REL2. No ontology fingerprint move
 (`a427b3ad…ed9d` unchanged); no new workspace dependency (the D44-S2
