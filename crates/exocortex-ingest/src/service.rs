@@ -1183,6 +1183,46 @@ fn internal_storage_status(
     Status::internal("internal storage error")
 }
 
+/// D46c: the supervised darwin store can die and restart mid-ingest (the
+/// SIGILL class the supervisor documents under D45/D46). A `Backend`
+/// error that is clearly a lost connection is transient across the
+/// supervisor's bounded restart — retry a few times with a gap longer
+/// than one store restart instead of failing the whole accepted batch.
+/// Both retryable operations are idempotent: the load is a read, and the
+/// commit deduplicates by batch key (retrying a landed commit yields
+/// `Duplicate`, which the caller already handles).
+async fn storage_retry<T, F, Fut>(operation: &'static str, mut call: F) -> Result<T, Status>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, exocortex_storage::StorageError>>,
+{
+    const MAX_ATTEMPTS: usize = 6;
+    const RETRY_GAP: std::time::Duration = std::time::Duration::from_millis(2000);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match call().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let transient = matches!(
+                    &error,
+                    exocortex_storage::StorageError::Backend(message)
+                        if message.to_lowercase().contains("connect")
+                );
+                if transient && attempt < MAX_ATTEMPTS {
+                    tracing::warn!(
+                        operation,
+                        attempt,
+                        "store connection lost mid-ingest; retrying after restart"
+                    );
+                    tokio::time::sleep(RETRY_GAP).await;
+                    continue;
+                }
+                return Err(internal_storage_status(operation, error));
+            }
+        }
+    }
+    unreachable!("the retry loop returns on every path")
+}
+
 impl<S: Storage + 'static> IngestServer<S> {
     fn reject_rows(batch: &IngestBatch, rejections: Vec<RejectRow>) -> IngestAck {
         let mut ack = ack_reject_all(batch, RejectCode::Unknown, "atomic batch rejected");
@@ -1545,14 +1585,13 @@ impl<S: Storage + 'static> IngestServer<S> {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let loaded = self
-            .storage
-            .get_memories(&unique_external)
-            .await
-            .map_err(|error| internal_storage_status("load relationship targets", error))?
-            .into_iter()
-            .map(|memory| (memory.id, memory))
-            .collect::<HashMap<_, _>>();
+        let loaded = storage_retry("load relationship targets", || {
+            self.storage.get_memories(&unique_external)
+        })
+        .await?
+        .into_iter()
+        .map(|memory| (memory.id, memory))
+        .collect::<HashMap<_, _>>();
         for (from_draft_key, encoded_id, id) in external_targets {
             match loaded.get(&id) {
                 Some(target)
@@ -2030,17 +2069,16 @@ impl<S: Storage + 'static> IngestServer<S> {
             batch_id: batch.batch_id.clone().into(),
         };
         let effect = self.post_ingest_effect(batch, rows, &key);
-        let outcome = self
-            .storage
-            .commit_ingest_batch_with_effect(
+        let outcome = storage_retry("commit ingest batch", || {
+            self.storage.commit_ingest_batch_with_effect(
                 &key,
                 &rows.memories,
                 &rows.relationships,
                 accepted,
                 &effect,
             )
-            .await
-            .map_err(|error| internal_storage_status("commit ingest batch", error))?;
+        })
+        .await?;
         match outcome {
             IngestCommitOutcome::Committed { settled, .. } => {
                 self.post_ingest_notify.notify_one();
