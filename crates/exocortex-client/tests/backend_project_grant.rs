@@ -96,8 +96,18 @@ impl Drop for ClientProcess {
 }
 
 fn spawn_client(backend: std::net::SocketAddr, data_dir: &std::path::Path) -> ClientProcess {
+    spawn_client_with_env(backend, data_dir, &[])
+}
+
+fn spawn_client_with_env(
+    backend: std::net::SocketAddr,
+    data_dir: &std::path::Path,
+    extra_env: &[(&str, &str)],
+) -> ClientProcess {
     let sse_key = exocortex_wire::signing::derive_sse_client_key(&CLUSTER_KEY, TOKEN);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_exocortex-mcp-client"))
+    let sse_key_hex = hex(&sse_key);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_exocortex-mcp-client"));
+    command
         .args([
             "--backend",
             &format!("http://{backend}"),
@@ -110,7 +120,11 @@ fn spawn_client(backend: std::net::SocketAddr, data_dir: &std::path::Path) -> Cl
         ])
         .env("EXOCORTEX_HMAC_KEY", hex(&PRODUCER_KEY))
         .env("EXOCORTEX_AUTH_TOKEN", TOKEN)
-        .env("EXOCORTEX_SSE_KEY", hex(&sse_key))
+        .env("EXOCORTEX_SSE_KEY", sse_key_hex);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -214,6 +228,61 @@ async fn backend_project_visibility_write_is_searchable_after_ack() {
         poll_until_found(&mut input, &client.reader, 100, "backend grant probe row"),
         "project-visibility write over --backend never became searchable: \
          the session read scope never joined the batch's project"
+    );
+}
+
+/// D51: a standalone-marked session (the wrapper stamps
+/// EXOCORTEX_STANDALONE=1 for owner and attached clients alike) reads
+/// the every-project principal's graph: rows an EARLIER session wrote
+/// at project visibility become searchable from a fresh process — the
+/// reported standalone bug. A plain --backend session (no marker)
+/// keeps per-batch grants, which the test above pins.
+#[tokio::test(flavor = "multi_thread")]
+async fn standalone_marker_grants_earlier_sessions_project_rows() {
+    let (_node, node_addr) = boot_node().await;
+
+    let mut writer = spawn_client(node_addr, &data_dir("swriter"));
+    let mut writer_input = writer.child.stdin.take().expect("writer stdin");
+    initialize(&mut writer, &mut writer_input);
+    say(
+        &mut writer_input,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exocortex.end_session","arguments":{"session_id":"grant-probe","project_id":"grant-proj","team_id":null,"memories":[{"draft_key":"w1","memory_type":"Fix","title":"standalone earlier row","content":"project-visibility row an earlier session wrote","visibility":"project","tags":[]}],"edges":[]}}}"#,
+    );
+    let ack = writer.reader.read_json_id(2, Duration::from_secs(20));
+    assert!(
+        tool_text(&ack).contains(r#""accepted":1"#),
+        "writer submit committed: {}",
+        tool_text(&ack)
+    );
+    assert!(
+        poll_until_found(
+            &mut writer_input,
+            &writer.reader,
+            500,
+            "standalone earlier row"
+        ),
+        "writer never saw its own row — the e2e premise is broken"
+    );
+    drop(writer_input);
+    let _ = writer.child.kill();
+    let _ = writer.child.wait();
+
+    let mut reader = spawn_client_with_env(
+        node_addr,
+        &data_dir("sreader"),
+        &[("EXOCORTEX_STANDALONE", "1")],
+    );
+    let mut reader_input = reader.child.stdin.take().expect("reader stdin");
+    initialize(&mut reader, &mut reader_input);
+    assert!(
+        poll_until_found(
+            &mut reader_input,
+            &reader.reader,
+            600,
+            "standalone earlier row"
+        ),
+        "a fresh standalone session could not read an earlier session's \
+         project-visibility row"
     );
 }
 

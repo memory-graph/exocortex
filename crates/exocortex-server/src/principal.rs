@@ -37,6 +37,24 @@ pub struct AuthenticatedPrincipal {
     pub audit_admin: bool,
 }
 
+/// D51: the standalone node's serving principal. Project is the
+/// instruction block's default write visibility, and an empty project
+/// list filtered those rows out of the SSE feed before they could reach
+/// any client cache (D31 fixed the offline client leg; this is the
+/// backend leg — attached sessions reuse this principal, so the grant
+/// covers them too). Every project rides as the `"*"` wildcard
+/// `memory_visible` honors; a policy-driven backend-node keeps its
+/// enumerated lists and never sees this form.
+pub fn standalone_visibility(user: &str, org: &str) -> VisibilityContext {
+    VisibilityContext {
+        user_id: user.into(),
+        org_id: org.into(),
+        project_ids: ["*".into()].into_iter().collect(),
+        team_ids: Default::default(),
+        max_visibility: exocortex_kernel::Visibility::Org,
+    }
+}
+
 /// Immutable credential registry installed at process startup.
 #[derive(Clone)]
 pub struct PrincipalRegistry {
@@ -184,6 +202,67 @@ mod tests {
     use super::*;
 
     const TEST_BEARER: &str = "test-bearer-token-32-bytes-long!";
+
+    /// D51: the standalone principal must grant EVERY project — an empty
+    /// list filtered project-visibility rows (the block's default write
+    /// visibility) out of the SSE feed before any client could read them.
+    #[test]
+    fn standalone_visibility_grants_every_project() {
+        let vc = standalone_visibility("greg", "personal");
+        assert_eq!(vc.user_id.as_str(), "greg");
+        assert_eq!(vc.org_id.as_str(), "personal");
+        let granted: Vec<&str> = vc.project_ids.iter().map(|p| p.as_str()).collect();
+        assert_eq!(granted, vec!["*"]);
+        assert!(vc.team_ids.is_empty());
+        assert_eq!(vc.max_visibility, exocortex_kernel::Visibility::Org);
+        // And the grant is real: the wildcard sees a project row in a
+        // project nobody enumerated.
+        let mut memory = exocortex_kernel::Memory {
+            rights: None,
+            id: exocortex_kernel::MemoryId::new_v7(),
+            memory_type: 0,
+            title: "row".into(),
+            content: "probe".into(),
+            summary: None,
+            tags: Default::default(),
+            visibility: exocortex_kernel::Visibility::Project,
+            provenance: exocortex_kernel::Provenance::Asserted {
+                author: "test".into(),
+                producer_kind: None,
+            },
+            context: exocortex_kernel::MemoryContext {
+                timestamp: chrono::Utc::now(),
+                project_id: Some("edu".into()),
+                project_path: None,
+                team_id: None,
+                tenant_id: Some("personal".into()),
+                session_id: None,
+                user_id: Some("greg".into()),
+                created_by: None,
+                files_involved: Default::default(),
+                languages: Default::default(),
+                frameworks: Default::default(),
+                technologies: Default::default(),
+                git_commit: None,
+                git_branch: None,
+                working_directory: None,
+                entities: Default::default(),
+                additional_metadata: serde_json::Value::Null,
+            },
+            importance: exocortex_kernel::memory::F01::new(0.5).unwrap(),
+            confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
+            effectiveness: None,
+            usage_count: 0,
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            recorded_at: chrono::Utc::now(),
+            invalidated_by: None,
+            embedding: None,
+            lsn: exocortex_kernel::LSN::new_local(0),
+        };
+        memory.context.project_id = Some("never-enumerated".into());
+        assert!(exocortex_storage::memory_visible(&memory, &vc));
+    }
 
     #[test]
     fn policy_maps_credentials_to_exact_scopes_and_rejects_bad_rows() {

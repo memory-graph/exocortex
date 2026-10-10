@@ -190,6 +190,10 @@ case "$mode" in
     fi
     # The foreground MCP runtime uses the supervised Falkor-backed node for
     # both writes and authenticated cache hydration.
+    # D51: mark the client as a standalone session (owner or attached) so
+    # its read scope joins the node's every-project principal — project
+    # rows earlier sessions wrote stay findable from a fresh process.
+    export EXOCORTEX_STANDALONE=1
     # A non-interactive shell may hand a BACKGROUND job /dev/null stdin
     # (POSIX async-list behavior, observed live in the release
     # validation's linux container where the client read instant EOF).

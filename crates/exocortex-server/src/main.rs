@@ -227,7 +227,16 @@ fn standalone_main(
         port_file: Some(data_home.join("port")),
         data_dir: data_home.clone(),
         port,
-        max_restarts: 3,
+        // D51: the bundled darwin runtime's index-GC fork can SIGILL the
+        // store under ambient traffic (D45/D50 — the quiesce window
+        // narrows but cannot eliminate it), and every consumer now rides
+        // a supervised restart (D46 reconnects, D46c ingest retry, cache
+        // reseed). A budget of 3 turned that recovery into session death
+        // whenever crashes clustered (five SIGILLs in nine minutes
+        // exhausted it live); standalone now rides through a full
+        // working day of them. The budget still exists — a genuinely
+        // dead store (bad runtime, missing binary) fails fast within it.
+        max_restarts: 512,
         auth_token: Some(store_token),
         supervisor_pid: None,
         startup_timeout: None,
@@ -259,13 +268,8 @@ fn standalone_main(
         .map_err(|_| anyhow::anyhow!("EXOCORTEX_AUTH_TOKEN is required for mcp-standalone"))?;
     let principal = exocortex_server::principal::PrincipalRegistry::single(
         bearer.clone(),
-        exocortex_storage::VisibilityContext {
-            user_id: args.standalone_user.clone().into(),
-            org_id: args.org.clone().into(),
-            project_ids: Default::default(),
-            team_ids: Default::default(),
-            max_visibility: exocortex_kernel::Visibility::Org,
-        },
+        // D51: every project — see principal::standalone_visibility.
+        exocortex_server::principal::standalone_visibility(&args.standalone_user, &args.org),
     )?;
     let bind = if args.bind == "0.0.0.0:8080" {
         "127.0.0.1:0".to_owned()

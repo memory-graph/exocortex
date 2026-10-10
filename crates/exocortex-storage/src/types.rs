@@ -398,9 +398,18 @@ pub struct DiscoveryAcceptance {
     pub audit: AuditEvent,
 }
 
+/// §17.2 project membership with the every-project wildcard: a literal
+/// `"*"` grant (the standalone principal's form — the same wildcard
+/// `sse.rs`'s discovery filter already honors) matches any project row.
+fn project_granted(project: &SmolStr, granted: &[SmolStr]) -> bool {
+    granted.iter().any(|id| id == project || id == "*")
+}
+
 /// One authoritative §17.2 memory visibility decision, shared by storage and
 /// cache. Project/team rows require an explicit row scope and membership;
-/// missing scope never widens access.
+/// missing scope never widens access. A literal `"*"` entry in
+/// `project_ids` is the every-project grant (the standalone principal's
+/// form — the same wildcard `sse.rs`'s discovery filter already honors).
 pub fn memory_visible(memory: &exocortex_kernel::Memory, vc: &VisibilityContext) -> bool {
     if memory.context.tenant_id.as_deref() != Some(vc.org_id.as_str()) {
         return false;
@@ -418,7 +427,7 @@ pub fn memory_visible(memory: &exocortex_kernel::Memory, vc: &VisibilityContext)
             .context
             .project_id
             .as_ref()
-            .is_some_and(|project| vc.project_ids.contains(project)),
+            .is_some_and(|project| project_granted(project, &vc.project_ids)),
         Visibility::Team => memory
             .context
             .team_id
@@ -457,7 +466,7 @@ pub fn relationship_visible(
                     .context
                     .project_id
                     .as_ref()
-                    .is_some_and(|project| vc.project_ids.contains(project))
+                    .is_some_and(|project| project_granted(project, &vc.project_ids))
         }),
         Visibility::Team => endpoints.iter().any(|memory| {
             memory.visibility == Visibility::Team
@@ -749,6 +758,161 @@ pub(crate) fn decode_feed_invalidation(payload: &str) -> Result<Invalidation, se
         }
     }
     serde_json::from_value(value)
+}
+
+#[cfg(test)]
+mod visibility_wildcard_tests {
+    use super::*;
+    use exocortex_kernel::{
+        MemoryContext, MemoryId, Provenance, RelKindId, Relationship, RelationshipId,
+        RelationshipProperties, LSN,
+    };
+
+    fn project_memory(project: &str, user: &str, org: &str) -> exocortex_kernel::Memory {
+        exocortex_kernel::Memory {
+            rights: None,
+            id: MemoryId::new_v7(),
+            memory_type: 0,
+            title: "row".into(),
+            content: "probe".into(),
+            summary: None,
+            tags: Default::default(),
+            visibility: Visibility::Project,
+            provenance: Provenance::Asserted {
+                author: "test".into(),
+                producer_kind: None,
+            },
+            context: MemoryContext {
+                timestamp: Utc::now(),
+                project_id: Some(project.into()),
+                project_path: None,
+                team_id: None,
+                tenant_id: Some(org.into()),
+                session_id: None,
+                user_id: Some(user.into()),
+                created_by: None,
+                files_involved: Default::default(),
+                languages: Default::default(),
+                frameworks: Default::default(),
+                technologies: Default::default(),
+                git_commit: None,
+                git_branch: None,
+                working_directory: None,
+                entities: Default::default(),
+                additional_metadata: serde_json::Value::Null,
+            },
+            importance: exocortex_kernel::memory::F01::new(0.5).unwrap(),
+            confidence: exocortex_kernel::memory::F01::new(0.8).unwrap(),
+            effectiveness: None,
+            usage_count: 0,
+            valid_from: Utc::now(),
+            valid_until: None,
+            recorded_at: Utc::now(),
+            invalidated_by: None,
+            embedding: None,
+            lsn: LSN::new_local(0),
+        }
+    }
+
+    fn vc(user: &str, org: &str, projects: &[&str]) -> VisibilityContext {
+        VisibilityContext {
+            user_id: user.into(),
+            org_id: org.into(),
+            project_ids: projects.iter().map(|p| (*p).into()).collect(),
+            team_ids: Default::default(),
+            max_visibility: Visibility::Org,
+        }
+    }
+
+    /// D51: the standalone principal's `"*"` grant must see a
+    /// project-visibility row in ANY project — without the wildcard the
+    /// exact-membership check hides every such row (the reported bug:
+    /// written at the block's default visibility, never findable).
+    #[test]
+    fn wildcard_project_grant_sees_every_project_row() {
+        let every = vc("u", "org", &["*"]);
+        for project in ["edu", "loanlight", "memorygraph"] {
+            let memory = project_memory(project, "u", "org");
+            assert!(
+                memory_visible(&memory, &every),
+                "wildcard grant must see project {project}"
+            );
+        }
+    }
+
+    /// The wildcard is a grant form, not a mode change: exact lists keep
+    /// exact semantics, and unrelated projects stay hidden.
+    #[test]
+    fn exact_grants_stay_exact_beside_the_wildcard() {
+        let scoped = vc("u", "org", &["edu"]);
+        assert!(memory_visible(&project_memory("edu", "u", "org"), &scoped));
+        assert!(!memory_visible(
+            &project_memory("other", "u", "org"),
+            &scoped
+        ));
+        let empty = vc("u", "org", &[]);
+        assert!(!memory_visible(&project_memory("edu", "u", "org"), &empty));
+    }
+
+    /// The wildcard never crosses tenants: another org's row stays
+    /// invisible even under the every-project grant.
+    #[test]
+    fn wildcard_does_not_cross_tenants() {
+        let every = vc("u", "org", &["*"]);
+        assert!(!memory_visible(
+            &project_memory("edu", "u", "other-org"),
+            &every
+        ));
+    }
+
+    /// Project-visibility EDGES ride the same grant: both endpoints and
+    /// the relationship's own project arm must see the wildcard.
+    #[test]
+    fn wildcard_covers_project_visibility_relationships() {
+        let from = project_memory("edu", "u", "org");
+        let to = project_memory("edu", "u", "org");
+        let kind = RelKindId(1);
+        let edge = Relationship {
+            id: RelationshipId::derive(from.id, kind, to.id, None),
+            kind,
+            from: from.id,
+            to: to.id,
+            visibility: Visibility::Project,
+            provenance: Provenance::Asserted {
+                author: "test".into(),
+                producer_kind: None,
+            },
+            properties: RelationshipProperties {
+                strength: 0.5,
+                confidence: 0.8,
+                context: None,
+                evidence_count: 1,
+                success_rate: None,
+                validation_count: 0,
+                counter_evidence_count: 0,
+                last_validated: Utc::now(),
+            },
+            description: None,
+            bidirectional: false,
+            valid_from: Utc::now(),
+            valid_until: None,
+            recorded_at: Utc::now(),
+            invalidated_by: None,
+            lsn: LSN::new_local(0),
+        };
+        assert!(relationship_visible(
+            &edge,
+            &from,
+            &to,
+            &vc("u", "org", &["*"])
+        ));
+        assert!(!relationship_visible(
+            &edge,
+            &from,
+            &to,
+            &vc("u", "org", &["unrelated"])
+        ));
+    }
 }
 
 #[cfg(test)]

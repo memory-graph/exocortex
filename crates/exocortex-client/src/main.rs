@@ -353,6 +353,16 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut vc = org_visibility(&args.org, &args.user);
+    // D51: standalone sessions read the wildcard principal's graph — the
+    // wrapper stamps EXOCORTEX_STANDALONE=1 (owner and attached alike),
+    // so project rows earlier sessions wrote stay findable from a fresh
+    // process. A plain --backend against a policy-driven backend-node
+    // keeps D31's per-batch session grants as the read filter.
+    let standalone_session = std::env::var("EXOCORTEX_STANDALONE").ok().as_deref() == Some("1")
+        || std::env::var("EXOCORTEX_ATTACHED").ok().as_deref() == Some("1");
+    if args.backend.is_some() && standalone_session {
+        wal_projects.insert("*".into());
+    }
     vc.project_ids = wal_projects.into_iter().collect();
     let server =
         mcp::ExocortexMcp::new(args.org.clone().into(), cache.clone(), vc, ontology.clone())
