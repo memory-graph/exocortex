@@ -13,6 +13,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use futures::StreamExt;
 use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +25,12 @@ use exocortex_storage::{
 };
 use exocortex_wire::cluster::v1::InvalidationEnvelope;
 use exocortex_wire::sse::v1::invalidation::Kind;
+
+/// The seed-envelope future the stream awaits AFTER flushing its anchor
+/// comment (issue #8: the scan runs inside the stream, so response
+/// headers and keepalives are never withheld behind it). Boxed so the
+/// handler and the tests can supply different producers.
+type SeedBuild = Pin<Box<dyn Future<Output = Result<InvalidationEnvelope, StorageError>> + Send>>;
 
 #[derive(serde::Serialize)]
 struct ClientGraphSnapshot {
@@ -211,17 +219,22 @@ async fn handler<S: Storage + 'static>(
     } else {
         None
     };
-    let initial_snapshot = if seed {
-        match graph_reseed_envelope(&cluster, visibility.as_ref()).await {
-            Ok(envelope) => Some(envelope),
-            Err(error) => {
-                tracing::warn!(?error, "SSE initial hydration failed");
-                return http::StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-        }
-    } else {
-        None
-    };
+    // Issue #8 / R-C5: the seed scan runs INSIDE the response stream.
+    // Building it here (the old order) withheld the response headers —
+    // and therefore the 5s keepalives — for the whole snapshot build, so
+    // a slow scan (storage, the D46b post-boot quiesce window, or a
+    // supervised store restart) outlived the client's 15s header
+    // deadline and surfaced as "SSE response headers timed out". The
+    // anchor comment below flushes first; keepalives hold the client's
+    // silence window while the envelope builds; a build failure closes
+    // the stream (the client reseeds with backoff — the existing
+    // mid-stream-failure path) instead of a pre-stream 503.
+    let seed_build = seed.then(|| {
+        let cluster = cluster.clone();
+        let visibility = visibility.clone();
+        Box::pin(async move { graph_reseed_envelope(&cluster, visibility.as_ref()).await })
+            as SeedBuild
+    });
     // R-C6: a reconnect older than the replay window must reseed, not
     // silently skip deltas. The 409 carries the buffer floor so the client
     // can resume (and rehydrate the gap via its resync hook).
@@ -249,23 +262,78 @@ async fn handler<S: Storage + 'static>(
     let node_id = cluster.node_id.to_string();
     // R-Sec5: token → per-client key; envelopes re-sign with it.
     let client_key = bearer.map(|token| derive_client_sse_key(&cluster.hmac_key, token));
-    let stream = async_stream::stream! {
+    let stream = event_stream(
+        state,
+        cluster,
+        rx,
+        visibility,
+        client_key,
+        supports_additive_events,
+        replay,
+        seed_build,
+        node_id,
+        live_permits,
+        _reseed_permit,
+    );
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(5)))
+        .into_response()
+}
+
+/// The handler's response stream, extracted so the seed-scan ordering
+/// (issue #8) is testable with an injectable seed future: the anchor
+/// comment flushes BEFORE the seed envelope builds, so headers and the
+/// 5s keepalives are never withheld behind a slow scan.
+#[allow(clippy::too_many_arguments)]
+fn event_stream<S: Storage + 'static>(
+    state: Arc<SseState<S>>,
+    cluster: Arc<ClusterNode<S>>,
+    rx: tokio::sync::broadcast::Receiver<InvalidationEnvelope>,
+    visibility: Option<VisibilityContext>,
+    client_key: Option<[u8; 32]>,
+    supports_additive_events: bool,
+    replay: Vec<InvalidationEnvelope>,
+    seed_build: Option<SeedBuild>,
+    node_id: String,
+    live_permits: LiveStreamPermits,
+    _reseed_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> impl futures::Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
         // Owned permits live exactly as long as the response stream. Client
         // cancellation drops the stream and releases both limits immediately.
         let _live_permits = live_permits;
+        // Issue #8: the reseed permit now spans the in-stream scan.
+        let _reseed_permit = _reseed_permit;
         let mut rx = tokio_stream::wrappers::BroadcastStream::new(rx);
         // Initial comment anchors the connection before the first delta.
         yield Ok::<Event, Infallible>(Event::default().comment(format!("exocortex {node_id}")));
-        if let Some(env) = initial_snapshot {
-            let Some(envelopes) =
-                admit_envelope(&cluster, &state.hydration, env, visibility.as_ref(), client_key.as_ref(), supports_additive_events, "initial")
-                    .await
-            else {
-                return;
-            };
-            for env in envelopes {
-                let payload = exocortex_wire::transport::base64_encode(&prost_encode(&env));
-                yield Ok(Event::default().event("inv").data(payload));
+        if let Some(seed_build) = seed_build {
+            // Issue #8: the scan is inside the stream; measure the phase.
+            let started = std::time::Instant::now();
+            match seed_build.await {
+                Ok(envelope) => {
+                    tracing::info!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "SSE seed envelope built"
+                    );
+                    let Some(envelopes) =
+                        admit_envelope(&cluster, &state.hydration, envelope, visibility.as_ref(), client_key.as_ref(), supports_additive_events, "initial")
+                            .await
+                    else {
+                        return;
+                    };
+                    for env in envelopes {
+                        let payload = exocortex_wire::transport::base64_encode(&prost_encode(&env));
+                        yield Ok(Event::default().event("inv").data(payload));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "SSE initial hydration failed; closing stream for client reseed"
+                    );
+                    return;
+                }
             }
         }
         // R-C6 replay first (LSN order); the client's LSN gate dedups any
@@ -301,10 +369,7 @@ async fn handler<S: Storage + 'static>(
                 yield Ok(Event::default().event("inv").data(payload));
             }
         }
-    };
-    Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(5)))
-        .into_response()
+    }
 }
 
 /// One envelope's full admission pipeline, shared by the initial-snapshot,
@@ -1362,5 +1427,95 @@ mod tests {
         drop(second);
         drop(replacement);
         assert!(admission.try_admit([3; 32]).is_ok());
+    }
+
+    /// Issue #8: the anchor comment — and therefore the response headers
+    /// and the 5s keepalives — must flush BEFORE the seed envelope
+    /// builds. A slow scan (storage, the D46b post-boot quiesce window,
+    /// a supervised store restart) must never withhold headers past the
+    /// client's stall deadline; the latch holds the seed future while
+    /// the first frame is polled. Pre-fix shape (scan awaited in the
+    /// handler before the stream existed) cannot pass: the first frame
+    /// poll blocks behind the latch.
+    #[tokio::test]
+    async fn seed_stream_flushes_the_anchor_before_a_slow_seed_scan() {
+        use super::{
+            event_stream, graph_reseed_envelope, LiveStreamAdmission, SharedEventHydration,
+            SseState, MAX_CONCURRENT_RESEEDS,
+        };
+
+        let onto = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let cluster = Arc::new(ClusterNode::new(
+            Arc::new(InMemoryStorage::new(onto.clone())),
+            "seed-flush".into(),
+            onto.fingerprint,
+            [11u8; 32],
+        ));
+        let state = Arc::new(SseState {
+            cluster: cluster.clone(),
+            reseeds: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESEEDS)),
+            live_streams: LiveStreamAdmission::new(16, 16),
+            hydration: SharedEventHydration::default(),
+        });
+        let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+        let seed_cluster = cluster.clone();
+        let seed_build = Box::pin(async move {
+            fired.await.expect("latch released");
+            graph_reseed_envelope(&seed_cluster, None).await
+        }) as super::SeedBuild;
+        let live_permits = state.live_streams.try_admit([0u8; 32]).expect("admit");
+        let rx = cluster.subscribe_local();
+        let stream = event_stream(
+            state,
+            cluster,
+            rx,
+            None,
+            None,
+            false,
+            vec![],
+            Some(seed_build),
+            "seed-flush".into(),
+            live_permits,
+            None,
+        );
+        use axum::response::sse::{KeepAlive, Sse};
+        use axum::response::IntoResponse as _;
+        let response = Sse::new(stream)
+            .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(5)))
+            .into_response();
+        let mut body = response.into_body().into_data_stream();
+        use futures::StreamExt as _;
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+            .await
+            .expect("the anchor frame flushes while the seed scan is still held")
+            .expect("body stays open")
+            .expect("body frame decodes");
+        let text = String::from_utf8_lossy(&first);
+        assert!(
+            text.contains(": exocortex seed-flush") && !text.contains("event: inv"),
+            "the first frame is the anchor comment, not a seed event: {text:?}"
+        );
+
+        fire.send(()).expect("release the seed latch");
+        let mut saw_seed = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), body.next()).await {
+                Ok(Some(Ok(chunk))) if String::from_utf8_lossy(&chunk).contains("event: inv") => {
+                    saw_seed = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            saw_seed,
+            "the seed envelope events must follow the latch release"
+        );
     }
 }
