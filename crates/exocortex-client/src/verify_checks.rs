@@ -14,12 +14,15 @@ use std::time::Duration;
 /// process title after startup, so a pid/name scan misses the real
 /// store and double-counts the watchdog shells that embed its argv —
 /// the PORT SET is the honest measure (two stores on one dir ⇔ two
-/// distinct ports mentioning that dir).
+/// distinct ports mentioning that dir). A reference means a whole
+/// path token: a sibling data dir whose path merely shares our prefix
+/// (`…/exocortex` vs `…/exocortex-loanlight/falkordb`) is a different
+/// dir and must not match.
 pub fn store_ports_on_dir(ps_output: &str, data_dir: &Path) -> Vec<u16> {
     let dir = data_dir.to_string_lossy();
     let mut ports: Vec<u16> = Vec::new();
     for line in ps_output.lines() {
-        if !line.contains(dir.as_ref()) {
+        if !references_dir(line, dir.as_ref()) {
             continue;
         }
         let is_store_plane = line.contains("redis-server")
@@ -36,6 +39,35 @@ pub fn store_ports_on_dir(ps_output: &str, data_dir: &Path) -> Vec<u16> {
     }
     ports.sort_unstable();
     ports
+}
+
+/// Does `line` reference `dir` as a whole path token? The occurrence
+/// must start at a token edge (line start, whitespace, quote, or `=`)
+/// and end at a path edge: end of token, a quote, or `/` — the last
+/// because the node's store lives in `dir/falkordb`. Without the end
+/// edge a sibling install whose path extends ours would false-match
+/// and its healthy store would read as an orphan on our data dir.
+fn references_dir(line: &str, dir: &str) -> bool {
+    let mut from = 0usize;
+    while let Some((at, _)) = line[from..].match_indices(dir).next() {
+        let start = from + at;
+        let end = start + dir.len();
+        let starts_at_edge = line[..start]
+            .chars()
+            .next_back()
+            .map(|c| c.is_whitespace() || c == '"' || c == '\'' || c == '=')
+            .unwrap_or(true);
+        let ends_at_edge = line[end..]
+            .chars()
+            .next()
+            .map(|c| c == '/' || c.is_whitespace() || c == '"' || c == '\'')
+            .unwrap_or(true);
+        if starts_at_edge && ends_at_edge {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 /// The `--port N` value of a command line, if present.
@@ -214,6 +246,27 @@ mod tests {
             Path::new("/data/exo"),
         );
         assert_eq!(one, vec![6400], "title-rewritten store + shells collapse");
+    }
+
+    #[test]
+    fn store_ports_ignore_sibling_dirs_sharing_a_path_prefix() {
+        // A sibling data dir that extends our path (`…/exo` vs
+        // `…/exo-loanlight/falkordb`) is a different dir: its store
+        // must not read as an orphaned store on OUR data dir.
+        let ps = "  30 sh -c trap x; redis-server --port 63951 --dir /data/exo-loanlight/falkordb
+ \
+                  31 sh -c trap x; redis-server --port 59705 --dir /data/exo/falkordb
+";
+        assert_eq!(
+            store_ports_on_dir(ps, Path::new("/data/exo")),
+            vec![59705],
+            "sibling prefix dir is not our dir"
+        );
+        assert_eq!(
+            store_ports_on_dir(ps, Path::new("/data/exo-loanlight")),
+            vec![63951],
+            "the sibling's own dir still matches its store"
+        );
     }
 
     #[test]
