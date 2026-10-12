@@ -19,7 +19,7 @@ live Falkor/Redis/Postgres/CDC legs and the SaaS adapter live suites
 not executed; compose chaos not run; D50's real-graph reproduction and
 verification ran on the owner's machine (this cut ships its fixes).
 
-**Post-0.5.1 (2026-10-10, unreleased on main):** D51 — standalone
+**Post-0.5.1 (2026-10-10, since pushed — see the 2026-10-11 entry):** D51 — standalone
 project-visibility rows were written, accepted, and then never
 readable from a new session (the owner's live bug report from Claude
 Code) — fixed in f52152e with unit + e2e tests and a live
@@ -32,6 +32,28 @@ degradation) — fixed in 8c68a3d: the scan moved inside the response
 stream behind the anchor comment, the seed-build phase is now logged,
 and the ordering is pinned by a latch-driven test through the real Sse
 body. A 0.5.2 cut is pending the owner's call.
+
+**2026-10-11/12 (post-crash triage):** the mid-release "system crash"
+was session-level (the machine never went down); v0.5.1 was already
+fully shipped — tag, release assets, all 17 crates at 0.5.1 — before
+the session died. The stranded D51/D52 commits passed a fresh full
+matrix on the exact tree (exit 0) and were pushed (51aa32b..6b4dda2)
+under the standing authorization. That same matrix run is the first
+full post-REL2 LOCAL measurement — 45,552s (12.65h) — recorded as
+**REL4 (Backlog, Proposed)**: lever 1 (single-execution trust, −~4.6h
+of duplicated suite execution) parks on the owner's gate-semantics
+call; levers 2-3 (nextest locally, contention hygiene — quit Docker
+Desktop at cut time) are the locally-satisfiable continuation of the
+owner's gate-speed ask; lever 4 (cold-compile caching) serves CI and
+crash-recovery reruns only. A 0.5.2 cut remains pending the owner's
+call. The REL4 row and this entry are local-only plan commits riding
+the next gated push. Also observed live: the standalone node
+restarted ~21:54 mid-matrix, and a long-lived MCP client holding the
+pre-restart port stayed connection-refused (frozen reads, failed
+writes) until its session restarted — consistent with the D46/D52
+boundaries, but if it reproduces with a CURRENT client it deserves
+its own row (the client may not re-resolve the node port after a
+wrapper restart).
 
 ## Archived status history
 
