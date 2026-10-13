@@ -12,6 +12,13 @@ set -euo pipefail
 export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-1}"
 export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-1}"
 
+# REL4 lever 3: the measured 12.65h matrix ran beside Docker Desktop's
+# VM (~37% of a core for the entire run). Contention is the operator's
+# to remove; this warns, never fails.
+if pgrep -q -f "Docker.app" 2>/dev/null; then
+  echo "[matrix] WARNING: Docker Desktop is running — quit it for a clean cut (measured ~37%-core contention, REL4)" >&2
+fi
+
 _MATRIX_START=${SECONDS:-0}
 _matrix_total_before=$_MATRIX_START
 phase() {
@@ -34,17 +41,31 @@ phase "clippy" cargo clippy --workspace --all-targets -- -D warnings
 phase "check-fastembed" cargo check -p exocortex-server --all-targets --features fastembed
 # REL2: compile and run attributed separately — the budget's biggest
 # phase deserves to say which half it spent.
-# REL2: CI runs the suites through nextest (parallel execution across
-# test binaries; doctests stay on cargo test) by exporting
-# EXOCORTEX_TEST_RUNNER=nextest — locally the default stays cargo test
-# so the script never depends on a tool the tree doesn't ship.
-if [ "${EXOCORTEX_TEST_RUNNER:-}" = "nextest" ] && command -v cargo-nextest >/dev/null 2>&1; then
-  phase "test-workspace-compile" cargo nextest run --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --no-fail-fast --profile ci
+# REL4: nextest is the DEFAULT runner when installed (parallel
+# execution across test binaries; doctests stay on cargo test).
+# EXOCORTEX_TEST_RUNNER=cargo opts out; a machine without cargo-nextest
+# falls back to cargo test unchanged, so the script never depends on a
+# tool the tree doesn't ship.
+if [ "${EXOCORTEX_TEST_RUNNER:-nextest}" != "cargo" ] && command -v cargo-nextest >/dev/null 2>&1; then
+  # No --profile: cargo-nextest 0.9.148 has no built-in `ci` profile,
+  # and CI's proven invocation (ci.yml) runs the default profile.
+  phase "test-workspace-compile" cargo nextest run --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --no-fail-fast
   phase "test-workspace-doctests" cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --doc --no-fail-fast
 else
   phase "test-workspace-compile" cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --no-run
   phase "test-workspace-run" cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing,exocortex-server/otlp --no-fail-fast
 fi
+# REL4: single-execution trust — the workspace phase above just ran
+# every suite the four duplicate-executing gates would re-run on this
+# exact tree (same or superset features). The marker is exported ONLY
+# here, only after that phase went green (set -e); seam-inventory,
+# adapter-contract, storage-conformance's in-memory leg, and
+# write-path-parity then run just their static assertions, each
+# printing an explicit "trusted from the matrix workspace phase" line.
+# Standalone gate invocations never see it and always execute suites;
+# the live backend legs are not covered by the workspace phase and run
+# regardless.
+export EXOCORTEX_MATRIX_TRUST=1
 phase "deny" cargo deny check
 phase "xtask:kernel-purity" cargo xtask kernel-purity
 phase "xtask:fingerprint" cargo xtask fingerprint

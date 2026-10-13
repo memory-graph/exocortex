@@ -141,37 +141,47 @@ fn adapter_contract() -> Result<()> {
 "
         )
     );
-    // The contract's suites (skip nothing — all hermetic).
-    run(
-        &[
-            "test",
-            "-p",
-            "exocortex-ingest",
-            "--test",
-            "preflight",
-            "--test",
-            "manifest_parity",
-            "--test",
-            "schema_evolution",
-        ],
-        &[],
-    )?;
-    run(
-        &[
-            "test",
-            "-p",
-            "exocortex-adapter-sdk",
-            "--features",
-            "testing",
-            "--test",
-            "projection",
-        ],
-        &[],
-    )?;
-    run(
-        &["test", "-p", "exocortex-server", "--test", "http_parity"],
-        &[],
-    )?;
+    if gates::matrix_trusts_workspace_runs(std::env::var("EXOCORTEX_MATRIX_TRUST").ok().as_deref())
+    {
+        // REL4: the workspace phase already executed these suites on
+        // this tree; re-running them here is duplicated execution.
+        println!(
+            "adapter-contract: suite execution trusted from the matrix workspace phase \
+             (preflight, manifest_parity, schema_evolution, projection, http_parity); static canaries ran here"
+        );
+    } else {
+        // The contract's suites (skip nothing — all hermetic).
+        run(
+            &[
+                "test",
+                "-p",
+                "exocortex-ingest",
+                "--test",
+                "preflight",
+                "--test",
+                "manifest_parity",
+                "--test",
+                "schema_evolution",
+            ],
+            &[],
+        )?;
+        run(
+            &[
+                "test",
+                "-p",
+                "exocortex-adapter-sdk",
+                "--features",
+                "testing",
+                "--test",
+                "projection",
+            ],
+            &[],
+        )?;
+        run(
+            &["test", "-p", "exocortex-server", "--test", "http_parity"],
+            &[],
+        )?;
+    }
     println!(
         "adapter-contract ok: {} obligations, each with a canary; every adapter crate claimed",
         gates::ADAPTER_CONTRACT.len()
@@ -1052,8 +1062,16 @@ fn storage_conformance() -> Result<()> {
         gates::validate_storage_target_listing(target, canary, &listing)?;
     }
     println!("storage-conformance: live target canaries LISTED (backend suite not yet executed)");
-    run(&["test", "-p", "exocortex-storage"], &[])?;
-    println!("storage-conformance: in-memory suite PASS");
+    if gates::matrix_trusts_workspace_runs(std::env::var("EXOCORTEX_MATRIX_TRUST").ok().as_deref())
+    {
+        // REL4: the workspace phase already executed this suite on
+        // this tree; the live legs below are NOT covered there and
+        // still run (or skip loudly) as always.
+        println!("storage-conformance: in-memory suite execution trusted from the matrix workspace phase");
+    } else {
+        run(&["test", "-p", "exocortex-storage"], &[])?;
+        println!("storage-conformance: in-memory suite PASS");
+    }
     if std::env::var("FALKOR_URL").is_ok_and(|url| !url.is_empty()) {
         println!("storage-conformance: live Falkor suite (FALKOR_URL set)");
         run(
@@ -1106,6 +1124,13 @@ fn storage_conformance() -> Result<()> {
 
 /// W2: golden verdict table through BOTH validators.
 fn write_path_parity() -> Result<()> {
+    if gates::matrix_trusts_workspace_runs(std::env::var("EXOCORTEX_MATRIX_TRUST").ok().as_deref())
+    {
+        // REL4: the workspace phase already executed this suite on
+        // this tree; this gate's whole body is that one execution.
+        println!("write-path-parity ok: suite execution trusted from the matrix workspace phase (offline and ingest validators agreed there)");
+        return Ok(());
+    }
     run(
         &[
             "test",
@@ -1691,6 +1716,24 @@ fn seam_inventory() -> Result<()> {
 "
         )
     );
+    if gates::matrix_trusts_workspace_runs(std::env::var("EXOCORTEX_MATRIX_TRUST").ok().as_deref())
+    {
+        // REL4: the workspace phase already executed every seam suite
+        // on this tree with the same feature set (REL2's alignment);
+        // the bijection above is this gate's own teeth and it ran.
+        let suites = gates::SEAM_INVENTORY
+            .iter()
+            .filter(|(_, _, file, _)| file.starts_with("tests/"))
+            .count();
+        println!(
+            "seam-inventory: suite execution trusted from the matrix workspace phase ({suites} seam suites); bijection ran here"
+        );
+        println!(
+            "seam-inventory ok: {} seams, each with a suite and a canary; no unclaimed suite files",
+            gates::SEAM_INVENTORY.len()
+        );
+        return Ok(());
+    }
     // Every declared seam's suite executes here (the live-feature
     // suites skip loudly without their backends, exactly as
     // storage-conformance reports them). REL2: suites ride the SAME

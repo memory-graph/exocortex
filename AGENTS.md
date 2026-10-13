@@ -128,6 +128,15 @@ cargo xtask ontology-surfaces     # §23 non-Rust ontology catalogues derive fro
 cargo xtask mock-provider-audit   # §23 #19 runtime no-LLM provider trap (on-demand; enforced transitively by acceptance-coverage)
 ```
 
+The matrix (`scripts/verify-release.sh`) exports
+`EXOCORTEX_MATRIX_TRUST=1` after its workspace test phase goes green:
+the four duplicate-executing gates (seam-inventory, adapter-contract,
+storage-conformance's in-memory leg, write-path-parity) then run only
+their static assertions in-matrix — every suite still executes exactly
+once per run, and standalone gate invocations always execute their
+suites. nextest is the default matrix test runner when installed
+(`EXOCORTEX_TEST_RUNNER=cargo` opts out; doctests stay on cargo test).
+
 CI (`.github/workflows/ci.yml`) runs all of these on push; the toolchain
 is pinned 1.85.0. Live-backend suites (`--features integration` with
 `FALKOR_URL`) and the compose chaos harness

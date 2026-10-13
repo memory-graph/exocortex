@@ -1,6 +1,17 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+/// REL4: single-execution trust. The matrix script exports
+/// EXOCORTEX_MATRIX_TRUST=1 only after its workspace test phase went
+/// green on the exact tree, so a gate seeing the marker may skip suite
+/// executions the workspace phase already performed byte-identically
+/// (the gate's static assertions always run). Standalone invocations
+/// never carry the marker and always execute their suites. Fail-closed:
+/// anything but exactly "1" means no trust.
+pub(crate) fn matrix_trusts_workspace_runs(marker: Option<&str>) -> bool {
+    marker == Some("1")
+}
+
 pub(crate) const DEAD_CONTROLS: &[(&str, &str, Option<&str>)] = &[
     (
         "admit_and_publish",
@@ -2468,6 +2479,21 @@ mod tests {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn matrix_trust_marker_is_exact_and_fail_closed() {
+        // Only the matrix script's exact marker trusts; a stale,
+        // empty, or creatively-valued variable must fall back to
+        // executing the suites.
+        assert!(matrix_trusts_workspace_runs(Some("1")));
+        assert!(!matrix_trusts_workspace_runs(None));
+        for wrong in ["", "0", "true", "yes", "1 ", " 1", "on"] {
+            assert!(
+                !matrix_trusts_workspace_runs(Some(wrong)),
+                "{wrong:?} must not trust"
+            );
+        }
     }
 
     #[test]
