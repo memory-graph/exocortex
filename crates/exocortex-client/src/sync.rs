@@ -186,6 +186,46 @@ impl std::fmt::Display for LastSseFailure {
 /// `None` = healthy (or never connected).
 pub type StreamErrorCell = Arc<std::sync::Mutex<Option<String>>>;
 
+/// D55: where a long-lived standalone client re-reads the attach record
+/// from when its owner is replaced. A wrapper-supervised owner restart
+/// (SIGILL class, harness restart, machine reboot) publishes a NEW
+/// `attach.json` with a NEW loopback endpoint and FRESH credentials;
+/// without re-resolution every long-lived session keeps dialing the dead
+/// port until the harness session itself restarts — writes fail
+/// `tcp connect error`, reads serve a frozen snapshot (reproduced live
+/// 2026-10-13 with the current client).
+#[derive(Debug, Clone)]
+pub struct AttachRediscovery {
+    /// The owner's data home — the directory holding `attach.json`.
+    pub data_home: std::path::PathBuf,
+    /// The org this client serves: a record naming a different org is
+    /// refused, never adopted (the R14-final UQ4 rule, client-side).
+    pub org: String,
+}
+
+impl AttachRediscovery {
+    /// Build from the wrapper-stamped `EXOCORTEX_STANDALONE_DATA_HOME`
+    /// (the owner node publishes it into every session's runtime env,
+    /// owner and attacher alike). `None` when not a standalone session.
+    pub fn from_env(org: &str) -> Option<Self> {
+        let data_home = std::env::var("EXOCORTEX_STANDALONE_DATA_HOME").ok()?;
+        if data_home.is_empty() {
+            return None;
+        }
+        Some(Self {
+            data_home: std::path::PathBuf::from(data_home),
+            org: org.to_owned(),
+        })
+    }
+
+    /// Read + validate the current attach record; `None` when absent,
+    /// malformed, or foreign-org (fail closed — keep the prior endpoint).
+    pub fn resolve(&self) -> Option<exocortex_wire::attach::AttachInfo> {
+        let info = exocortex_wire::attach::AttachInfo::read(&self.data_home).ok()?;
+        (info.org == self.org).then_some(info)
+    }
+}
+
 /// Configuration for the SSE subscriber.
 #[derive(Clone)]
 pub struct SseSyncConfig {
@@ -227,6 +267,11 @@ pub struct SseSyncConfig {
     pub last_stream_error: Option<StreamErrorCell>,
     /// Org graph replaced by a full SSE reseed.
     pub org: smol_str::SmolStr,
+    /// D55: re-read the attach record between reconnects; when a replaced
+    /// owner published a new endpoint, the loop adopts it (and its fresh
+    /// credentials) instead of redialing the dead port forever. `None`
+    /// keeps the configured backend fixed (plain `--backend` sessions).
+    pub rediscover: Option<Arc<AttachRediscovery>>,
 }
 
 impl SseSyncConfig {
@@ -247,6 +292,7 @@ impl SseSyncConfig {
             hydration_ready: None,
             last_stream_error: None,
             org: "org".into(),
+            rediscover: None,
         }
     }
 }
@@ -654,7 +700,7 @@ fn bounded_sse_stream(
 /// resubscribe from the last applied LSN (R-C6), invoking `resync` first
 /// when provided (targeted rehydration).
 pub async fn run_sse_sync(
-    cfg: SseSyncConfig,
+    mut cfg: SseSyncConfig,
     cache: Arc<LocalCache>,
     mut next_lsn: u64,
     resync: Option<ResyncFn>,
@@ -761,6 +807,12 @@ pub async fn run_sse_sync(
                                     }
                                 }
                                 Ok(DecodedEvent::Reseed(snapshot, lsn)) => {
+                                    tracing::info!(
+                                        lsn,
+                                        memories = snapshot.memories.len(),
+                                        relationships = snapshot.relationships.len(),
+                                        "sse reseed applied"
+                                    );
                                     cache
                                         .reseed_rows(
                                             cfg.org.clone(),
@@ -821,6 +873,40 @@ pub async fn run_sse_sync(
         }
         tracing::info!(reason = reconnect_reason, next_lsn, "sse reconnecting");
         metrics::counter!("exocortex_sync_reconnects_total").increment(1);
+        // D55: between reconnects, re-read the attach record. A replaced
+        // owner (supervised restart under a NEW wrapper boot) publishes a
+        // new loopback endpoint and FRESH credentials; adopting them here
+        // keeps the read path live without restarting the harness session.
+        // Absent/malformed/foreign-org records change nothing (fail closed).
+        if let Some(discovery) = &cfg.rediscover {
+            if let Some(info) = discovery.resolve() {
+                if info.backend != cfg.backend {
+                    tracing::warn!(
+                        from = %cfg.backend,
+                        to = %info.backend,
+                        "D55: owner replaced; adopting the new standalone endpoint and credentials"
+                    );
+                    cfg.backend = info.backend;
+                    if let Ok(key) = exocortex_wire::signing::decode_hex32(&info.hmac_key) {
+                        cfg.hmac_key = key;
+                    }
+                    if let Ok(key) = exocortex_wire::signing::decode_hex32(&info.sse_key) {
+                        cfg.client_key = Some(key);
+                    }
+                    cfg.bearer = Some(info.auth_token);
+                    // A fresh endpoint gets a fresh reconnect budget.
+                    backoff = cfg.backoff;
+                    // ...and a FULL authoritative reseed: the successor's
+                    // LSN numbering is not comparable to the dead owner's
+                    // (same data dir in production, but the only safe
+                    // state after adoption is the new owner's image), so
+                    // the frontier resets and the next subscription is a
+                    // fresh seed.
+                    needs_seed = true;
+                    next_lsn = 0;
+                }
+            }
+        }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(10));
     }

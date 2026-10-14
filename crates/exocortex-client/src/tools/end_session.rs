@@ -23,6 +23,98 @@ use exocortex_wire::ingest::v1::{
     ProducerIdentity, RegisterSourceRequest,
 };
 
+/// D55: swappable backend state for standalone sessions. When the
+/// supervised owner is replaced (SIGILL class, harness restart, reboot)
+/// the new owner publishes a new endpoint and FRESH credentials in the
+/// attach record; the submit path re-resolves on transport failure,
+/// adopts them, and retries once — instead of failing `tcp connect
+/// error` until the harness session itself restarts. Plain `--backend`
+/// sessions keep the fixed channel (`None` here).
+pub struct LiveBackend {
+    rediscover: crate::sync::AttachRediscovery,
+    state: std::sync::Mutex<LiveBackendState>,
+}
+
+struct LiveBackendState {
+    backend: String,
+    hmac_key: [u8; 32],
+    auth_token: String,
+    channel: Option<tonic::transport::Channel>,
+}
+
+impl LiveBackend {
+    /// Seed with the boot-time owner's endpoint and credentials.
+    pub fn new(
+        rediscover: crate::sync::AttachRediscovery,
+        backend: String,
+        hmac_key: [u8; 32],
+        auth_token: String,
+    ) -> Self {
+        Self {
+            rediscover,
+            state: std::sync::Mutex::new(LiveBackendState {
+                backend,
+                hmac_key,
+                auth_token,
+                channel: None,
+            }),
+        }
+    }
+
+    /// The current client + credentials, building the channel lazily
+    /// (inside the caller's tokio runtime — `connect_lazy` needs one).
+    fn acquire(
+        &self,
+    ) -> (
+        IngestServiceClient<tonic::transport::Channel>,
+        [u8; 32],
+        String,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        if state.channel.is_none() {
+            if let Ok(endpoint) = tonic::transport::Endpoint::from_shared(state.backend.clone()) {
+                state.channel = Some(endpoint.connect_lazy());
+            }
+        }
+        let channel = state
+            .channel
+            .clone()
+            .expect("a live backend always resolves to a channel or the boot values were invalid");
+        (
+            IngestServiceClient::new(channel),
+            state.hmac_key,
+            state.auth_token.clone(),
+        )
+    }
+
+    /// Re-read the attach record; when it names a DIFFERENT owner,
+    /// adopt its endpoint and fresh credentials (dropping the cached
+    /// channel). `true` only when state actually moved — an unchanged
+    /// record, an absent one, or a foreign-org one returns `false` and
+    /// the caller surfaces the original transport error.
+    fn adopt_replacement(&self) -> bool {
+        let Some(info) = self.rediscover.resolve() else {
+            return false;
+        };
+        let mut state = self.state.lock().unwrap();
+        if info.backend == state.backend {
+            return false;
+        }
+        tracing::warn!(
+            from = %state.backend,
+            to = %info.backend,
+            "D55: owner replaced; end_session adopts the new endpoint and credentials"
+        );
+        state.backend = info.backend;
+        if let Ok(key) = exocortex_wire::signing::decode_hex32(&info.hmac_key) {
+            state.hmac_key = key;
+        }
+        state.auth_token = info.auth_token;
+        state.channel = None;
+        true
+    }
+}
+
 /// `exocortex.end_session` arguments (§13.5).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct EndSessionArgs {
@@ -129,6 +221,9 @@ pub struct EndSessionTool {
     pub cache: Option<Arc<exocortex_cache::LocalCache>>,
     /// Caller visibility (cache lookups are caller-scoped, R-MT4).
     pub vc: exocortex_ops::VisibilityContext,
+    /// D55: standalone sessions re-resolve a replaced owner here;
+    /// `None` keeps the fixed `client`/credentials above.
+    pub live: Option<Arc<LiveBackend>>,
 }
 
 fn parse_visibility(s: &str) -> Result<i32, String> {
@@ -314,62 +409,98 @@ impl EndSessionTool {
                 }),
             }),
         };
-        // Canonical checksum + HMAC from the single wire implementation
-        // (PRD R3/R6 — no local copies).
-        exocortex_wire::signing::prepare_batch(&self.hmac_key, &mut batch);
-
         // RegisterSource before the first Submit (R-I3); idempotent on the
         // server side. The registration is signed with the same producer
         // HMAC as the batch (audit WS1) — the server rejects unsigned
         // registry mutations. D8: declares the closed producer kind.
-        let mut client = self.client.clone();
-        let mut registration = RegisterSourceRequest {
-            default_rights: None,
-            org_id: self.org_id.clone(),
-            source_uri: batch.source_uri.clone(),
-            producer_id: "session-wrapup".into(),
-            ceiling: 3,
-            source_flavor: "session".into(),
-            projection: None,
-            producer_kind: exocortex_wire::ingest::v1::ProducerKind::CodingAgent.into(),
-            producer: Some(ProducerIdentity {
-                node_id: self.node_id.clone(),
-                agent_id: self.agent_id.clone(),
-                adapter_id: String::new(),
-                hmac_signature: vec![],
-                client_metadata: batch
-                    .producer
-                    .as_ref()
-                    .and_then(|p| p.client_metadata.clone()),
-            }),
-        };
-        exocortex_wire::signing::sign_registration(&self.hmac_key, &mut registration);
-        let mut reg_req = tonic::Request::new(registration);
-        // R-R3 discipline (bug-prd-standalone-submit-hang): a lost or
-        // wedged gRPC exchange must surface as DeadlineExceeded, never a
-        // silently dropped tool response.
-        reg_req.set_timeout(std::time::Duration::from_secs(20));
-        if let Some(token) = &self.auth_token {
-            if let Ok(v) = format!("Bearer {token}").parse() {
+        //
+        // D55: the wire phase runs as a bounded two-attempt loop. Each
+        // attempt acquires the CURRENT transport (fixed for plain
+        // --backend sessions; the attach record's for standalone), signs
+        // with the CURRENT producer key — a replaced owner means a NEW
+        // key, so signatures never ride stale credentials — and on a
+        // transport-class failure with an adoptable replacement owner in
+        // the attach record, retries once against it. Everything else
+        // surfaces verbatim.
+        let mut ack = None;
+        for attempt in 0..2 {
+            let (mut client, producer_key, bearer) = match &self.live {
+                Some(live) => live.acquire(),
+                None => (
+                    self.client.clone(),
+                    self.hmac_key,
+                    self.auth_token.clone().unwrap_or_default(),
+                ),
+            };
+            // Canonical checksum + HMAC from the single wire
+            // implementation (PRD R3/R6 — no local copies), under the
+            // key this attempt will actually present.
+            exocortex_wire::signing::prepare_batch(&producer_key, &mut batch);
+            let mut registration = RegisterSourceRequest {
+                default_rights: None,
+                org_id: self.org_id.clone(),
+                source_uri: batch.source_uri.clone(),
+                producer_id: "session-wrapup".into(),
+                ceiling: 3,
+                source_flavor: "session".into(),
+                projection: None,
+                producer_kind: exocortex_wire::ingest::v1::ProducerKind::CodingAgent.into(),
+                producer: Some(ProducerIdentity {
+                    node_id: self.node_id.clone(),
+                    agent_id: self.agent_id.clone(),
+                    adapter_id: String::new(),
+                    hmac_signature: vec![],
+                    client_metadata: batch
+                        .producer
+                        .as_ref()
+                        .and_then(|p| p.client_metadata.clone()),
+                }),
+            };
+            exocortex_wire::signing::sign_registration(&producer_key, &mut registration);
+            let mut reg_req = tonic::Request::new(registration);
+            // R-R3 discipline (bug-prd-standalone-submit-hang): a lost or
+            // wedged gRPC exchange must surface as DeadlineExceeded, never a
+            // silently dropped tool response.
+            reg_req.set_timeout(std::time::Duration::from_secs(20));
+            if let Ok(v) = format!("Bearer {bearer}").parse() {
                 reg_req.metadata_mut().insert("authorization", v);
             }
-        }
-        if let Err(e) = client.register_source(reg_req).await {
-            tracing::warn!(%e, "register_source failed; submit will surface the cause");
-        }
+            if let Err(e) = client.register_source(reg_req).await {
+                tracing::warn!(%e, "register_source failed; submit will surface the cause");
+            }
 
-        let mut submit_req = tonic::Request::new(batch);
-        submit_req.set_timeout(std::time::Duration::from_secs(30));
-        if let Some(token) = &self.auth_token {
-            if let Ok(v) = format!("Bearer {token}").parse() {
+            let mut submit_req = tonic::Request::new(batch.clone());
+            submit_req.set_timeout(std::time::Duration::from_secs(30));
+            if let Ok(v) = format!("Bearer {bearer}").parse() {
                 submit_req.metadata_mut().insert("authorization", v);
             }
+            match client.submit(submit_req).await {
+                Ok(response) => {
+                    tracing::info!(
+                        attempt,
+                        accepted = response.get_ref().accepted,
+                        assigned_lsn = response.get_ref().assigned_lsn,
+                        "end_session submit acked"
+                    );
+                    ack = Some(response.into_inner());
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(attempt, code = ?e.code(), %e, "end_session submit failed");
+                    let transport_dead = e.code() == tonic::Code::Unavailable;
+                    let adopted = attempt == 0
+                        && transport_dead
+                        && self
+                            .live
+                            .as_ref()
+                            .is_some_and(|live| live.adopt_replacement());
+                    if !adopted {
+                        return Err(rmcp::Error::internal_error(format!("ingest: {e}"), None));
+                    }
+                }
+            }
         }
-        let ack = client
-            .submit(submit_req)
-            .await
-            .map_err(|e| rmcp::Error::internal_error(format!("ingest: {e}"), None))?
-            .into_inner();
+        let ack = ack.expect("the loop returns, retries once, or errors — never falls through");
 
         Ok(EndSessionAck {
             accepted: ack.accepted,

@@ -307,119 +307,24 @@ impl std::fmt::Display for DataDirOwned {
 
 impl std::error::Error for DataDirOwned {}
 
-/// D44-S2: the attach record the owning node publishes beside its graph
-/// — the endpoint and secrets a second concurrent session reuses in
-/// client mode instead of starting a second store. Mode 0600; the data
-/// home is single-user by construction in standalone mode.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct AttachInfo {
-    /// The owner node's loopback HTTP/gRPC base URL.
-    pub backend: String,
-    /// The org the owner serves (R14-final): attachers refuse a
-    /// different `--org` instead of hydrating a foreign partition.
-    pub org: String,
-    /// The owner's bearer (EXOCORTEX_AUTH_TOKEN).
-    pub auth_token: String,
-    /// The owner's producer key (EXOCORTEX_HMAC_KEY, 64 hex).
-    pub hmac_key: String,
-    /// The owner's SSE client key (64 hex).
-    pub sse_key: String,
-}
+/// D44-S2: the attach record the owning node publishes beside its graph.
+/// D55: the shape moved to `exocortex_wire::attach` so the client parses
+/// the SAME record when it re-resolves a replaced owner — one
+/// implementation, fail-closed in one place.
+pub use exocortex_wire::attach::AttachInfo;
 
-impl AttachInfo {
-    /// Every field must be present and well-shaped; a malformed record
-    /// fails closed (an attacher must never guess at credentials).
-    /// R14-B6: the backend is pinned to a literal loopback HOST by
-    /// parsing it (a string prefix admits userinfo —
-    /// `http://127.0.0.1:1@evil.example/` passes the prefix and dials
-    /// evil), with scheme http and no `@` in the authority; the secrets
-    /// ride the ONE hex validator (`signing::decode_hex32` — the CL3
-    /// one-impl rule; hex also cannot carry shell-significant bytes into
-    /// the file the wrapper `source`s).
-    fn validate(&self) -> anyhow::Result<()> {
-        let uri: http::Uri = self
-            .backend
-            .parse()
-            .map_err(|e| anyhow::anyhow!("attach record backend is not a URI: {e}"))?;
-        anyhow::ensure!(
-            uri.scheme_str() == Some("http"),
-            "attach record backend must be plain http, got {}",
-            self.backend
-        );
-        let authority = uri
-            .authority()
-            .ok_or_else(|| anyhow::anyhow!("attach record backend has no authority"))?;
-        anyhow::ensure!(
-            !authority.as_str().contains('@'),
-            "attach record backend carries userinfo: {}",
-            self.backend
-        );
-        let host = uri.host().unwrap_or_default();
-        anyhow::ensure!(
-            host == "127.0.0.1" || host == "::1" || host == "localhost",
-            "attach record backend must be loopback, got {host}"
-        );
-        anyhow::ensure!(
-            uri.port_u16().is_some(),
-            "attach record backend must carry an explicit port"
-        );
-        // R14-final (SO-3): nothing may follow the authority — a path or
-        // query can carry quote bytes that escape the single-quoted env
-        // file the wrapper sources. The owner always renders a bare
-        // authority; anything else is not our record.
-        anyhow::ensure!(
-            uri.path().is_empty() || uri.path() == "/",
-            "attach record backend must carry no path, got {}",
-            self.backend
-        );
-        anyhow::ensure!(
-            uri.query().is_none(),
-            "attach record backend must carry no query"
-        );
-        for (name, value) in [
-            ("auth_token", &self.auth_token),
-            ("hmac_key", &self.hmac_key),
-            ("sse_key", &self.sse_key),
-        ] {
-            exocortex_wire::signing::decode_hex32(value)
-                .map_err(|e| anyhow::anyhow!("attach record {name}: {e}"))?;
-        }
-        Ok(())
-    }
-
-    /// Render the runtime-env lines a wrapper sources: the backend + SSE
-    /// key every session gets, plus the owner's credentials (an attacher
-    /// must present the owner's identity — standalone serves ONE
-    /// principal) and the attach marker the wrapper keys its per-session
-    /// WAL slot on.
-    pub fn runtime_env_lines(&self) -> String {
-        format!(
-            "EXOCORTEX_BACKEND='{}'\nEXOCORTEX_SSE_KEY='{}'\nEXOCORTEX_AUTH_TOKEN='{}'\nEXOCORTEX_HMAC_KEY='{}'\nEXOCORTEX_ATTACHED='1'\n",
-            self.backend, self.sse_key, self.auth_token, self.hmac_key
-        )
-    }
-
-    /// Read + validate the attach record from `<data_dir>/attach.json`.
-    pub fn read(data_dir: &std::path::Path) -> anyhow::Result<Self> {
-        let path = data_dir.join("attach.json");
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("no attach record at {}: {e}", path.display()))?;
-        let info: AttachInfo = serde_json::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("malformed attach record: {e}"))?;
-        info.validate()?;
-        Ok(info)
-    }
-
-    /// Publish (0600, atomic) as the owning node.
-    pub fn write(&self, data_dir: &std::path::Path) -> anyhow::Result<()> {
-        let raw = serde_json::to_string(self)?;
-        exocortex_storage::bounded_io::atomic_write_private(
-            &data_dir.join("attach.json"),
-            raw.as_bytes(),
-            "attach record",
-        )?;
-        Ok(())
-    }
+/// Publish an attach record (0600, atomic) as the owning node. The
+/// bounded private atomic write lives in storage's `bounded_io`; the
+/// wire type carries the shape and validation, this side owns the
+/// durable file discipline.
+pub fn publish_attach_record(info: &AttachInfo, data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let raw = serde_json::to_string(info)?;
+    exocortex_storage::bounded_io::atomic_write_private(
+        &data_dir.join("attach.json"),
+        raw.as_bytes(),
+        "attach record",
+    )?;
+    Ok(())
 }
 
 /// D44: exclusively own the data dir for the lifetime of the supervised
@@ -787,7 +692,7 @@ mod tests {
             hmac_key: hmac.clone(),
             sse_key: sse.clone(),
         };
-        info.write(&dir).unwrap();
+        publish_attach_record(&info, &dir).unwrap();
         let read_back = AttachInfo::read(&dir).unwrap();
         assert_eq!(read_back.backend, info.backend);
         assert_eq!(read_back.org, "attach-org");
@@ -805,13 +710,19 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         // The runtime env a wrapper sources carries ALL of it + the
-        // marker, each field under its own key with its own value.
-        let lines = info.runtime_env_lines();
+        // marker and (D55) the data home a replaced-owner client
+        // re-reads the record from, each field under its own key.
+        let lines = info.runtime_env_lines(&dir);
         assert!(lines.contains("EXOCORTEX_ATTACHED='1'"));
         assert!(lines.contains(&format!("EXOCORTEX_AUTH_TOKEN='{token}'")));
         assert!(lines.contains(&format!("EXOCORTEX_HMAC_KEY='{hmac}'")));
         assert!(lines.contains(&format!("EXOCORTEX_SSE_KEY='{sse}'")));
-        // Malformed records never authorize an attach.
+        assert!(lines.contains(&format!(
+            "EXOCORTEX_STANDALONE_DATA_HOME='{}'",
+            dir.display()
+        )));
+        // Malformed records never authorize an attach (the full
+        // validation matrix lives beside the type in exocortex-wire).
         std::fs::write(
             dir.join("attach.json"),
             "{\"backend\":\"http://10.0.0.1:1\"}",
@@ -820,25 +731,6 @@ mod tests {
         assert!(
             AttachInfo::read(&dir).is_err(),
             "non-loopback must fail closed"
-        );
-        // R14-B6: the userinfo shape passes a naive prefix check but must
-        // fail the parsed one.
-        let mut evil = serde_json::to_string(&info).unwrap();
-        evil = evil.replace(
-            "http://127.0.0.1:41234",
-            "http://127.0.0.1:1@evil.example:6379/",
-        );
-        std::fs::write(dir.join("attach.json"), evil).unwrap();
-        assert!(
-            AttachInfo::read(&dir).is_err(),
-            "userinfo-prefixed backend must fail closed"
-        );
-        let mut evil = serde_json::to_string(&info).unwrap();
-        evil = evil.replace(&token, "short"); // not 64 hex
-        std::fs::write(dir.join("attach.json"), evil).unwrap();
-        assert!(
-            AttachInfo::read(&dir).is_err(),
-            "short credentials must fail closed"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

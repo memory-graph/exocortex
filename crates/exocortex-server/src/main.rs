@@ -340,8 +340,9 @@ fn standalone_main(
                 write!(sse_key_hex, "{byte:02x}").expect("writing to a string cannot fail");
             }
             let contents = format!(
-                "EXOCORTEX_BACKEND='http://{}'\nEXOCORTEX_SSE_KEY='{sse_key_hex}'\n",
-                node.local_addr
+                "EXOCORTEX_BACKEND='http://{}'\nEXOCORTEX_SSE_KEY='{sse_key_hex}'\nEXOCORTEX_STANDALONE_DATA_HOME='{}'\n",
+                node.local_addr,
+                data_home.display()
             );
             exocortex_storage::bounded_io::atomic_write_private(
                 path,
@@ -354,14 +355,16 @@ fn standalone_main(
             // data home is single-user in standalone mode. The org rides
             // the record (R14-final): an attacher running a different
             // --org must refuse, not hydrate the owner's graph.
-            supervisor::AttachInfo {
-                backend: format!("http://{}", node.local_addr),
-                org: args.org.clone(),
-                auth_token: bearer.clone(),
-                hmac_key: std::env::var("EXOCORTEX_HMAC_KEY")?,
-                sse_key: sse_key_hex,
-            }
-            .write(&data_home)?;
+            supervisor::publish_attach_record(
+                &supervisor::AttachInfo {
+                    backend: format!("http://{}", node.local_addr),
+                    org: args.org.clone(),
+                    auth_token: bearer.clone(),
+                    hmac_key: std::env::var("EXOCORTEX_HMAC_KEY")?,
+                    sse_key: sse_key_hex,
+                },
+                &data_home,
+            )?;
             Some(RemoveAttachOnExit(data_home.clone()))
         } else {
             None
@@ -464,7 +467,7 @@ fn attach_to_live_node(
                 if let Some(path) = args.standalone_runtime_file.as_deref() {
                     exocortex_storage::bounded_io::atomic_write_private(
                         path,
-                        info.runtime_env_lines().as_bytes(),
+                        info.runtime_env_lines(data_home).as_bytes(),
                         "standalone attach runtime",
                     )?;
                 }
@@ -1308,14 +1311,16 @@ mod attach_tests {
         };
 
         // Matching owner: the attach publishes the owner's env and exits 0.
-        supervisor::AttachInfo {
-            backend: format!("http://{}", node.local_addr),
-            org: "attach-org".into(),
-            auth_token: token.clone(),
-            hmac_key: "2".repeat(64),
-            sse_key: "3".repeat(64),
-        }
-        .write(&dir)
+        supervisor::publish_attach_record(
+            &supervisor::AttachInfo {
+                backend: format!("http://{}", node.local_addr),
+                org: "attach-org".into(),
+                auth_token: token.clone(),
+                hmac_key: "2".repeat(64),
+                sse_key: "3".repeat(64),
+            },
+            &dir,
+        )
         .unwrap();
         // attach_to_live_node owns a current-thread runtime — production
         // calls it from sync main; the test must keep it off this async

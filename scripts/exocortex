@@ -155,6 +155,11 @@ case "$mode" in
       exit 1
     }
     export EXOCORTEX_SSE_KEY
+    # D55: the owner node publishes the standalone data home in the
+    # runtime env (owner and attach paths alike); the client re-reads
+    # attach.json from it when a replaced owner publishes a new
+    # endpoint. Sourced assignments are not exported by default.
+    [ -z "${EXOCORTEX_STANDALONE_DATA_HOME:-}" ] || export EXOCORTEX_STANDALONE_DATA_HOME
     # D44-S2: an attached session reuses the OWNER's credentials (the
     # standalone node serves one principal) and must not share the
     # default client WAL dir — sled locks it exclusively.

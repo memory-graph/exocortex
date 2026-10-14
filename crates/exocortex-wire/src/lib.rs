@@ -27,6 +27,10 @@ pub mod cluster {
         tonic::include_proto!("exocortex.cluster.v1");
     }
 }
+/// D44-S2/D55: the standalone attach record — ONE parse/validate shape
+/// shared by the publishing server and every attaching or re-resolving
+/// client.
+pub mod attach;
 /// Wire-side compatibility-fingerprint policy for kernel-free
 /// components (OC-PRD D2 AdapterSdk row).
 pub mod compatibility;

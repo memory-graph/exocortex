@@ -394,6 +394,7 @@ async fn main() -> anyhow::Result<()> {
                 team_ids: Default::default(),
                 max_visibility: Visibility::Org,
             },
+            live: None,
         };
         let ack = tool
             .handle(EndSessionArgs {

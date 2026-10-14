@@ -412,6 +412,11 @@ fn main() -> anyhow::Result<()> {
             sync_config.bearer = Some(bearer.clone());
             sync_config.client_key = Some(sse_key);
             sync_config.org = org.clone().into();
+            // D55: standalone sessions re-resolve a replaced owner from
+            // the wrapper-stamped data home (owner and attacher alike).
+            let rediscover =
+                exocortex_client::sync::AttachRediscovery::from_env(&org).map(Arc::new);
+            sync_config.rediscover = rediscover.clone();
             // D47: the degradation cell is shared with the MCP read surface
             // so a failing backend stream stamps reads and backend_status.
             let sync_health = exocortex_client::sync::StreamErrorCell::default();
@@ -455,6 +460,16 @@ fn main() -> anyhow::Result<()> {
                     .await;
                 });
             }
+            // D55: the swappable submit transport for standalone
+            // sessions (fixed-channel sessions pass None).
+            let live = rediscover.map(|rediscover| {
+                std::sync::Arc::new(exocortex_client::tools::end_session::LiveBackend::new(
+                    (*rediscover).clone(),
+                    backend.clone(),
+                    hmac_key,
+                    auth_token.clone().unwrap_or_default(),
+                ))
+            });
             let tool = exocortex_client::tools::end_session::EndSessionTool {
                 client: exocortex_wire::ingest::v1::ingest_service_client::IngestServiceClient::new(
                     channel,
@@ -470,6 +485,7 @@ fn main() -> anyhow::Result<()> {
                 ontology: ontology_for_drain,
                 cache: Some(cache.clone()),
                 vc: org_visibility(&org, &user),
+                live,
             };
             server = server.with_end_session(Arc::new(tool));
         }
