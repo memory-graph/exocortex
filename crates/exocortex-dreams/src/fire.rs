@@ -716,10 +716,15 @@ impl RedisFireQueue {
             .arg("LEFT")
             .arg("RIGHT")
             .arg(timeout.as_secs_f64())
-            .query_async(&mut self.conn)
+            .query_async::<Option<String>>(&mut self.conn)
             .await
         {
-            Ok(pair) => pair,
+            // An idle BLMOVE unblocks with a nil reply, not an error: an
+            // empty queue is the drain loop's steady state (D57 — decoded
+            // as a String the nil surfaced as a TypeError the owner node
+            // warned about on every idle poll).
+            Ok(Some(payload)) => payload,
+            Ok(None) => return Ok(DrainResult::TimedOut),
             Err(e) => {
                 if e.to_string().contains("timeout") {
                     return Ok(DrainResult::TimedOut);

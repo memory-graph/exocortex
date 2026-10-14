@@ -1170,3 +1170,21 @@ async fn counters_and_failed_cycle_survive_standalone_queue_restarts() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn drain_on_an_idle_queue_times_out_cleanly() {
+    // D57: an idle BLMOVE answers nil, not an error. Decoded straight into
+    // String the nil surfaced as a TypeError, so the owner node's drain
+    // loop warned once per second on every quiet store (visible live on
+    // the loanlight-org graph, whose queue is idle between sessions).
+    let Some((_client, mut queue, _key)) = isolated_queue("org").await else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let drained = queue.drain(Duration::from_millis(500)).await;
+    assert_eq!(
+        drained.expect("idle drain is not an error"),
+        DrainResult::TimedOut
+    );
+    assert!(started.elapsed() >= Duration::from_millis(400));
+}
