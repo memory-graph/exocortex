@@ -3311,3 +3311,113 @@ itest!(
         ));
     }
 );
+
+itest!(count_state_stays_sublinear_under_thousands_of_assertions, {
+    // D56: the aggregate-then-rescan count shape was O(rows^2) in FalkorDB;
+    // at ~2.5k relationship assertions it crossed the 500ms default
+    // response timeout of the redis 1.x client the falkordb crate rides,
+    // and every hydration on the real loanlight-org graph died as an
+    // opaque connection error. This seeds that scale — including
+    // superseded versions, so the max-lsn-per-id window logic carries
+    // real weight — and expects get_state_at to stay correct and fast.
+    let s = connect("count-state").await;
+    let now = Utc::now();
+    let yesterday = now - Duration::hours(24);
+    const BATCH: usize = 25;
+    const MEMORIES: usize = 2101;
+    const RELS: usize = 2100;
+    const CLOSED_LATEST: usize = 100;
+    for chunk in (0..MEMORIES).collect::<Vec<_>>().chunks(BATCH) {
+        let rows: Vec<Memory> = chunk
+            .iter()
+            .map(|i| {
+                let mut row = mem(&format!("count-state-{i}"), 3, Visibility::Org);
+                row.id = MemoryId([
+                    0xA0,
+                    *i as u8,
+                    (*i >> 8) as u8,
+                    0xC1,
+                    0xC1,
+                    0xC1,
+                    0xC1,
+                    0xC1,
+                    0xC1,
+                    0xC1,
+                    0xC1,
+                    0xC1,
+                    0xC1,
+                    0xC1,
+                    0xC1,
+                    0xC1,
+                ]);
+                row
+            })
+            .collect();
+        s.upsert_batch(&rows, &[]).await.expect("seed memories");
+    }
+    for chunk in (0..RELS).collect::<Vec<_>>().chunks(BATCH) {
+        let mut rows = Vec::new();
+        for i in chunk {
+            let from = MemoryId([
+                0xA0,
+                *i as u8,
+                (*i >> 8) as u8,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+            ]);
+            let to = MemoryId([
+                0xA0,
+                (*i + 1) as u8,
+                ((*i + 1) >> 8) as u8,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+                0xC1,
+            ]);
+            // A superseded predecessor for every relationship: same id,
+            // closed yesterday, so the count must resolve max(lsn) per id.
+            let mut old = rel(from, to, 0);
+            old.valid_until = Some(yesterday);
+            let mut current = rel(from, to, 0);
+            if i % (RELS / CLOSED_LATEST) == 0 {
+                // The latest version itself is closed: excluded entirely.
+                current.valid_until = Some(yesterday);
+            }
+            rows.push(old);
+            rows.push(current);
+        }
+        s.upsert_batch(&[], &rows)
+            .await
+            .expect("seed relationships");
+    }
+    let started = std::time::Instant::now();
+    let snapshot = s.get_state_at(Utc::now()).await.expect("state at scale");
+    let elapsed = started.elapsed();
+    assert_eq!(snapshot.memory_count, MEMORIES as u64);
+    assert_eq!(snapshot.relationship_count, (RELS - CLOSED_LATEST) as u64);
+    assert!(
+        elapsed < StdDuration::from_millis(400),
+        "get_state_at took {elapsed:?} — the count queries have regressed past the \
+         falkordb client's 500ms response timeout (D56)"
+    );
+});

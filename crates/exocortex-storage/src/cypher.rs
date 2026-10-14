@@ -1735,16 +1735,23 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         id: "count_state_at",
         read_only: true,
         required_params: &["at", "max_visibility"],
+        // D56: single-pass max-by-list-key. The prior shape (aggregate, then
+        // re-MATCH by id+lsn) made FalkorDB rescan every assertion once per
+        // id — O(rows^2); past ~2.5k relationship assertions the query
+        // crossed 500ms, the default response timeout of the redis 1.x
+        // client the falkordb crate rides, so every hydration died as an
+        // opaque connection error. The sentinel sorts above every RFC3339
+        // stamp and stands in for an open-ended valid_until; per-id lsns
+        // are globally unique, so the list max is decided by the lsn alone.
         cypher: r#"
             MATCH (m:_MemoryAssertion)
             WHERE m.recorded_at <= $at AND m.valid_from <= $at
               AND m.visibility <= $max_visibility
-            WITH m.id AS assertion_id, max(m.lsn) AS assertion_lsn
-            MATCH (current:_MemoryAssertion)
-            WHERE current.id = assertion_id AND current.lsn = assertion_lsn
-              AND current.valid_from <= $at
-              AND (current.valid_until IS NULL OR current.valid_until > $at)
-            RETURN count(current) AS memories
+            WITH m.id AS assertion_id, m.lsn AS assertion_lsn,
+                 coalesce(m.valid_until, '9999-12-31T00:00:00+00:00') AS valid_until_key
+            WITH assertion_id, max([assertion_lsn, valid_until_key]) AS current_row
+            WHERE current_row[1] = '9999-12-31T00:00:00+00:00' OR current_row[1] > $at
+            RETURN count(assertion_id) AS memories
         "#,
     });
 
@@ -1752,16 +1759,17 @@ pub static TEMPLATES: Lazy<HashMap<&'static str, Template>> = Lazy::new(|| {
         id: "count_state_at_rels",
         read_only: true,
         required_params: &["at", "max_visibility"],
+        // D56: same single-pass rewrite as count_state_at — the quadratic
+        // rescan here is what killed every loanlight-org hydration.
         cypher: r#"
             MATCH (r:_RelationshipAssertion)
             WHERE r.recorded_at <= $at AND r.valid_from <= $at
               AND r.visibility <= $max_visibility
-            WITH r.id AS assertion_id, max(r.lsn) AS assertion_lsn
-            MATCH (current:_RelationshipAssertion)
-            WHERE current.id = assertion_id AND current.lsn = assertion_lsn
-              AND current.valid_from <= $at
-              AND (current.valid_until IS NULL OR current.valid_until > $at)
-            RETURN count(current) AS relationships
+            WITH r.id AS assertion_id, r.lsn AS assertion_lsn,
+                 coalesce(r.valid_until, '9999-12-31T00:00:00+00:00') AS valid_until_key
+            WITH assertion_id, max([assertion_lsn, valid_until_key]) AS current_row
+            WHERE current_row[1] = '9999-12-31T00:00:00+00:00' OR current_row[1] > $at
+            RETURN count(assertion_id) AS relationships
         "#,
     });
 

@@ -220,6 +220,25 @@ cross-cutting gates (§3). Commits: one per milestone, `M<n>: <what and why>`.
     path) is still asserted, now with both a negative and a positive
     control.
 
+### Standalone live triage (2026-10-14)
+23. **Every graph-plane round trip rides a hidden 500ms client response
+    ceiling**: the falkordb 0.3.0 crate's async pool is built on redis
+    1.2.2, whose `AsyncConnectionConfig::default()` ships
+    `response_timeout = Some(500ms)` — and the crate exposes no override
+    (its `with_timeout` is the server-side query timeout). Any graph
+    command slower than 500ms surfaces as `FalkorDBError::ConnectionDown`
+    ("...may be able to create a new connection..."), which reads as a
+    store fault while the store is healthy — D56's "poisoned data" was
+    exactly this: a 523ms count query over 2.5k relationship assertions
+    (the template was O(rows^2) in FalkorDB). The PRD pins sub-ms SLOs
+    but knows no 500ms ceiling; until a configurable client lands (plan
+    row D58), the operating rule is that registered Cypher templates
+    stay comfortably under 500ms on org-scale data — the D56 rewrite
+    (3ms at 4.2k seeded assertion rows) and the
+    `count_state_stays_sublinear_under_thousands_of_assertions`
+    integration test (400ms bound; the pre-fix tree ConnectionDowns at
+    that scale) keep that distance executable.
+
 ## Post-review round 1 (2026-08-24)
 
 The deep review of the M0–M8 implementation found two correctness bugs and
