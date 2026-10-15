@@ -82,9 +82,10 @@ stacks holding the WAL lock — was cleared on the owner's machine
 during triage).
 
 **2026-10-14 (power-outage recovery; D56 root-caused — not the data):**
-the outage lost nothing (D55 had closed clean at 522465b; six local
-commits now ride the next gated matrix alongside today's, which parks
-while the box is this loaded). D56's "poisoned graph rows" hypothesis
+the outage lost nothing (D55 had closed clean at 522465b; eight local
+commits — six pre-outage plus today's D56 (38c9611) / D57 (b5339a6)
+pair — now ride the next gated matrix, which parks while the box is
+this loaded). D56's "poisoned graph rows" hypothesis
 is REFUTED: reproduced deterministically on a copy of the loanlight
 data — the hydration count query `count_state_at_rels` was O(rows^2)
 in FalkorDB (aggregate, then rescan-by-id per group), taking 523ms at
@@ -98,8 +99,8 @@ by a live-backend integration test that ConnectionDowns on the pre-fix
 tree. Companion defect D57 fell out of the same e2e: an idle BLMOVE
 answers nil, which the Dreams fire drain decoded straight to String —
 one TypeError warning per second on every quiet store (visible live on
-loanlight, masked on personal by traffic); its fix lands in the paired
-commit immediately after this one. End-to-end on a copy of the real
+loanlight, masked on personal by traffic); its fix landed in the paired
+commit (b5339a6). End-to-end on a copy of the real
 7.3M loanlight data with this tree's binaries: zero hydration
 failures, zero warnings. The `~/loanlight/.mcp.json` personal-org
 workaround STAYS until a release installs the fix (0.5.2 still pending
@@ -330,19 +331,20 @@ Skipped legs for any release note: live Falkor SLO + storage-conformance
 live Falkor/Redis (FALKOR_URL/REDIS_URL unset), Postgres CDC, GitHub/
 Linear adapters (credentials), and the compose chaos harness. The table below carries the
 CLOSED detail ledgers (Rounds 6-9; every row Done, evidence inline;
-the summary rows live in the Done section). The next locally
-satisfiable work was Wave 5 (D3/D15) per the open-row gates —
-reordered 2026-10-13 by PLT1's owner go ("get exocortex working with
-all our coding agents: droid, codex, and claude code"; row open, see
-the Backlog PLT1 entry); the release cut waits on the owner's version
-call; D14/D16/D26 + the training-corpus direction park on owner
+the summary rows live in the Done section). PLT1 remains the open
+umbrella; its live-defect run drained the blockers in sequence (D53
+65fc6f2, D54 still open, D55 522465b, D56 38c9611 + D57 b5339a6 on
+2026-10-14), so the next locally satisfiable row is D54 (the
+`--verify` WAL row — reproducible with any healthy standalone stack
+up), while D58 (the falkordb client timeout decision), the release cut
+(0.5.2), D14/D16/D26 + the training-corpus direction park on owner
 decisions; REL2/D33 sit Proposed. A new item enters here only when
 work actually starts.
 
 | ID | Item | Owner | Notes |
 |----|------|-------|-------|
 | D19 | SaaS-API adapters: `exocortex-adapter-linear` first, `exocortex-adapter-github` second; design decisions recorded in the Sequenced row (direct APIs not MCP, one additive `SaaSAdapter` producer kind, D21 bounded projections, D13 ExternalKey joins from structured references only) | Crush | Owner supplied credentials 2026-09-03 (GitHub via gh CLI; Linear needs an API key minted — the MCP auth cannot ride the adapter). LANDED: the kind, `exocortex-api-client`, both adapter crates (hermetic suites; adapter-contract 19 obligations; no-llm reviews the transport dep), and the EXECUTED GitHub live leg (real rows parsed clean; it caught the UA/filterBy/Keychain defects). REMAINING to close: the owner mints a Linear API key → the Linear live leg → one full backend-submit run per adapter against a live node (the PX4 precedent) with idempotent rerun proven. **Rounds 10-12 hardened the family heavily** (49 verified findings across them): the never-written cursor, window/boundary arithmetic, per-batch edge ceilings with the bounded slicing mapper (git), fetch-bound truncation ceilings, composite foreign closing-ref identity (with the repository field the query now actually requests), case-insensitive same-repo folding, and createdAt-anchored `valid_from` so retired rows stop being permanently rejected |
-| PLT1 | Coding-agent pilot: exocortex working across every coding agent (owner directive 2026-10-13 — droid, codex, claude code; Crush already live) | Crush | Opened with the same-day wiring audit (full state in the Backlog PLT1 row): codex + claude code already wired on the installed 0.5.1 entrypoint (`personal`/`gregory`). **Wiring unit CLOSED 2026-10-13, same commit:** droid wired (`droid mcp add` with the `--` separator), block in `~/.factory/AGENTS.md` proven globally loaded, and droid read the day's Crush-written memories through the shared node (cross-agent read works; concurrent boot under a held WAL verified harmless — the wrapper attaches to the live node). All four harnesses on one graph. **Org-topology audit (2026-10-13, owner flag):** Codex's GLOBAL config (`~/.codex/config.toml`) pins `--org personal` — Codex has no per-project MCP scoping, so every Codex session, loanlight repos included, converges on the personal-org graph (correct for the one-graph goal; project separation inside it is `end_session`'s `project_id` + D51 visibility, not `--org`). Two strays found beside it: (1) `n` — a renamed-exocortex deployment wired in `~/loanlight/.mcp.json` + an `n-block` in `~/loanlight/AGENTS.md` — is DEAD wiring (binary `~/.cargo/bin/n` absent, no `n-loanlight` data dir), so Claude Code sessions working in `~/loanlight` get an unbootable server and NO memory tools; (2) a live `loanlight`-org stack (7.3M real data, `exocortex-loanlight` data dir) spawned 2026-10-11 21:54 by a Claude bg-spare (the plan header's mid-matrix restart event) and wired by NO harness config. Both await the owner's topology call: consolidate on personal-org (+ export/import the loanlight-org data) or express a split Codex cannot honor. REMAINING: the backend-node cutover decision; R12-44's SERVER half (principal project membership) is the repo-work piece |
+| PLT1 | Coding-agent pilot: exocortex working across every coding agent (owner directive 2026-10-13 — droid, codex, claude code; Crush already live) | Crush | Opened with the same-day wiring audit (full state in the Backlog PLT1 row): codex + claude code already wired on the installed 0.5.1 entrypoint (`personal`/`gregory`). **Wiring unit CLOSED 2026-10-13, same commit:** droid wired (`droid mcp add` with the `--` separator), block in `~/.factory/AGENTS.md` proven globally loaded, and droid read the day's Crush-written memories through the shared node (cross-agent read works; concurrent boot under a held WAL verified harmless — the wrapper attaches to the live node). All four harnesses on one graph. **Org-topology audit (2026-10-13, owner flag):** Codex's GLOBAL config (`~/.codex/config.toml`) pins `--org personal` — Codex has no per-project MCP scoping, so every Codex session, loanlight repos included, converges on the personal-org graph (correct for the one-graph goal; project separation inside it is `end_session`'s `project_id` + D51 visibility, not `--org`). Two strays found beside it: (1) `n` — a renamed-exocortex deployment wired in `~/loanlight/.mcp.json` + an `n-block` in `~/loanlight/AGENTS.md` — is DEAD wiring (binary `~/.cargo/bin/n` absent, no `n-loanlight` data dir), so Claude Code sessions working in `~/loanlight` get an unbootable server and NO memory tools; (2) a live `loanlight`-org stack (7.3M real data, `exocortex-loanlight` data dir) spawned 2026-10-11 21:54 by a Claude bg-spare (the plan header's mid-matrix restart event) and wired by NO harness config. Both await the owner's topology call: consolidate on personal-org (+ export/import the loanlight-org data) or express a split Codex cannot honor. **[2026-10-14 D56 amendment:** the loanlight-org data is no longer suspect — its hydration failure was the O(rows^2) count query crossing the falkordb client's 500ms response timeout, fixed in 38c9611 and verified end-to-end on a copy of that data dir; after a release installs the fix, the loanlight-org graph boots natively, so the export/import leg of the consolidation option is a choice, not a repair. Until then the 2026-10-13 workaround (loanlight sessions wired to the personal-org shared graph) stands.] REMAINING: the backend-node cutover decision; R12-44's SERVER half (principal project membership) is the repo-work piece |
 | R7-1 | Round 7 finding: Iceberg manifest paths are commonly URI-encoded (`%20`); the iceberg `resolve_path` treated them literally (real tables with a space in a path would fail at read time), and the two catalog flavors disagreed on decoding — the exact divergence the shared crate exists to prevent | Crush | **Done** — `percent_decode` moved to `exocortex-adapter-table` as the ONE implementation; delta delegates; iceberg `resolve_path` decodes through it (and refuses a relative path behind `file://` instead of silently resolving against the table root). Regressions: iceberg lib `percent_escaped_manifest_paths_decode` (decode + malformed-escape fail-closed) and delta's pre-existing `percent_escaped_paths_decode` (now riding the shared fn) |
 | R7-2 | Round 7 finding: the iceberg Avro value decoder had no `Union` arm — `from_avro_datum` without a reader schema returns `Union(index, inner)`, and the fallback arm would silently decode a non-null union to a Debug-string placeholder. Latent (no shipped path reads a union field) but a silent-corruption shape | Crush | **Done** — `avro_value_to_json` unwraps `Union(_, inner)` to the inner value. Regression: `union_fields_decode_to_their_inner_value` (hand-framed container, union branch 1 = long 9001, asserted to decode as a number via the record-field path) |
 | R7-3 | Round 7 finding (advisory): `exocortex-er classify` could not pin thresholds — an operator iterating on the labelled set had to accept calibration as-is or edit code | Crush | **Done** — `--accept` / `--review` overrides on `classify` (calibration stays the default and stays printed by `evaluate`). Regression: `classify_thresholds_are_pinnable_at_classification_time` pins both thresholds and proves every proposal lands in the review band |
