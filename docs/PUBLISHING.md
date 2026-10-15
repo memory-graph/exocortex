@@ -60,6 +60,45 @@ binaries (`exocortex-adapter-parquet` / `-iceberg` / `-delta` /
 manifests with the standing adapter-crate policy that always excluded
 them from ORDER (their manifests could previously publish by mistake).
 
+**0.5.2 (2026-10-14)** — the standalone-live-triage patch release
+(D51-D53, D55-D57; no ontology fingerprint move, `a427b3ad…ed9d`
+unchanged; no new workspace dependency). The set, in live-report
+order: **D51** — project-visibility rows written in standalone backend
+mode are readable from a new session (two stacking filters dropped
+them: the standalone principal now grants the wildcard project scope,
+and standalone-marked clients join it; the standalone restart budget
+rides 3 → 512 — the "node stopped silently" symptom was budget
+exhaustion under clustered SIGILLs, not a new crash class). **D52** —
+SSE response headers flush before the seed scan (issue #8's
+intermittent degraded sync: keepalives were withheld behind the scan,
+past the client's stall window). **D53** — `--verify`'s store row no
+longer false-REDs on a sibling data dir sharing a path prefix
+(whole-path token matching). **D55** — a current client re-resolves a
+replaced standalone owner (the attach record moved to
+`exocortex_wire` as the one parse/validate shape; `end_session`
+retries once with re-signed successor credentials; the SSE loop
+adopts the successor between reconnects with a forced full reseed).
+**D56** — the hydration state counts are single-pass (the
+aggregate-then-rescan Cypher was O(rows^2) in FalkorDB; at ~2.5k
+relationship assertions it crossed the falkordb client's hidden 500ms
+response timeout and every hydration on the org died as an opaque
+connection error — the loanlight-org graph was never poisoned; see
+deviation 23 and row D58 for the client-side ceiling itself). **D57**
+— an idle Dreams fire drain times out cleanly instead of logging a
+TypeError once per second (BLMOVE's idle answer is a nil reply).
+Also rides: REL4's gate-matrix wall-time levers (single-execution
+trust + nextest-by-default; tooling only). Release-note honesty: the
+falkordblite darwin-arm64 SIGILL-per-boot condition is unchanged from
+0.5.1 (upstream rebuild remains the permanent fix; bounded restarts
+and ingest retry ride through it). This cut's matrix runs the live
+Falkor storage-conformance leg and the live Redis Dreams-fire leg
+against local scratch stores (the D56/D57 regressions execute there)
+plus the bundled-runtime attach suite; NOT executed: Postgres CDC,
+the GitHub/Linear adapter live suites (no credentials), and the
+compose chaos harness. D56's end-to-end verification ran on a scratch
+copy of the real loanlight-org data dir; D51's live repro
+verification ran on the real personal graph.
+
 **0.5.1 (2026-10-07)** — the store-crash-tolerance patch release
 (D46/D46b/D46c; no ontology fingerprint move, `a427b3ad…ed9d`
 unchanged; no new workspace dependency). Root cause, from the owner's
