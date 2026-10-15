@@ -64,4 +64,10 @@ ignore = [
     "RUSTSEC-2026-0251", # sized-chunks unmaintained — via chitchat 0.9
     "RUSTSEC-2026-0002", # lru 0.12 unsound — PRD-pinned lru 0.12 (§2.2); no fixed release on that line
     "RUSTSEC-2026-0253", # lru 0.12 unsound (second advisory) — same pin, same reason
+    # rustls 0.21.12 (EOL; api-client's hyper 0.14 stack — retirement
+    # tracked by plan row D33). No patch path: 0.21.12 is the line's
+    # last release and both are fixed only in >=0.23.46, which the
+    # 0.23 server path now carries.
+    "RUSTSEC-2026-0346", # rustls 0.21 Debug impls expose TLS session secrets
+    "RUSTSEC-2026-0349", # rustls 0.21 unauthenticated ServerHello kx downgrade
 ]
