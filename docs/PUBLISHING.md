@@ -90,14 +90,24 @@ Also rides: REL4's gate-matrix wall-time levers (single-execution
 trust + nextest-by-default; tooling only). Release-note honesty: the
 falkordblite darwin-arm64 SIGILL-per-boot condition is unchanged from
 0.5.1 (upstream rebuild remains the permanent fix; bounded restarts
-and ingest retry ride through it). This cut's matrix runs the live
-Falkor storage-conformance leg and the live Redis Dreams-fire leg
-against local scratch stores (the D56/D57 regressions execute there)
-plus the bundled-runtime attach suite; NOT executed: Postgres CDC,
-the GitHub/Linear adapter live suites (no credentials), and the
-compose chaos harness. D56's end-to-end verification ran on a scratch
-copy of the real loanlight-org data dir; D51's live repro
-verification ran on the real personal graph.
+and ingest retry ride through it). **This cut's gates were carried by
+CI** (the D32 precedent): the local verify-release run was blocked by
+a degraded macOS process-assessment path on the release machine —
+every newly-built binary's first spawn wedged in dyld behind a
+continuously busy syspolicyd (evidence: `codesign -v --force` itself
+blocked 2m05s at zero CPU; nextest's test discovery sat 17+ minutes
+per binary with Docker quit and load ~4; cached/assessed binaries
+spawned instantly, isolating the fault to first-assessment). fmt,
+clippy, fastembed-check, and the workspace test compile all ran green
+locally before the wedge; CI ran the full gate set on the pushed
+tree. NOT executed anywhere this cut: the storage-conformance live
+Falkor leg and the Dreams live Redis-fire leg INSIDE a matrix (the
+D56/D57 live suites themselves ran green against local scratch
+stores during the fix, with stash-verified red pre-fix trees, and
+D56's end-to-end ran on a scratch copy of the real loanlight-org
+data dir; D51's live repro verification ran on the real personal
+graph), the standalone attach suite, Postgres CDC, the GitHub/Linear
+adapter live suites (no credentials), and the compose chaos harness.
 
 **0.5.1 (2026-10-07)** — the store-crash-tolerance patch release
 (D46/D46b/D46c; no ontology fingerprint move, `a427b3ad…ed9d`
