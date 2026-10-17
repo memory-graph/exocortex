@@ -235,3 +235,40 @@ jobs:
         with:
           name: installers
           path: dist/install.sh
+
+  # Publish the crates to crates.io from CI, off the release machine
+  # entirely. Runs only on v-tags after the assets are assembled, and
+  # reuses publish.sh's own fail-closed checks; the registry token
+  # never touches the repo or a laptop (Actions secret
+  # CARGO_REGISTRY_TOKEN). The ci workflow runs the same tree in
+  # parallel; PUBLISH_VERIFY=ci's attestation waits for its green
+  # (bounded below by the build+release jobs finishing first, so ci
+  # has typically completed by then — the poll below covers the race).
+  publish:
+    needs: [build, release]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1
+        with:
+          ref: ${{ github.ref }}
+      - name: Publish crates (CI-attested, fail-closed)
+        run: |
+          # The attestation may race the parallel ci run on this tag;
+          # poll it for up to 30 minutes before refusing.
+          deadline=$(( $(date +%s) + 1800 ))
+          until PUBLISH_VERIFY=ci bash scripts/publish.sh; do
+            if ! bash scripts/ci-attestation.sh 2>&1 | grep -q 'no completed-success'; then
+              echo "publish failed for a non-race reason; refusing" >&2
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "ci never went green on this tree within 30m; refusing" >&2
+              exit 1
+            fi
+            echo "ci still running on this tag; retrying attestation in 60s" >&2
+            sleep 60
+          done

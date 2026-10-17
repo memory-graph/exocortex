@@ -20,6 +20,16 @@ being published with every gate shard green
 (`scripts/ci-attestation.sh`; fail-closed — no green run on the exact
 tree, no publish). The local matrix remains the default.
 
+**CI-side publishing (REL7).** `release.yml` now carries a `publish`
+job: on a `v*` tag, after the builds and asset assembly, it runs
+`PUBLISH_VERIFY=ci scripts/publish.sh` on a Blacksmith runner with the
+registry token from the `CARGO_REGISTRY_TOKEN` Actions secret — the
+token never touches the repo or a laptop, and a release completes
+without the release machine being awake or healthy. The job polls the
+attestation for up to 30 minutes to cover the race with the parallel
+ci run on the same tag, then refuses. Local publishing via
+`scripts/publish.sh` remains available and equally valid.
+
 **Shipped in 0.4.1 (round-10)** — the SaaS adapters gain direct `chrono` +
 `prost-types` deps (RFC3339 -> protobuf Timestamp; both pre-existing
 workspace deps, recorded here per rule 9).
