@@ -32,10 +32,10 @@ env:
 
 jobs:
   correctness:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: "1.85.0"
@@ -74,7 +74,7 @@ jobs:
           # so it cannot dlopen on macOS 14; its linux-x64 redis-server
           # references GLIBC_2.38 symbols. Validate the packaged artifact
           # where the runtime can actually load (D29).
-          - os: macos-15
+          - os: blacksmith-6vcpu-macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
             standalone: true
@@ -92,7 +92,7 @@ jobs:
           # runs the packaged runtime inside the digest-pinned trixie
           # userland (glibc 2.41 + the runtime's shared libs) the compose
           # harness already trusts — 22.04 itself cannot load it.
-          - os: ubuntu-22.04
+          - os: blacksmith-4vcpu-ubuntu-2204
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
             standalone: true
@@ -211,11 +211,11 @@ jobs:
   # Installer scripts + final release assembly.
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
