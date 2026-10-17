@@ -82,7 +82,7 @@ jobs:
           # FalkorDB publishes no macOS-x64 embedded runtime. Keep the
           # client/team binaries on GitHub's native Intel runner, but do not
           # misrepresent this artifact as self-contained standalone.
-          - os: blacksmith-6vcpu-macos-15
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
             standalone: false
