@@ -35,7 +35,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
-      - uses: useblacksmith/checkout@v1 # v4
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: "1.85.0"
@@ -215,7 +215,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: useblacksmith/checkout@v1 # v4
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
