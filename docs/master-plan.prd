@@ -106,6 +106,35 @@ failures, zero warnings. The `~/loanlight/.mcp.json` personal-org
 workaround STAYS until a release installs the fix (0.5.2 still pending
 the owner's call).
 
+**2026-10-17 (0.5.2 SHIPPED; Blacksmith + CI-attested publish landed):**
+all 17 crates published to crates.io at 0.5.2 (publish exit 0, "All
+Exocortex crates published"), closing the multi-day release: the
+gates were carried by CI on the exact tree (run 38758603256 on
+cf8239e; the local matrix was unwinnable — the box's assessment queue
+wedged three matrix runs and one publish, and even the attested
+publish's first `cargo metadata` wedged 45 minutes before a calm
+window let it run through; the tag/release workflow had been green
+since 2026-10-15). Two durable fixes landed and were dogfooded
+same-day, both CI-green on the FIRST Blacksmith run (PR #9 merged —
+runner tags validated against Blacksmith's docs; Intel macOS stays on
+GitHub runners, ubuntu-2204 preserved for the linux build's
+userland): **REL5** `PUBLISH_VERIFY=ci` attests CI's green gate shards
+on the exact HEAD and lets publish.sh proceed without the local
+matrix (fail-closed; `scripts/ci-attestation.sh`), and **REL6** the
+spawn-health canary heads verify-release.sh so a degraded queue fails
+the matrix in seconds with the remediation instead of wedging it for
+hours. Honest notes for the record: the attested publish itself had
+to survive the queue (the canary would have refused the LOCAL path —
+correctly); REL4's quiet-box re-measurement is still unexecuted (the
+queue makes local timing runs unreliable; CI's Blacksmith timings are
+now the stable reference); the local matrix remains the default
+publish path, with the attestation as the degraded-box escape hatch.
+Next candidate (owner call): a release.yml publish job on Blacksmith
+runners with the registry token in Actions secrets — publishing fully
+off the laptop. The 0.5.2 installer/runtime carries D56/D57 —
+repointing `~/loanlight/.mcp.json` at the loanlight-org graph is now
+safe after `exocortex --version` shows 0.5.2.
+
 ## Archived status history
 
 Every superseded status entry (2026-08-25 through 2026-10-06), the
