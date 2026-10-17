@@ -94,7 +94,17 @@ for i, name in enumerate(order):
 fi
 
 # No mutation or publication occurs until every mandatory release check passes.
-if ! bash scripts/verify-release.sh; then
+# REL5: PUBLISH_VERIFY=ci replaces the LOCAL matrix with an attestation that
+# CI ran the identical gate set green on the exact HEAD — for release
+# machines that cannot complete a local matrix (the 0.5.2 assessment-queue
+# incident). Fail-closed either way: no green run on the exact tree, no
+# publish. The local matrix remains the default.
+if [ "${PUBLISH_VERIFY:-local}" = "ci" ]; then
+  if ! bash scripts/ci-attestation.sh; then
+    echo "publish refused: PUBLISH_VERIFY=ci and CI has not attested HEAD" >&2
+    exit 1
+  fi
+elif ! bash scripts/verify-release.sh; then
   echo "publish refused: mandatory correctness prerequisite failed" >&2
   exit 1
 fi

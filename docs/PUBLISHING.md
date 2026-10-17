@@ -9,6 +9,17 @@ planned for `ghcr.io`).
 All 14 crate names were verified available (2026-08-25;
 exocortex-adapter-sdk joined with A1).
 
+**PUBLISH_VERIFY=ci (REL5).** `scripts/publish.sh` normally demands a
+full LOCAL `verify-release.sh` run before any upload. When the release
+machine cannot complete one (a degraded macOS assessment queue wedges
+freshly-built binaries' first exec — see the 0.5.2 incident and
+verify-release.sh's spawn canary), `PUBLISH_VERIFY=ci
+scripts/publish.sh` substitutes an attestation: `gh` must show a
+completed-success `ci` workflow run whose headSha is the EXACT HEAD
+being published with every gate shard green
+(`scripts/ci-attestation.sh`; fail-closed — no green run on the exact
+tree, no publish). The local matrix remains the default.
+
 **Shipped in 0.4.1 (round-10)** — the SaaS adapters gain direct `chrono` +
 `prost-types` deps (RFC3339 -> protobuf Timestamp; both pre-existing
 workspace deps, recorded here per rule 9).
