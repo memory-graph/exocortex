@@ -19,6 +19,44 @@ if pgrep -q -f "Docker.app" 2>/dev/null; then
   echo "[matrix] WARNING: Docker Desktop is running — quit it for a clean cut (measured ~37%-core contention, REL4)" >&2
 fi
 
+# REL6: darwin first-spawn health canary. A freshly-built binary's FIRST
+# exec pays macOS code-signature assessment; when syspolicyd's queue is
+# degraded that assessment wedges indefinitely (zero CPU parked in
+# _dyld_start) and the matrix's test phase stalls for hours with no
+# diagnosis at the point of wedge. Fail fast instead: compile a tiny
+# never-before-seen binary, time its first exec, and refuse to start
+# when it exceeds the bound. EXOCORTEX_SKIP_SPAWN_CANARY=1 opts out
+# (CI's linux runners never take this branch).
+if [ "$(uname -s)" = "Darwin" ] && [ -z "${EXOCORTEX_SKIP_SPAWN_CANARY:-}" ]; then
+  _canary_src="$(mktemp -t exocortex_spawn_canary).rs"
+  _canary_bin="${_canary_src%.rs}"
+  printf 'fn main() {}\n' > "$_canary_src"
+  if ! rustc --edition 2021 --crate-name exocortex_spawn_canary \
+       -o "$_canary_bin" "$_canary_src" >/dev/null 2>&1; then
+    echo "[matrix] spawn canary: rustc unavailable — skipping" >&2
+  else
+    _canary_max="${EXOCORTEX_SPAWN_CANARY_MAX_SECS:-30}"
+    _canary_t0=${SECONDS:-0}
+    "$_canary_bin" &
+    _canary_pid=$!
+    _canary_ok=""
+    while [ $(( ${SECONDS:-0} - _canary_t0 )) -lt "$_canary_max" ]; do
+      if ! kill -0 "$_canary_pid" 2>/dev/null; then _canary_ok=1; break; fi
+      sleep 1
+    done
+    if [ -n "$_canary_ok" ]; then
+      wait "$_canary_pid" 2>/dev/null || true
+      printf '[matrix] %2ds  spawn-canary (first-exec assessment)\n' "$(( ${SECONDS:-0} - _canary_t0 ))" >&2
+    else
+      kill -9 "$_canary_pid" 2>/dev/null || true
+      echo "[matrix] spawn canary FAILED: a fresh binary's first exec exceeded ${_canary_max}s — the macOS process-assessment queue is degraded (REL6). Reboot the machine, or publish with PUBLISH_VERIFY=ci (REL5)." >&2
+      rm -f "$_canary_src" "$_canary_bin"
+      exit 1
+    fi
+  fi
+  rm -f "$_canary_src" "$_canary_bin"
+fi
+
 _MATRIX_START=${SECONDS:-0}
 _matrix_total_before=$_MATRIX_START
 phase() {
