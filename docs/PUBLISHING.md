@@ -20,6 +20,19 @@ being published with every gate shard green
 (`scripts/ci-attestation.sh`; fail-closed — no green run on the exact
 tree, no publish). The local matrix remains the default.
 
+**Standalone runtime provenance (D59).** The darwin-arm64 packaged
+runtime's `falkordb.so` is our maintained FalkorDB fork
+(`gregorydickson/FalkorDB`, rolling release `darwin-runtime-4.16`),
+fetched and pinned by SHA-256 in `scripts/fetch-standalone-runtime.sh`
+exactly like the npm archive and ghcr bottle digests — the stock
+module SIGILLs the store on macOS (module forks over parked worker
+threads; the fork gates off every fork site on darwin). The fork is
+SSPL-1.0; `RUNTIME-MANIFEST.txt` carries the source offer and the
+pinned digest. The linux-x64 runtime is unchanged (stock
+`@falkordblite/linux-x64`). Bumping the module = update the digest in
+the fetch script; the fork's CI proves the three fork-safety
+properties on every build.
+
 **CI-side publishing (REL7).** `release.yml` now carries a `publish`
 job: on a `v*` tag, after the builds and asset assembly, it runs
 `PUBLISH_VERIFY=ci scripts/publish.sh` on a Blacksmith runner with the

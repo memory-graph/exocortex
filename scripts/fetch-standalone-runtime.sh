@@ -90,6 +90,27 @@ case "$target" in
     fetch_bottle_dylib openssl/3 \
       9a8fa2ae1ef3424b116d7e6422d979e0290f4affdef072b1592e4535d2617d92 \
       libssl.3.dylib libcrypto.3.dylib
+    # D59: the packaged darwin module is our maintained FalkorDB fork's
+    # build — the stock module SIGILLs the store on macOS (module forks
+    # over parked worker threads; the fork's three darwin gates remove
+    # every fork site: fork-GC off, async-delete synchronous, GRAPH.COPY
+    # refused). Pinned by content digest like every native artifact here;
+    # bump by updating the digest when the fork's rolling release
+    # (darwin-runtime-4.16) moves.
+    fork_module_url=https://github.com/gregorydickson/FalkorDB/releases/download/darwin-runtime-4.16/falkordb.so
+    fork_module_sha256=bdc47d95448c39296da10cf0e2a5737b8c646297bb818b1f8b9cf31a67ca9ce8
+    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+      "$fork_module_url" -o "$tmp/falkordb-fork.so"
+    if command -v sha256sum >/dev/null 2>&1; then
+      actual=$(sha256sum "$tmp/falkordb-fork.so" | awk '{print $1}')
+    else
+      actual=$(shasum -a 256 "$tmp/falkordb-fork.so" | awk '{print $1}')
+    fi
+    [ "$actual" = "$fork_module_sha256" ] || {
+      echo "fork module digest mismatch: expected $fork_module_sha256, got $actual" >&2
+      exit 1
+    }
+    install -m 0555 "$tmp/falkordb-fork.so" "$out/falkordb.so"
     ;;
 esac
 
@@ -118,6 +139,14 @@ with LLVM exceptions, https://openmp.llvm.org) and openssl@3 3.6.0
 (Apache-2.0, https://www.openssl.org), both the last arm64_sequoia
 bottles (macOS 15 floor) from homebrew-core. No Homebrew install is
 required on the target machine.
+Darwin module: the maintained fork gregorydickson/FalkorDB
+(darwin-runtime-4.16 rolling release), pinned by SHA-256
+$fork_module_sha256. It replaces the stock module, which SIGILLs the
+store on macOS (module forks over parked worker threads; the fork
+gates off the fork-GC timer, defaults async-delete synchronous, and
+refuses GRAPH.COPY). Fork license SSPL-1.0; source offer:
+https://github.com/gregorydickson/FalkorDB (branch
+darwin-no-fork-gc; the release notes name the exact build commit).
 EOF
     ;;
 esac
