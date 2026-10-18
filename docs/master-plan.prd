@@ -135,6 +135,29 @@ off the laptop. The 0.5.2 installer/runtime carries D56/D57 —
 repointing `~/loanlight/.mcp.json` at the loanlight-org graph is now
 safe after `exocortex --version` shows 0.5.2.
 
+**2026-10-18 (0.5.3 SHIPPED — the fork-safe darwin runtime):** all 17
+crates at 0.5.3 on crates.io, tag v0.5.3 at 0b49d06, release run
+39157774882 fully green — correctness, all three platform builds (the
+darwin-arm64 build packaged the D59 fork module and validated it
+natively on the runner), asset release, and the REL7 CI-side publish,
+which exercised the whole new machinery end to end (attestation →
+publish.sh → 17 crates) for the first time. Release-day fixes, all
+gates doing their jobs: the publish job needed protoc, the fixtures
+gate refused a mutable apt install so protoc 36.2 is digest-pinned
+from its immutable release (with the well-known protos extracted —
+the first cut dropped them and wire's tarball verification could not
+compile timestamp.proto), and the asset-integrity guard correctly
+refused non-identical overwrites when the tag moved to the fixed
+tree (the stale release object was deleted and rebuilt; the
+correctness shard also flaked once on a worker-fixture transport
+connect — green on rerun, the D36 class). The tag moved twice
+pre-announcement (69a2333 → ac17c14 → 0b49d06); the 4 crates
+published by the first attempt were skipped as already-published by
+the final run. Local install done (0.5.3 binaries + the pinned fork
+module bdc47d95…9ce8); a live session booted on it same-hour. The
+first fully-laptop-independent release: nothing in the chain touched
+the release machine.
+
 ## Archived status history
 
 Every superseded status entry (2026-08-25 through 2026-10-06), the
