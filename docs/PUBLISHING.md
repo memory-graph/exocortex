@@ -94,6 +94,32 @@ binaries (`exocortex-adapter-parquet` / `-iceberg` / `-delta` /
 manifests with the standing adapter-crate policy that always excluded
 them from ORDER (their manifests could previously publish by mistake).
 
+**0.5.3 (2026-10-18)** — the fork-safe-darwin-runtime release (D59; no
+ontology fingerprint move, `a427b3ad…ed9d` unchanged; no new workspace
+dependency; zero Rust code changes from 0.5.2 — the payload is the
+packaged runtime and the release machinery). The darwin-arm64
+standalone runtime now ships our maintained FalkorDB fork's module
+(`gregorydickson/FalkorDB`, rolling release `darwin-runtime-4.16`,
+SHA-256-pinned in `fetch-standalone-runtime.sh`): the stock module
+SIGILLs the store one-to-two times per boot window because its
+fork-GC timer, async-delete worker, and GRAPH.COPY all call
+`RedisModule_Fork` over parked module threads on macOS; the fork
+gates off all three on darwin, proven live by the fork's CI on every
+build and by the exocortex release build's native runtime validation.
+The supervisor's 0.5.1-era mitigations (ASYNC_DELETE no, the post-boot
+fork quiesce window) remain as harmless belt-and-braces. Also rides
+since 0.5.2: the release machinery itself — `PUBLISH_VERIFY=ci`
+attestation (REL5), the spawn-health canary (REL6), and CI-side
+crates.io publishing on tags (REL7); this is the first cut exercising
+all three. Release-note honesty: live matrix legs were not executed
+locally (the release machine's assessment-queue condition persists);
+CI on Blacksmith carried the gate set on the exact tree, the darwin
+build's native runtime validation executed the packaged runtime
+(fork-safety properties), and D56/D57's live suites ran during their
+fixes. NOT executed anywhere: Postgres CDC, GitHub/Linear adapter
+live suites (no credentials), the compose chaos harness. The
+linux-x64 runtime is unchanged (stock `@falkordblite/linux-x64`).
+
 **0.5.2 (2026-10-14)** — the standalone-live-triage patch release
 (D51-D53, D55-D57; no ontology fingerprint move, `a427b3ad…ed9d`
 unchanged; no new workspace dependency). The set, in live-report
