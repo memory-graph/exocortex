@@ -263,7 +263,7 @@ jobs:
             -o "$proto_zip" \
             https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-x86_64.zip
           echo "121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278  $proto_zip" | sha256sum -c -
-          sudo unzip -oq "$proto_zip" -d /usr/local bin/protoc
+          sudo unzip -oq "$proto_zip" -d /usr/local bin/protoc 'include/*'
           protoc --version
       - name: Publish crates (CI-attested, fail-closed)
         run: |
