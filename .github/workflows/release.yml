@@ -255,6 +255,11 @@ jobs:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1
         with:
           ref: ${{ github.ref }}
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
+          protoc --version
       - name: Publish crates (CI-attested, fail-closed)
         run: |
           # The attestation may race the parallel ci run on this tag;
