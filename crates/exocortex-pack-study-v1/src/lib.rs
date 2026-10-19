@@ -91,7 +91,11 @@ pack! {
         Covers         => (Resource | StudySession | ReviewSession, Topic),
         About          => (Insight | Question, Topic),
         StudiedFrom    => (Insight | StudySession, Resource),
-        Answers        => (Insight, Question),
+        // D61: anything may answer a question — dev answers land as Fix or
+        // Solution, study answers as Insight; naming the cross-pack types
+        // would couple this pack to dev-v1, so the from-side is open (the
+        // ClusteredWith precedent). Additive superset per OC-PRD D2.
+        Answers        => (_, Question),
         Raises         => (StudySession | Resource, Question),
         FoundDifficult => (StudySession | ReviewSession, Topic),
         Reinforces     => (ReviewSession, Topic),

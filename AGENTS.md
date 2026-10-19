@@ -105,7 +105,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --features exocortex-adapter-sdk/testing,exocortex-server/testing
 cargo deny check
 cargo xtask kernel-purity   # kernel purity + SDK single-dep + worker kernel-ban
-cargo xtask fingerprint     # two-level (OC-PRD D1): line 1 compatibility a427b3ad…ed9d gates (round 12's Summarizes-to-end append moved it from 9f92957f…69c9, LP1's study-pack append from 4615018b…96c4, D8's Summarizes addition from 2c3ec388…5c23); line 2 build e21654cb…989f reports
+cargo xtask fingerprint     # two-level (OC-PRD D1): line 1 compatibility 46282e1b…6554 gates (D61's Answers-widening moved it from a427b3ad…ed9d, round 12's Summarizes-to-end append from 9f92957f…69c9, LP1's study-pack append from 4615018b…96c4); line 2 build 16172330…7525 reports
 cargo xtask compatibility-policy  # every fingerprint comparison consults the OC-PRD D2 policy table
 cargo xtask seam-inventory   # PX3: declared seams <-> conformance suites bijection
 cargo xtask adapter-contract  # D21-e: projection/manifest/schema-policy canaries + adapter-crate bijection

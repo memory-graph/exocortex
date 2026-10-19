@@ -82,7 +82,7 @@ fn composed_fingerprint_differs_and_is_stable() {
         let _ = write!(pinned, "{b:02x}");
     }
     assert_eq!(
-        pinned, "a427b3ad1df71fe2eac441108871de2223f0bb454cbd2ff9d6e25c9a96cced9d",
+        pinned, "46282e1bd31f3cb233b6bbac18b17cf16f11fa5f5e5a7284e32a0ae0c2d26554",
         "the composed compatibility fingerprint moved"
     );
 }
