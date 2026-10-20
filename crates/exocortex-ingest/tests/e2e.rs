@@ -505,3 +505,93 @@ async fn storage_inverse_idempotent() {
     assert!(ids.contains(&rel.id));
     assert!(ids.contains(&companion.id));
 }
+
+// D62: the ontology-demand ledger. An InvalidTypeTriple rejection is
+// ontology pressure; without the ledger it surfaces only in ack payloads
+// and logs (D61's wall was discovered by accident). The recording sink
+// must capture the exact kind/type coordinates so the owner sees
+// "Solves/Problem->Fix ×N" instead of a mystery.
+#[tokio::test(flavor = "multi_thread")]
+async fn demand_ledger_records_rejected_triples_and_unknown_kinds() {
+    use exocortex_ingest::demand::RecordingSink;
+    use tonic::Request;
+
+    let sink = Arc::new(RecordingSink::new());
+    let srv = server().with_demand_sink(sink.clone());
+    srv.register_source(Request::new(exocortex_wire::signing::registration(
+        &[5u8; 32],
+        "org",
+        "session://d62",
+        "test-adapter",
+        3,
+        "custom",
+        "test-node",
+        exocortex_wire::ingest::v1::ProducerKind::CodingAgent,
+    )))
+    .await
+    .unwrap();
+
+    let mut b = exocortex_wire::ingest::v1::IngestBatch {
+        org_id: "org".into(),
+        source_uri: "session://d62".into(),
+        producer_id: "test-adapter".into(),
+        batch_id: "d62-demand".into(),
+        mapping_version: "1".into(),
+        ontology_fingerprint: srv.ontology.fingerprint.0.to_vec(),
+        ceiling: 3,
+        checksum: String::new(),
+        observed_at: None,
+        recorded_at: None,
+        snapshot: None,
+        memories: vec![row("a", "Fix", 3), row("b", "Problem", 3)],
+        relationships: vec![
+            // Problem --Solves--> Fix: from-side illegal (the D61 shape).
+            exocortex_wire::ingest::v1::RelationshipDraft {
+                from_draft_key: "b".into(),
+                to_draft_key: "a".into(),
+                kind: "Solves".into(),
+                strength: 0.0,
+                confidence: 0.0,
+                context: String::new(),
+                visibility: 3,
+                to_memory_id: String::new(),
+            },
+            // A kind that does not exist at all.
+            exocortex_wire::ingest::v1::RelationshipDraft {
+                from_draft_key: "a".into(),
+                to_draft_key: "b".into(),
+                kind: "Wibbles".into(),
+                strength: 0.0,
+                confidence: 0.0,
+                context: String::new(),
+                visibility: 3,
+                to_memory_id: String::new(),
+            },
+        ],
+        producer: Some(ProducerIdentity {
+            node_id: "n".into(),
+            agent_id: String::new(),
+            adapter_id: String::new(),
+            hmac_signature: vec![],
+            client_metadata: None,
+        }),
+    };
+    exocortex_wire::signing::prepare_batch(&[5u8; 32], &mut b);
+    let ack = srv.submit(Request::new(b)).await.unwrap().into_inner();
+    assert!(ack
+        .rejections
+        .iter()
+        .any(|r| r.code == exocortex_wire::ingest::v1::RejectCode::InvalidTypeTriple as i32));
+
+    let events = sink.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.key == "Solves/Problem->Fix" && e.org == "org"),
+        "the triple rejection must record its coordinates: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e.key == "Wibbles/<unknown>"),
+        "the unknown kind must record its name: {events:?}"
+    );
+}

@@ -11,5 +11,6 @@ pub mod explorer;
 pub mod http_bind;
 pub mod org_backup;
 pub mod principal;
+pub mod resp_demand_sink;
 pub mod sse;
 pub mod telemetry;

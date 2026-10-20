@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod gates;
+mod ontology_evolve;
 
 #[derive(Parser)]
 struct Cli {
@@ -24,6 +25,12 @@ enum Cmd {
         #[arg(long)]
         verify_metadata_independence: bool,
     },
+
+    /// D63: the fingerprint-move ritual as one command — diff current
+    /// vs golden, rewrite the three reference sites, print the plan-row
+    /// stub. Run after an intentional ontology change lands in the
+    /// packs.
+    OntologyEvolve,
     /// Generate MCP + OpenAPI schemas from the operation registry.
     /// Fails if generated schemas are out of date (CI gate). Pass --write to
     /// regenerate and commit the goldens.
@@ -104,6 +111,7 @@ fn main() -> Result<()> {
         Cmd::Fingerprint {
             verify_metadata_independence,
         } => fingerprint(verify_metadata_independence),
+        Cmd::OntologyEvolve => ontology_evolve::evolve(),
         Cmd::GenSchemas { write } => gen_schemas(write),
         Cmd::GenPlaybook { write } => gen_playbook(write),
         Cmd::KernelPurity => kernel_purity(),

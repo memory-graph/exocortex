@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::demand::DemandEvent;
 use exocortex_kernel::{
     Memory, MemoryContext, MemoryId, Ontology, Provenance, Relationship, RelationshipId,
     Visibility, LSN,
@@ -205,6 +206,8 @@ pub struct IngestServer<S: Storage> {
     post_ingest_notify: Arc<tokio::sync::Notify>,
     /// D6 grouping rules selected by the registered source flavor.
     grouping_rules: Arc<Vec<crate::grouping::GroupingRule>>,
+    /// D62: where ontology-pressure rejections are tallied.
+    demand_sink: Arc<dyn crate::demand::OntologyDemandSink>,
     /// D21-d: snapshot ids observed per source, newest last, bounded —
     /// a batch naming an already-superseded snapshot is a rewind. In
     /// memory by design; the durable cursor/snapshot record is D20's
@@ -338,11 +341,19 @@ impl<S: Storage> Clone for IngestServer<S> {
             post_ingest_notify: self.post_ingest_notify.clone(),
             grouping_rules: self.grouping_rules.clone(),
             seen_snapshots: self.seen_snapshots.clone(),
+            demand_sink: self.demand_sink.clone(),
         }
     }
 }
 
 impl<S: Storage> IngestServer<S> {
+    /// D62: install the ontology-demand sink (the server installs a
+    /// RESP-hash writer; tests use `RecordingSink`).
+    pub fn with_demand_sink(mut self, sink: Arc<dyn crate::demand::OntologyDemandSink>) -> Self {
+        self.demand_sink = sink;
+        self
+    }
+
     /// Build the server (unpinned org — tests, library embedding).
     pub fn new(storage: Arc<S>, ontology: Arc<Ontology>, hmac_key: [u8; 32]) -> Self {
         let org = "org".to_string();
@@ -377,6 +388,7 @@ impl<S: Storage> IngestServer<S> {
             submit_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_CONCURRENT_SUBMITS)),
             post_ingest_notify: Arc::new(tokio::sync::Notify::new()),
             grouping_rules: Arc::new(crate::grouping::grouping_rules().to_vec()),
+            demand_sink: Arc::new(crate::demand::NoDemandSink),
         }
     }
 
@@ -848,7 +860,6 @@ impl<S: Storage> IngestServer<S> {
         crate::entities::attach_entities(&mut mem, &self.extractor);
         Ok(mem)
     }
-
     fn validate_relationship(
         &self,
         batch: &IngestBatch,
@@ -880,6 +891,11 @@ impl<S: Storage> IngestServer<S> {
             return Err(RejectCode::InvalidTypeTriple);
         };
         let Some(kind) = self.ontology.kind_id(&r.kind) else {
+            // D62: an unregistered kind name is ontology demand.
+            self.demand_sink.record(DemandEvent {
+                key: DemandEvent::unknown_kind_key(&r.kind),
+                org: batch.org_id.to_string(),
+            });
             return Err(RejectCode::UnknownKind);
         };
         // R-T14: computed-only kinds land exclusively via the Dreams cycle
@@ -911,6 +927,31 @@ impl<S: Storage> IngestServer<S> {
             kind,
             to_mem.memory_type,
         ) {
+            // D62: a known kind whose triple the ontology lacks is the
+            // highest-signal demand there is (the D61 class).
+            if matches!(e, exocortex_kernel::KernelError::InvalidTypeTriple { .. }) {
+                let kind_name = self
+                    .ontology
+                    .kinds_by_id
+                    .get(&kind)
+                    .map(|k| k.display_name.to_string())
+                    .unwrap_or_else(|| format!("kind:{}", kind.0));
+                let label = |t: u8| {
+                    self.ontology
+                        .memory_type_names
+                        .get(t as usize)
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| format!("type:{t}"))
+                };
+                self.demand_sink.record(DemandEvent {
+                    key: DemandEvent::triple_key(
+                        &kind_name,
+                        &label(from_mem.memory_type),
+                        &label(to_mem.memory_type),
+                    ),
+                    org: batch.org_id.to_string(),
+                });
+            }
             return Err(kernel_error_to_reject(&e));
         }
         // WS4 (audit): non-finite or out-of-range values are REJECTED,
@@ -933,7 +974,7 @@ impl<S: Storage> IngestServer<S> {
                 producer_kind: Some(producer_kind),
             }
         };
-        Ok(Relationship {
+        let relationship = Relationship {
             id: RelationshipId::derive(from_mem.id, kind, to_mem.id, None),
             kind,
             from: from_mem.id,
@@ -945,21 +986,21 @@ impl<S: Storage> IngestServer<S> {
                     self.ontology
                         .kinds_by_id
                         .get(&kind)
-                        .map(|m| m.default_strength)
-                        .unwrap_or(0.5)
+                        .map(|k| k.default_strength)
+                        .unwrap_or(0.8)
                 } else {
                     r.strength
                 },
                 confidence: if r.confidence == 0.0 {
-                    0.8
+                    self.ontology
+                        .kinds_by_id
+                        .get(&kind)
+                        .map(|k| k.default_strength)
+                        .unwrap_or(0.8)
                 } else {
                     r.confidence
                 },
-                context: if r.context.is_empty() {
-                    None
-                } else {
-                    Some(r.context.clone().into())
-                },
+                context: None,
                 evidence_count: 1,
                 success_rate: None,
                 validation_count: 0,
@@ -967,13 +1008,18 @@ impl<S: Storage> IngestServer<S> {
                 last_validated: times.recorded_at,
             },
             description: None,
-            bidirectional: false,
+            bidirectional: self
+                .ontology
+                .kinds_by_id
+                .get(&kind)
+                .is_some_and(|m| m.bidirectional),
             valid_from: times.recorded_at,
             valid_until: None,
             recorded_at: times.recorded_at,
             invalidated_by: None,
             lsn: LSN::new_local(0),
-        })
+        };
+        Ok(relationship)
     }
 }
 

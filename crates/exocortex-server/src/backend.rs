@@ -902,6 +902,36 @@ async fn run_backend_node_inner<S: Storage + 'static>(
             .as_str(),
         "1" | "true" | "on" | "yes"
     );
+    // D62: the ontology-demand ledger — every InvalidTypeTriple /
+    // UnknownKind ingest rejection tallies into an org-scoped hash on
+    // the redis plane (fire-queue precedent); surfaced by
+    // `exocortex-cli ontology-demand`. Failures are absorbed: a tally
+    // must never fail a batch.
+    // The fire-queue plane is the tally plane: standalone nodes derive
+    // it from the supervised store, clustered nodes carry it in args.
+    let redis_url_for_demand = args.redis_url.clone().or_else(|| {
+        let Ok(url) = std::env::var("EXOCORTEX_REDIS_URL") else {
+            return None;
+        };
+        (!url.is_empty()).then_some(url)
+    });
+    let demand_sink: Arc<dyn exocortex_ingest::demand::OntologyDemandSink> =
+        match redis_url_for_demand.as_deref() {
+            Some(url) => match redis::Client::open(url).map_err(|e| e.to_string()) {
+                Ok(client) => match client.get_connection_manager().await {
+                    Ok(conn) => Arc::new(crate::resp_demand_sink::RespDemandSink::new(conn)),
+                    Err(error) => {
+                        tracing::warn!("ontology-demand ledger disabled: {error}");
+                        Arc::new(exocortex_ingest::demand::NoDemandSink)
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!("ontology-demand ledger disabled: {error}");
+                    Arc::new(exocortex_ingest::demand::NoDemandSink)
+                }
+            },
+            None => Arc::new(exocortex_ingest::demand::NoDemandSink),
+        };
     let ingest = match standalone_producer_key {
         Some(key) => {
             IngestServer::new(storage.clone(), ontology.clone(), key).allow_personal_scopes()
@@ -912,6 +942,7 @@ async fn run_backend_node_inner<S: Storage + 'static>(
             args.admin_source_policies.clone(),
         ),
     }
+    .with_demand_sink(demand_sink)
     .with_reasoning(reasoning.clone())
     .with_dreams(dreams.clone())
     .with_org(&org)
