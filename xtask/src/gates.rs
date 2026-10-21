@@ -1742,6 +1742,12 @@ pub(crate) const SEAM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "all_three_packs_register_into_one_ontology",
     ),
     (
+        "pack-study-answers-widening",
+        "exocortex-pack-study-v1",
+        "tests/answers_widening.rs",
+        "fix_solution_and_insight_all_answer_questions",
+    ),
+    (
         "wire-signing",
         "exocortex-wire",
         "src/signing.rs",
