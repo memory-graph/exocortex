@@ -135,6 +135,36 @@ off the laptop. The 0.5.2 installer/runtime carries D56/D57 —
 repointing `~/loanlight/.mcp.json` at the loanlight-org graph is now
 safe after `exocortex --version` shows 0.5.2.
 
+**2026-10-19/21 (turnkey-but-expandable landed; SPK2; D61-D64):** owner
+direction 2026-10-19 set the posture — turnkey but expandable,
+external ontology systems (EvoOntology-class) welcome as producers
+behind the validation gate, ontology-evolve if benefits are clear.
+Landed: **SPK2** (`docs/research/flexible-ontologies.md` — the trend's
+discipline without its engine; three adoptables identified) —
+**D61** (the pub/sub lens's use case A: `Answers` widened to
+`(_, Question)`; fingerprint moved deliberately
+`a427b3ad…ed9d → 46282e1b…6554`; the open-operator-questions query
+verified end-to-end; playbook teaches the convention; the CI
+seam-inventory gate later caught the unregistered test file —
+registered as `pack-study-answers-widening`, `fc160bd`) — **D62**
+(the ontology demand ledger: InvalidTypeTriple/UnknownKind
+rejections HINCRBY into `exocortex:<org>:ontology-demand` on the
+redis plane, `b24a921`) — **D63** (`cargo xtask ontology-evolve`:
+one-command fingerprint ritual, refuses rather than classifies) —
+**D64** Proposed/demand-gated (the EvoOntology producer adapter).
+Also landed in range: D59 (the FalkorDB fork as the maintained darwin
+runtime: fork-GC off, async-delete synchronous, GRAPH.COPY refused;
+both 4.16/4.18 lines, fork CI proving the properties per push,
+release-pipeline packaging digest-pinned — see the row), D60 (the
+residual SIGILL: forks and heap corruption ELIMINATED as mechanisms
+by a 2.5h ASan differential; narrowed to a libc-sync trap on module
+threads; 0.5.3 rides through every instance; root cause pends TSan
+or a second-machine control), and 0.5.3 shipped fully CI-side
+(`51d3a41` record). Security: RUSTSEC-2026-0382 — webpki 0.103.16 on
+the server path, the EOL 0.101 hit ignored with the D33 pointer
+(`cbdd1cd`). Local stack: healthy on 0.5.3 + the fork module,
+total_forks:0 since install.
+
 **2026-10-18 (0.5.3 SHIPPED — the fork-safe darwin runtime):** all 17
 crates at 0.5.3 on crates.io, tag v0.5.3 at 0b49d06, release run
 39157774882 fully green — correctness, all three platform builds (the
