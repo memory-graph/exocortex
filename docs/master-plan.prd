@@ -135,6 +135,27 @@ off the laptop. The 0.5.2 installer/runtime carries D56/D57 —
 repointing `~/loanlight/.mcp.json` at the loanlight-org graph is now
 safe after `exocortex --version` shows 0.5.2.
 
+**2026-10-22 (the D60 SIGILL class killed the overnight stack; new
+sessions saw "exocortex unavailable"):** the residual parked-worker
+trap (D60, narrowed not fixed) struck twice on Oct 21 night (crash
+reports 21:49, 22:32), eventually taking the node; the wrapper+client
+pair survived as zombies (the wrapper's cleanup never fired — its
+child node was gone, but the wrapper waits on the CLIENT's stdin, and
+the client sat on a dead endpoint), and the stale port/attach/lock
+artifacts made the next morning's fresh boot die within a second (the
+D44 watchdog correctly killed the new store when ITS node hit the
+stale state, SIGTERM — not the SIGILL class). Remediated by hand:
+zombies killed, stale artifacts cleared, a persistent owner booted
+(clean hydration, zero failures), and a second wrapper verified
+attaching through D44-S2 (`attached to the live standalone node`,
+backend published). The new Claude session recovers on its next
+harness restart. TWO structural findings for rows: (a) the wrapper
+does not exit when its node dies AFTER publication — the cleanup only
+covers the pre-publication window (the zombie pair held a dead
+endpoint for hours); (b) a stale `.supervised.lock` naming a dead pid
+does not self-heal on the next boot's path. Both are small supervisor
+fixes riding the same lifecycle as D44/D55 — opened as D65.
+
 **2026-10-19/21 (turnkey-but-expandable landed; SPK2; D61-D64):** owner
 direction 2026-10-19 set the posture — turnkey but expandable,
 external ontology systems (EvoOntology-class) welcome as producers
@@ -241,6 +262,7 @@ each step (88 tests at completion).
 
 | ID | Item | Source | Status |
 |----|------|--------|--------|
+| D65 | **The standalone wrapper outlives its node after publication, and a stale `.supervised.lock` naming a dead pid blocks the next boot's path** — the 2026-10-22 outage's two structural findings: (a) `scripts/exocortex` cleans up on EXIT and on pre-publication node death, but once the node publishes and LATER dies, the wrapper (waiting on the client's stdin) and the client (parked on the dead endpoint) both survive as zombies — for hours in the observed case — holding a dead backend while fresh sessions read stale attach.json; (b) the D44-S1 exclusive-lock file names the owner node's pid, but a new boot on a dead-pid lock does not self-heal (the 09:21 boot died inside a second against the stale state). Fix shape: (1) the attached/owner client already re-resolves a REPLACED owner (D55) — the gap is detecting node death when no replacement comes; the wrapper (or the owner client, via the same port-file/pid liveness check `--verify` uses) should exit loudly when the owner pid is gone and no successor published within a bounded window; (2) `supervisor.rs`'s lock acquisition already treats a dead-pid holder as absent (D49's orphan-detection precedent) — audit the boot path that raced the stale lock this morning and make the new-boot path prove the holder is live before deferring | 2026-10-22 outage triage | **Proposed** |
 | D62 | **Ontology demand ledger — make the ontology's missing triples visible instead of accidental** — the keystone of the owner's 2026-10-19 positioning ("turnkey but expandable"): external ontology systems (EvoOntology-class) feed exocortex as producers behind the validation gate ("LLM proposes, kernel disposes"), and their ontology pressure arrives as `InvalidTypeTriple` ingest rejections. Today those rejections surface only in ack payloads and logs — D61's wall was discovered by accident in a coding session. Fix shape: a deterministic server-side tally (org-scoped store hash: kind/from-type → count, incremented exactly where ingest produces the rejection) surfaced as an additive `ontology_demand` field on `backend_status`, top entries with counts; no wire change, no LLM, client-visible by construction | owner direction 2026-10-19 | **Done (2026-10-19, this commit)** — `exocortex_ingest::demand` (sink trait, `DemandEvent` with `Kind/From->To` and `Kind/<unknown>` keys, `NoDemandSink` default) records at the two production sites in `validate_relationship` (UnknownKind + InvalidTypeTriple with resolved kind/type names); the backend installs `resp_demand_sink::RespDemandSink` (fire-queue connection precedent, detached-task HINCRBY — a tally never fails or blocks a batch) on the redis plane (`args.redis_url` or `EXOCORTEX_REDIS_URL`); read surface: `redis-cli HGETALL exocortex:<org>:ontology-demand` (CLI subcommand deferred — RESP is already agent/operator reachable). Fail-without-it: ingest e2e `demand_ledger_records_rejected_triples_and_unknown_kinds` — a batch with an illegal `Solves/Problem->Fix` AND an unknown `Wibbles` kind records exactly those coordinates (stash-verified: the test will not compile against the pre-change service) |
 | D63 | **`cargo xtask ontology-evolve` — the fingerprint-move ritual as one command** — D61 proved the ceremony costs more than the change: golden literal + AGENTS.md fingerprint-history line + CLAUDE.md fingerprint paragraph + plan-row stub, four hand edits with known gotchas. The command diffs current vs golden, asserts the OC-PRD D2 class through the existing policy machinery (refuses non-additive moves), rewrites the golden + AGENTS + CLAUDE references, and prints a plan-row stub. Pure ceremony removal; every future widening (and external-producer pressure landing through D62) gets cheaper and typo-proof | owner direction 2026-10-19 ("implement ontology-evolve if it has clear benefits" — benefit case: D61's ritual exceeded the change) | **Done (2026-10-19, this commit)** — `cargo xtask ontology-evolve`: computes the current fingerprint, extracts the pinned golden from the study pack test, verifies the three reference sites (golden / AGENTS / CLAUDE) carry the pin, rewrites full literals AND 8-hex short forms, and prints the plan-row stub with the follow-up gate commands. The additive-superset verdict stays where it belongs — `compatibility-policy` + the pack tests' `is_subset_of` assertions — the command refuses rather than classifying. No-op-clean when fingerprints agree (verified: prints the agreement) |
 | D64 | **EvoOntology-class producer adapter** — the concrete "expandable" example: a thin adapter (`exocortex-adapter-evoontology`) that pulls a deployed EvoOntology MCP server's learned entities/edges and maps them to typed memory drafts through the standard §18 ingest path, refusing unmapped concepts LOUDLY (the D34 refuse-on-unmapped discipline) so ontology pressure flows into D62's ledger instead of silent drops. The LLM stays in THEIR process — exocortex receives typed submissions over the wire exactly as every adapter does (R-D6 untouched; agent-authored content is already the normal case). Demand-gated on a real EvoOntology deployment to feed | owner direction 2026-10-19 ("maybe we use EvoOntology to feed data to us") | **Proposed (demand-gated)** |
