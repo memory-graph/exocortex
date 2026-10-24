@@ -156,6 +156,28 @@ endpoint for hours); (b) a stale `.supervised.lock` naming a dead pid
 does not self-heal on the next boot's path. Both are small supervisor
 fixes riding the same lifecycle as D44/D55 — opened as D65.
 
+**2026-10-22/24 (D65 landed — no more zombie pairs; two advisory
+bumps; PAUSED FOR REBOOT):** the 2026-10-22 outage's two structural
+findings are FIXED (`6f86574`): the wrapper's owner-liveness watchdog
+(owner dead + no successor on the lock past a grace window kills the
+client so the wrapper exits and the harness restarts into a fresh
+boot; a live successor stands down for the D55 re-resolution path)
+and the data-dir lock file truncates before its pid write. The e2e
+(`owner_death_stops_the_wrapper_instead_of_zombieing`) proves it:
+green in 2.5s fixed, WEDGES on the pre-fix tree (the zombie shape
+observed live). Two fresh advisories turned deny red on the D65 push
+(RUSTSEC-2026-0386 tokio AsyncFd unsoundness → 1.53.3;
+RUSTSEC-2026-0385 ctutils non-constant-time masks → 0.4.4) — both
+bumped, deny green. The reboot the owner is taking also serves as the
+second-machine-class control D60 wants (a fresh boot clears the
+assessment queue; if the SIGILL class survives reboots, the
+environmental hypothesis weakens). STATE AT PAUSE: tree clean,
+everything pushed; CI on 6f86574 went red on the advisories only
+(fixed in this commit); local stack healthy on 0.5.3 + fork module.
+OPEN: D60 root cause (TSan/second-machine), D64 (demand-gated),
+0.5.4 whenever wanted (carries D61 Answers + D62 ledger + D63 evolve
++ D65 lifecycle).
+
 **2026-10-19/21 (turnkey-but-expandable landed; SPK2; D61-D64):** owner
 direction 2026-10-19 set the posture — turnkey but expandable,
 external ontology systems (EvoOntology-class) welcome as producers
