@@ -351,6 +351,11 @@ pub fn acquire_data_dir_lock(data_dir: &std::path::Path) -> anyhow::Result<std::
         }
     }
     let mut file = file;
+    // D65: truncate before writing — `truncate(false)` + write_all on a
+    // shorter new pid would leave the prior pid's trailing digits (a
+    // stale "123456" read as "7890456" by liveness checks). The flock
+    // itself self-heals on process death; the pid BYTES must too.
+    file.set_len(0)?;
     let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
     Ok(file)
 }

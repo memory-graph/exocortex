@@ -611,3 +611,152 @@ fn archive_live_harness_leaves_sibling_runtime_resolution_to_wrapper() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// D65: the owner-liveness watchdog. The 2026-10-22 outage left the
+// wrapper + client alive for hours after the node died — the wrapper
+// waits on the client, the client retries the dead endpoint forever.
+// The watchdog kills the client when the owner dies with no successor
+// taking the data dir, so the wrapper exits and the harness restarts
+// the session into a fresh boot.
+#[test]
+#[cfg(unix)]
+fn owner_death_stops_the_wrapper_instead_of_zombieing() {
+    let dir = std::env::temp_dir().join(format!(
+        "exocortex-standalone-ownerwatch-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let client_started = dir.join("client-started");
+    let node_pid_file = dir.join("node.pid");
+    let fake_node = dir.join("exocortex-node");
+    let fake_client = dir.join("exocortex-mcp-client");
+    let runtime_dir = dir.join("standalone-runtime");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::write(runtime_dir.join("redis-server"), "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::write(runtime_dir.join("falkordb.so"), "fixture").unwrap();
+    // The fake node publishes the runtime env (carrying the data home so
+    // the watchdog's successor check has a dir to read), records its
+    // pid for the test to kill, then serves forever.
+    std::fs::write(
+        &fake_node,
+        format!(
+            "#!/bin/sh\nruntime=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --standalone-runtime-file ]; then runtime=$2; shift 2; else shift; fi\ndone\nprintf \"EXOCORTEX_BACKEND='http://127.0.0.1:43119'\\nEXOCORTEX_SSE_KEY='0000000000000000000000000000000000000000000000000000000000000000'\\nEXOCORTEX_STANDALONE_DATA_HOME='{}'\\n\" > \"$runtime\"\nprintf '%s\\n' \"$$\" > '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            dir.display(),
+            node_pid_file.display(),
+        ),
+    )
+    .unwrap();
+    // The zombie shape: acknowledge MCP initialize, then survive stdin
+    // EOF and never exit on its own (the observed client parked on a
+    // dead endpoint). Only the watchdog's kill ends it.
+    std::fs::write(
+        &fake_client,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nIFS= read -r request\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'\nwhile :; do sleep 1; done\n",
+            client_started.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&fake_client, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(
+        runtime_dir.join("redis-server"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+
+    let wrapper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/exocortex");
+    // Own process group: the red-path run (no watchdog) leaves the
+    // fake client alive; the failure path must reap the whole group or
+    // the suite wedges exactly like the outage it tests.
+    use std::os::unix::process::CommandExt as _;
+    let mut child = Command::new(wrapper)
+        .process_group(0)
+        .args([
+            "--mode",
+            "mcp-standalone",
+            "--org",
+            "standalone-ownerwatch",
+            "--user",
+            "tester",
+            "--data-dir",
+            dir.to_str().unwrap(),
+        ])
+        .env("EXOCORTEX_BIN_DIR", &dir)
+        .env_remove("EXOCORTEX_REDIS_SERVER")
+        .env_remove("EXOCORTEX_FALKORDB_MODULE")
+        .env("EXOCORTEX_STANDALONE_NODE_BIN", &fake_node)
+        .env("EXOCORTEX_STANDALONE_CLIENT_BIN", &fake_client)
+        // Fast watchdog for the test: 1s interval, 1s grace.
+        .env("EXOCORTEX_OWNER_WATCH_INTERVAL", "1")
+        .env("EXOCORTEX_OWNER_GRACE_SECS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let responses = support::BoundedLineReader::new(child.stdout.take().unwrap());
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": { "name": "ownerwatch-test", "version": "0" }
+            }
+        })
+    )
+    .unwrap();
+    child.stdin.as_mut().unwrap().flush().unwrap();
+    let response = responses.read_json(&mut child);
+    assert!(response.get("result").is_some(), "{response}");
+
+    // Both the node (pid file) and the client (marker) are up.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while (!node_pid_file.exists() || !client_started.exists())
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(node_pid_file.exists(), "fake node never published its pid");
+    assert!(client_started.exists(), "session client never started");
+
+    // The outage shape: the node DIES after publication, no successor.
+    let node_pid: i32 = std::fs::read_to_string(&node_pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(node_pid.to_string())
+        .status();
+
+    // THE assertion: the wrapper must exit (watchdog kills the client,
+    // `wait` returns) instead of zombieing. Without the watchdog the
+    // wrapper sits in `wait client_pid` forever and this deadline fires.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut exited = None;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait().unwrap() {
+            Some(status) => {
+                exited = Some(status);
+                break;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    let status = exited.unwrap_or_else(|| {
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(format!("-{}", child.id()))
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("wrapper still alive long after owner death — the zombie pair (D65)");
+    });
+    assert!(!status.success(), "the watchdog exit is a kill path");
+    std::fs::remove_dir_all(dir).unwrap();
+}

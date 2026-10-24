@@ -99,7 +99,11 @@ case "$mode" in
     fi
     supervisor_pid=$!
     client_pid=""
+    owner_watch_pid=""
     cleanup() {
+      if [ -n "$owner_watch_pid" ]; then
+        kill "$owner_watch_pid" 2>/dev/null || true
+      fi
       if [ -n "$client_pid" ]; then
         kill "$client_pid" 2>/dev/null || true
         wait "$client_pid" 2>/dev/null || true
@@ -207,6 +211,54 @@ case "$mode" in
     # shellcheck disable=SC2086 -- client_data_args is wrapper-built, word-split safe
     "$client_bin" --backend "$EXOCORTEX_BACKEND" "$@" $client_data_args <&3 &
     client_pid=$!
+    # D65: the owner-liveness watchdog. When the node behind this session
+    # dies, the wrapper must not outlive it as a zombie pair (the
+    # 2026-10-22 outage: wrapper + client sat for hours on a dead
+    # endpoint). A successor node taking the data dir is the healthy
+    # replacement path (D55 client re-resolution rides it) — the lock
+    # file's pid changing names the successor, and the watchdog stands
+    # down. Owner dead + no successor within the grace window: the
+    # client is stopped and the wrapper exits, so the harness restarts
+    # the session into a fresh boot. Attached sessions watch the same
+    # lock (their "supervisor" IS the lock-named owner).
+    owner_watch_data_home="${EXOCORTEX_STANDALONE_DATA_HOME:-}"
+    if [ -n "${EXOCORTEX_ATTACHED:-}" ]; then
+      owner_watch_self=""
+    else
+      owner_watch_self="$supervisor_pid"
+    fi
+    (
+      while :; do
+        sleep "${EXOCORTEX_OWNER_WATCH_INTERVAL:-5}"
+        if [ -n "$owner_watch_self" ]; then
+          kill -0 "$owner_watch_self" 2>/dev/null && continue
+        fi
+        # Owner (ours or the lock-named one) is gone: successor check.
+        if [ -n "$owner_watch_data_home" ] \
+           && [ -f "$owner_watch_data_home/.supervised.lock" ]; then
+          owner_watch_succ=$(head -1 "$owner_watch_data_home/.supervised.lock" 2>/dev/null)
+          if [ -n "$owner_watch_succ" ] && [ "$owner_watch_succ" != "$owner_watch_self" ] \
+             && kill -0 "$owner_watch_succ" 2>/dev/null; then
+            # A successor owns the dir; the client re-resolves (D55).
+            continue
+          fi
+        fi
+        # Grace: a successor may still be booting.
+        sleep "${EXOCORTEX_OWNER_GRACE_SECS:-30}"
+        if [ -n "$owner_watch_data_home" ] \
+           && [ -f "$owner_watch_data_home/.supervised.lock" ]; then
+          owner_watch_succ=$(head -1 "$owner_watch_data_home/.supervised.lock" 2>/dev/null)
+          if [ -n "$owner_watch_succ" ] && [ "$owner_watch_succ" != "$owner_watch_self" ] \
+             && kill -0 "$owner_watch_succ" 2>/dev/null; then
+            continue
+          fi
+        fi
+        echo "standalone owner exited with no successor; stopping the session client (restart the harness session to boot fresh)" >&2
+        kill "$client_pid" 2>/dev/null
+        exit 0
+      done
+    ) &
+    owner_watch_pid=$!
     set +e
     wait "$client_pid"
     status=$?
