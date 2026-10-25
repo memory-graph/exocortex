@@ -139,6 +139,22 @@ pub fn lock_holder_pid(data_dir: &Path) -> Option<u32> {
     raw.trim().parse::<u32>().ok()
 }
 
+/// D54 (plan row; the 2026-10-13 live finding): is this WAL open failure
+/// the LOCK-CONTENTION shape — another live process holds sled's
+/// database lock? Sled surfaces it as an `Io` error whose text is all
+/// we get: `WouldBlock` (the wrapped io::Error kind) and/or "database
+/// is used by other process", depending on version. Anything else is a
+/// real I/O failure and must not be diagnosed as contention.
+pub fn wal_lock_contended(error: &crate::wal::WalError) -> bool {
+    match error {
+        crate::wal::WalError::Io(detail) => {
+            let lower = detail.to_ascii_lowercase();
+            lower.contains("wouldblock") || lower.contains("used by other process")
+        }
+        _ => false,
+    }
+}
+
 /// Outcome of the harness-config check (PRD S6): green iff some known
 /// harness config names a binary from the install directory this client
 /// runs from.

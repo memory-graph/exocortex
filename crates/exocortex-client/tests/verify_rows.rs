@@ -185,3 +185,77 @@ fn stale_port_file_is_red_until_a_server_answers() {
     server.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// D54 (plan row, the 2026-10-13 live finding): a WAL lock held by a
+/// LIVE standalone stack is a row, never a crash — the owner's
+/// diagnostic died with `Error: wal io: … WouldBlock` exactly when the
+/// system was running. Fail-without-it: pre-fix verify exits via the
+/// propagated error (no wal row at all, exit 1 ≠ red count).
+#[test]
+fn wal_lock_held_by_a_live_stack_renders_an_ok_row_not_a_crash() {
+    let dir = temp_dir("wal-live");
+    // Hold the sled lock from the test process — the "live stack".
+    let _wal = Wal::open(&dir.join("wal")).unwrap();
+    // The supervised node's lock names THIS test's pid (alive), in the
+    // wrapper's `--data-dir D → D/falkordb` artifact topology.
+    let artifacts = dir.join("falkordb");
+    std::fs::create_dir_all(&artifacts).unwrap();
+    std::fs::write(
+        artifacts.join(".supervised.lock"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    let (out, code) = run_verify(&dir, "org", "user");
+    assert!(
+        out.contains("ok    wal: held by the live standalone stack"),
+        "a live holder must render an ok row naming the pid, got:\n{out}"
+    );
+    assert!(
+        !out.contains("Error: wal io:"),
+        "verify must not die on the WAL lock, got:\n{out}"
+    );
+    assert_eq!(
+        code.unwrap_or(0),
+        out.lines()
+            .filter(|l| l.trim_start().starts_with("RED"))
+            .count() as i32,
+        "exit code must equal the red-row count"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The orphan case the row exists to catch: the WAL is locked and the
+/// supervised lock names a DEAD pid — RED naming the holder, not a
+/// crash and not a false green.
+#[test]
+fn wal_lock_with_no_live_supervisor_is_red_not_a_crash() {
+    let dir = temp_dir("wal-orphan");
+    let _wal = Wal::open(&dir.join("wal")).unwrap();
+    let mut dead = std::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .unwrap();
+    let dead_pid = dead.id();
+    dead.kill().unwrap();
+    let _ = dead.wait();
+    let artifacts = dir.join("falkordb");
+    std::fs::create_dir_all(&artifacts).unwrap();
+    std::fs::write(artifacts.join(".supervised.lock"), dead_pid.to_string()).unwrap();
+    let (out, code) = run_verify(&dir, "org", "user");
+    assert!(
+        out.contains("RED   wal: locked by another process"),
+        "an orphaned holder must be a RED row, got:\n{out}"
+    );
+    assert!(
+        !out.contains("Error: wal io:"),
+        "verify must not die on the WAL lock, got:\n{out}"
+    );
+    assert_eq!(
+        code.unwrap_or(0),
+        out.lines()
+            .filter(|l| l.trim_start().starts_with("RED"))
+            .count() as i32,
+        "exit code must equal the red-row count"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

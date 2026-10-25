@@ -740,44 +740,85 @@ fn verify(
     }
 
     // 5. WAL health: pending entries would drift on a future write.
+    // D54: a lock held by another process is a ROW, never a crash —
+    // the diagnostic was unusable exactly when the system was running
+    // (a live standalone stack holds the sled lock; the owner's
+    // `--verify` died with `Error: wal io: … WouldBlock` while three
+    // sessions were being served). Healthy holder → ok row naming the
+    // pid; no live supervisor → the orphan case this row exists to
+    // catch, RED.
     let wal_dir = data_dir.join("wal");
     if wal_dir.exists() {
-        let wal = wal::Wal::open(&wal_dir)?;
-        // R14 (P3): one decode pass carries both projections.
-        let (pending, partitions) = wal.pending_and_partitions()?;
-        if pending > 0 {
-            red += 1;
-        }
-        println!(
-            "  {}  wal: {pending} pending entries (drained at startup when a backend is configured)",
-            if pending == 0 { "ok" } else { "RED" }
-        );
+        match wal::Wal::open(&wal_dir) {
+            Ok(wal) => {
+                // R14 (P3): one decode pass carries both projections.
+                match wal.pending_and_partitions() {
+                    Ok((pending, partitions)) => {
+                        if pending > 0 {
+                            red += 1;
+                        }
+                        println!(
+                            "  {}  wal: {pending} pending entries (drained at startup when a backend is configured)",
+                            if pending == 0 { "ok" } else { "RED" }
+                        );
 
-        // D49 (d): the WAL's own partition ledger vs the configured pair.
-        // A wrong --org/--user silently starts an empty graph next door
-        // (issue #6: README says my-org/me, defaults say personal/dev,
-        // the live data said personal/gregory).
-        if partitions.is_empty() {
-            println!("  ok    partition: no stamped writes yet (first write stamps this pair)");
-        } else if partitions
-            .iter()
-            .any(|(o, u)| o == &args.org && u == &args.user)
-        {
-            println!(
-                "  ok    partition: --org {} --user {} has writes in the local ledger",
-                args.org, args.user
-            );
-        } else {
-            red += 1;
-            let held = partitions
-                .iter()
-                .map(|(o, u)| format!("{o}/{u}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!(
-                "  RED   partition: --org {} --user {} has NO writes in the local ledger, which holds: {held} — wiring the wrong pair starts an empty graph next door",
-                args.org, args.user
-            );
+                        // D49 (d): the WAL's own partition ledger vs the
+                        // configured pair. A wrong --org/--user silently
+                        // starts an empty graph next door (issue #6:
+                        // README says my-org/me, defaults say
+                        // personal/dev, the live data said
+                        // personal/gregory).
+                        if partitions.is_empty() {
+                            println!("  ok    partition: no stamped writes yet (first write stamps this pair)");
+                        } else if partitions
+                            .iter()
+                            .any(|(o, u)| o == &args.org && u == &args.user)
+                        {
+                            println!(
+                                "  ok    partition: --org {} --user {} has writes in the local ledger",
+                                args.org, args.user
+                            );
+                        } else {
+                            red += 1;
+                            let held = partitions
+                                .iter()
+                                .map(|(o, u)| format!("{o}/{u}"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            println!(
+                                "  RED   partition: --org {} --user {} has NO writes in the local ledger, which holds: {held} — wiring the wrong pair starts an empty graph next door",
+                                args.org, args.user
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        red += 1;
+                        println!("  RED   wal: the local ledger cannot be read: {e}");
+                    }
+                }
+            }
+            Err(e) if exocortex_client::verify_checks::wal_lock_contended(&e) => {
+                use exocortex_client::verify_checks::{
+                    lock_holder_pid, pid_alive, store_artifact_dir,
+                };
+                let holder = lock_holder_pid(&store_artifact_dir(data_dir));
+                if holder.is_some_and(pid_alive) {
+                    println!(
+                        "  ok    wal: held by the live standalone stack (supervised pid {}) — pending-count check skipped while the stack is up",
+                        holder.expect("just checked")
+                    );
+                } else {
+                    red += 1;
+                    println!(
+                        "  RED   wal: locked by another process and NO live supervised node owns it (supervised lock holder pid {holder:?}) — an orphaned holder blocks every write; kill it or re-run standalone"
+                    );
+                }
+                println!("  ok    partition: skipped (the WAL is locked by another process)");
+            }
+            Err(e) => {
+                red += 1;
+                println!("  RED   wal: the local WAL cannot be opened: {e}");
+            }
         }
     } else {
         println!("  ok    wal: no local WAL yet (nothing buffered)");
