@@ -302,15 +302,21 @@ fn event_stream<S: Storage + 'static>(
         // Owned permits live exactly as long as the response stream. Client
         // cancellation drops the stream and releases both limits immediately.
         let _live_permits = live_permits;
-        // Issue #8: the reseed permit now spans the in-stream scan.
-        let _reseed_permit = _reseed_permit;
         let mut rx = tokio_stream::wrappers::BroadcastStream::new(rx);
         // Initial comment anchors the connection before the first delta.
         yield Ok::<Event, Infallible>(Event::default().comment(format!("exocortex {node_id}")));
         if let Some(seed_build) = seed_build {
             // Issue #8: the scan is inside the stream; measure the phase.
+            // Issue #10: the reseed permit caps concurrent seed SCANS, not
+            // live streams — D52 bound it beside the live permits for the
+            // stream's whole lifetime, so MAX_CONCURRENT_RESEEDS long-lived
+            // seeded clients starved every later hydration with a permanent
+            // 429. It is released the moment the scan resolves, before the
+            // seed envelopes are yielded and the live loop begins.
             let started = std::time::Instant::now();
-            match seed_build.await {
+            let scanned = seed_build.await;
+            drop(_reseed_permit);
+            match scanned {
                 Ok(envelope) => {
                     tracing::info!(
                         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1517,5 +1523,146 @@ mod tests {
             saw_seed,
             "the seed envelope events must follow the latch release"
         );
+    }
+
+    /// Issue #10: the reseed permit caps concurrent seed SCANS, not live
+    /// streams. D52 bound the acquired permit beside the live permits for
+    /// the response stream's whole lifetime, so MAX_CONCURRENT_RESEEDS
+    /// long-lived seeded clients starved every later hydration with a
+    /// permanent `HTTP 429: SSE hydration concurrency limit reached` (the
+    /// observed v0.5.3 repro: owner + one attached session hydrate; a
+    /// third client 429s until one of them disconnects). Pre-fix shape
+    /// fails here: the earlier streams are still open, both permits are
+    /// still held, and the third acquisition is the permanent 429.
+    #[tokio::test]
+    async fn a_third_seeded_client_hydrates_while_earlier_streams_stay_open() {
+        use super::{
+            event_stream, graph_reseed_envelope, LiveStreamAdmission, SharedEventHydration,
+            SseState, MAX_CONCURRENT_RESEEDS,
+        };
+        use axum::response::sse::{KeepAlive, Sse};
+        use axum::response::IntoResponse as _;
+        use futures::StreamExt as _;
+
+        let onto = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let cluster = Arc::new(ClusterNode::new(
+            Arc::new(InMemoryStorage::new(onto.clone())),
+            "permit-lifetime".into(),
+            onto.fingerprint,
+            [12u8; 32],
+        ));
+        let state = Arc::new(SseState {
+            cluster: cluster.clone(),
+            reseeds: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESEEDS)),
+            live_streams: LiveStreamAdmission::new(16, 16),
+            hydration: SharedEventHydration::default(),
+        });
+
+        // One seeded response body per permit slot, driven to its seed
+        // events (hydration COMPLETE) and then kept open — the exact
+        // attached-session shape from the issue.
+        let mut earlier_bodies = Vec::new();
+        for i in 0..MAX_CONCURRENT_RESEEDS {
+            let permit = state
+                .reseeds
+                .clone()
+                .try_acquire_owned()
+                .expect("the handler path acquires a reseed permit");
+            let live_permits = state
+                .live_streams
+                .try_admit([i as u8; 32])
+                .expect("live admission");
+            let rx = cluster.subscribe_local();
+            let seed_cluster = cluster.clone();
+            let seed_build =
+                Box::pin(async move { graph_reseed_envelope(&seed_cluster, None).await })
+                    as super::SeedBuild;
+            let stream = event_stream(
+                state.clone(),
+                cluster.clone(),
+                rx,
+                None,
+                None,
+                false,
+                vec![],
+                Some(seed_build),
+                format!("permit-lifetime-{i}"),
+                live_permits,
+                Some(permit),
+            );
+            let response = Sse::new(stream)
+                .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(5)))
+                .into_response();
+            let mut body = response.into_body().into_data_stream();
+            let mut saw_seed = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), body.next()).await {
+                    Ok(Some(Ok(chunk)))
+                        if String::from_utf8_lossy(&chunk).contains("event: inv") =>
+                    {
+                        saw_seed = true;
+                        break;
+                    }
+                    Ok(Some(Ok(_))) => continue,
+                    _ => break,
+                }
+            }
+            assert!(saw_seed, "earlier seeded client {i} must hydrate");
+            earlier_bodies.push(body);
+        }
+
+        // The regression: every earlier stream is STILL OPEN, yet a third
+        // seed client must acquire the permit and hydrate. Pre-fix, both
+        // permits were still bound into the open streams and this expect
+        // is the permanent 429.
+        let permit = state.reseeds.clone().try_acquire_owned().expect(
+            "the reseed permit is released once the seed scan completes, not held for the stream lifetime",
+        );
+        let live_permits = state
+            .live_streams
+            .try_admit([MAX_CONCURRENT_RESEEDS as u8; 32])
+            .expect("live admission");
+        let rx = cluster.subscribe_local();
+        let seed_cluster = cluster.clone();
+        let seed_build = Box::pin(async move { graph_reseed_envelope(&seed_cluster, None).await })
+            as super::SeedBuild;
+        let stream = event_stream(
+            state,
+            cluster,
+            rx,
+            None,
+            None,
+            false,
+            vec![],
+            Some(seed_build),
+            "permit-lifetime-third".into(),
+            live_permits,
+            Some(permit),
+        );
+        let response = Sse::new(stream)
+            .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(5)))
+            .into_response();
+        let mut body = response.into_body().into_data_stream();
+        let mut saw_seed = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), body.next()).await {
+                Ok(Some(Ok(chunk))) if String::from_utf8_lossy(&chunk).contains("event: inv") => {
+                    saw_seed = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            saw_seed,
+            "the third client must hydrate while the earlier streams stay open"
+        );
+        drop(earlier_bodies);
     }
 }
