@@ -174,9 +174,32 @@ assessment queue; if the SIGILL class survives reboots, the
 environmental hypothesis weakens). STATE AT PAUSE: tree clean,
 everything pushed; CI on 6f86574 went red on the advisories only
 (fixed in this commit); local stack healthy on 0.5.3 + fork module.
-OPEN: D60 root cause (TSan/second-machine), D64 (demand-gated),
-0.5.4 whenever wanted (carries D61 Answers + D62 ledger + D63 evolve
-+ D65 lifecycle).
+OPEN: D60 root cause (TSan/second-machine), D64 (demand-gated).
+
+**2026-11-02 (0.5.4 shipped — the connect-everything patch; D68/D70/D71
+landed, CI green again).** The parked D68+D70 tree landed as two
+commits (D70 toolchain first, D68 runtime second), plus D71 — a defect
+found live when the day's harness outage (all MCP sessions dead) was
+traced through D66's permit leak on the long-lived 0.5.3 node into a
+kernel refusal: graphs pinned before D61's Answers-widening could
+never advance onto it (`is_subset_of` compared type triples by exact
+set, so the open from-side could never cover a pinned narrow row — the
+authorized advance was impossible for every pre-D61 graph; the
+personal-org production graph reproduced it and validated the fix
+live). v0.5.4 carries D61+D62+D63, D54, D65, D66, D68, D70, D71, the
+prior security bumps, and three fresh zstd-family advisories fixed at
+cut time (zstd 0.13.4/zstd-safe 7.4.0/zstd-sys 2.1.2 — first seen in
+this cut's deny shard). The local matrix was attempted and wedged in
+clippy (the REL6 assessment-queue class; two clippy-drivers at 0% CPU
+for 30+ minutes — killed), so per the 0.5.3 precedent the gate set ran
+CI-side: ci green on main and the tag, release.yml's on-tag matrix
+green, all three platform builds green (darwin-arm64 with native
+runtime validation), the REL7 publish job shipped crates.io. Not
+executed anywhere, stated in the release note: live Falkor/Redis
+matrix legs, Postgres CDC, GitHub/Linear adapter live suites, the
+compose chaos harness. Next locally satisfiable rows: D67 (CLI
+credential discovery — hit live during this session's memory writes
+through attach.json) and D69.
 
 **2026-10-25 evening (D68 — the crash loop root-caused and fixed):**
 after the day's Mac-crash recovery the live store settled into a
