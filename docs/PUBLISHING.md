@@ -20,18 +20,24 @@ being published with every gate shard green
 (`scripts/ci-attestation.sh`; fail-closed — no green run on the exact
 tree, no publish). The local matrix remains the default.
 
-**Standalone runtime provenance (D59).** The darwin-arm64 packaged
-runtime's `falkordb.so` is our maintained FalkorDB fork
-(`gregorydickson/FalkorDB`, rolling release `darwin-runtime-4.16`),
-fetched and pinned by SHA-256 in `scripts/fetch-standalone-runtime.sh`
-exactly like the npm archive and ghcr bottle digests — the stock
-module SIGILLs the store on macOS (module forks over parked worker
-threads; the fork gates off every fork site on darwin). The fork is
-SSPL-1.0; `RUNTIME-MANIFEST.txt` carries the source offer and the
-pinned digest. The linux-x64 runtime is unchanged (stock
-`@falkordblite/linux-x64`). Bumping the module = update the digest in
-the fetch script; the fork's CI proves the three fork-safety
-properties on every build.
+**Standalone runtime provenance (D59; D68 bump).** The darwin-arm64
+packaged runtime's `falkordb.so` is our maintained FalkorDB fork
+(`gregorydickson/FalkorDB`, rolling release `darwin-runtime-4.18`,
+FalkorDB 4.18.11), fetched and pinned by SHA-256 in
+`scripts/fetch-standalone-runtime.sh` exactly like the npm archive and
+ghcr bottle digests — the stock module SIGILLs the store on macOS
+(module forks over parked worker threads; the fork gates off every
+fork site on darwin). D68 moved the pin off `darwin-runtime-4.16`
+(4.16.9 crash-looped the live store: SIGILL on a parked thread-pool/cron
+cond wait — a kernel psynch validation kill at the `__psynch_cvwait`
+svc — roughly 107s after every start under node traffic with real data;
+deterministic in a full-stack repro on copied production data, with an
+empty store and synthetic clients immune; the 4.18 build survives the
+identical repro indefinitely). The fork is SSPL-1.0;
+`RUNTIME-MANIFEST.txt` carries the source offer and the pinned digest.
+The linux-x64 runtime is unchanged (stock `@falkordblite/linux-x64`).
+Bumping the module = update the digest in the fetch script; the fork's
+CI proves the three fork-safety properties on every build.
 
 **CI-side publishing (REL7).** `release.yml` now carries a `publish`
 job: on a `v*` tag, after the builds and asset assembly, it runs

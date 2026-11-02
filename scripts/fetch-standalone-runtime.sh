@@ -96,9 +96,16 @@ case "$target" in
     # every fork site: fork-GC off, async-delete synchronous, GRAPH.COPY
     # refused). Pinned by content digest like every native artifact here;
     # bump by updating the digest when the fork's rolling release
-    # (darwin-runtime-4.16) moves.
-    fork_module_url=https://github.com/gregorydickson/FalkorDB/releases/download/darwin-runtime-4.16/falkordb.so
-    fork_module_sha256=bdc47d95448c39296da10cf0e2a5737b8c646297bb818b1f8b9cf31a67ca9ce8
+    # (darwin-runtime-4.18) moves.
+    # D68: 4.16.9 (bdc47d95…) crash-looped the live store — SIGILL on a
+    # parked thread-pool/cron cond wait (kernel psynch validation kill,
+    # ESR EC 0x15 at the __psynch_cvwait svc) ~107s after every start
+    # under node traffic with real data; deterministic in a full-stack
+    # repro on copied production data, survived by an empty store and by
+    # the same data behind synthetic clients. The 4.18 rolling build
+    # (7b1b8bd) survives the identical repro past every kill window.
+    fork_module_url=https://github.com/gregorydickson/FalkorDB/releases/download/darwin-runtime-4.18/falkordb.so
+    fork_module_sha256=d8c6c04b872db84c88e91acb0509451fbcfe05a7c6b2141e84cff30567f6f50c
     curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
       "$fork_module_url" -o "$tmp/falkordb-fork.so"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -140,13 +147,16 @@ with LLVM exceptions, https://openmp.llvm.org) and openssl@3 3.6.0
 bottles (macOS 15 floor) from homebrew-core. No Homebrew install is
 required on the target machine.
 Darwin module: the maintained fork gregorydickson/FalkorDB
-(darwin-runtime-4.16 rolling release), pinned by SHA-256
+(darwin-runtime-4.18 rolling release, FalkorDB 4.18.11), pinned by
+SHA-256
 $fork_module_sha256. It replaces the stock module, which SIGILLs the
 store on macOS (module forks over parked worker threads; the fork
 gates off the fork-GC timer, defaults async-delete synchronous, and
-refuses GRAPH.COPY). Fork license SSPL-1.0; source offer:
+refuses GRAPH.COPY; the 4.18 line also carries the D68 psynch fix —
+4.16.9 SIGILLed parked worker threads under live node traffic). Fork
+license SSPL-1.0; source offer:
 https://github.com/gregorydickson/FalkorDB (branch
-darwin-no-fork-gc; the release notes name the exact build commit).
+darwin-no-fork-gc-4.18; the release notes name the exact build commit).
 EOF
     ;;
 esac
