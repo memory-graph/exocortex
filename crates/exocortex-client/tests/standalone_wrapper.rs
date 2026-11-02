@@ -207,7 +207,7 @@ fn attached_session_reuses_owner_credentials_and_gets_its_own_wal_slot() {
         .collect::<Vec<_>>()
         .windows(2)
         .filter(|w| w[0] == "--data-dir")
-        .last()
+        .next_back()
         .expect("a --data-dir must be forwarded")[1]
         .to_string();
     assert!(

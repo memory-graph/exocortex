@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 ///
 /// - High bit clear: kernel space (constants below).
 /// - High bit set:   pack space (assigned by pack at register time,
-///                   `RelKindId((pack_id << 16) | local_id | 0x8000_0000)`).
+///   `RelKindId((pack_id << 16) | local_id | 0x8000_0000)`).
 ///
 /// `RelMeta.display_name` doubles as the stable ASCII Cypher label (R-T2).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

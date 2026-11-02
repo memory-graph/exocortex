@@ -2,6 +2,10 @@
 //! then the §7.13 pipeline; batches are atomic and the ack names the first
 //! offending draft_key with its RejectCode.
 
+// tonic handlers return `Result<_, Status>` — the framework's shape, not
+// ours; boxing gRPC statuses to satisfy a size lint would fight the API.
+#![allow(clippy::result_large_err)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status, Streaming};
@@ -1175,18 +1179,16 @@ struct BatchTimes {
 /// silently clamped.
 fn kernel_rights(rights: &exocortex_wire::ingest::v1::Rights) -> exocortex_kernel::memory::Rights {
     exocortex_kernel::memory::Rights {
-        licence: rights
-            .licence
-            .trim()
-            .is_empty()
-            .then_some(None)
-            .unwrap_or_else(|| Some(rights.licence.trim().to_string().into())),
-        consent_basis: rights
-            .consent_basis
-            .trim()
-            .is_empty()
-            .then_some(None)
-            .unwrap_or_else(|| Some(rights.consent_basis.trim().to_string().into())),
+        licence: if rights.licence.trim().is_empty() {
+            None
+        } else {
+            Some(rights.licence.trim().to_string().into())
+        },
+        consent_basis: if rights.consent_basis.trim().is_empty() {
+            None
+        } else {
+            Some(rights.consent_basis.trim().to_string().into())
+        },
         retention_until: rights.retention_until.as_ref().map(|stamp| {
             chrono::DateTime::from_timestamp(stamp.seconds, stamp.nanos as u32).unwrap_or_default()
         }),

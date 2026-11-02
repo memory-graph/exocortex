@@ -101,6 +101,10 @@ struct HydrationKey {
 }
 
 #[derive(Clone)]
+// Variants carry hydrated payloads straight to serialization on this
+// connection's own task; the size spread beats boxing (no shared
+// ownership, no allocator churn per event).
+#[allow(clippy::large_enum_variant)]
 enum HydratedEvent {
     Memory(Option<Memory>),
     Relationship(Option<(Relationship, Vec<Memory>)>),

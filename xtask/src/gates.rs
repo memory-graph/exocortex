@@ -1593,7 +1593,7 @@ fn command_executes_test(command: &str, relative: &str, target: &str, symbol: &s
                 return false;
             }
         }
-        let exact_filter = tokens.iter().any(|token| *token == symbol);
+        let exact_filter = tokens.contains(&symbol);
         let exact_target = tokens
             .windows(2)
             .any(|pair| pair[0] == "--test" && pair[1] == target)

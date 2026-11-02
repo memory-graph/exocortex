@@ -25,6 +25,11 @@
 //! This crate depends on exactly one `exocortex-*` crate, `exocortex-wire`
 //! (R-I4); `cargo xtask kernel-purity` enforces that.
 
+// `SdkError` is the crate's public error surface and carries its payloads
+// unboxed by design (adapter authors match on it exhaustively; boxing the
+// variants would trade an allocation-free path for a clippy size opinion).
+#![allow(clippy::result_large_err)]
+
 pub mod classify;
 pub mod retry;
 pub mod split;

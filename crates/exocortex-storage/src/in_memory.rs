@@ -1742,7 +1742,7 @@ impl Storage for InMemoryStorage {
         let store = self.inner.memories.lock().unwrap();
         let rels = self.inner.rels.lock().unwrap();
         let valid =
-            |vf: DateTime<Utc>, vu: &Option<DateTime<Utc>>| vf <= t && vu.map_or(true, |v| v > t);
+            |vf: DateTime<Utc>, vu: &Option<DateTime<Utc>>| vf <= t && vu.is_none_or(|v| v > t);
         // ST12 (audit): evaluate validity against the CURRENT version only
         // (the historical `any()` counted an id if ANY version was valid, so
         // a deleted memory stayed counted forever). Visibility follows

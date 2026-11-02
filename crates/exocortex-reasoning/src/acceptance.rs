@@ -70,13 +70,7 @@ pub fn verify_nine_catalogued_rules(ontology: &Ontology) -> Result<(), String> {
             rules::pair_counts(derived.co_occurrence_affinity).contains(&(a, b, 1)),
             "R7",
         ),
-        (
-            derived
-                .problem_solution_bridge
-                .iter()
-                .any(|pair| *pair == (a, b)),
-            "R8",
-        ),
+        (derived.problem_solution_bridge.contains(&(a, b)), "R8"),
         (
             rules::pair_counts(derived.similar_tags_affinity).contains(&(a, b, 1)),
             "R9",

@@ -138,7 +138,8 @@ suites. nextest is the default matrix test runner when installed
 (`EXOCORTEX_TEST_RUNNER=cargo` opts out; doctests stay on cargo test).
 
 CI (`.github/workflows/ci.yml`) runs all of these on push; the toolchain
-is pinned 1.85.0. Live-backend suites (`--features integration` with
+is pinned 1.87.0 (ctutils 0.4.4's RUSTSEC security floor). Live-backend
+suites (`--features integration` with
 `FALKOR_URL`) and the compose chaos harness
 (`scripts/chaos-leader-kill.sh`) run manually/Docker.
 
