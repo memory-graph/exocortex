@@ -454,9 +454,12 @@ impl OntologySummary {
                 _ => return false,
             }
         }
-        let ours: std::collections::BTreeSet<_> = self.type_triples.iter().collect();
         let theirs: std::collections::BTreeSet<_> = superset.type_triples.iter().collect();
-        if !ours.is_subset(&theirs) {
+        if !self
+            .type_triples
+            .iter()
+            .all(|t| theirs.contains(t) || triple_covered(t, superset))
+        {
             return false;
         }
         let ours: std::collections::BTreeSet<_> = self.rule_ids.iter().collect();
@@ -510,11 +513,14 @@ impl OntologySummary {
                 None => return Some(format!("kind {} (id {:#x}) is missing", row.name, row.id)),
             }
         }
-        let ours: std::collections::BTreeSet<_> = self.type_triples.iter().collect();
         let theirs: std::collections::BTreeSet<_> = superset.type_triples.iter().collect();
-        if let Some(t) = ours.difference(&theirs).next() {
+        if let Some(t) = self
+            .type_triples
+            .iter()
+            .find(|t| !theirs.contains(t) && !triple_covered(t, superset))
+        {
             return Some(format!(
-                "type-triple rule for kind {:#x} is missing",
+                "type-triple rule for kind {:#x} is not covered (endpoint sets narrowed or kind absent)",
                 t.kind
             ));
         }
@@ -541,6 +547,29 @@ impl OntologySummary {
         }
         None
     }
+}
+
+/// Relational triple subsetting (OC-PRD D3; the D61 Answers-widening
+/// rule): a pinned triple is covered when the superset governs the
+/// same kind with endpoint sets at least as wide. `None` is the
+/// universe — an open side admits every memory type, so it covers any
+/// narrower pinned side; the reverse (pinned open, superset
+/// constrained) is a narrowing and never covered. Exact-equality rows
+/// short-circuit before this runs (the caller checks set membership
+/// first), so identical triples cost nothing extra.
+fn triple_covered(pinned: &TripleSummary, superset: &OntologySummary) -> bool {
+    fn covers(sub: &Option<Vec<u8>>, sup: &Option<Vec<u8>>) -> bool {
+        match (sub, sup) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(a), Some(b)) => a.iter().all(|t| b.contains(t)),
+        }
+    }
+    superset.type_triples.iter().any(|row| {
+        row.kind == pinned.kind
+            && covers(&pinned.from_types, &row.from_types)
+            && covers(&pinned.to_types, &row.to_types)
+    })
 }
 
 /// Every fingerprint comparison failure, named per boundary (OC-PRD
@@ -1051,6 +1080,51 @@ mod tests {
         corrupt.compatibility = hex(&[9; 32]);
         let err = admit_node_graph(PersistedPin::V2(Box::new(corrupt)), &small_onto);
         assert!(matches!(err, Err(CompatibilityError::CorruptRecord(_))));
+    }
+
+    #[test]
+    fn node_graph_policy_advances_on_endpoint_widening() {
+        // The D61 Answers-widening shape: a graph pinned under a
+        // narrow triple must advance onto a runtime that widened the
+        // same kind's endpoints (superset sides), whether the widening
+        // is a wider list or a fully open side; narrowing refuses.
+        let mut widened = fixture_pack();
+        let mut opened = fixture_pack();
+        let mut narrowed = fixture_pack();
+        for (pack, from, to) in [
+            (&mut widened, Some(vec![1, 2]), Some(vec![0, 3])),
+            (&mut opened, None, Some(vec![0])),
+            (&mut narrowed, Some(vec![2]), Some(vec![0])),
+        ] {
+            for t in pack.type_triples.iter_mut() {
+                if t.kind == crate::RelKindId(0x8000_0000) {
+                    t.from_types = from.clone();
+                    t.to_types = to.clone();
+                }
+            }
+        }
+        // The pinned fixture carries the narrow (Some([1]), Some([0]))
+        // rule for 0x8000_0000.
+        let mut pinned_pack = fixture_pack();
+        for t in pinned_pack.type_triples.iter_mut() {
+            if t.kind == crate::RelKindId(0x8000_0000) {
+                t.from_types = Some(vec![1]);
+                t.to_types = Some(vec![0]);
+            }
+        }
+        let pinned_onto = Ontology::from_packs(vec![pinned_pack]).expect("valid");
+        let pinned = PinnedOntology::describing(&pinned_onto);
+
+        for runtime_pack in [widened, opened] {
+            let runtime = Ontology::from_packs(vec![runtime_pack]).expect("valid");
+            let decision = admit_node_graph(PersistedPin::V2(Box::new(pinned.clone())), &runtime)
+                .expect("widened runtime advances the pin");
+            assert!(matches!(decision, NodeGraphDecision::Advance(_)));
+        }
+
+        let runtime = Ontology::from_packs(vec![narrowed]).expect("valid");
+        let err = admit_node_graph(PersistedPin::V2(Box::new(pinned)), &runtime);
+        assert!(matches!(err, Err(CompatibilityError::NotASuperset { .. })));
     }
 
     #[test]
