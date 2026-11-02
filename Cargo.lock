@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-delta"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-git"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1441,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-github"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1461,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-iceberg"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-linear"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-parquet"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-postgres"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1546,7 +1546,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-sdk"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "axum",
  "exocortex-wire",
@@ -1564,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-adapter-table"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1578,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-api-client"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "hyper 0.14.32",
  "hyper-rustls 0.24.2",
@@ -1590,7 +1590,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-cache"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-client"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1662,7 +1662,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-cluster"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -1689,7 +1689,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-dreams"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-entity-resolution"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1728,7 +1728,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-ingest"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-kernel"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "bincode",
  "blake3",
@@ -1784,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-ops"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-pack-dev-v1"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "exocortex-kernel",
  "inventory",
@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-pack-mortgage-v1"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-pack-study-v1"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
@@ -1847,7 +1847,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-reasoning"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "chrono",
  "crepe",
@@ -1868,7 +1868,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-server"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-storage"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-wire"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "blake3",
  "bytes",
@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "exocortex-worker"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -6252,7 +6252,7 @@ checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
 
 [[package]]
 name = "xtask"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -6314,27 +6314,27 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+checksum = "cdb02c3132d251ab1606e9fc913a7da6c6ed08cc263df15edf082e1dc497d157"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "7.2.4"
+version = "7.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
+checksum = "1c8ea04668f5de8d8d51051714ba560c9536519cadcdb8829bba4fe2ad159b03"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.0.16+zstd.1.5.7"
+version = "2.1.2+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
  "pkg-config",

@@ -100,6 +100,55 @@ binaries (`exocortex-adapter-parquet` / `-iceberg` / `-delta` /
 manifests with the standing adapter-crate policy that always excluded
 them from ORDER (their manifests could previously publish by mistake).
 
+**0.5.4 (2026-11-02)** — the connect-everything patch release (D61–D63,
+D65, D66, D68, D70, D71; one authorized compatibility fingerprint move:
+`a427b3ad…ed9d` → `46282e1b…6554`). Payload since 0.5.3:
+
+- **D61** — `Answers` widened to `(_, Question)`: anything may answer a
+  Question (the authorized fingerprint move, full ritual in one commit);
+  the org-wide open-questions query and the playbook convention landed
+  with it.
+- **D62+D63** — the ontology demand ledger (InvalidTypeTriple tallies
+  surfaced per org) and `cargo xtask ontology-evolve` (the
+  fingerprint-move ceremony as one command).
+- **D65** — the standalone wrapper's owner-liveness watchdog: no more
+  zombie wrapper/client pairs after node death; stale lock files
+  self-heal.
+- **D66 (GitHub #10)** — the SSE reseed permit is released after the
+  seed scan: a third attached session hydrates instead of 429ing
+  forever. This is the bug that kept killing every harness session on
+  the long-lived 0.5.3 node.
+- **D68** — the darwin-arm64 runtime moves to the fork's
+  `darwin-runtime-4.18` (FalkorDB 4.18.11, `d8c6c04b…f50c`): ends the
+  ~107s SIGILL crash loop; D60's residual class closes.
+- **D70** — toolchain pin 1.85.0 → 1.87.0 (ctutils 0.4.4's
+  RUSTSEC-2026-0385 floor); CI green again; the workspace
+  `rust-version` floor follows.
+- **D71** — kernel compatibility fix: graphs pinned before D61's
+  widening now advance onto the widened triple (relational triple
+  subsetting — `None` is the universe). Without it every pre-D61 graph
+  refused to boot on a post-D61 binary (`FingerprintMismatch` with
+  zeroed storage bytes); found live on the personal-org production
+  graph after the D66 node restart.
+- Also rides: D54 (`--verify` renders WAL-lock rows instead of dying),
+  security bumps (tokio 1.53.3, ctutils 0.4.4, webpki 0.103.15→.16,
+  and at cut time: zstd 0.13.4 / zstd-safe 7.4.0 / zstd-sys 2.1.2 for
+  RUSTSEC-2026-0391, RUSTSEC-2026-0398, and the zstd-sys wasm-frame
+  advisory — all three first seen in this cut's CI deny shard).
+
+Release-note honesty: the local `verify-release.sh` matrix was
+ATTEMPTED on `0d8d685` and wedged in the clippy phase — two
+clippy-driver processes parked at 0% CPU for 30+ minutes, the box's
+degraded assessment-queue condition (the REL6 class; the same
+condition suspended the prior session's matrix). Per the 0.5.3
+CI-side precedent the gate set runs in CI on the exact tree: the ci
+workflow on the pushed sha and release.yml's
+verify-release.sh-on-the-tag ("Mandatory correctness prerequisite").
+Live Falkor/Redis matrix legs were NOT executed locally
+(FALKOR_URL/REDIS_URL unset — skipped loudly). NOT executed anywhere:
+Postgres CDC, GitHub/Linear adapter live suites (no credentials), the
+compose chaos harness.
+
 **0.5.3 (2026-10-18)** — the fork-safe-darwin-runtime release (D59; no
 ontology fingerprint move, `a427b3ad…ed9d` unchanged; no new workspace
 dependency; zero Rust code changes from 0.5.2 — the payload is the
