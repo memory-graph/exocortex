@@ -115,4 +115,6 @@ Row meanings:
 
 Version skew: `exocortex-mcp-client --version` reports the binary; the
 compatibility fingerprint in `--verify` output must match the repo
-golden it was built from — `a427b3ad…ed9d` on current main.
+golden it was built from — `46282e1b…6554` on current main (D61's
+Answers-widening moved it from `a427b3ad…ed9d`; a graph pinned older
+advances automatically on a current binary — D71 guarantees it).
