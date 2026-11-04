@@ -240,6 +240,67 @@ pub fn harness_config_paths() -> Vec<(&'static str, std::path::PathBuf)> {
     ]
 }
 
+/// D67 (issue #12): locate the sibling `exocortex-cli` in the install
+/// directory of the running binary. The fallback the instruction block
+/// teaches must actually exist in the install — a release archive that
+/// ships the MCP client without the CLI is incomplete.
+pub fn cli_sibling(install_dir: &Path) -> Option<std::path::PathBuf> {
+    let plain = install_dir.join("exocortex-cli");
+    if plain.is_file() {
+        return Some(plain);
+    }
+    let exe = install_dir.join("exocortex-cli.exe");
+    exe.is_file().then_some(exe)
+}
+
+/// D67 (issue #12): run `exocortex-cli search` READ-ONLY (issue #12's
+/// ask: a verify row that actually exercises the fallback path) with a
+/// hard timeout — `Command::output` has none, so this polls `try_wait`.
+/// Returns the child's output, or `Err` naming a timeout/spawn failure.
+pub fn run_cli_search_probe(cli: &Path, timeout: Duration) -> Result<std::process::Output, String> {
+    let mut child = std::process::Command::new(cli)
+        .args(["search", "exocortex", "--limit", "1", "--json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot spawn {}: {e}", cli.display()))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read as _;
+                    let _ = out.read_to_string(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    use std::io::Read as _;
+                    let _ = err.read_to_string(&mut stderr);
+                }
+                // Reassemble an Output for the caller's classification.
+                return Ok(std::process::Output {
+                    status,
+                    stdout: stdout.into_bytes(),
+                    stderr: stderr.into_bytes(),
+                });
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return Err(format!(
+                        "exocortex-cli search did not answer within {}s",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("probe wait failed: {e}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,6 +10,7 @@ pub mod no_backend;
 pub mod ops_registrations;
 pub mod playbook;
 pub mod preflight;
+pub mod standalone_creds;
 pub mod sync;
 pub mod tools;
 pub mod verify_checks;

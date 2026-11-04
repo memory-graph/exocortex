@@ -241,6 +241,23 @@ node (client mode, the owner's published endpoint, its own per-session
 WAL slot) instead of starting a second store — concurrent harness
 sessions share one graph safely.
 
+### If the MCP session dies: `exocortex-cli`
+
+Every install ships `exocortex-cli`, the same graph from a shell —
+`search`, `get`, `related`, `chain`, and `add` (one memory, `--draft
+file.json`, or a full wrapup with `add --batch wrapup.json`, the
+`end_session` shape: several memories plus edges in one call). When
+`EXOCORTEX_BACKEND`/`EXOCORTEX_AUTH_TOKEN`/`EXOCORTEX_HMAC_KEY` are
+not in the environment (exactly the state a dead MCP session leaves),
+the CLI auto-finds the live standalone node's credentials via the
+attach record in the data home (`--data-dir`, else
+`EXOCORTEX_STANDALONE_DATA_HOME`, else the platform default) — no
+temp runtime.env hunting. Point an agent at
+`exocortex-cli --dump-block` for the CLI-only instruction block.
+`exocortex-mcp-client --verify` includes a row that actually runs a
+read-only `exocortex-cli search`, so a broken fallback is visible
+before it is needed.
+
 ## The ontology
 
 This is the product. Everything else exists to serve it.

@@ -486,6 +486,7 @@ fn main() -> anyhow::Result<()> {
                 cache: Some(cache.clone()),
                 vc: org_visibility(&org, &user),
                 live,
+                timeouts: Default::default(),
             };
             server = server.with_end_session(Arc::new(tool));
         }
@@ -874,6 +875,58 @@ fn verify(
             None => {
                 red += 1;
                 println!("  RED   harness: cannot determine this binary's directory");
+            }
+        }
+    }
+
+    // D67 (issue #12): the CLI fallback row — actually RUN
+    // `exocortex-cli search` read-only. The block teaches the fallback;
+    // this row proves the binary exists in the install and answers. In
+    // a mode with no node to talk to (no --backend and no attach
+    // record), the row says so honestly instead of failing a probe
+    // that has nothing to probe.
+    {
+        use exocortex_client::verify_checks::{cli_sibling, run_cli_search_probe};
+        use std::time::Duration;
+        let install_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        match install_dir.and_then(|dir| cli_sibling(&dir)) {
+            None => {
+                red += 1;
+                println!(
+                    "  RED   cli: no exocortex-cli beside this binary — the dead-MCP fallback the block teaches is missing from the install"
+                );
+            }
+            Some(cli) => {
+                let node_expected = args.backend.is_some()
+                    || exocortex_client::standalone_creds::discover(data_dir, None).is_ok();
+                match run_cli_search_probe(&cli, Duration::from_secs(15)) {
+                    Ok(output) if output.status.success() => println!(
+                        "  ok    cli: {} answers search (the dead-MCP fallback works)",
+                        cli.display()
+                    ),
+                    Ok(output) => {
+                        let tail = String::from_utf8_lossy(&output.stderr);
+                        let tail = tail.lines().last().unwrap_or("(no stderr)");
+                        if node_expected {
+                            red += 1;
+                            println!(
+                                "  RED   cli: search exited {}: {tail}",
+                                output.status.code().unwrap_or(-1)
+                            );
+                        } else {
+                            println!(
+                                "  ok    cli: present; search not exercised (no backend configured and no standalone attach record under {})",
+                                data_dir.display()
+                            );
+                        }
+                    }
+                    Err(reason) => {
+                        red += 1;
+                        println!("  RED   cli: {reason}");
+                    }
+                }
             }
         }
     }

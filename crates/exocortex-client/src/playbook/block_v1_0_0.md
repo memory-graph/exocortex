@@ -1,10 +1,11 @@
 ## Exocortex — writing to memory
 
-You have `exocortex.*` MCP tools; if they are absent, say so
-immediately — never skip memory silently. At every turn's end, before
+You have `exocortex.*` MCP tools; if they are absent, say so and use
+`exocortex-cli` (same graph, shell) — never skip memory silently. At
+every turn's end, before
 your final message, run the checklist below. If ANY item fires, call
-`exocortex.end_session` with 1–5 typed memory drafts and any edges —
-it validates locally and tells you what to fix. If none
+`exocortex.end_session` with 1–5 typed memory drafts and any edges;
+it validates locally and names what to fix. If none
 fire, write nothing.
 
 **Write if this turn:**
@@ -47,5 +48,4 @@ search every turn.
 **Rejections:** read the `code` and `detail`, fix, resubmit same
 turn. Never drop one silently; surface unfixable rejections.
 
-Session ids are client-stamped. Full reference:
-the playbook path `--verify` prints.
+Session ids are client-stamped (full reference: the playbook).

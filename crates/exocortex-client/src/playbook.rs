@@ -237,6 +237,19 @@ mod tests {
         );
     }
 
+    /// D67-3: the block teaches the CLI fallback for absent/dead MCP
+    /// tools — the gap issue #11 filed. Without the line, an agent
+    /// whose MCP session died skips memory silently instead of
+    /// reaching for the shell.
+    #[test]
+    fn block_teaches_the_cli_fallback() {
+        assert!(
+            BLOCK.contains("exocortex-cli"),
+            "the block names the CLI fallback: {}",
+            BLOCK
+        );
+    }
+
     /// D48: `--install-block` is idempotent — running it twice leaves
     /// exactly one copy (GitHub issue #7: `--dump-block >> CLAUDE.md`
     /// appended a second copy on every rerun).

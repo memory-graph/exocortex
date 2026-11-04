@@ -97,7 +97,21 @@ Row meanings:
    A healthy server answers `initialize` then `tools/list`. EOF before
    answering = the process dies at startup (check the WAL lock: a
    still-running older server instance can hold it).
-3. Restart the harness — MCP servers connect only at session start; a
+3. **While MCP is down, memory does not stop**: `exocortex-cli`
+   (installed beside the client) reads and writes the same graph from a
+   shell — `search`/`get`/`related`/`chain`, `add` (single memory,
+   `--draft file.json`, or a full wrapup via
+   `add --batch wrapup.json`, the `end_session` shape). When
+   `EXOCORTEX_BACKEND`/`EXOCORTEX_AUTH_TOKEN`/`EXOCORTEX_HMAC_KEY` are
+   not in the env (the normal state when the MCP session died), the CLI
+   auto-finds the live standalone node's credentials via the attach
+   record in the data home (`--data-dir`, else
+   `EXOCORTEX_STANDALONE_DATA_HOME`, else the platform default) — it
+   announces `credentials from <path>` on stderr. An explicit `--org`
+   that disagrees with the record is refused (foreign-org guard). An
+   agent can run `exocortex-cli --dump-block` for the CLI-only
+   instruction block.
+4. Restart the harness — MCP servers connect only at session start; a
    mid-session fix needs a new session.
 
 ## 5. Install paths

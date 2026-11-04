@@ -224,6 +224,29 @@ pub struct EndSessionTool {
     /// D55: standalone sessions re-resolve a replaced owner here;
     /// `None` keeps the fixed `client`/credentials above.
     pub live: Option<Arc<LiveBackend>>,
+    /// D69 (issue #13): the per-phase wire deadlines. Production
+    /// defaults are the R-R3 budgets (20s register / 30s submit); a
+    /// test shrinks them so a wedged submit is deterministic.
+    pub timeouts: PhaseTimeouts,
+}
+
+/// D69: the end_session wire deadlines, per phase. The deadline ERROR
+/// names its phase and states retry safety (the deterministic batch
+/// id dedupes a verbatim retry); overridable so the regression test
+/// can wedge a submit without a 30-second wall.
+#[derive(Debug, Clone, Copy)]
+pub struct PhaseTimeouts {
+    pub register: std::time::Duration,
+    pub submit: std::time::Duration,
+}
+
+impl Default for PhaseTimeouts {
+    fn default() -> Self {
+        Self {
+            register: std::time::Duration::from_secs(20),
+            submit: std::time::Duration::from_secs(30),
+        }
+    }
 }
 
 fn parse_visibility(s: &str) -> Result<i32, String> {
@@ -457,25 +480,57 @@ impl EndSessionTool {
                 }),
             };
             exocortex_wire::signing::sign_registration(&producer_key, &mut registration);
+            // D69 (issue #13): a node swallowing a phase silently must
+            // not hide WHICH phase was slow. Per-phase latency at INFO
+            // past this bound; deadline errors name their phase below.
+            const SLOW_PHASE: std::time::Duration = std::time::Duration::from_secs(2);
+            let register_started = std::time::Instant::now();
             let mut reg_req = tonic::Request::new(registration);
             // R-R3 discipline (bug-prd-standalone-submit-hang): a lost or
             // wedged gRPC exchange must surface as DeadlineExceeded, never a
             // silently dropped tool response.
-            reg_req.set_timeout(std::time::Duration::from_secs(20));
+            reg_req.set_timeout(self.timeouts.register);
             if let Ok(v) = format!("Bearer {bearer}").parse() {
                 reg_req.metadata_mut().insert("authorization", v);
             }
             if let Err(e) = client.register_source(reg_req).await {
-                tracing::warn!(%e, "register_source failed; submit will surface the cause");
+                let deadline_hit = e.code() == tonic::Code::DeadlineExceeded
+                    || (e.code() == tonic::Code::Cancelled
+                        && e.message().contains("Timeout expired"));
+                if deadline_hit {
+                    tracing::warn!(
+                        %e,
+                        "end_session register phase exceeded its deadline (node slow or wedged); continuing to submit"
+                    );
+                } else {
+                    tracing::warn!(%e, "register_source failed; submit will surface the cause");
+                }
+            }
+            let register_elapsed = register_started.elapsed();
+            if register_elapsed > SLOW_PHASE {
+                tracing::info!(
+                    phase = "register",
+                    elapsed_ms = register_elapsed.as_millis() as u64,
+                    "ingest phase exceeded the latency bound"
+                );
             }
 
+            let submit_started = std::time::Instant::now();
             let mut submit_req = tonic::Request::new(batch.clone());
-            submit_req.set_timeout(std::time::Duration::from_secs(30));
+            submit_req.set_timeout(self.timeouts.submit);
             if let Ok(v) = format!("Bearer {bearer}").parse() {
                 submit_req.metadata_mut().insert("authorization", v);
             }
             match client.submit(submit_req).await {
                 Ok(response) => {
+                    let submit_elapsed = submit_started.elapsed();
+                    if submit_elapsed > SLOW_PHASE {
+                        tracing::info!(
+                            phase = "submit",
+                            elapsed_ms = submit_elapsed.as_millis() as u64,
+                            "ingest phase exceeded the latency bound"
+                        );
+                    }
                     tracing::info!(
                         attempt,
                         accepted = response.get_ref().accepted,
@@ -486,6 +541,14 @@ impl EndSessionTool {
                     break;
                 }
                 Err(e) => {
+                    let submit_elapsed = submit_started.elapsed();
+                    if submit_elapsed > SLOW_PHASE {
+                        tracing::info!(
+                            phase = "submit",
+                            elapsed_ms = submit_elapsed.as_millis() as u64,
+                            "ingest phase exceeded the latency bound"
+                        );
+                    }
                     tracing::warn!(attempt, code = ?e.code(), %e, "end_session submit failed");
                     let transport_dead = e.code() == tonic::Code::Unavailable;
                     let adopted = attempt == 0
@@ -495,7 +558,36 @@ impl EndSessionTool {
                             .as_ref()
                             .is_some_and(|live| live.adopt_replacement());
                     if !adopted {
-                        return Err(rmcp::Error::internal_error(format!("ingest: {e}"), None));
+                        // D69 (issue #13): a deadline must name its
+                        // phase and state retry safety. The commit may
+                        // have happened server-side before the response
+                        // was lost to the timeout — the deterministic
+                        // batch id (content digest over session id +
+                        // drafts + edges) dedupes a verbatim retry at
+                        // the idempotency registry, so resubmitting
+                        // identical input is safe; changing the
+                        // session_id or any draft writes a second copy.
+                        // The client-side timeout surfaces as
+                        // `Cancelled: Timeout expired` (issue #13's
+                        // observed shape) or DeadlineExceeded when the
+                        // budget propagates server-side — both are the
+                        // deadline case.
+                        let deadline_hit = e.code() == tonic::Code::DeadlineExceeded
+                            || (e.code() == tonic::Code::Cancelled
+                                && e.message().contains("Timeout expired"));
+                        let message = if deadline_hit {
+                            format!(
+                                "ingest submit phase exceeded its {}s deadline: {e}. \
+                                 The batch may already be committed server-side; retrying \
+                                 end_session with the SAME session_id and drafts is safe \
+                                 (the deterministic batch id dedupes server-side); changing \
+                                 either writes a second copy",
+                                self.timeouts.submit.as_secs()
+                            )
+                        } else {
+                            format!("ingest: {e}")
+                        };
+                        return Err(rmcp::Error::internal_error(message, None));
                     }
                 }
             }
@@ -553,5 +645,171 @@ struct ToolCallContextArgs {
 impl ToolCallContextArgs {
     fn arguments(&self) -> serde_json::Map<String, serde_json::Value> {
         self.request.arguments.clone().unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use exocortex_wire::ingest::v1::ingest_service_server::IngestService;
+    use exocortex_wire::ingest::v1::{
+        FingerprintRequest, FingerprintResponse, IngestAck, ManifestRequest, ManifestResponse,
+        RegisterSourceResponse, SubmitOne,
+    };
+
+    /// A node that accepts the connection, answers registration and
+    /// fingerprint instantly, and WEDGES on Submit — the #13 shape (the
+    /// redis restart cycle sitting under the deadline).
+    #[derive(Clone)]
+    struct WedgedIngest;
+
+    #[tonic::async_trait]
+    impl IngestService for WedgedIngest {
+        type SubmitStreamStream = std::pin::Pin<
+            Box<
+                dyn tonic::codegen::tokio_stream::Stream<
+                        Item = Result<exocortex_wire::ingest::v1::SubmitAck, tonic::Status>,
+                    > + Send,
+            >,
+        >;
+
+        async fn submit(
+            &self,
+            _request: tonic::Request<IngestBatch>,
+        ) -> Result<tonic::Response<IngestAck>, tonic::Status> {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            unreachable!("the client deadline fires long before the wedge clears")
+        }
+
+        async fn submit_stream(
+            &self,
+            _request: tonic::Request<tonic::Streaming<SubmitOne>>,
+        ) -> Result<tonic::Response<Self::SubmitStreamStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
+        async fn register_source(
+            &self,
+            _request: tonic::Request<RegisterSourceRequest>,
+        ) -> Result<tonic::Response<RegisterSourceResponse>, tonic::Status> {
+            Ok(tonic::Response::new(RegisterSourceResponse { ceiling: 3 }))
+        }
+
+        async fn fingerprint(
+            &self,
+            _request: tonic::Request<FingerprintRequest>,
+        ) -> Result<tonic::Response<FingerprintResponse>, tonic::Status> {
+            Ok(tonic::Response::new(FingerprintResponse {
+                fingerprint: vec![],
+                kernel_version: String::new(),
+                packs: vec![],
+            }))
+        }
+
+        async fn preflight(
+            &self,
+            _request: tonic::Request<IngestBatch>,
+        ) -> Result<tonic::Response<IngestAck>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
+        async fn get_validation_manifest(
+            &self,
+            _request: tonic::Request<ManifestRequest>,
+        ) -> Result<tonic::Response<ManifestResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+    }
+
+    /// D69 (issue #13): a wedged submit must surface a deadline error
+    /// that NAMES the phase and states retry safety — the deterministic
+    /// batch id dedupes a verbatim retry, so the agent can resubmit
+    /// instead of guessing. Pre-D69 the message was a bare
+    /// `ingest: status: Deadline exceeded`.
+    #[tokio::test]
+    async fn submit_deadline_names_the_phase_and_retry_safety() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let incoming = async_stream::stream! {
+                loop {
+                    if let Ok((socket, _)) = listener.accept().await {
+                        yield Ok::<_, std::io::Error>(socket);
+                    }
+                }
+            };
+            tonic::transport::Server::builder()
+                .add_service(
+                    exocortex_wire::ingest::v1::ingest_service_server::IngestServiceServer::new(
+                        WedgedIngest,
+                    ),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let tool = EndSessionTool {
+            client: IngestServiceClient::new(channel),
+            org_id: "org".into(),
+            fingerprint: [0u8; 32],
+            hmac_key: [1u8; 32],
+            node_id: "deadline-test".into(),
+            agent_id: "tester".into(),
+            auth_token: None,
+            ontology: Arc::new(
+                exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                    .unwrap(),
+            ),
+            cache: None,
+            vc: exocortex_ops::VisibilityContext {
+                user_id: "tester".into(),
+                org_id: "org".into(),
+                project_ids: Default::default(),
+                team_ids: Default::default(),
+                max_visibility: exocortex_kernel::Visibility::Org,
+            },
+            live: None,
+            timeouts: PhaseTimeouts {
+                register: std::time::Duration::from_secs(5),
+                submit: std::time::Duration::from_millis(300),
+            },
+        };
+        let err = tool
+            .handle(EndSessionArgs {
+                session_id: Some("wedged-session".into()),
+                project_id: "p".into(),
+                team_id: None,
+                memories: vec![MemoryDraftInput {
+                    draft_key: "d1".into(),
+                    memory_type: "Fix".into(),
+                    title: "Deadline message regression row".into(),
+                    content: "The submit deadline error must name its phase.".into(),
+                    visibility: "org".into(),
+                    tags: vec![],
+                }],
+                edges: vec![],
+            })
+            .await
+            .expect_err("the wedged submit must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("submit phase exceeded"),
+            "names the phase: {message}"
+        );
+        assert!(
+            message.contains("dedupes"),
+            "states retry safety via the dedupe key: {message}"
+        );
+        assert!(
+            message.contains("SAME session_id and drafts"),
+            "says exactly what a safe retry preserves: {message}"
+        );
+        server.abort();
     }
 }

@@ -9,8 +9,12 @@
 //! No MCP handshake, no long-lived server: one process, one command,
 //! exit. Credentials follow the house pattern — env, never argv:
 //! `EXOCORTEX_AUTH_TOKEN` (bearer) and, for `add`, `EXOCORTEX_HMAC_KEY`
-//! (64 hex chars). `--json` prints the raw operation output; the
-//! default is plain text a human reads in a terminal.
+//! (64 hex chars). When `EXOCORTEX_BACKEND` is unset (a dead MCP
+//! session leaves no runtime env to source), the CLI falls back to the
+//! standalone attach record in the data home (D67) — the same
+//! re-resolution source the long-lived client consults (D55). `--json`
+//! prints the raw operation output; the default is plain text a human
+//! reads in a terminal.
 
 use clap::{Parser, Subcommand};
 use exocortex_api_client::ApiClient;
@@ -28,6 +32,11 @@ struct Args {
     /// Owning org. Env: EXOCORTEX_ORG.
     #[arg(long, global = true)]
     org: Option<String>,
+    /// Data home whose attach.json supplies credentials when the
+    /// backend env is unset (default: EXOCORTEX_STANDALONE_DATA_HOME,
+    /// then the platform data home).
+    #[arg(long, global = true, value_name = "DIR")]
+    data_dir: Option<std::path::PathBuf>,
     /// Print raw operation JSON instead of plain text.
     #[arg(long, global = true)]
     json: bool,
@@ -74,10 +83,12 @@ enum Command {
     /// Write one memory through the signed submit path.
     Add {
         /// Memory type (a registered label, e.g. Task, Insight, Topic).
-        memory_type: String,
-        /// Title (1..=200 chars). Optional only with --draft, which
-        /// carries its own.
-        #[arg(required_unless_present = "draft_file")]
+        /// Optional only with --draft/--batch, which carry their own.
+        #[arg(required_unless_present_any = ["draft_file", "batch_file"])]
+        memory_type: Option<String>,
+        /// Title (1..=200 chars). Optional only with --draft/--batch,
+        /// which carry their own.
+        #[arg(required_unless_present_any = ["draft_file", "batch_file"])]
         title: Option<String>,
         /// Content ('-' reads stdin).
         #[arg(long, default_value = "-")]
@@ -95,16 +106,37 @@ enum Command {
         links: Vec<String>,
         /// Read the draft from a JSON file (PreflightMemoryDraft shape)
         /// instead of the positional title/content arguments.
-        #[arg(long = "draft", value_name = "PATH")]
+        #[arg(long = "draft", value_name = "PATH", conflicts_with = "batch_file")]
         draft_file: Option<String>,
+        /// Read a full wrapup batch from a JSON file (the `end_session`
+        /// shape: session_id?, project_id?, team_id?, 1-5 memories,
+        /// edges) — one call, the fallback a dead-MCP agent needs.
+        #[arg(
+            long = "batch",
+            value_name = "PATH",
+            conflicts_with_all = ["draft_file", "links", "content", "tags", "visibility"]
+        )]
+        batch_file: Option<String>,
     },
 }
 
-fn env_or_flag(value: Option<String>, env_name: &str, flag: &str) -> Result<String, anyhow::Error> {
-    value
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var(env_name).ok().filter(|v| !v.is_empty()))
-        .ok_or_else(|| anyhow::anyhow!("--{flag} or {env_name} is required"))
+/// The `--batch` file shape (D67-2): a full `end_session` submit — 1-5
+/// memory drafts plus intra-batch/cross-batch edges — so a fallback
+/// wrapup is ONE CLI call, not one call per memory.
+#[derive(Debug, serde::Deserialize)]
+struct BatchWrap {
+    #[serde(default)]
+    session_id: Option<String>,
+    /// Defaults to EXOCORTEX_PROJECT, then "cli" (the single-draft
+    /// path's rule).
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    team_id: Option<String>,
+    #[serde(default)]
+    memories: Vec<MemoryDraftInput>,
+    #[serde(default)]
+    edges: Vec<exocortex_client::tools::end_session::EdgeHintInput>,
 }
 
 async fn op(
@@ -197,10 +229,11 @@ fn render_chain(out: &serde_json::Value) {
 /// the gen-playbook generator is the recorded follow-up if it drifts.
 const INSTRUCTION_BLOCK: &str = r#"# Exocortex memory (CLI bridge - for harnesses without MCP)
 
-You have a shared memory graph, reached by RUNNING SHELL COMMANDS. Setup is
-already in the shell environment: EXOCORTEX_BACKEND, EXOCORTEX_ORG,
-EXOCORTEX_AUTH_TOKEN (and EXOCORTEX_HMAC_KEY for writes) are set, and
-`exocortex-cli` is on PATH.
+You have a shared memory graph, reached by RUNNING SHELL COMMANDS.
+`exocortex-cli` is on PATH. Credentials come from the environment
+(EXOCORTEX_BACKEND/ORG/AUTH_TOKEN, and EXOCORTEX_HMAC_KEY for writes);
+when those are unset, the CLI auto-finds the live standalone node's
+credentials from its attach record — no setup needed.
 
 Read at the start of a task, and whenever stuck:
   exocortex-cli search "<terms>"          ranked hits: id [Type] title (score)
@@ -218,6 +251,8 @@ Write at the end of a turn when ANY of these fire:
   - you found a problem, solved or not
 Then run:
   exocortex-cli add <Type> "<specific title>" --content "<what and why>"       --tags tag1,tag2 --visibility project
+  exocortex-cli add --batch wrapup.json   (the end_session shape: several
+   memories plus edges, one call)
 
 Usual types: Fix, Solution, Problem, Error, CodePattern, Command, Technology;
 for learning: Topic, Insight, Question, Resource, StudySession, LearningGoal.
@@ -247,11 +282,65 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
     };
-    let backend = env_or_flag(args.backend, "EXOCORTEX_BACKEND", "backend")?;
-    let org = env_or_flag(args.org.clone(), "EXOCORTEX_ORG", "org")?;
+    // Credential resolution (D67): --backend flag > EXOCORTEX_BACKEND >
+    // the standalone attach record. The record is the LIVE owner's
+    // endpoint and secrets, valid exactly while a node owns the data
+    // home (it is removed on owner exit) — the same D55 re-resolution
+    // source the long-lived client consults. A dead MCP session has no
+    // runtime env; this is what makes the CLI fallback reachable.
+    let mut attach: Option<exocortex_client::standalone_creds::Discovered> = None;
+    let backend = match args.backend.clone().filter(|v| !v.is_empty()).or_else(|| {
+        std::env::var("EXOCORTEX_BACKEND")
+            .ok()
+            .filter(|v| !v.is_empty())
+    }) {
+        Some(backend) => backend,
+        None => {
+            let explicit_org = args.org.clone().filter(|v| !v.is_empty()).or_else(|| {
+                std::env::var("EXOCORTEX_ORG")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+            });
+            let home =
+                exocortex_client::standalone_creds::standalone_data_home(args.data_dir.clone());
+            match exocortex_client::standalone_creds::discover(&home, explicit_org.as_deref()) {
+                Ok(found) => {
+                    eprintln!(
+                        "exocortex-cli: credentials from {} (standalone node at {})",
+                        found.data_home.join("attach.json").display(),
+                        found.info.backend
+                    );
+                    let backend = found.info.backend.clone();
+                    attach = Some(found);
+                    backend
+                }
+                Err(reason) => {
+                    return Err(anyhow::anyhow!(
+                        "--backend or EXOCORTEX_BACKEND is required (no usable standalone attach record under {}: {reason})",
+                        home.display()
+                    ));
+                }
+            }
+        }
+    };
+    let org = match args
+        .org
+        .clone()
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var("EXOCORTEX_ORG")
+                .ok()
+                .filter(|v| !v.is_empty())
+        })
+        .or_else(|| attach.as_ref().map(|d| d.info.org.clone()))
+    {
+        Some(org) => org,
+        None => return Err(anyhow::anyhow!("--org or EXOCORTEX_ORG is required")),
+    };
     let token = std::env::var("EXOCORTEX_AUTH_TOKEN")
         .ok()
         .filter(|v| !v.is_empty())
+        .or_else(|| attach.as_ref().map(|d| d.info.auth_token.clone()))
         .ok_or_else(|| anyhow::anyhow!("EXOCORTEX_AUTH_TOKEN is required"))?;
 
     let base = backend.trim_end_matches('/');
@@ -286,76 +375,128 @@ async fn main() -> anyhow::Result<()> {
         visibility,
         links,
         draft_file,
+        batch_file,
     } = &command
     {
-        let mut edges: Vec<(String, String)> = Vec::new();
-        for link in links {
-            let (kind, to_id) = link
-                .split_once(':')
-                .ok_or_else(|| anyhow::anyhow!("--link takes Kind:<32-hex-id>, got {link:?}"))?;
-            anyhow::ensure!(
-                to_id.len() == 32
-                    && to_id.chars().all(|c| c.is_ascii_hexdigit())
-                    && kind.chars().all(|c| c.is_alphabetic()),
-                "--link takes Kind:<32-hex-id>, got {link:?}"
-            );
-            // Resolved to a real EdgeHintInput after the draft loads:
-            // a --draft file carries its own draft_key and --link must
-            // target it (round-10 R10-5 found the hardcoded "cli-1"
-            // dangling under --draft).
-            edges.push((kind.to_string(), to_id.to_ascii_lowercase()));
-        }
-        let draft = if let Some(path) = draft_file {
-            let raw = std::fs::read_to_string(path)?;
-            let value: serde_json::Value = serde_json::from_str(&raw)?;
-            let draft: MemoryDraftInput = serde_json::from_value(value)
-                .map_err(|e| anyhow::anyhow!("draft file must carry the draft shape: {e}"))?;
-            anyhow::ensure!(
-                draft.memory_type == *memory_type,
-                "draft file type {} disagrees with the positional {} (they must match)",
-                draft.memory_type,
-                memory_type
-            );
-            draft
-        } else {
-            MemoryDraftInput {
-                draft_key: "cli-1".into(),
-                memory_type: memory_type.clone(),
-                title: title.clone().expect("clap requires title unless --draft"),
-                content: content.clone(),
-                visibility: visibility.clone(),
-                tags: tags.clone(),
-            }
-        };
-        let edges: Vec<exocortex_client::tools::end_session::EdgeHintInput> = edges
-            .into_iter()
-            .map(
-                |(kind, to_id)| exocortex_client::tools::end_session::EdgeHintInput {
-                    from_draft_key: draft.draft_key.clone(),
-                    to_draft_key: String::new(),
-                    to_memory_id: to_id,
-                    kind,
-                    strength: 0.0,
-                },
-            )
-            .collect();
-        let content = if draft.content == "-" {
-            use std::io::Read as _;
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            buf
-        } else {
-            draft.content.clone()
-        };
+        // The signing key: env first, then the discovered attach record
+        // (a dead-MCP session leaves no runtime env — D67).
         let hmac_key = exocortex_wire::signing::decode_hex32(
             &std::env::var("EXOCORTEX_HMAC_KEY")
                 .ok()
                 .filter(|v| !v.is_empty())
+                .or_else(|| attach.as_ref().map(|d| d.info.hmac_key.clone()))
                 .ok_or_else(|| {
                     anyhow::anyhow!("EXOCORTEX_HMAC_KEY is required for add (64 hex chars)")
                 })?,
         )
         .map_err(anyhow::Error::msg)?;
+
+        // '-' expands to stdin per draft, at most once per submit.
+        fn expand_stdin(content: String) -> anyhow::Result<String> {
+            if content != "-" {
+                return Ok(content);
+            }
+            use std::io::Read as _;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            Ok(buf)
+        }
+
+        let submit: EndSessionArgs = if let Some(path) = batch_file {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("--batch {}: {e}", path))?;
+            let batch: BatchWrap = serde_json::from_str(&raw)
+                .map_err(|e| anyhow::anyhow!("batch file must carry the end_session shape: {e}"))?;
+            anyhow::ensure!(!batch.memories.is_empty(), "batch file carries no memories");
+            let mut memories = Vec::with_capacity(batch.memories.len());
+            for mut draft in batch.memories {
+                draft.content = expand_stdin(draft.content)?;
+                memories.push(draft);
+            }
+            EndSessionArgs {
+                session_id: batch.session_id,
+                project_id: batch.project_id.unwrap_or_else(|| {
+                    std::env::var("EXOCORTEX_PROJECT").unwrap_or_else(|_| "cli".into())
+                }),
+                team_id: batch.team_id,
+                memories,
+                edges: batch.edges,
+            }
+        } else {
+            let mut edges: Vec<(String, String)> = Vec::new();
+            for link in links {
+                let (kind, to_id) = link.split_once(':').ok_or_else(|| {
+                    anyhow::anyhow!("--link takes Kind:<32-hex-id>, got {link:?}")
+                })?;
+                anyhow::ensure!(
+                    to_id.len() == 32
+                        && to_id.chars().all(|c| c.is_ascii_hexdigit())
+                        && kind.chars().all(|c| c.is_alphabetic()),
+                    "--link takes Kind:<32-hex-id>, got {link:?}"
+                );
+                // Resolved to a real EdgeHintInput after the draft loads:
+                // a --draft file carries its own draft_key and --link must
+                // target it (round-10 R10-5 found the hardcoded "cli-1"
+                // dangling under --draft).
+                edges.push((kind.to_string(), to_id.to_ascii_lowercase()));
+            }
+            let draft = if let Some(path) = draft_file {
+                let raw = std::fs::read_to_string(path)?;
+                let value: serde_json::Value = serde_json::from_str(&raw)?;
+                let draft: MemoryDraftInput = serde_json::from_value(value)
+                    .map_err(|e| anyhow::anyhow!("draft file must carry the draft shape: {e}"))?;
+                anyhow::ensure!(
+                    Some(&draft.memory_type) == memory_type.as_ref(),
+                    "draft file type {} disagrees with the positional {} (they must match)",
+                    draft.memory_type,
+                    memory_type.as_deref().unwrap_or("(absent)")
+                );
+                draft
+            } else {
+                MemoryDraftInput {
+                    draft_key: "cli-1".into(),
+                    memory_type: memory_type
+                        .clone()
+                        .expect("clap requires the type unless --draft/--batch"),
+                    title: title
+                        .clone()
+                        .expect("clap requires title unless --draft/--batch"),
+                    content: content.clone(),
+                    visibility: visibility.clone(),
+                    tags: tags.clone(),
+                }
+            };
+            let edges: Vec<exocortex_client::tools::end_session::EdgeHintInput> = edges
+                .into_iter()
+                .map(
+                    |(kind, to_id)| exocortex_client::tools::end_session::EdgeHintInput {
+                        from_draft_key: draft.draft_key.clone(),
+                        to_draft_key: String::new(),
+                        to_memory_id: to_id,
+                        kind,
+                        strength: 0.0,
+                    },
+                )
+                .collect();
+            let content = expand_stdin(draft.content.clone())?;
+            // One deterministic session for all single CLI writes: the
+            // backend groups them (and admin source policy can pin
+            // session://cli with its own ceiling and signing key).
+            // The requested project/team scopes default to "cli",
+            // overridable by env so an authenticated backend's
+            // project/team membership checks can pass for the
+            // operator's REAL scopes. A --batch file may carry its own
+            // session/project/team per wrapup.
+            EndSessionArgs {
+                session_id: Some("cli".into()),
+                project_id: std::env::var("EXOCORTEX_PROJECT").unwrap_or_else(|_| "cli".into()),
+                team_id: std::env::var("EXOCORTEX_TEAM")
+                    .ok()
+                    .filter(|t| !t.is_empty()),
+                memories: vec![MemoryDraftInput { content, ..draft }],
+                edges,
+            }
+        };
 
         let channel = tonic::transport::Endpoint::new(format!("{base}/"))?
             .connect()
@@ -395,24 +536,10 @@ async fn main() -> anyhow::Result<()> {
                 max_visibility: Visibility::Org,
             },
             live: None,
+            timeouts: Default::default(),
         };
         let ack = tool
-            .handle(EndSessionArgs {
-                // One deterministic session for all CLI writes: the
-                // backend groups them (and admin source policy can pin
-                // session://cli with its own ceiling and signing key).
-                // The requested project/team scopes default to "cli",
-                // overridable by env so an authenticated backend's
-                // project/team membership checks can pass for the
-                // operator's REAL scopes.
-                session_id: Some("cli".into()),
-                project_id: std::env::var("EXOCORTEX_PROJECT").unwrap_or_else(|_| "cli".into()),
-                team_id: std::env::var("EXOCORTEX_TEAM")
-                    .ok()
-                    .filter(|t| !t.is_empty()),
-                memories: vec![MemoryDraftInput { content, ..draft }],
-                edges,
-            })
+            .handle(submit)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         if args.json {
@@ -512,8 +639,12 @@ mod tests {
     }
 
     #[test]
-    fn env_or_flag_prefers_flag_then_env() {
-        // (unit-level: flag wins over env; env fills an absent flag)
-        assert_eq!(env_or_flag(Some("x".into()), "PATH", "path").unwrap(), "x");
+    fn instruction_block_names_the_standalone_credential_fallback() {
+        // D67-4a: the block must not promise env an unwired shell never
+        // had — the CLI auto-finds the live node when env is unset.
+        assert!(
+            INSTRUCTION_BLOCK.contains("auto-finds"),
+            "the CLI block teaches the attach-record fallback: {INSTRUCTION_BLOCK}"
+        );
     }
 }
