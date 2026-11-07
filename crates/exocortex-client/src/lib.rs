@@ -4,6 +4,7 @@
 pub mod backup;
 pub mod drain;
 pub mod eof_drain;
+pub mod federation;
 pub mod materialize;
 pub mod mcp;
 pub mod no_backend;

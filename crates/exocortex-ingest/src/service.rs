@@ -567,12 +567,20 @@ impl<S: Storage> IngestServer<S> {
         // record's rolling-upgrade history — a producer may know less
         // than the server, never more. The error text is the legible
         // rejection a subset node owes a superset producer (D3).
-        exocortex_kernel::admit_producer_batch(
-            &b.ontology_fingerprint,
-            &self.ontology,
-            &self.storage.recognized_ontology_fingerprints(),
-        )
-        .map_err(|e| e.to_string())
+        //
+        // D3 federation widens "recognized" with the DERIVED prefix
+        // fingerprints of our own composition: any canonical
+        // pack-prefix is a structurally-verified "knows less" claim
+        // (each prefix is a legal smaller deployment), computed — not
+        // negotiated — exactly like the fingerprint itself (OC-PRD
+        // §5.2). Rows are revalidated against OUR full rulebook below
+        // regardless, so a lying claim still hits per-row rejection.
+        let mut recognized = self.storage.recognized_ontology_fingerprints();
+        recognized.extend(exocortex_kernel::federation::prefix_fingerprints(
+            &self.ontology.packs,
+        ));
+        exocortex_kernel::admit_producer_batch(&b.ontology_fingerprint, &self.ontology, &recognized)
+            .map_err(|e| e.to_string())
     }
 
     fn request_principal<T>(

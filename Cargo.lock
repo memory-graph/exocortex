@@ -1739,6 +1739,8 @@ dependencies = [
  "exocortex-dreams",
  "exocortex-kernel",
  "exocortex-pack-dev-v1",
+ "exocortex-pack-mortgage-v1",
+ "exocortex-pack-study-v1",
  "exocortex-reasoning",
  "exocortex-storage",
  "exocortex-wire",

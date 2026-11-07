@@ -862,6 +862,77 @@ pub fn build_fingerprint(packs: &[PackDef]) -> BuildFingerprint {
     BuildFingerprint(out)
 }
 
+// ---- D3 federation (master plan Wave 5, §24 q15): the derived
+// common-subset plan. The D2 table's federated-peer row lives or dies
+// here, so the prefix matching is a policy decision in this file —
+// every fingerprint comparison in the workspace stays inside the
+// policy homes (the compatibility-policy gate enforces exactly that).
+
+/// What a sender needs to project a batch toward a peer (or a superset
+/// receiver needs to describe what it will admit): the shared prefix's
+/// pack names, its fingerprint (the batch-level claim), and the type
+/// and kind NAME sets a row must live inside to survive projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommonSubsetPlan {
+    /// The shared prefix's pack names, canonical order.
+    pub packs: Vec<String>,
+    /// The compatibility fingerprint OF the prefix packs — the honest
+    /// ontology claim a projected batch presents.
+    pub fingerprint: [u8; 32],
+    /// Memory-type labels a projected draft may carry.
+    pub memory_types: std::collections::BTreeSet<String>,
+    /// Edge-kind labels a projected edge may carry.
+    pub kinds: std::collections::BTreeSet<String>,
+}
+
+/// The compatibility fingerprint of every canonical pack-prefix of
+/// `packs`: `[p0]`, `[p0, p1]`, … through the full list (whose entry
+/// equals the composition's own fingerprint). These are exactly the
+/// "I know less than you, by structure" claims a superset graph
+/// recognizes at the ingest boundary — the D2 ingest row's rule,
+/// generalized from remembered pins to derived ones.
+pub fn prefix_fingerprints(packs: &[PackDef]) -> Vec<[u8; 32]> {
+    let canon = canonicalized(packs);
+    (1..=canon.len())
+        .map(|n| {
+            OntologySummary::of_canonical_packs(&canon[..n])
+                .compatibility_fingerprint()
+                .0
+        })
+        .collect()
+}
+
+/// Derive the common-subset plan for `ours` against an offered
+/// fingerprint: the plan is the canonical prefix of OUR pack list whose
+/// fingerprint equals `offered`. Ok(plan) when one matches;
+/// [`CompatibilityError::ProducerNotAdmitted`] (the legible subset
+/// refusal the ingest boundary already speaks) when nothing does — a
+/// foreign ontology, a mid/tail subset, or a same-name-different-content
+/// pack all land here, because each changes the prefix fingerprint.
+pub fn common_subset(
+    ours: &crate::ontology::Ontology,
+    offered: &[u8; 32],
+) -> Result<CommonSubsetPlan, CompatibilityError> {
+    let canon = canonicalized(&ours.packs);
+    for n in 1..=canon.len() {
+        let slice = &canon[..n];
+        let summary = OntologySummary::of_canonical_packs(slice);
+        let fingerprint = summary.compatibility_fingerprint();
+        if fingerprint.0 == *offered {
+            return Ok(CommonSubsetPlan {
+                packs: slice.iter().map(|p| p.name.to_string()).collect(),
+                fingerprint: fingerprint.0,
+                memory_types: summary.memory_types.into_iter().collect(),
+                kinds: summary.kinds.iter().map(|k| k.name.clone()).collect(),
+            });
+        }
+    }
+    Err(CompatibilityError::ProducerNotAdmitted {
+        offered: *offered,
+        current: ours.fingerprint.0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,5 +1259,146 @@ mod tests {
             err,
             Err(CompatibilityError::LegacyPinMismatch { .. })
         ));
+    }
+
+    // ---- D3 federation policy tests ----
+    // Inline packs in nested modules (the kernel-purity pattern: no
+    // pack-crate dev-deps; the macro generates one `pack_def` per
+    // module so both can coexist). Names sort fed-a before fed-b, so
+    // the canonical order — and therefore the prefix relation — is
+    // fixed by name.
+    // The pack! macro's generated boilerplate (entity enums, table
+    // helpers) trips in-crate dead-code lints that pub pack crates
+    // never see; scope the allows to the fixtures.
+    #[allow(
+        dead_code,
+        unused_mut,
+        clippy::redundant_field_names,
+        semicolon_in_expressions_from_macros
+    )]
+    mod fed_a {
+        crate::pack! {
+            name: "fed-a",
+            version: "1.0.0",
+            kernel_min: "1.0.0",
+
+            memory_types! { AFix, AProblem, }
+
+            entity_types! { AThing, }
+
+            kinds! {
+                ASolves    => bucket: Causal,   inverse: ASolvedBy,    bi: false, default_strength: 0.85, kernel_const: SOLVES,
+                AFixes     => bucket: Causal,   inverse: AFixedBy,     bi: false, default_strength: 0.90, kernel_const: FIXES,
+                ACauses    => bucket: Causal,   inverse: ACausedBy,    bi: false, default_strength: 0.85, kernel_const: CAUSES,
+                AInSession => bucket: Context,  inverse: AHasMember,   bi: false, default_strength: 0.80, kernel_const: IN_SESSION,
+            }
+
+            type_triples! {
+                ASolves    => (AFix, AProblem),
+                AFixes     => (AFix, AProblem),
+                ACauses    => (_, AProblem),
+                AInSession => (_, _),
+            }
+
+            crepe_rules! {
+                fed_a_rule(a, b) <- edge(a, b, ASolves), memory(a, _, _);
+            }
+        }
+    }
+
+    #[allow(
+        dead_code,
+        unused_mut,
+        clippy::redundant_field_names,
+        semicolon_in_expressions_from_macros
+    )]
+    mod fed_b {
+        crate::pack! {
+            name: "fed-b",
+            version: "1.0.0",
+            kernel_min: "1.0.0",
+
+            memory_types! { BLoan, BTask, }
+
+            entity_types! { BThing, }
+
+            kinds! {
+                BFunds => bucket: Workflow, inverse: BFundedBy, bi: false, default_strength: 0.8,
+            }
+
+            type_triples! {
+                BFunds => (BLoan, BTask),
+            }
+
+            crepe_rules! {
+                fed_b_rule(a, b) <- edge(a, b, BFunds), memory(a, _, _);
+            }
+        }
+    }
+
+    fn both() -> [PackDef; 2] {
+        [fed_a::pack_def(), fed_b::pack_def()]
+    }
+
+    /// The load-bearing property: a pack's fingerprint is the same
+    /// computed standalone and as a prefix of a bigger composition —
+    /// running type offsets and pack kind-slots both assign in
+    /// canonical order, so the prefix summary is byte-identical.
+    #[test]
+    fn prefix_fingerprint_equals_the_standalone_composition() {
+        let packs = both();
+        let prefixes = prefix_fingerprints(&packs);
+        assert_eq!(prefixes.len(), 2);
+        let a_alone = Ontology::from_packs(vec![packs[0].clone()]).expect("fed-a alone assembles");
+        assert_eq!(
+            prefixes[0], a_alone.fingerprint.0,
+            "fed-a's prefix fingerprint is its standalone fingerprint"
+        );
+        let full = Ontology::from_packs(both().to_vec()).expect("both assemble");
+        assert_eq!(
+            prefixes[1], full.fingerprint.0,
+            "the full list is its own last prefix"
+        );
+    }
+
+    /// The plan the personal↔employer case needs: the bigger
+    /// derivation against the smaller deployment's fingerprint lands on
+    /// the shared prefix, with only that prefix's vocabulary.
+    #[test]
+    fn common_subset_derives_the_shared_prefix_plan() {
+        let ours = Ontology::from_packs(both().to_vec()).expect("both assemble");
+        let small = Ontology::from_packs(vec![fed_a::pack_def()]).expect("fed-a assembles");
+        let plan = common_subset(&ours, &small.fingerprint.0).expect("the shared prefix matches");
+        assert_eq!(plan.packs, vec!["fed-a".to_string()]);
+        assert_eq!(plan.fingerprint, small.fingerprint.0);
+        assert!(plan.memory_types.contains("AFix"));
+        assert!(
+            !plan.memory_types.contains("BLoan"),
+            "later pack's type absent"
+        );
+        assert!(plan.kinds.contains("ASolves"));
+        assert!(!plan.kinds.contains("BFunds"), "later pack's kind absent");
+    }
+
+    /// A mid/tail subset re-slots its kind ids (the per-pack slot is
+    /// assigned by canonical INDEX), so its standalone fingerprint
+    /// matches no prefix of the composed set — refused, never guessed.
+    #[test]
+    fn mid_set_fingerprints_are_refused() {
+        let ours = Ontology::from_packs(both().to_vec()).expect("both assemble");
+        // fed-b alone re-slots its kind ids (slot 0 here vs slot 1 in
+        // the composition), so its summary fingerprint — computable
+        // without it ever being a legal composition — matches no
+        // prefix: the naive "send only the shared-looking pack" peer
+        // is refused.
+        let b_alone =
+            OntologySummary::of_canonical_packs(&[fed_b::pack_def()]).compatibility_fingerprint();
+        let err = common_subset(&ours, &b_alone.0).expect_err("a mid/tail subset is not a prefix");
+        assert!(matches!(
+            err,
+            CompatibilityError::ProducerNotAdmitted { .. }
+        ));
+        // A completely foreign fingerprint is refused the same way.
+        assert!(common_subset(&ours, &[7; 32]).is_err());
     }
 }

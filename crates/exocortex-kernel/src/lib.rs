@@ -30,6 +30,9 @@ pub mod draft;
 pub mod entity;
 /// The kernel error surface.
 pub mod error;
+/// D3 federation: the derived common-subset plan and prefix
+/// fingerprints (§24 q15, OC-PRD D3 subset-is-prefix).
+pub mod federation;
 /// `OntologyFingerprint` — SHA-256 over the effective ontology (§7.17).
 pub mod fingerprint;
 /// Typed reads — the four kernel Functions (§7.12).

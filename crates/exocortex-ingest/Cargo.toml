@@ -57,5 +57,9 @@ tokio = { workspace = true, features = ["test-util"] }
 blake3 = { workspace = true }
 prost = { workspace = true }
 exocortex-pack-dev-v1 = { workspace = true }
+# D3 federation e2e: the composed (superset) server needs the second
+# and third packs as fixtures; the storage/chaos dev-dep precedent.
+exocortex-pack-mortgage-v1 = { workspace = true }
+exocortex-pack-study-v1 = { workspace = true }
 futures = { workspace = true }
 exocortex-reasoning = { workspace = true }

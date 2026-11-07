@@ -674,3 +674,18 @@ in this workspace links, calls, or embeds an LLM. Option (b) — LLM
 inside the node — would be an invariant reversal and requires an
 explicit record here; none exists. No PRD conflict; the core PRD's §24
 deferral of semantic search stands.
+
+## D3 federation — q15 deviation, recorded (2026-11-04)
+
+Core PRD §24 open question 15 asked for "a Function that projects
+memories/edges into the common subset." The delivered projection is a
+plain deterministic function (kernel `federation::common_subset` +
+client `federation::project_batch`), NOT a pack-registered Function
+verb. Reason: a verb registration lands in the compatibility
+fingerprint of every install, moving a value the OC-PRD gates treat as
+authorized-only — for what is sender-side client machinery, not stored
+ontology meaning. The projection needs no ontology authority; the
+receiver revalidates every row regardless. The D2 policy table gained
+the federated-peer row (OC-PRD amendment in the same commit) and §5.2
+gained the derivation-not-negotiation note. No other PRD conflict; the
+compatibility fingerprint is unchanged by this work.

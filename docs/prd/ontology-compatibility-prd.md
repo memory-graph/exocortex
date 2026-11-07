@@ -178,6 +178,7 @@ declares the strongest rule it can honestly support:
 | SSE subscriber | Same as cluster peer |
 | Adapter SDK | Same as ingest, surfaced as a typed, actionable error naming the specific divergence |
 | Backup restore | Superset accepted, because every draft is already revalidated against the current rulebook before the WAL is touched (`backup.rs:103`) |
+| Federated peer (cross-deployment ingest; master plan D3) | Same as the ingest rule, with "recognised" widened to the canonical **pack-prefix fingerprints** of the server's own composition — each prefix is a structurally verified smaller deployment ("knows less"), computed per-side like the fingerprint itself. Rows are revalidated against the server's full rulebook regardless, so a dishonest claim buys nothing (batch-atomic rejection) |
 
 The point of the table is that these are **different questions**. Today they
 share an answer by accident of implementation.
@@ -265,6 +266,14 @@ third cost, and it fails today.
 - **Runtime ontology negotiation.** No handshake in which two components agree
   on a reduced common ontology. Compatible or not; a partial agreement is a
   silent-divergence generator.
+
+  *D3 amendment (2026-11-04, master plan Wave 5):* federation DERIVES the
+  common subset per-side — the maximal shared canonical pack prefix, each
+  pack identity-verified by the prefix fingerprint — rather than negotiating
+  it; no component ever accepts a peer's proposal of a reduced ontology.
+  The prohibition above stands untouched: derivation has the same epistemics
+  as the fingerprint itself, and both sides compute the same answer from the
+  same pinned inputs or refuse.
 
 ---
 
