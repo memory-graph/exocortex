@@ -205,6 +205,46 @@ timeout recurs. D3 (federation's common-subset fingerprint +
 projection + prefix admission) also closed 2026-11-04 — q15 is
 answered; automated peer transport remains under D3's umbrella.
 
+**2026-11-07 evening (the resumed init measurement ran; the no-tools
+family is root-caused as SSE admission saturation — D73 opened):** the
+morning entry's "RESUME IT FIRST" item ran first. The decisive answer:
+it was never `tools/list` cost, and no cold boot happens while a
+supervisor lives — a fresh `mcp-standalone` spawn ATTACHES to the live
+node (the wrapper's own log line: "attached to the live standalone
+node on this data dir"), so the morning entry's "every session
+cold-boots the stack" model was wrong. The session-initialization
+death is at the SSE seed, reproduced three ways tonight (a probe
+wrapper's 429 wall, then direct socket probes against
+`/v1/changes`). Live state at 22:15: EIGHT concurrent
+`exocortex-mcp-client` processes attached to the personal node
+(49578) — the 16:06-16:09 post-reboot harness burst — all as the SAME
+principal (personal:gregory), one holding two connections, and the
+per-principal live-stream cap is exactly
+`MAX_LIVE_STREAMS_PER_PRINCIPAL = 8`: the 9th stream answers `HTTP
+429: SSE live-stream concurrency limit reached` instantly and
+forever; the client's 15s seed deadline expires ("backend did not
+provide an initial graph seed within 15s"), the MCP server exits, and
+crush logs `MCP client failed to initialize: context canceled` — the
+11-02/11-03/11-07 family, at last with the mechanism in hand. Earlier
+in the evening the same flail wore the OTHER limiter's message
+(`SSE hydration concurrency limit reached`, `MAX_CONCURRENT_RESEEDS
+= 2`) while post-store-restart reseeds churned — the store SIGILL'd
+twice under the supervisor (16:09, 16:12;
+`exocortex_supervisor_restarts_total 2`; D60's residual class, rode
+through). Probe-hygiene notes for future sessions: the SSE path is
+`/v1/changes` (NOT `/sse` — that hits a gRPC catch-all answering
+`200 + grpc-status: 12 + content-type: application/grpc`, which
+masquerades as a silent empty 200 to a careless probe); and the
+personal store's requirepass is the node auth_token
+(`supervised_store_urls`), so `AUTH <attach-token>` + any store
+command is the direct store probe. D73 opened below (raise the two
+caps to fit the multi-session pilot reality: per-principal 8 → 64,
+reseed 2 → 8; the global 256 cap stands as the real backstop). The D3
+push still parks on the matrix; the next matrix run serves this fix's
+gate too. The owner's reboot DID restore the keychain (SSL_CERT_FILE
+unset all session; no trust-store error in any probe or build), so
+D72's workaround is dormant — the fix stays queued.
+
 **2026-11-07 (D3 landed; D72 opened; push parks):** D3's tree landed
 as commit `667314c` (kernel `compatibility::{CommonSubsetPlan,
 prefix_fingerprints, common_subset}` + `pub mod federation`, ingest
@@ -381,6 +421,7 @@ each step (88 tests at completion).
 
 | ID | Item | Source | Status |
 |----|------|--------|--------|
+| D73 | **SSE admission caps are below the multi-session pilot reality, so the 9th concurrent harness session can never initialize against a shared node** — found live 2026-11-07 evening (the header entry carries the full evidence): every attached `exocortex-mcp-client` holds ONE live SSE stream for its whole lifetime as the SAME principal, and the pilot topology (four harnesses + CLI + probes on one personal-org node) observed EIGHT concurrent clients at 16:06-16:09 — exactly `MAX_LIVE_STREAMS_PER_PRINCIPAL = 8` — so every later session's `/v1/changes` connect answers `HTTP 429: SSE live-stream concurrency limit reached` forever; the client dies at its 15s seed deadline and the harness session has no exocortex tools (the 11-02/11-03/11-07 crush init-failure family). The sibling limiter showed the same fragility an hour earlier: `MAX_CONCURRENT_RESEEDS = 2` serializes seed scans, and under post-store-restart reseed churn (two SIGILL restarts rode through the same evening) a new client can spend its whole 15s window behind two busy scan slots (`SSE hydration concurrency limit reached`). Fix: `MAX_LIVE_STREAMS_PER_PRINCIPAL` 8 → 64 (pilot sessions-per-user reality; the GLOBAL 256 cap stands as the node-wide backstop), `MAX_CONCURRENT_RESEEDS` 2 → 8 (concurrent read-only paged scans; the D52 permit-lifetime fix is untouched — permits still release the moment the scan resolves). No wire change, no fingerprint movement. Fail-without-it: sse unit `nine_same_principal_sessions_all_admit_live_streams` (9 admissions for ONE principal key — the 9th is the permanent 429 pre-fix) and `a_third_seed_scan_admits_while_two_scans_stay_open` (two never-resolving seed futures hold two permits; a third acquisition must still succeed — red at 2 slots, green at 8) | 2026-11-07 Crush session (resumed init measurement; live repro on the personal-org node) | **In progress — opened this commit; fix + tests land in the next** |
 | D72 | **`ApiClient` builds the rustls TLS connector eagerly even for plaintext `http://` endpoints, so keychain-less macOS contexts kill every loopback client call with a platform trust-store error** — found live 2026-11-07 landing D3: `cargo test -p exocortex-client --test cli_smoke` failed 4/4 with `could not load platform certs: No keychain is available` (hyper-rustls 0.24 `with_native_roots` panic, retried 3x by `build_connector` then surfaced as `ApiError::Transport`) — in an agent-harness context with no keychain, against a plaintext loopback standalone node the CLI had ALREADY found via attach.json; the TLS load has nothing to do with the connection being made. `SSL_CERT_FILE=/etc/ssl/cert.pem` makes the suite green (rustls-native-certs honors the override) — the interim local workaround. Fix shape (the `sync.rs` precedent, `read_sse` ~lines 570-619: scheme-conditional connector + catch_unwind): plaintext endpoints get `hyper::Client::new()` and never touch rustls; https keeps the guarded `build_connector`. Fail-without-it that works on ANY machine: point `SSL_CERT_FILE` at a nonexistent path inside the test (rustls-native-certs fails that load even where a keychain exists), serve a loopback `http://` endpoint, assert the request still succeeds — red pre-fix (trust-store error), green post-fix | 2026-11-07 Crush session (cli_smoke outage while landing D3) | **Proposed — opened at the owner's reboot park; export `SSL_CERT_FILE=/etc/ssl/cert.pem` for any local `cli_smoke`/matrix run until it lands** |
 | D71 | **Graphs pinned before D61's Answers-widening can never boot on a post-D61 binary — the pin advance is refused as NotASuperset** — found live (2026-11-02): after killing the permit-leaked 0.5.3 node (D66's class), every fresh `mcp-standalone` boot on a main-built binary died with `ontology fingerprint mismatch: storage=[zeros]` against the personal-org graph (pinned `a427b3ad…ed9d`, the pre-D61 golden the Oct-18 install wrote). Root cause: `is_subset_of` compared `type_triples` by exact set membership, so D61's `(_, Question)` widening (open from-side encoded as `None`) can never cover a pinned narrow `(Some([25]), Some([26]))` row — the advance D61's own row authorizes ("additive superset per OC-PRD D2") is impossible at the predicate level, for every pre-D61 graph, and the refusal synthesizes all-zero storage bytes at the falkor boundary (the kernel's divergence string is discarded there, which is why the error read as corruption rather than refusal). Fix: relational triple coverage in `is_subset_of`/`first_divergence` — `triple_covered` treats `None` as the universe covering any narrower pinned side, pinned-open vs runtime-constrained as never covered, exact rows short-circuiting through the existing set check. Compatibility fingerprint UNMOVED (`46282e1b…6554`; predicate-only change — `xtask fingerprint` and `compatibility-policy` green) | live outage 2026-11-02 (Claude/Codex/Crush sessions dead on attach; reproduced on a scratch copy of the real AOF) | **Done (2026-11-02, this commit)** — fail-without-it: kernel `node_graph_policy_advances_on_endpoint_widening` (narrow-pinned → widened runtime Advances; → fully-open runtime Advances; → narrowed runtime refuses — stash-verified red on the exact-set compare). Live evidence: the pinned record extracted from the personal-org AOF through `admit_node_graph` against the composed runtime flips `REFUSED: type-triple rule for kind 0x80020006 is missing` → `Advance to 46282e1b…6554`; the live stack then boots and hydrates. Kernel 17/17, storage 20/20, server lib 22/22, clippy -D warnings clean |
 | D70 | **Cold builds fail on the pinned toolchain: ctutils 0.4.4 (the RUSTSEC-2026-0385 bump, ae921fc) declares rustc >= 1.87 while the pin was 1.85.0** — every CI run since ae921fc is red at the first resolve ("ctutils@0.4.4 requires rustc 1.87"); warm local caches (pre-resolved lock) masked it for the D54 session's touched-crate suites, which is exactly how the red landed unnoticed. Fix: toolchain pin 1.85.0 → 1.87.0 (rust-toolchain.toml + the four ci.yml jobs + AGENTS.md; the M0 deviation note carries the new floor) — the security bump must hold, so the toolchain moves | 2026-10-25 D68 push blocked at the matrix fmt phase | **Done (2026-10-25, this commit)** — pinned 1.87.0 everywhere the pin lives; the full matrix on this tree is the verification (cold resolve + build + tests on the new toolchain) |
