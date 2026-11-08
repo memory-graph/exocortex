@@ -1862,6 +1862,12 @@ pub(crate) const SEAM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "fifty_row_batch_accepted_lsn_monotonic",
     ),
     (
+        "ingest-federation-prefix",
+        "exocortex-ingest",
+        "tests/federation.rs",
+        "prefix_fingerprint_batches_are_admitted_and_rows_revalidated",
+    ),
+    (
         "ingest-rights",
         "exocortex-ingest",
         "tests/rights.rs",
