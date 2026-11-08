@@ -40,9 +40,22 @@ struct ClientGraphSnapshot {
 
 const MAX_RESEED_ROWS: usize = 50_000;
 const MAX_RESEED_BYTES: usize = exocortex_wire::limits::MAX_SSE_RESEED_JSON_BYTES;
-const MAX_CONCURRENT_RESEEDS: usize = 2;
+// D73: two seed-scan slots serialize every hydration; under
+// post-store-restart reseed churn a fresh client can spend its whole
+// 15s seed window behind two busy scans. Permits still release the
+// moment a scan resolves (the D52 fix); 8 slots fit the multi-session
+// pilot without unbounding concurrent read-only paged scans.
+const MAX_CONCURRENT_RESEEDS: usize = 8;
 const MAX_LIVE_STREAMS_GLOBAL: usize = 256;
-const MAX_LIVE_STREAMS_PER_PRINCIPAL: usize = 8;
+// D73: every attached client holds one live stream for its whole
+// lifetime as its principal, so the per-principal cap is the
+// concurrent-SESSIONS-per-user ceiling. The multi-harness pilot
+// (crush + claude code + codex + droid + CLI fallbacks on one shared
+// node, all one principal) observed eight concurrent clients hours
+// after a reboot — the 9th session 429'd forever and died at its 15s
+// seed deadline. 64 fits pilot reality; the global cap above stays
+// the node-wide backstop.
+const MAX_LIVE_STREAMS_PER_PRINCIPAL: usize = 64;
 
 struct SseState<S: Storage> {
     cluster: Arc<ClusterNode<S>>,
@@ -1668,5 +1681,138 @@ mod tests {
             "the third client must hydrate while the earlier streams stay open"
         );
         drop(earlier_bodies);
+    }
+
+    /// D73: every attached client holds one live stream for its whole
+    /// lifetime as its principal, so the per-principal cap is the
+    /// concurrent-sessions-per-user ceiling. The pilot observed eight
+    /// concurrent harness sessions on one shared node (2026-11-07,
+    /// hours after a reboot — no leak, just real sessions), and the
+    /// ninth connect answered `HTTP 429: SSE live-stream concurrency
+    /// limit reached` until the client died at its 15s seed deadline:
+    /// the harness session then had no exocortex tools at all. Nine
+    /// admissions for ONE principal key must all succeed at the
+    /// production limits; pre-fix (cap 8) the ninth is the permanent
+    /// 429.
+    #[test]
+    fn nine_same_principal_sessions_all_admit_live_streams() {
+        let admission = super::LiveStreamAdmission::new(
+            super::MAX_LIVE_STREAMS_GLOBAL,
+            super::MAX_LIVE_STREAMS_PER_PRINCIPAL,
+        );
+        let mut held = Vec::new();
+        for _ in 0..9 {
+            held.push(
+                admission
+                    .try_admit([7u8; 32])
+                    .expect("nine concurrent sessions of one principal must all admit"),
+            );
+        }
+        // The cap still bounds a single principal: at the limit itself
+        // admission refuses (the runaway-client backstop D73 keeps).
+        for _ in 9..super::MAX_LIVE_STREAMS_PER_PRINCIPAL {
+            held.push(admission.try_admit([7u8; 32]).expect("fills to the cap"));
+        }
+        assert!(
+            admission.try_admit([7u8; 32]).is_err(),
+            "the per-principal cap must still refuse past its limit"
+        );
+        // A different principal is unaffected: the global cap, not
+        // this principal's, governs it.
+        assert!(admission.try_admit([9u8; 32]).is_ok());
+    }
+
+    /// D73: two never-resolving seed scans (the post-store-restart
+    /// shape: a scan holding its slot while reseed churn runs) must
+    /// not fence a third client out of the seed path. Pre-fix (2
+    /// slots) the third acquisition is the permanent
+    /// `SSE hydration concurrency limit reached` the live flail wore
+    /// before the live-stream cap saturated.
+    #[tokio::test]
+    async fn a_third_seed_scan_admits_while_two_scans_stay_open() {
+        use super::{LiveStreamAdmission, SharedEventHydration, SseState, MAX_CONCURRENT_RESEEDS};
+
+        let onto = Arc::new(
+            exocortex_kernel::Ontology::from_packs(vec![exocortex_pack_dev_v1::pack_def()])
+                .unwrap(),
+        );
+        let cluster = Arc::new(ClusterNode::new(
+            Arc::new(InMemoryStorage::new(onto.clone())),
+            "seed-slot-capacity".into(),
+            onto.fingerprint,
+            [13u8; 32],
+        ));
+        let state = Arc::new(SseState {
+            cluster: cluster.clone(),
+            reseeds: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RESEEDS)),
+            live_streams: LiveStreamAdmission::new(16, 16),
+            hydration: SharedEventHydration::default(),
+        });
+
+        // Two open scans that never resolve, each holding a reseed
+        // permit exactly as the handler path acquires it.
+        let mut held_scans = Vec::new();
+        for _ in 0..2 {
+            let permit = state
+                .reseeds
+                .clone()
+                .try_acquire_owned()
+                .expect("the handler path acquires a reseed permit");
+            held_scans.push(permit);
+        }
+
+        // The regression: a third seed client must still acquire a
+        // slot and hydrate while both slow scans stay open.
+        let permit = state
+            .reseeds
+            .clone()
+            .try_acquire_owned()
+            .expect("a third concurrent seed scan must admit while two scans stay open");
+        let live_permits = state
+            .live_streams
+            .try_admit([3u8; 32])
+            .expect("live admission");
+        let rx = cluster.subscribe_local();
+        let seed_cluster = cluster.clone();
+        let seed_build =
+            Box::pin(async move { super::graph_reseed_envelope(&seed_cluster, None).await })
+                as super::SeedBuild;
+        let stream = super::event_stream(
+            state,
+            cluster,
+            rx,
+            None,
+            None,
+            false,
+            vec![],
+            Some(seed_build),
+            "seed-slot-capacity-third".into(),
+            live_permits,
+            Some(permit),
+        );
+        use axum::response::sse::{KeepAlive, Sse};
+        use axum::response::IntoResponse as _;
+        use futures::StreamExt as _;
+        let response = Sse::new(stream)
+            .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(5)))
+            .into_response();
+        let mut body = response.into_body().into_data_stream();
+        let mut saw_seed = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), body.next()).await {
+                Ok(Some(Ok(chunk))) if String::from_utf8_lossy(&chunk).contains("event: inv") => {
+                    saw_seed = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            saw_seed,
+            "the third seed client must hydrate while two scans hold their slots"
+        );
+        drop(held_scans);
     }
 }
