@@ -205,6 +205,34 @@ timeout recurs. D3 (federation's common-subset fingerprint +
 projection + prefix admission) also closed 2026-11-04 — q15 is
 answered; automated peer transport remains under D3's umbrella.
 
+**2026-11-10 (matrix attempted for the parked push; D72 landed in a
+worktree; PAUSED FOR REBOOT — machine degraded):** the resumed session
+ran the full matrix (`verify-release.sh`, `SSL_CERT_FILE` exported) on
+the exact db358b2 tree: 817/854 passed, but 37 failed — every failure
+in the node-booting deadline family (`exocortex-client` boot/stdio/
+wrapper suites + 3 server supervisor / worker smoke tests) at uniform
+5/10/20s deadlines, under a machine running 400%+ CPU of runaway
+SYSTEM daemons (`diagnosticd` 141%, jumpcloud `log stream` 99%,
+`audiomxd` 94%, `syspolicyd` 76% with 814 CPU-minutes; load 7.26
+sustained) — D60's environmental class, not code: db358b2 touches only
+`xtask/src/gates.rs`, and all three failed suites re-ran GREEN
+SERIALLY on the same tree minutes later (cli_smoke 4/4,
+standalone_readback 10/10, stdio_smoke 15/15). The reboot the owner is
+taking is the remediation this class wants. D72 (TLS eager-init)
+CLOSED in the side worktree `../exocortex-d72`, branch
+`d72-tls-plaintext`, commit `4f9090e` (fix + fail-without-it +
+plan-row Done, fast gates + adapters + cli_smoke-without-workaround
+all green) — cherry-pick it to main on resume. CI state found red on
+origin/main: the 11-08 run (39d8f6f) failed ONLY xtask-gates — the
+seam-inventory claim db358b2 fixes (its local `cargo xtask
+seam-inventory` verification was started and interrupted by this
+reboot — RERUN IT FIRST on resume); the 11-05 run's test-shard red
+was already healed (11-08 tests shard green). RESUME ORDER: (1)
+`cargo xtask seam-inventory` on main; (2) cherry-pick `4f9090e`;
+(3) the push still parks on a green matrix — decide local re-run (post-
+reboot machine) vs the 0.5.3/0.5.4 CI-side precedent, record it, push
+db358b2+D72, and watch the CI run to green.
+
 **2026-11-07 evening (the resumed init measurement ran; the no-tools
 family is root-caused as SSE admission saturation — D73 opened):** the
 morning entry's "RESUME IT FIRST" item ran first. The decisive answer:
