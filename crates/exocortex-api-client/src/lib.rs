@@ -24,6 +24,9 @@
 //! (native-tokio); `http` is permitted for local mocks and proxies the
 //! operator pins deliberately — a non-local plaintext endpoint draws a
 //! loud warning, because the bearer token would travel unencrypted.
+//! A plaintext endpoint never touches rustls at all (D72): the trust
+//! store is loaded only when TLS will actually be spoken, so a
+//! keychain-less context cannot break a loopback `http` call.
 //! Response bodies are capped ([`BODY_CAP`]) so a hostile or broken
 //! endpoint cannot exhaust the host; exceeding the cap is an error,
 //! never a truncation.
@@ -116,13 +119,36 @@ pub enum ApiError {
 }
 
 /// A minimal bearer-authenticated JSON POST client for one endpoint.
-/// The connection (and TLS session) is built ONCE and reused for every
-/// request — a per-request client pays a TCP+TLS handshake and a
+/// The connection is built ONCE and reused for every request — a
+/// per-request client pays a TCP (+TLS) handshake and a
 /// platform-trust-store load per page.
 pub struct ApiClient {
     endpoint: hyper::Uri,
     user_agent: String,
-    client: hyper::Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>, hyper::Body>,
+    transport: Transport,
+}
+
+/// The scheme-conditional connection pool (the exocortex-client SSE
+/// precedent, D72): plaintext endpoints get a plain hyper client and
+/// never load the platform trust store — a keychain-less macOS context
+/// panics inside `with_native_roots`, which used to kill every loopback
+/// client call even though TLS was never spoken. TLS endpoints pay the
+/// guarded rustls build.
+enum Transport {
+    Https(hyper::Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>, hyper::Body>),
+    Plain(hyper::Client<hyper::client::HttpConnector, hyper::Body>),
+}
+
+impl Transport {
+    async fn request(
+        &self,
+        request: hyper::Request<hyper::Body>,
+    ) -> Result<hyper::Response<hyper::Body>, hyper::Error> {
+        match self {
+            Transport::Https(client) => client.request(request).await,
+            Transport::Plain(client) => client.request(request).await,
+        }
+    }
 }
 
 /// A loopback or link-local host: plaintext `http` is the local-mock
@@ -143,8 +169,13 @@ impl ApiClient {
         let uri: hyper::Uri = endpoint
             .parse()
             .map_err(|e| ApiError::InvalidEndpoint(format!("{endpoint}: {e}")))?;
-        match uri.scheme_str() {
-            Some("https") => {}
+        // D72: the connector is scheme-conditional — a plaintext
+        // endpoint never loads the platform trust store (a keychain-less
+        // macOS context panics inside `with_native_roots`, which used to
+        // kill every loopback client call even though TLS was never
+        // spoken).
+        let transport = match uri.scheme_str() {
+            Some("https") => Transport::Https(hyper::Client::builder().build(build_connector()?)),
             // Local mocks and pinned proxies only; never a live SaaS API.
             Some("http") => {
                 let host = uri.host().unwrap_or_default();
@@ -154,17 +185,18 @@ impl ApiClient {
                         "plaintext http endpoint: the bearer token travels unencrypted; local mocks and pinned proxies only"
                     );
                 }
+                Transport::Plain(hyper::Client::new())
             }
             other => {
                 return Err(ApiError::InvalidEndpoint(format!(
                     "{endpoint}: scheme must be http or https, got {other:?}"
                 )));
             }
-        }
+        };
         Ok(Self {
             endpoint: uri,
             user_agent: format!("exocortex-api-client/{}", env!("CARGO_PKG_VERSION")),
-            client: hyper::Client::builder().build(build_connector()?),
+            transport,
         })
     }
 
@@ -198,7 +230,7 @@ impl ApiClient {
         // hang the adapter forever.
         let (status, rate, bytes) = tokio::time::timeout(REQUEST_TIMEOUT, async {
             let response = self
-                .client
+                .transport
                 .request(request)
                 .await
                 .map_err(|e| ApiError::Transport(e.to_string()))?;
@@ -284,11 +316,10 @@ fn summarize(bytes: &[u8], secret: &str) -> String {
     }
 }
 
-/// Build the process-reusable TLS connector (both schemes: the pinned
-/// endpoint's URI decides per request; the scheme is validated at
-/// construction). The trust-store load can panic on platforms without
-/// roots — an environment error the operator can fix, surfaced as a
-/// typed error (the exocortex-client SSE precedent).
+/// Build the TLS connector for an `https` endpoint. The trust-store
+/// load can panic on platforms without roots — an environment error
+/// the operator can fix, surfaced as a typed error (the exocortex-client
+/// SSE precedent).
 fn build_connector() -> Result<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>, ApiError>
 {
     // `with_native_roots` loads the platform trust store eagerly and
@@ -304,7 +335,7 @@ fn build_connector() -> Result<hyper_rustls::HttpsConnector<hyper::client::HttpC
         match std::panic::catch_unwind(|| {
             hyper_rustls::HttpsConnectorBuilder::new()
                 .with_native_roots()
-                .https_or_http()
+                .https_only()
                 .enable_http1()
                 .enable_http2()
                 .build()
@@ -350,6 +381,17 @@ async fn read_capped(response: hyper::Response<hyper::Body>) -> Result<Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that mutate process-global env (`SSL_CERT_FILE`)
+    /// against tests that construct TLS clients, which read it —
+    /// `cargo test` runs this module's tests in one process, in parallel.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn acquire_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
         let mut map = hyper::HeaderMap::new();
@@ -429,6 +471,7 @@ mod tests {
 
     #[test]
     fn endpoints_must_be_http_or_https() {
+        let _env = acquire_env_lock();
         assert!(ApiClient::new("https://api.linear.app/graphql").is_ok());
         assert!(ApiClient::new("http://127.0.0.1:9955/graphql").is_ok());
         for bad in ["ftp://x", "api.linear.app", ""] {
@@ -447,5 +490,92 @@ mod tests {
         assert!(!summary.contains(token), "token redacted: {summary}");
         assert!(summary.contains("***"), "redaction marker present");
         assert!(summary.contains("and more text"), "context preserved");
+    }
+
+    /// One-shot HTTP/1.1 responder: reads a single POST to completion
+    /// (headers + `Content-Length` body), answers a fixed JSON document,
+    /// closes. Hand-rolled over the tokio TcpListener so the crate's
+    /// dependency surface stays untouched (the workspace `hyper` carries
+    /// no `server` feature).
+    async fn serve_one_post(listener: tokio::net::TcpListener) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.expect("client connects");
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            let n = socket.read(&mut chunk).await.expect("read request");
+            assert!(n > 0, "client closed before sending headers");
+            received.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let header_text = String::from_utf8_lossy(&received[..header_end]).to_string();
+        let content_length: usize = header_text
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+            .and_then(|line| line.split(':').nth(1))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        while received.len() < header_end + content_length {
+            let n = socket.read(&mut chunk).await.expect("read request body");
+            assert!(n > 0, "client closed mid-body");
+            received.extend_from_slice(&chunk[..n]);
+        }
+        let response_body = r#"{"data":{"ok":true}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
+        socket.shutdown().await.ok();
+    }
+
+    /// D72: a plaintext loopback endpoint must never load the platform
+    /// trust store. Pointing `SSL_CERT_FILE` at a nonexistent path makes
+    /// `with_native_roots` fail that load even where a keychain exists,
+    /// so on the eager-connector tree this is red on ANY machine (the
+    /// constructor surfaces the trust-store failure), and green only
+    /// when plaintext construction skips rustls entirely.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plaintext_loopback_serves_without_a_trust_store() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { serve_one_post(listener).await });
+
+        // The env mutation needs to cover only the synchronous
+        // construction (the eager trust-store load lives there); the
+        // guard is scoped so it never spans an await.
+        let client = {
+            let _env = acquire_env_lock();
+            let previous = std::env::var("SSL_CERT_FILE").ok();
+            std::env::set_var("SSL_CERT_FILE", "/nonexistent/exocortex-d72/no-certs.pem");
+            let client = ApiClient::new(&format!("http://{addr}/graphql"));
+            // Restore before asserting so a failure cannot poison the
+            // rest of the process's env-dependent tests.
+            match &previous {
+                Some(value) => std::env::set_var("SSL_CERT_FILE", value),
+                None => std::env::remove_var("SSL_CERT_FILE"),
+            }
+            client.expect("plaintext construction never touches the trust store")
+        };
+
+        let (status, _rate, json) = client
+            .post_json(
+                "token",
+                &serde_json::json!({ "query": "{ viewer { id } }" }),
+            )
+            .await
+            .expect("the loopback POST round-trips without TLS roots");
+        assert_eq!(status, 200);
+        assert_eq!(
+            json["data"]["ok"], true,
+            "parsed the responder's JSON: {json}"
+        );
+        server.await.expect("responder ran to completion");
     }
 }
