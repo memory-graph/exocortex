@@ -269,7 +269,17 @@ authoritative matrix — local evidence on the exact tree stands at fmt
 green, api-client clippy `-D warnings` green, api-client 6/6,
 `cli_smoke` 4/4 WITHOUT the workaround, and seam-inventory green; CI
 on db358b2's seam-inventory fix is the red this push heals. A reboot
-remains the remediation this class wants (owner's call).
+remains the remediation this class wants (owner's call). The push
+landed (`39d8f6f..3686a5a`: db358b2 + 3987771 + 23388ea + the matrix
+decision) and **CI run 43602419800 is GREEN on it — all four jobs
+(xtask-gates 7m19s, the seam-inventory red this push claimed to heal;
+fixtures; lint; tests 12m11s)** — the parked D3/D73/D72 push is
+closed, origin/main is current, and the `../exocortex-d72` worktree
+and `d72-tls-plaintext` branch are removed (4f9090e's crate diff
+against the pick 23388ea is empty; the sha lives here and in D72's
+row). Local build work parks until the machine reboots: with
+signature-fcntl stalls at this depth, even cached cargo no-ops take
+an hour — no local row is viably selectable on this machine state.
 
 **2026-11-07 evening (the resumed init measurement ran; the no-tools
 family is root-caused as SSE admission saturation — D73 opened):** the
